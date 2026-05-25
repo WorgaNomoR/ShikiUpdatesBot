@@ -64,8 +64,8 @@ python main.py
 
 | Константа | По умолчанию | Описание |
 |---|---|---|
-| `SHIKI_USER` | `USER` | Ник на Shikimori |
-| `DISPLAY_NAME` | `NAME` | Отображаемое имя в сообщениях |
+| `SHIKI_USER` | `WNR` | Ник на Shikimori |
+| `DISPLAY_NAME` | `Ворга` | Отображаемое имя в сообщениях |
 | `SHIKI_BASE_URL` | `https://shikimori.io` | Домен — менять при смене зеркала |
 | `CHECK_INTERVAL` | `900` (15 мин) | Интервал проверки в секундах |
 
