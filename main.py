@@ -10,7 +10,7 @@ Shikimori History Watcher Bot
     2. Задать переменные окружения и запустить:
            export BOT_TOKEN='токен_от_BotFather'
            export OWNER_ID='твой_telegram_id'
-           python shikimori_bot.py
+           python main.py
     3. Написать боту /start — бот запомнит тебя и начнёт слать уведомления
     4. Поделиться ссылкой на бота с друзьями — они тоже пишут /start
 
@@ -18,6 +18,7 @@ Shikimori History Watcher Bot
     /start — подписаться на уведомления
     /stop  — отписаться
     /subs  — посмотреть список подписчиков (только для владельца)
+    /status — показывает что сейчас смотрит/читает пользователь
 """
 
 import asyncio
