@@ -31,7 +31,7 @@ from pathlib import Path
 from datetime import datetime
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, BotCommand
@@ -43,9 +43,8 @@ from aiogram.types import Message, BotCommand
 # Задать: export BOT_TOKEN="токен_от_BotFather"
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Твой личный Telegram ID — узнать можно у @userinfobot.
+# Твой Telegram ID — узнать у @userinfobot.
 # Нужен для команды /subs (только владелец видит список подписчиков).
-# Твой Telegram ID — узнать у @userinfobot
 # Задать: export OWNER_ID="123456789"
 OWNER_ID = int(os.environ["OWNER_ID"])
 
@@ -53,8 +52,12 @@ SHIKI_USER     = "WNR"              # ник на Shikimori (для API)
 SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь при смене зеркала
 DISPLAY_NAME   = "Ворга"           # отображаемое имя в сообщениях
 CHECK_INTERVAL = 15 * 60           # интервал проверки в секундах (15 минут)
-SEEN_IDS_FILE  = "seen_ids.json"   # файл для хранения виденных ID
-SUBS_FILE      = "subscribers.json" # файл для хранения подписчиков
+# Пути к файлам данных.
+# По умолчанию создаются в рабочей директории.
+# Чтобы хранить в другом месте — задай переменную окружения DATA_DIR=/путь/к/папке
+_DATA_DIR      = os.environ.get("DATA_DIR", ".")
+SEEN_IDS_FILE  = f"{_DATA_DIR}/seen_ids.json"      # ID обработанных событий
+SUBS_FILE      = f"{_DATA_DIR}/subscribers.json"   # список подписчиков
 
 # ─────────────────────────────────────────────
 #  ФИЛЬТР ПО ТИПУ (kind)
@@ -76,6 +79,11 @@ ANIME_ALLOWED_KINDS: frozenset[str] = frozenset({
 MANGA_BLOCKED_KINDS: frozenset[str] = frozenset({
     "one_shot", # Ваншот
     "doujin",   # Додзинси (любительское)
+})
+
+# Все виды, которые Shikimori относит к манге (используется в get_media_info)
+MANGA_KINDS: frozenset[str] = frozenset({
+    "manga", "manhwa", "manhua", "novel", "ranobe", "one_shot", "doujin",
 })
 
 # ─────────────────────────────────────────────
@@ -385,7 +393,6 @@ def get_media_info(entry: dict) -> tuple[str, str]:
     kind     = (target.get("kind") or "").lower()   # "tv", "movie", "ova", "manga", ...
 
     # Манга — если явно указан тип Manga, либо kind из «мангового» набора
-    MANGA_KINDS = {"manga", "manhwa", "manhua", "novel", "ranobe", "one_shot", "doujin"}
     if raw_type == "manga" or kind in MANGA_KINDS:
         return "manga", kind
 
@@ -413,8 +420,6 @@ def is_relevant(media_type: str, kind: str) -> bool:
         return kind not in MANGA_BLOCKED_KINDS
 
     return False
-
-
 
 
 def extract_score_change(description: str) -> tuple[int, int] | None:
@@ -534,8 +539,6 @@ def build_message(entry: dict) -> str:
     event_type = classify_event(description)
 
     score = None
-    old_score = None
-    new_score = None
 
     if event_type == "score_changed":
         # Изменение оценки — берём шаблон из общего банка, не из anime/manga
@@ -577,13 +580,13 @@ def build_message(entry: dict) -> str:
             score="?",
         )
 
-    # Временна́я метка события
     # Ссылка на тайтл — target.url приходит как "/animes/123-name" или "/mangas/456-name"
     target_url = (target.get("url") or "").strip()
     if target_url:
         full_url = f"{SHIKI_BASE_URL}{target_url}"
         text += f"\n🔗 [Открыть на Shikimori]({full_url})"
 
+    # Временна́я метка события
     created_at = entry.get("created_at", "")
     if created_at:
         try:
@@ -814,8 +817,6 @@ async def cmd_subs(message: Message) -> None:
         lines.append(f"{i}. {uname} (`{cid}`)")
     sep = "\n"
     await message.answer(sep.join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
 
 
 async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict]:
