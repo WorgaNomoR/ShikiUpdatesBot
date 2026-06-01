@@ -15,13 +15,18 @@ Shikimori History Watcher Bot
     4. Поделиться ссылкой на бота с друзьями — они тоже пишут /start
 
 Команды бота:
-    /start — подписаться на уведомления
-    /stop  — отписаться
-    /subs  — посмотреть список подписчиков (только для владельца)
-    /status — показывает что сейчас смотрит/читает пользователь
+    /start      — подписаться на уведомления
+    /stop       — отписаться
+    /status     — что сейчас смотрит/читает пользователь
+    /broadcast  — написать подписчикам (только для владельца)
+    /cancel     — отменить текущую операцию
+    /subs       — список подписчиков (только для владельца)
+    /export     — выгрузить subscribers.json (только для владельца)
+    /import     — загрузить subscribers.json из файла (только для владельца)
 """
 
 import asyncio
+import html
 import json
 import os
 import logging
@@ -31,10 +36,16 @@ from pathlib import Path
 from datetime import datetime
 
 import aiohttp
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, BotCommand
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, BotCommand, FSInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ — заполни перед запуском
@@ -44,7 +55,7 @@ from aiogram.types import Message, BotCommand
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # Твой Telegram ID — узнать у @userinfobot.
-# Нужен для команды /subs (только владелец видит список подписчиков).
+# Нужен для команд только для владельца (/subs, /export, /import, /broadcast).
 # Задать: export OWNER_ID="123456789"
 OWNER_ID = int(os.environ["OWNER_ID"])
 
@@ -107,6 +118,87 @@ log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
+#  FSM — состояния для команды /broadcast
+# ═══════════════════════════════════════════════════════════════
+
+class BroadcastStates(StatesGroup):
+    waiting_content = State()   # ждём сообщение от владельца
+    waiting_confirm = State()   # ждём нажатия кнопки подтверждения
+
+
+BROADCAST_HEADER = f"📢 <b>{DISPLAY_NAME} говорит:</b>"
+
+
+def _confirm_kb() -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура с кнопками подтверждения/отмены рассылки."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📢 Отправить", callback_data="broadcast_send"),
+        InlineKeyboardButton(text="❌ Отмена",    callback_data="broadcast_cancel"),
+    ]])
+
+
+async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> None:
+    """
+    Отправляет одно сообщение рассылки в указанный чат.
+    data — словарь, сохранённый в FSM:
+      msg_type  : "text" | "photo" | "video" | "animation" | "document" | "voice" | "sticker"
+      file_id   : str | None
+      user_text : str  (текст сообщения или caption от пользователя)
+    """
+    msg_type  = data["msg_type"]
+    user_text = data.get("user_text", "")
+    file_id   = data.get("file_id")
+
+    if msg_type == "text":
+        # Текст оборачиваем в цитату
+        body = f"\n<blockquote>{h(user_text)}</blockquote>" if user_text else ""
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{BROADCAST_HEADER}{body}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif msg_type == "sticker":
+        # Стикеры не поддерживают caption — шапка отдельным сообщением
+        await bot.send_message(chat_id=chat_id, text=BROADCAST_HEADER, parse_mode=ParseMode.HTML)
+        await bot.send_sticker(chat_id=chat_id, sticker=file_id)
+
+    else:
+        # Фото, видео, GIF, документ, голосовое — шапка + текст пользователя в caption
+        if user_text:
+            caption = f"{BROADCAST_HEADER}\n\n{h(user_text)}"
+        else:
+            caption = BROADCAST_HEADER
+
+        common = dict(chat_id=chat_id, caption=caption, parse_mode=ParseMode.HTML)
+
+        if msg_type == "photo":
+            await bot.send_photo(
+                photo=file_id, show_caption_above_media=True, **common,
+            )
+        elif msg_type == "video":
+            await bot.send_video(
+                video=file_id, show_caption_above_media=True, **common,
+            )
+        elif msg_type == "animation":
+            await bot.send_animation(
+                animation=file_id, show_caption_above_media=True, **common,
+            )
+        elif msg_type == "document":
+            await bot.send_document(document=file_id, **common)
+        elif msg_type == "voice":
+            await bot.send_voice(voice=file_id, **common)
+
+
+def h(text: str) -> str:
+    """Экранируем спецсимволы HTML — защита от поломки разметки в Telegram.
+    Экранирует: & → &amp;  < → &lt;  > → &gt;
+    Применять ко всем пользовательским данным из API перед вставкой в сообщение.
+    """
+    return html.escape(str(text))
+
+
+# ═══════════════════════════════════════════════════════════════
 #  БАНК СООБЩЕНИЙ
 #
 #  Переменные в шаблонах:
@@ -128,92 +220,92 @@ MESSAGES = {
 
         # 📋 Добавил в «Запланированное»
         "planned": [
-            "📋 {n} закинул *{title}* в бесконечный список «посмотрю когда-нибудь». Ждём.",
-            "🗂️ *{title}* занял своё место в очереди на годы. Дождётся ли?",
-            "📌 {n} запланировал *{title}*. Статистика говорит: 80% таких тайтлов умирают непросмотренными.",
-            "🧠 Судьба *{title}* решена — оно теперь в списке. Просмотр — под вопросом.",
-            "🔖 *{title}* добавлено в коллекцию намерений {n}. Осталось только посмотреть.",
-            "📥 Хоп — и *{title}* в planned. Как будто кто-то собирается это смотреть 👀",
+            "📋 {n} закинул <b>{title}</b> в бесконечный список «посмотрю когда-нибудь». Ждём.",
+            "🗂️ <b>{title}</b> занял своё место в очереди на годы. Дождётся ли?",
+            "📌 {n} запланировал <b>{title}</b>. Статистика говорит: 80% таких тайтлов умирают непросмотренными.",
+            "🧠 Судьба <b>{title}</b> решена — оно теперь в списке. Просмотр — под вопросом.",
+            "🔖 <b>{title}</b> добавлено в коллекцию намерений {n}. Осталось только посмотреть.",
+            "📥 Хоп — и <b>{title}</b> в planned. Как будто кто-то собирается это смотреть 👀",
         ],
 
         # ▶️ Начал смотреть
         "watching": [
-            "▶️ {n} начал смотреть *{title}*. Запасаемся попкорном.",
-            "🎬 Поехали! *{title}* запущено. Возврата нет.",
-            "👁️ {n} открыл *{title}* и пропал. Ждём отчёта.",
-            "🍿 *{title}* в плеере, {n} у экрана. Классика.",
-            "🚀 Старт! *{title}* вышло на орбиту просмотра.",
-            "😤 {n} не выдержал и таки начал *{title}*. Посмотрим, чем это закончится.",
+            "▶️ {n} начал смотреть <b>{title}</b>. Запасаемся попкорном.",
+            "🎬 Поехали! <b>{title}</b> запущено. Возврата нет.",
+            "👁️ {n} открыл <b>{title}</b> и пропал. Ждём отчёта.",
+            "🍿 <b>{title}</b> в плеере, {n} у экрана. Классика.",
+            "🚀 Старт! <b>{title}</b> вышло на орбиту просмотра.",
+            "😤 {n} не выдержал и таки начал <b>{title}</b>. Посмотрим, чем это закончится.",
         ],
 
         # 🔁 Пересматривает
         "rewatching": [
-            "🔁 {n} пересматривает *{title}*. Не надоело — значит шедевр (или мазохизм).",
-            "♻️ *{title}* снова в деле. {n} возвращается к проверенному.",
-            "🌀 Повторный заход на *{title}*. Уважаю.",
-            "📺 {n} включил *{title}* ещё раз. Некоторые вещи просто не отпускают.",
-            "🔂 *{title}* на втором (третьем? десятом?) круге у {n}. Это уже традиция.",
-            "👏 Решился на ремастер впечатлений — *{title}* снова смотрит {n}.",
+            "🔁 {n} пересматривает <b>{title}</b>. Не надоело — значит шедевр (или мазохизм).",
+            "♻️ <b>{title}</b> снова в деле. {n} возвращается к проверенному.",
+            "🌀 Повторный заход на <b>{title}</b>. Уважаю.",
+            "📺 {n} включил <b>{title}</b> ещё раз. Некоторые вещи просто не отпускают.",
+            "🔂 <b>{title}</b> на втором (третьем? десятом?) круге у {n}. Это уже традиция.",
+            "👏 Решился на ремастер впечатлений — <b>{title}</b> снова смотрит {n}.",
         ],
 
         # 💀 Бросил (dropped)
         "dropped": [
-            "🗑️ *{title}* — в мусор. {n} не пощадил.",
-            "💀 Dropped. *{title}* не пережило встречи с {n}.",
-            "🚪 {n} покинул *{title}* без объяснений. Бывает.",
-            "❌ *{title}* — дропнуто. Минус одно аниме в этом жестоком мире.",
-            "😤 {n} посмотрел на *{title}* и сказал «нет». Твёрдая позиция.",
-            "🏳️ *{title}* не справилось с испытанием {n}. Позор или избавление — решай сам.",
+            "🗑️ <b>{title}</b> — в мусор. {n} не пощадил.",
+            "💀 Dropped. <b>{title}</b> не пережило встречи с {n}.",
+            "🚪 {n} покинул <b>{title}</b> без объяснений. Бывает.",
+            "❌ <b>{title}</b> — дропнуто. Минус одно аниме в этом жестоком мире.",
+            "😤 {n} посмотрел на <b>{title}</b> и сказал «нет». Твёрдая позиция.",
+            "🏳️ <b>{title}</b> не справилось с испытанием {n}. Позор или избавление — решай сам.",
         ],
 
         # ✅ Завершил без оценки
         "completed_no_score": [
-            "✅ {n} досмотрел *{title}*. Оценку зажал — интригует.",
-            "🏁 *{title}* завершено. Впечатления {n} покрыты тайной.",
-            "👀 Конец *{title}*. Молчание {n} красноречивее слов.",
-            "📺 {n} прошёл путь *{title}* до конца. Без комментариев.",
-            "🎌 *{title}* — пройдено. Оценка — не для слабонервных, видимо.",
-            "🤐 Закончил *{title}* и молчит. Либо шедевр, либо травма.",
+            "✅ {n} досмотрел <b>{title}</b>. Оценку зажал — интригует.",
+            "🏁 <b>{title}</b> завершено. Впечатления {n} покрыты тайной.",
+            "👀 Конец <b>{title}</b>. Молчание {n} красноречивее слов.",
+            "📺 {n} прошёл путь <b>{title}</b> до конца. Без комментариев.",
+            "🎌 <b>{title}</b> — пройдено. Оценка — не для слабонервных, видимо.",
+            "🤐 Закончил <b>{title}</b> и молчит. Либо шедевр, либо травма.",
         ],
 
         # ⭐ Оценка 1–3
         "completed_score_low": [
-            "💩 *{title}* — {score}/10. {n} страдал, но добил. Настоящий герой.",
-            "😭 {score}/10 за *{title}*. Боль реальна. Зачем вообще?",
-            "🤮 *{title}* получает {score}/10 от {n}. Это приговор.",
-            "⚰️ {score}/10 — *{title}* мертво и похоронено в памяти {n}.",
-            "🧟 {n} выжил после *{title}* ({score}/10). Это уже достижение.",
-            "🔥 *{title}* — {score}/10. Сожжено дотла заслуженно.",
+            "💩 <b>{title}</b> — {score}/10. {n} страдал, но добил. Настоящий герой.",
+            "😭 {score}/10 за <b>{title}</b>. Боль реальна. Зачем вообще?",
+            "🤮 <b>{title}</b> получает {score}/10 от {n}. Это приговор.",
+            "⚰️ {score}/10 — <b>{title}</b> мертво и похоронено в памяти {n}.",
+            "🧟 {n} выжил после <b>{title}</b> ({score}/10). Это уже достижение.",
+            "🔥 <b>{title}</b> — {score}/10. Сожжено дотла заслуженно.",
         ],
 
         # 😐 Оценка 4–6
         "completed_score_mid": [
-            "😐 *{title}* — {score}/10. Ни рыба ни мясо, говорит {n}.",
-            "🫤 {score}/10 за *{title}*. Не плохо, не хорошо. Просто... было.",
-            "🤷 {n} поставил *{title}* {score}/10. Среднячок прожил и умер.",
-            "📊 *{title}* — твёрдый {score}/10. {n} явно ожидал большего.",
-            "🌫️ {score}/10 — *{title}* оставило {n} в тумане безразличия.",
-            "😶 Посмотрел. Оценил. {score}/10. *{title}* не потрясло мир {n}.",
+            "😐 <b>{title}</b> — {score}/10. Ни рыба ни мясо, говорит {n}.",
+            "🫤 {score}/10 за <b>{title}</b>. Не плохо, не хорошо. Просто... было.",
+            "🤷 {n} поставил <b>{title}</b> {score}/10. Среднячок прожил и умер.",
+            "📊 <b>{title}</b> — твёрдый {score}/10. {n} явно ожидал большего.",
+            "🌫️ {score}/10 — <b>{title}</b> оставило {n} в тумане безразличия.",
+            "😶 Посмотрел. Оценил. {score}/10. <b>{title}</b> не потрясло мир {n}.",
         ],
 
         # 🌟 Оценка 7–9
         "completed_score_high": [
-            "🌟 *{title}* — {score}/10! {n} доволен. Хороший вкус подтверждён.",
-            "🔥 {score}/10 за *{title}*! {n} в восторге, и это заслужено.",
-            "👏 *{title}* получает {score}/10 от {n}. Браво, студия!",
-            "✨ {score}/10 — *{title}* попало в сердечко {n}.",
-            "🎉 Вот это да! {score}/10 за *{title}*. Рекомендую к просмотру всем.",
-            "💫 *{title}* — {score}/10. {n} явно не разочарован. Редкий случай.",
+            "🌟 <b>{title}</b> — {score}/10! {n} доволен. Хороший вкус подтверждён.",
+            "🔥 {score}/10 за <b>{title}</b>! {n} в восторге, и это заслужено.",
+            "👏 <b>{title}</b> получает {score}/10 от {n}. Браво, студия!",
+            "✨ {score}/10 — <b>{title}</b> попало в сердечко {n}.",
+            "🎉 Вот это да! {score}/10 за <b>{title}</b>. Рекомендую к просмотру всем.",
+            "💫 <b>{title}</b> — {score}/10. {n} явно не разочарован. Редкий случай.",
         ],
 
         # 👑 Оценка 10
         "completed_score_perfect": [
-            "👑 *{title}* — ДЕСЯТКА! {n} нашёл новый фаворит. Занесите в анналы.",
-            "🏆 10/10! *{title}* вошло в пантеон {n}. Это серьёзно.",
-            "💎 {n} раздаёт десятки! *{title}* — абсолютный шедевр по его версии.",
-            "🌌 10/10 за *{title}*. {n} разрушен и счастлив одновременно.",
-            "🎌 Максимум! *{title}* — теперь часть души {n}. Трогательно.",
-            "🔮 *{title}* получает священную десятку. {n} преклоняется.",
+            "👑 <b>{title}</b> — ДЕСЯТКА! {n} нашёл новый фаворит. Занесите в анналы.",
+            "🏆 10/10! <b>{title}</b> вошло в пантеон {n}. Это серьёзно.",
+            "💎 {n} раздаёт десятки! <b>{title}</b> — абсолютный шедевр по его версии.",
+            "🌌 10/10 за <b>{title}</b>. {n} разрушен и счастлив одновременно.",
+            "🎌 Максимум! <b>{title}</b> — теперь часть души {n}. Трогательно.",
+            "🔮 <b>{title}</b> получает священную десятку. {n} преклоняется.",
         ],
     },
 
@@ -225,92 +317,92 @@ MESSAGES = {
 
         # 📋 Добавил в «Запланированное»
         "planned": [
-            "📚 {n} добавил мангу *{title}* в список «прочитаю как-нибудь». Не факт.",
-            "🗂️ *{title}* записана в очередь. Полки ломятся, {n} не останавливается.",
-            "📌 {n} запланировал *{title}*. Главы сами себя не прочитают.",
-            "🧠 Манга *{title}* теперь в списке {n}. До прочтения — бесконечность.",
-            "🔖 *{title}* зафиксирована. {n} снова расширяет свои непрочитанные владения.",
-            "📥 Хоп — *{title}* в planned. Сколько глав? Неважно. Прочитаю. Когда-нибудь.",
+            "📚 {n} добавил мангу <b>{title}</b> в список «прочитаю как-нибудь». Не факт.",
+            "🗂️ <b>{title}</b> записана в очередь. Полки ломятся, {n} не останавливается.",
+            "📌 {n} запланировал <b>{title}</b>. Главы сами себя не прочитают.",
+            "🧠 Манга <b>{title}</b> теперь в списке {n}. До прочтения — бесконечность.",
+            "🔖 <b>{title}</b> зафиксирована. {n} снова расширяет свои непрочитанные владения.",
+            "📥 Хоп — <b>{title}</b> в planned. Сколько глав? Неважно. Прочитаю. Когда-нибудь.",
         ],
 
         # ▶️ Начал читать
         "watching": [
-            "📖 {n} открыл мангу *{title}*. Поехали, глава за главой.",
-            "🎌 {n} приступил к чтению *{title}*. Спать, видимо, не скоро.",
-            "👁️ *{title}* в руках {n}. Ждём отчёта с полей.",
-            "📜 {n} начал читать *{title}*. Надеемся, глав там хватит.",
-            "🚀 Старт! *{title}* — новая манга в арсенале {n}.",
-            "😤 {n} не устоял и взялся за *{title}*. Конца и края не видно, но кого это останавливало.",
+            "📖 {n} открыл мангу <b>{title}</b>. Поехали, глава за главой.",
+            "🎌 {n} приступил к чтению <b>{title}</b>. Спать, видимо, не скоро.",
+            "👁️ <b>{title}</b> в руках {n}. Ждём отчёта с полей.",
+            "📜 {n} начал читать <b>{title}</b>. Надеемся, глав там хватит.",
+            "🚀 Старт! <b>{title}</b> — новая манга в арсенале {n}.",
+            "😤 {n} не устоял и взялся за <b>{title}</b>. Конца и края не видно, но кого это останавливало.",
         ],
 
         # 🔁 Перечитывает
         "rewatching": [
-            "🔁 {n} перечитывает *{title}*. Значит, оно того стоило.",
-            "♻️ *{title}* снова открыта. {n} возвращается за второй дозой.",
-            "🌀 Повторный заход на мангу *{title}*. Хороший знак.",
-            "📚 {n} листает *{title}* по второму кругу. Некоторые детали проявляются только так.",
-            "🔂 *{title}* на перечитке у {n}. Привязанность подтверждена.",
-            "👏 {n} снова с *{title}* в руках. Уважаю преданность.",
+            "🔁 {n} перечитывает <b>{title}</b>. Значит, оно того стоило.",
+            "♻️ <b>{title}</b> снова открыта. {n} возвращается за второй дозой.",
+            "🌀 Повторный заход на мангу <b>{title}</b>. Хороший знак.",
+            "📚 {n} листает <b>{title}</b> по второму кругу. Некоторые детали проявляются только так.",
+            "🔂 <b>{title}</b> на перечитке у {n}. Привязанность подтверждена.",
+            "👏 {n} снова с <b>{title}</b> в руках. Уважаю преданность.",
         ],
 
         # 💀 Бросил
         "dropped": [
-            "🗑️ Манга *{title}* — дропнута. {n} не пощадил.",
-            "💀 {n} закрыл *{title}* и больше не открывал. Всё.",
-            "🚪 *{title}* осталась недочитанной. {n} ушёл без объяснений.",
-            "❌ *{title}* — в архив. Минус одна манга в этом суровом мире.",
-            "😤 {n} дал *{title}* шанс. Манга не оценила. Итог — дроп.",
-            "🏳️ *{title}* не выдержала испытания {n}. Бывает с лучшими.",
+            "🗑️ Манга <b>{title}</b> — дропнута. {n} не пощадил.",
+            "💀 {n} закрыл <b>{title}</b> и больше не открывал. Всё.",
+            "🚪 <b>{title}</b> осталась недочитанной. {n} ушёл без объяснений.",
+            "❌ <b>{title}</b> — в архив. Минус одна манга в этом суровом мире.",
+            "😤 {n} дал <b>{title}</b> шанс. Манга не оценила. Итог — дроп.",
+            "🏳️ <b>{title}</b> не выдержала испытания {n}. Бывает с лучшими.",
         ],
 
         # ✅ Завершил без оценки
         "completed_no_score": [
-            "✅ {n} дочитал мангу *{title}*. Молчит. Обрабатывает.",
-            "🏁 *{title}* — прочитано. {n} ставит точку без комментариев.",
-            "👀 Финальная глава *{title}* перевёрнута. Мнение {n} — тайна.",
-            "📚 {n} прошёл *{title}* до конца. Оценка засекречена.",
-            "🎌 *{title}* прочитана. {n} не спешит раскрываться.",
-            "🤐 Дочитал и молчит. *{title}* явно оставила след.",
+            "✅ {n} дочитал мангу <b>{title}</b>. Молчит. Обрабатывает.",
+            "🏁 <b>{title}</b> — прочитано. {n} ставит точку без комментариев.",
+            "👀 Финальная глава <b>{title}</b> перевёрнута. Мнение {n} — тайна.",
+            "📚 {n} прошёл <b>{title}</b> до конца. Оценка засекречена.",
+            "🎌 <b>{title}</b> прочитана. {n} не спешит раскрываться.",
+            "🤐 Дочитал и молчит. <b>{title}</b> явно оставила след.",
         ],
 
         # ⭐ Оценка 1–3
         "completed_score_low": [
-            "💩 Манга *{title}* — {score}/10. {n} дочитал из принципа. Терпеливый человек.",
-            "😭 {score}/10 за *{title}*. Жертва времени принесена. Ради чего?",
-            "🤮 *{title}* получает {score}/10. {n} явно не в восторге.",
-            "⚰️ {score}/10 — *{title}* похоронена в памяти {n}.",
-            "🧟 {n} пережил *{title}* ({score}/10). Медаль за стойкость.",
-            "🔥 *{title}* — {score}/10. Сожжено, забыто, не рекомендуется.",
+            "💩 Манга <b>{title}</b> — {score}/10. {n} дочитал из принципа. Терпеливый человек.",
+            "😭 {score}/10 за <b>{title}</b>. Жертва времени принесена. Ради чего?",
+            "🤮 <b>{title}</b> получает {score}/10. {n} явно не в восторге.",
+            "⚰️ {score}/10 — <b>{title}</b> похоронена в памяти {n}.",
+            "🧟 {n} пережил <b>{title}</b> ({score}/10). Медаль за стойкость.",
+            "🔥 <b>{title}</b> — {score}/10. Сожжено, забыто, не рекомендуется.",
         ],
 
         # 😐 Оценка 4–6
         "completed_score_mid": [
-            "😐 *{title}* — {score}/10. Среднячок. {n} не потрясён.",
-            "🫤 {score}/10 за мангу *{title}*. Прочитал. Закрыл. Пошёл дальше.",
-            "🤷 {n} поставил *{title}* {score}/10. Бывало лучше, бывало хуже.",
-            "📊 *{title}* — {score}/10. В целом норм, но без огня.",
-            "🌫️ {score}/10 — *{title}* прошла мимо сердца {n}.",
-            "😶 Прочитал. Оценил. {score}/10. *{title}* не изменила мировоззрение.",
+            "😐 <b>{title}</b> — {score}/10. Среднячок. {n} не потрясён.",
+            "🫤 {score}/10 за мангу <b>{title}</b>. Прочитал. Закрыл. Пошёл дальше.",
+            "🤷 {n} поставил <b>{title}</b> {score}/10. Бывало лучше, бывало хуже.",
+            "📊 <b>{title}</b> — {score}/10. В целом норм, но без огня.",
+            "🌫️ {score}/10 — <b>{title}</b> прошла мимо сердца {n}.",
+            "😶 Прочитал. Оценил. {score}/10. <b>{title}</b> не изменила мировоззрение.",
         ],
 
         # 🌟 Оценка 7–9
         "completed_score_high": [
-            "🌟 Манга *{title}* — {score}/10! {n} доволен. Художник постарался.",
-            "🔥 {score}/10 за *{title}*! {n} явно не разочарован.",
-            "👏 *{title}* — {score}/10 от {n}. Достойное чтиво.",
-            "✨ {score}/10 — *{title}* зацепила {n} за живое.",
-            "🎉 {score}/10 за *{title}*. Рекомендую всем любителям хорошей манги.",
-            "💫 *{title}* — {score}/10. Редкий случай, когда {n} доволен.",
+            "🌟 Манга <b>{title}</b> — {score}/10! {n} доволен. Художник постарался.",
+            "🔥 {score}/10 за <b>{title}</b>! {n} явно не разочарован.",
+            "👏 <b>{title}</b> — {score}/10 от {n}. Достойное чтиво.",
+            "✨ {score}/10 — <b>{title}</b> зацепила {n} за живое.",
+            "🎉 {score}/10 за <b>{title}</b>. Рекомендую всем любителям хорошей манги.",
+            "💫 <b>{title}</b> — {score}/10. Редкий случай, когда {n} доволен.",
         ],
 
         # 👑 Оценка 10
         "completed_score_perfect": [
-            "👑 *{title}* — ДЕСЯТКА! {n} нашёл новый шедевр манги. Запишите.",
-            "🏆 10/10! *{title}* — в пантеоне {n} навсегда.",
-            "💎 {n} поставил манге *{title}* десятку. Художник может гордиться.",
-            "🌌 10/10 за *{title}*. {n} дочитал и сидит в тишине. Это говорит всё.",
-            "🎌 Максимум! *{title}* — теперь часть {n}. Прямо в душу.",
-            "🔮 *{title}* получает священную десятку. {n} не шутит.",
+            "👑 <b>{title}</b> — ДЕСЯТКА! {n} нашёл новый шедевр манги. Запишите.",
+            "🏆 10/10! <b>{title}</b> — в пантеоне {n} навсегда.",
+            "💎 {n} поставил манге <b>{title}</b> десятку. Художник может гордиться.",
+            "🌌 10/10 за <b>{title}</b>. {n} дочитал и сидит в тишине. Это говорит всё.",
+            "🎌 Максимум! <b>{title}</b> — теперь часть {n}. Прямо в душу.",
+            "🔮 <b>{title}</b> получает священную десятку. {n} не шутит.",
         ],
 
     },  # конец "manga"
@@ -319,12 +411,12 @@ MESSAGES = {
     #  ОБЩИЕ — изменение оценки (для аниме и манги одинаково)
     # ────────────────────────────────
     "score_changed": [
-        "🔄 {n} пересмотрел оценку *{title}*: было {old}, стало {new}. Что-то изменилось.",
-        "🤔 *{title}* переоценено: {old} → {new}. {n} явно что-то переосмыслил.",
-        "🏹 {old} → {new} за *{title}*. {n} дал второй шанс (или отобрал).",
-        "⚖️ Весы справедливости скорректированы: *{title}* теперь {new}/10 вместо {old}.",
-        "✏️ {n} исправил оценку *{title}* с {old} на {new}. Бывает, мнения меняются.",
-        "📊 Обновление рейтинга: *{title}* {old} → {new}. {n} не стоит на месте.",
+        "🔄 {n} пересмотрел оценку <b>{title}</b>: было {old}, стало {new}. Что-то изменилось.",
+        "🤔 <b>{title}</b> переоценено: {old} → {new}. {n} явно что-то переосмыслил.",
+        "🏹 {old} → {new} за <b>{title}</b>. {n} дал второй шанс (или отобрал).",
+        "⚖️ Весы справедливости скорректированы: <b>{title}</b> теперь {new}/10 вместо {old}.",
+        "✏️ {n} исправил оценку <b>{title}</b> с {old} на {new}. Бывает, мнения меняются.",
+        "📊 Обновление рейтинга: <b>{title}</b> {old} → {new}. {n} не стоит на месте.",
     ],
 }
 
@@ -345,11 +437,20 @@ def load_seen_ids() -> set[int]:
     return set()
 
 
+def _atomic_write(path: str, data: str) -> None:
+    """Атомарная запись файла: пишем во временный файл, затем rename.
+    Защищает от повреждения данных при аварийном завершении процесса.
+    """
+    tmp = path + ".tmp"
+    Path(tmp).write_text(data, encoding="utf-8")
+    os.replace(tmp, path)  # атомарная операция на уровне ОС
+
+
 def save_seen_ids(seen_ids: set[int]) -> None:
-    """Сохраняем виденные ID в JSON-файл."""
-    Path(SEEN_IDS_FILE).write_text(
+    """Сохраняем виденные ID в JSON-файл (атомарно)."""
+    _atomic_write(
+        SEEN_IDS_FILE,
         json.dumps({"seen_ids": list(seen_ids)}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
 
 
@@ -370,10 +471,10 @@ def load_subscribers() -> dict[int, str]:
 
 
 def save_subscribers(subs: dict[int, str]) -> None:
-    """Сохраняем подписчиков в JSON."""
-    Path(SUBS_FILE).write_text(
+    """Сохраняем подписчиков в JSON (атомарно)."""
+    _atomic_write(
+        SUBS_FILE,
         json.dumps({"subscribers": {str(k): v for k, v in subs.items()}}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
 
 
@@ -422,18 +523,28 @@ def is_relevant(media_type: str, kind: str) -> bool:
     return False
 
 
+def _strip_html(text: str) -> str:
+    """Удаляем HTML-теги из строки.
+    Shikimori может возвращать description с тегами вроде <b>7</b> —
+    без очистки регулярки не найдут число.
+    """
+    return re.sub(r"<[^>]+>", "", text)
+
+
 def extract_score_change(description: str) -> tuple[int, int] | None:
     """
     Парсим «изменена оценка с X на Y» → возвращаем (old, new).
     Если не распознали — None.
     """
+    desc = _strip_html(description)
     match = re.search(
         r"изменена\s+оценка\s+с\s+(\d+)\s+на\s+(\d+)",
-        description, re.IGNORECASE
+        desc, re.IGNORECASE
     )
     if match:
         return int(match.group(1)), int(match.group(2))
     return None
+
 
 def extract_score(description: str) -> int | None:
     """
@@ -443,16 +554,17 @@ def extract_score(description: str) -> int | None:
       "выставил оценку 8"     <- альтернативный
       "rated 7" / "scored 7"  <- английский
     """
-    # Основной русский формат: «оценено на 9»
-    match = re.search(r"оценено\s+на\s+(\d+)", description, re.IGNORECASE)
+    desc = _strip_html(description)
+    # Основной русский формат: «оценено на 9» (число может быть в <b>9</b>)
+    match = re.search(r"оценено\s+на\s+(\d+)", desc, re.IGNORECASE)
     if match:
         return int(match.group(1))
     # Альтернативный русский: «выставил/выставила оценку 9»
-    match = re.search(r"(?:выставил|выставила)\s+оценку\s+(\d+)", description, re.IGNORECASE)
+    match = re.search(r"(?:выставил|выставила)\s+оценку\s+(\d+)", desc, re.IGNORECASE)
     if match:
         return int(match.group(1))
     # Английский: «rated 7» или «scored 7»
-    match = re.search(r"(?:rated?|score[d]?)\s+(\d+)", description, re.IGNORECASE)
+    match = re.search(r"(?:rated?|score[d]?)\s+(\d+)", desc, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return None
@@ -476,7 +588,7 @@ def classify_event(description: str) -> str:
       "прочитано"           -> completed  (без оценки)
       "оценено на 9"        -> completed  (с оценкой, парсим отдельно)
     """
-    desc = description.lower()
+    desc = _strip_html(description).lower()
 
     # Порядок важен: специфичные — выше, чтобы не поглотил более общий паттерн
 
@@ -529,11 +641,11 @@ def build_message(entry: dict) -> str:
     media_type, _kind = get_media_info(entry)
     bank = MESSAGES[media_type]
 
-    # Название тайтла — предпочитаем русское
+    # Название тайтла — предпочитаем русское, экранируем для HTML
     target = entry.get("target") or {}
     title_ru = target.get("russian") or ""
     title_en = target.get("name") or "???"
-    title = title_ru if title_ru else title_en
+    title = h(title_ru if title_ru else title_en)
 
     description = entry.get("description", "") or ""
     event_type = classify_event(description)
@@ -544,7 +656,6 @@ def build_message(entry: dict) -> str:
         # Изменение оценки — берём шаблон из общего банка, не из anime/manga
         change = extract_score_change(description)
         old_score, new_score = change if change else (None, None)
-        key = "score_changed"
         template = random.choice(MESSAGES["score_changed"])
         text = template.format(
             n=DISPLAY_NAME,
@@ -584,14 +695,14 @@ def build_message(entry: dict) -> str:
     target_url = (target.get("url") or "").strip()
     if target_url:
         full_url = f"{SHIKI_BASE_URL}{target_url}"
-        text += f"\n🔗 [Открыть на Shikimori]({full_url})"
+        text += f'\n🔗 <a href="{full_url}">Открыть на Shikimori</a>'
 
     # Временна́я метка события
     created_at = entry.get("created_at", "")
     if created_at:
         try:
             dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            text += f"\n_🕐 {dt.strftime('%d.%m.%Y %H:%M')} UTC_"
+            text += f"\n<i>🕐 {dt.strftime('%d.%m.%Y %H:%M')} UTC</i>"
         except ValueError:
             pass
 
@@ -640,7 +751,7 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
             await bot.send_message(
                 chat_id=chat_id,
                 text=text,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
             log.info("  → Отправлено подписчику %s (chat_id=%d)", name, chat_id)
         except Exception as e:
@@ -812,11 +923,175 @@ async def cmd_subs(message: Message) -> None:
         return
 
     count = len(subs)
-    lines = [f"👥 Подписчиков: *{count}*", ""]
+    lines = [f"👥 Подписчиков: <b>{count}</b>", ""]
     for i, (cid, uname) in enumerate(subs.items(), 1):
-        lines.append(f"{i}. {uname} (`{cid}`)")
+        lines.append(f"{i}. {h(uname)} (<code>{cid}</code>)")
     sep = "\n"
-    await message.answer(sep.join(lines), parse_mode=ParseMode.MARKDOWN)
+    await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_export(message: Message) -> None:
+    """Отправить subscribers.json владельцу."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+
+    path = Path(SUBS_FILE)
+    if not path.exists() or path.stat().st_size == 0:
+        await message.answer("📭 Файл подписчиков пуст или не существует.")
+        return
+
+    subs = load_subscribers()
+    await message.answer_document(
+        document=FSInputFile(path, filename="subscribers.json"),
+        caption=f"📤 Экспорт подписчиков — {len(subs)} чел.",
+    )
+    log.info("Экспорт subscribers.json отправлен владельцу.")
+
+
+async def cmd_import(message: Message) -> None:
+    """
+    Загрузить subscribers.json из присланного файла.
+    Использование: отправить файл боту с подписью /import
+    (или переслать команду отдельным сообщением — бот попросит прислать файл).
+    """
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+
+    if not message.document:
+        await message.answer(
+            "📎 Пришли файл <code>subscribers.json</code> боту с подписью <code>/import</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not (message.document.file_name or "").endswith(".json"):
+        await message.answer("❌ Ожидается .json файл.")
+        return
+
+    tmp_path = SUBS_FILE + ".import_tmp"
+    try:
+        await message.bot.download(message.document, destination=tmp_path)
+        raw = Path(tmp_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        subs = {int(k): v for k, v in data.get("subscribers", {}).items()}
+    except Exception as e:
+        await message.answer(f"❌ Не удалось прочитать файл: {e}")
+        return
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    save_subscribers(subs)
+    log.info("Импортировано %d подписчиков от владельца.", len(subs))
+    await message.answer(f"✅ Импортировано подписчиков: {len(subs)}")
+
+
+async def cmd_broadcast(message: Message, state: FSMContext) -> None:
+    """Начать рассылку сообщения подписчикам."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+    await state.set_state(BroadcastStates.waiting_content)
+    await message.answer(
+        "✍️ Пришли сообщение для рассылки.\n"
+        "Поддерживаются: текст, фото, видео, GIF, стикер, документ, голосовое.\n\n"
+        "/cancel — передумал",
+    )
+
+
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    """Отменить текущую операцию (работает в любом FSM-состоянии)."""
+    if await state.get_state() is None:
+        await message.answer("🤷 Нечего отменять.")
+        return
+    await state.clear()
+    await message.answer("❌ Отменено.")
+
+
+async def broadcast_receive(message: Message, state: FSMContext) -> None:
+    """Получаем сообщение от владельца, сохраняем в FSM и показываем превью."""
+    # Определяем тип и извлекаем нужные данные
+    if message.sticker:
+        data = {"msg_type": "sticker", "file_id": message.sticker.file_id, "user_text": ""}
+    elif message.photo:
+        data = {"msg_type": "photo",   "file_id": message.photo[-1].file_id, "user_text": message.caption or ""}
+    elif message.video:
+        data = {"msg_type": "video",   "file_id": message.video.file_id,     "user_text": message.caption or ""}
+    elif message.animation:
+        data = {"msg_type": "animation","file_id": message.animation.file_id, "user_text": message.caption or ""}
+    elif message.document:
+        data = {"msg_type": "document","file_id": message.document.file_id,  "user_text": message.caption or ""}
+    elif message.voice:
+        data = {"msg_type": "voice",   "file_id": message.voice.file_id,     "user_text": message.caption or ""}
+    elif message.text:
+        data = {"msg_type": "text",    "file_id": None,                      "user_text": message.text}
+    else:
+        await message.answer("⚠️ Такой тип сообщения не поддерживается. Попробуй другой или /cancel.")
+        return
+
+    await state.update_data(**data)
+    await state.set_state(BroadcastStates.waiting_confirm)
+
+    # Превью — отправляем владельцу как будет выглядеть
+    await message.answer("👀 Вот как увидят подписчики:")
+    await _send_broadcast_message(message.bot, message.chat.id, data)
+    subs_count = len(load_subscribers())
+    await message.answer(
+        f"Отправить {subs_count} подписчик(ам)?",
+        reply_markup=_confirm_kb(),
+    )
+
+
+async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Подтверждение рассылки — отправляем всем подписчикам."""
+    data = await state.get_data()
+    await state.clear()
+    # Убираем кнопки с превью-сообщения
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    subs = load_subscribers()
+    if not subs:
+        await callback.answer()
+        await callback.message.answer("📭 Подписчиков нет — некому отправлять.")
+        return
+
+    await callback.answer("Отправляю...")
+    sent, failed = 0, 0
+    to_remove: list[int] = []
+
+    for chat_id, name in subs.items():
+        try:
+            await _send_broadcast_message(callback.message.bot, chat_id, data)
+            sent += 1
+            log.info("  broadcast → %s (chat_id=%d)", name, chat_id)
+        except Exception as e:
+            err = str(e).lower()
+            if "bot was blocked" in err or "user is deactivated" in err or "chat not found" in err:
+                log.warning("  broadcast ✗ %s (chat_id=%d) заблокировал бота.", name, chat_id)
+                to_remove.append(chat_id)
+            else:
+                log.error("  broadcast ✗ %s (chat_id=%d): %s", name, chat_id, e)
+            failed += 1
+        await asyncio.sleep(0.3)
+
+    if to_remove:
+        for cid in to_remove:
+            subs.pop(cid, None)
+        save_subscribers(subs)
+        log.info("Отписано %d заблокировавших бота.", len(to_remove))
+
+    await callback.message.answer(
+        f"✅ Отправлено: {sent}" + (f", ошибок: {failed}" if failed else "") + "."
+    )
+
+
+async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отмена рассылки через кнопку."""
+    await state.clear()
+    await callback.answer("Отменено.")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Рассылка отменена.")
 
 
 async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict]:
@@ -855,7 +1130,7 @@ def format_rate_entry(item: dict, media: str) -> str:
     target = item.get(media) or {}
     title_ru = target.get("russian") or ""
     title_en = target.get("name") or "???"
-    title = title_ru if title_ru else title_en
+    title = h(title_ru if title_ru else title_en)
 
     status = item.get("_status", "")
     # Иконка в зависимости от статуса
@@ -866,7 +1141,7 @@ def format_rate_entry(item: dict, media: str) -> str:
 
     url = target.get("url", "")
     if url:
-        return f"{icon} [{title}]({SHIKI_BASE_URL}{url})"
+        return f'{icon} <a href="{SHIKI_BASE_URL}{url}">{title}</a>'
     return f"{icon} {title}"
 
 
@@ -890,14 +1165,14 @@ async def cmd_status(message: Message) -> None:
     lines: list[str] = []
 
     if anime_list:
-        lines.append("🎌 *Сейчас смотрит:*")
+        lines.append("🎌 <b>Сейчас смотрит:</b>")
         for item in anime_list:
             lines.append(format_rate_entry(item, "anime"))
 
     if manga_list:
         if lines:
             lines.append("")  # пустая строка-разделитель
-        lines.append("📚 *Сейчас читает:*")
+        lines.append("📚 <b>Сейчас читает:</b>")
         for item in manga_list:
             lines.append(format_rate_entry(item, "manga"))
 
@@ -908,29 +1183,39 @@ async def cmd_status(message: Message) -> None:
         return
 
     sep = "\n"
-    await message.answer(sep.join(lines), parse_mode=ParseMode.MARKDOWN)
+    await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
+
 
 async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
-    dp  = Dispatcher()
+    dp  = Dispatcher(storage=MemoryStorage())
 
     # Регистрируем команды
-    dp.message.register(cmd_start, Command("start"))
-    dp.message.register(cmd_stop,  Command("stop"))
-    dp.message.register(cmd_subs,   Command("subs"))
-    dp.message.register(cmd_status, Command("status"))
+    dp.message.register(cmd_start,     Command("start"))
+    dp.message.register(cmd_stop,      Command("stop"))
+    dp.message.register(cmd_subs,      Command("subs"))
+    dp.message.register(cmd_export,    Command("export"))
+    dp.message.register(cmd_import,    Command("import"))
+    dp.message.register(cmd_status,    Command("status"))
+    dp.message.register(cmd_broadcast, Command("broadcast"))
+    dp.message.register(cmd_cancel,    Command("cancel"))
 
-    # Устанавливаем описания команд — появятся в меню "/" в Telegram
+    # FSM-обработчики для /broadcast
+    dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
+    dp.callback_query.register(broadcast_confirm_cb, F.data == "broadcast_send",   BroadcastStates.waiting_confirm)
+    dp.callback_query.register(broadcast_cancel_cb,  F.data == "broadcast_cancel", BroadcastStates.waiting_confirm)
+
+    # Публичные команды в меню "/" — команды владельца не показываем
     await bot.set_my_commands([
         BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
         BotCommand(command="stop",   description="Отписаться 😢"),
-        BotCommand(command="status", description="Что сейчас смотрит и читает Костя 👀"),
+        BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
     ])
 
     # polling_loop работает параллельно как фоновая задача
     asyncio.create_task(polling_loop(bot))
 
-    await dp.start_polling(bot, allowed_updates=["message"])
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
