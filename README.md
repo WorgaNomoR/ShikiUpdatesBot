@@ -108,3 +108,23 @@ DATA_DIR=/путь/к/папке
 - [aiogram 3.x](https://docs.aiogram.dev/) — Telegram Bot API
 - [aiohttp](https://docs.aiohttp.org/) — HTTP-клиент для Shikimori API
 - [Shikimori API](https://shikimori.io/api/doc) — история и списки пользователя
+
+## Разработка и тестирование
+
+### Установка зависимостей разработки
+
+Для запуска тестов необходимо установить зависимости:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+```
+
+### Запуск тестов
+
+```bash
+pytest tests/                        # Запустить все тесты
+pytest tests/test_notify.py -v       # Конкретный файл с подробным выводом
+pytest tests/ -v --cov               # С измерением покрытия кода
+```
+
+**Важно:** Тесты требуют переменные окружения `BOT_TOKEN` и `OWNER_ID` (они автоматически устанавливаются в `conftest.py` для тестирования).
