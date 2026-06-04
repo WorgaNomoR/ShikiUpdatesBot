@@ -1,3 +1,5 @@
+![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg)
+
 # 🎌 [ShikiUpdatesBot](https://github.com/WorgaNomoR/ShikiUpdatesBot) — Shikimori Activity Tracker
 
 Telegram-бот, который следит за аниме и мангой любого пользователя на [Shikimori](https://shikimori.io) и отправляет весёлые уведомления подписчикам.
