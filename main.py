@@ -1,9 +1,10 @@
 """
 Shikimori History Watcher Bot
-Следит за историей пользователя на Shikimori и отправляет весёлые сообщения в Telegram.
+Следит за историей и избранным пользователя на Shikimori и отправляет весёлые сообщения в Telegram.
 
 Зависимости:
-    pip install aiogram aiohttp
+    pip install -r requirements.txt
+    pip install -r requirements-dev.txt
 
 Запуск:
     1. Создать бота через @BotFather, получить BOT_TOKEN
@@ -23,6 +24,11 @@ Shikimori History Watcher Bot
     /subs       — список подписчиков (только для владельца)
     /export     — выгрузить subscribers.json (только для владельца)
     /import     — загрузить subscribers.json из файла (только для владельца)
+
+Отслеживаемые события:
+    История: добавил в список, начал смотреть/читать, пересматривает,
+             бросил, завершил, поставил оценку, изменил оценку
+    Избранное: добавил аниме, мангу, персонажа или человека индустрии
 """
 
 import asyncio
@@ -67,8 +73,9 @@ CHECK_INTERVAL = 15 * 60           # интервал проверки в сек
 # По умолчанию создаются в рабочей директории.
 # Чтобы хранить в другом месте — задай переменную окружения DATA_DIR=/путь/к/папке
 _DATA_DIR      = os.environ.get("DATA_DIR", ".")
-SEEN_IDS_FILE  = f"{_DATA_DIR}/seen_ids.json"      # ID обработанных событий
-SUBS_FILE      = f"{_DATA_DIR}/subscribers.json"   # список подписчиков
+SEEN_IDS_FILE  = f"{_DATA_DIR}/seen_ids.json"        # ID обработанных событий
+SUBS_FILE      = f"{_DATA_DIR}/subscribers.json"     # список подписчиков
+SEEN_FAVS_FILE = f"{_DATA_DIR}/seen_favourites.json" # ID избранного
 
 # ─────────────────────────────────────────────
 #  ФИЛЬТР ПО ТИПУ (kind)
@@ -100,7 +107,8 @@ MANGA_KINDS: frozenset[str] = frozenset({
 # ─────────────────────────────────────────────
 #  API
 # ─────────────────────────────────────────────
-HISTORY_URL = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/history?limit=50"
+HISTORY_URL    = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/history?limit=50"
+FAVOURITES_URL = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/favourites"
 HEADERS = {
     "User-Agent": f"ShikimoriWatcherBot/1.0 (TelegramBot; monitoring {SHIKI_USER})",
     "Accept": "application/json",
@@ -205,6 +213,7 @@ def h(text: str) -> str:
 #    {n}     — отображаемое имя пользователя (DISPLAY_NAME)
 #    {title} — название аниме или манги
 #    {score} — оценка (только в completed_score_*)
+#    {category} — тип (подставляется автоматически)
 #
 #  Каждый раздел дублируется для аниме и манги —
 #  тексты немного разные, чтобы было живо.
@@ -307,7 +316,7 @@ MESSAGES = {
             "🎌 Максимум! <b>{title}</b> — теперь часть души {n}. Трогательно.",
             "🔮 <b>{title}</b> получает священную десятку. {n} преклоняется.",
         ],
-    },
+    },  # конец "anime"
 
     # ────────────────────────────────
     #  МАНГА (свои тексты — читает, а не смотрит)
@@ -417,7 +426,44 @@ MESSAGES = {
         "⚖️ Весы справедливости скорректированы: <b>{title}</b> теперь {new}/10 вместо {old}.",
         "✏️ {n} исправил оценку <b>{title}</b> с {old} на {new}. Бывает, мнения меняются.",
         "📊 Обновление рейтинга: <b>{title}</b> {old} → {new}. {n} не стоит на месте.",
-    ],
+    ],  # конец "score_changed"
+
+    # ────────────────────────────────
+    #  ИЗБРАННОЕ — добавление в favourites
+    # ────────────────────────────────
+    "favourites": {
+
+        "anime": [
+            "⭐ {n} добавил <b>{title}</b> в избранное. Это не просто хорошее аниме — это особенное.",
+            "💫 <b>{title}</b> теперь в избранном у {n}. Значит, зацепило по-настоящему.",
+            "🏅 Особая отметка: <b>{title}</b> попало в избранное {n}. Это дорогого стоит.",
+            "✨ {n} выделил <b>{title}</b> среди всех. Избранное — это серьёзно.",
+            "🌟 <b>{title}</b> — в избранном. {n} не раздаёт такое направо и налево.",
+        ],
+
+        "manga": [
+            "⭐ {n} добавил мангу <b>{title}</b> в избранное. Художник может гордиться.",
+            "💫 <b>{title}</b> теперь в избранном у {n}. Среди всей прочитанной манги — особняком.",
+            "🏅 Особая отметка: манга <b>{title}</b> в избранном {n}. Это не просто хорошо.",
+            "✨ {n} выделил <b>{title}</b> среди всей манги. Редкий знак уважения.",
+            "🌟 <b>{title}</b> — в избранном. {n} знает толк в хорошей манге.",
+        ],
+
+        "character": [
+            "❤️ {n} добавил персонажа <b>{title}</b> в избранное. Кто-то явно запал в душу.",
+            "💙 <b>{title}</b> — в избранных персонажах {n}. Это симпатия серьёзная.",
+            "🎭 {n} выделил <b>{title}</b> среди всех персонажей. Характер оценён.",
+            "✨ <b>{title}</b> попал в избранное. {n} явно не равнодушен.",
+            "🌟 Новый любимый персонаж {n} — <b>{title}</b>. Запоминаем.",
+        ],
+
+        "person": [
+            "🎌 {n} добавил <b>{title}</b> в избранных людей индустрии. Уважение оказано.",
+            "👏 <b>{title}</b> — в избранном у {n}. Талант замечен и отмечен.",
+            "✨ {n} выделил <b>{title}</b> среди людей аниме-индустрии. Достойный выбор.",
+            "🌟 <b>{title}</b> попал в избранное {n}. Вклад в аниме оценён по достоинству.",
+        ],
+    },  # конец "favourites"
 }
 
 
@@ -437,13 +483,14 @@ def load_seen_ids() -> set[int]:
     return set()
 
 
-def _atomic_write(path: str, data: str) -> None:
+def _atomic_write(path: "Path | str", data: str) -> None:
     """Атомарная запись файла: пишем во временный файл, затем rename.
     Защищает от повреждения данных при аварийном завершении процесса.
     """
-    tmp = path + ".tmp"
-    Path(tmp).write_text(data, encoding="utf-8")
-    os.replace(tmp, path)  # атомарная операция на уровне ОС
+    path = Path(path)
+    tmp  = path.with_name(path.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)  # атомарная операция на уровне ОС
 
 
 def save_seen_ids(seen_ids: set[int]) -> None:
@@ -475,6 +522,30 @@ def save_subscribers(subs: dict[int, str]) -> None:
     _atomic_write(
         SUBS_FILE,
         json.dumps({"subscribers": {str(k): v for k, v in subs.items()}}, ensure_ascii=False, indent=2),
+    )
+
+
+def load_seen_favourites() -> set[str]:
+    """
+    Загружаем ID уже виденных записей избранного.
+    Ключи хранятся как строки вида "anime_123" — категория + ID,
+    чтобы избежать коллизий между разными категориями с одинаковыми ID.
+    """
+    path = Path(SEEN_FAVS_FILE)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return set(data.get("seen_favourites", []))
+        except (json.JSONDecodeError, KeyError):
+            log.warning("Не удалось прочитать %s, начинаем с нуля.", SEEN_FAVS_FILE)
+    return set()
+
+
+def save_seen_favourites(seen: set[str]) -> None:
+    """Сохраняем виденные ID избранного в JSON (атомарно)."""
+    _atomic_write(
+        SEEN_FAVS_FILE,
+        json.dumps({"seen_favourites": list(seen)}, ensure_ascii=False, indent=2),
     )
 
 
@@ -730,6 +801,102 @@ async def fetch_history(session: aiohttp.ClientSession) -> list[dict]:
         return []
 
 
+async def fetch_favourites(session: aiohttp.ClientSession) -> dict:
+    """
+    Запрашиваем избранное с API Shikimori.
+    Возвращает словарь вида:
+      {"animes": [...], "mangas": [...], "characters": [...], "people": [...], ...}
+    Каждый элемент содержит хотя бы "id", "name", "russian", "url".
+    """
+    try:
+        async with session.get(
+            FAVOURITES_URL,
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("fetch_favourites: API вернул статус %d", resp.status)
+                return {}
+            return await resp.json()
+    except aiohttp.ClientError as e:
+        log.error("Ошибка запроса избранного к Shikimori: %s", e)
+        return {}
+
+
+def build_favourite_message(category: str, item: dict) -> str:
+    """
+    Формируем сообщение об добавлении в избранное.
+    category: "animes" | "mangas" | "characters" | "people"
+    item:     объект из API с полями id, name, russian, url и др.
+    """
+    # Категория API → ключ банка сообщений
+    cat_map = {
+        "animes":     "anime",
+        "mangas":     "manga",
+        "characters": "character",
+        "people":     "person",
+    }
+    bank_key = cat_map.get(category, "anime")
+    templates = MESSAGES["favourites"].get(bank_key, MESSAGES["favourites"]["anime"])
+
+    title_ru = item.get("russian") or ""
+    title_en = item.get("name") or "???"
+    title = h(title_ru if title_ru else title_en)
+
+    text = random.choice(templates).format(n=DISPLAY_NAME, title=title)
+
+    url = (item.get("url") or "").strip()
+    if url:
+        text += f'\n🔗 <a href="{SHIKI_BASE_URL}{url}">Открыть на Shikimori</a>'
+
+    return text
+
+
+async def check_and_notify_favourites(bot: Bot, seen: set[str]) -> set[str]:
+    """
+    Проверяем избранное:
+    1. Загружаем текущий список с Shikimori
+    2. Находим новые элементы (которых нет в seen)
+    3. Отправляем уведомления и обновляем seen
+    Ключ в seen: "{category}_{id}", например "animes_5114".
+    """
+    async with aiohttp.ClientSession() as session:
+        favourites = await fetch_favourites(session)
+
+    if not favourites:
+        log.info("Избранное пусто или запрос не удался.")
+        return seen
+
+    # Категории которые отслеживаем
+    tracked = ("animes", "mangas", "characters", "people")
+    found_new = False
+
+    for category in tracked:
+        items = favourites.get(category) or []
+        for item in items:
+            item_id = item.get("id")
+            if item_id is None:
+                continue
+            key = f"{category}_{item_id}"
+            if key in seen:
+                continue
+
+            # Новый элемент в избранном
+            seen.add(key)
+            found_new = True
+            log.info("Новое в избранном: %s (id=%s)", category, item_id)
+
+            text = build_favourite_message(category, item)
+            await send_to_all_chats(bot, text)
+            await asyncio.sleep(1)
+
+    if not found_new:
+        log.info("Изменений в избранном нет.")
+
+    save_seen_favourites(seen)
+    return seen
+
+
 async def send_to_all_chats(bot: Bot, text: str) -> None:
     """
     Отправляем одно сообщение всем подписчикам.
@@ -834,30 +1001,40 @@ async def polling_loop(bot: Bot) -> None:
     Бесконечный цикл проверки каждые CHECK_INTERVAL секунд.
 
     Первый запуск (seen_ids.json не существует):
-      — бот молча запоминает все текущие ID из истории
+      — бот молча запоминает все текущие ID из истории и избранного
       — сообщения НЕ отправляются (не спамим историей за последние месяцы)
       — с этого момента бот следит только за НОВЫМИ событиями
     """
-    seen_ids = load_seen_ids()
+    seen_ids  = load_seen_ids()
+    seen_favs = load_seen_favourites()
     log.info(
         "Бот запущен. Отображаемое имя: %s | Подписчиков: %d | Виденных ID: %d | Интервал: %d сек.",
         DISPLAY_NAME, len(load_subscribers()), len(seen_ids), CHECK_INTERVAL,
     )
 
     if not seen_ids:
-        log.info("Первый запуск — инициализируем список ID без отправки сообщений.")
+        log.info("Первый запуск — инициализируем историю без отправки сообщений.")
         async with aiohttp.ClientSession() as session:
             entries = await fetch_history(session)
         seen_ids = {e["id"] for e in entries}
         save_seen_ids(seen_ids)
-        log.info(
-            "Инициализировано %d ID. Следим только за новыми событиями.",
-            len(seen_ids),
-        )
+        log.info("Инициализировано %d ID истории.", len(seen_ids))
+
+    if not seen_favs:
+        log.info("Инициализируем избранное без отправки сообщений.")
+        async with aiohttp.ClientSession() as session:
+            favourites = await fetch_favourites(session)
+        for category in ("animes", "mangas", "characters", "people"):
+            for item in (favourites.get(category) or []):
+                if item.get("id") is not None:
+                    seen_favs.add(f"{category}_{item['id']}")
+        save_seen_favourites(seen_favs)
+        log.info("Инициализировано %d записей избранного.", len(seen_favs))
 
     while True:
-        log.info("Проверяем историю...")
-        seen_ids = await check_and_notify(bot, seen_ids)
+        log.info("Проверяем историю и избранное...")
+        seen_ids  = await check_and_notify(bot, seen_ids)
+        seen_favs = await check_and_notify_favourites(bot, seen_favs)
         log.info("Следующая проверка через %d мин.", CHECK_INTERVAL // 60)
         await asyncio.sleep(CHECK_INTERVAL)
 
