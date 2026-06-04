@@ -32,4 +32,4 @@ jobs:
           BOT_TOKEN: test-token
           OWNER_ID: 123456
         run: |
-          pytest -v
+          pytest --cov=main --cov-report=term-missing
