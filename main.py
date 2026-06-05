@@ -1,34 +1,19 @@
 """
 Shikimori History Watcher Bot
-Следит за историей и избранным пользователя на Shikimori и отправляет весёлые сообщения в Telegram.
+Следит за историей и избранным пользователя на Shikimori 
+и отправляет весёлые уведомления в Telegram.
 
-Зависимости:
-    pip install -r requirements.txt
-    pip install -r requirements-dev.txt
+Copyright (C) 2026  WorgaNomoR
 
-Запуск:
-    1. Создать бота через @BotFather, получить BOT_TOKEN
-    2. Задать переменные окружения и запустить:
-           export BOT_TOKEN='токен_от_BotFather'
-           export OWNER_ID='твой_telegram_id'
-           python main.py
-    3. Написать боту /start — бот запомнит тебя и начнёт слать уведомления
-    4. Поделиться ссылкой на бота с друзьями — они тоже пишут /start
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-Команды бота:
-    /start      — подписаться на уведомления
-    /stop       — отписаться
-    /status     — что сейчас смотрит/читает пользователь
-    /broadcast  — написать подписчикам (только для владельца)
-    /cancel     — отменить текущую операцию
-    /subs       — список подписчиков (только для владельца)
-    /export     — выгрузить subscribers.json (только для владельца)
-    /import     — загрузить subscribers.json из файла (только для владельца)
-
-Отслеживаемые события:
-    История: добавил в список, начал смотреть/читать, пересматривает,
-             бросил, завершил, поставил оценку, изменил оценку
-    Избранное: добавил аниме, мангу, персонажа или человека индустрии
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  
+See the GNU General Public License for more details.
 """
 
 import asyncio
