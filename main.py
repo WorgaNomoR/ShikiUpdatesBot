@@ -488,6 +488,7 @@ def _atomic_write(path: "Path | str", data: str) -> None:
     Защищает от повреждения данных при аварийном завершении процесса.
     """
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp  = path.with_name(path.name + ".tmp")
     tmp.write_text(data, encoding="utf-8")
     tmp.replace(path)  # атомарная операция на уровне ОС
@@ -784,8 +785,10 @@ def build_message(entry: dict) -> str:
 #  ОСНОВНАЯ ЛОГИКА
 # ═══════════════════════════════════════════════════════════════
 
-async def fetch_history(session: aiohttp.ClientSession) -> list[dict]:
-    """Запрашиваем историю с API Shikimori."""
+async def fetch_history(session: aiohttp.ClientSession) -> list[dict] | None:
+    """Запрашиваем историю с API Shikimori.
+    Возвращает список записей при успехе или None при любой ошибке.
+    """
     try:
         async with session.get(
             HISTORY_URL,
@@ -793,20 +796,24 @@ async def fetch_history(session: aiohttp.ClientSession) -> list[dict]:
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if resp.status != 200:
-                log.warning("API вернул статус %d", resp.status)
-                return []
+                log.warning("fetch_history: API вернул статус %d", resp.status)
+                return None
             return await resp.json()
-    except aiohttp.ClientError as e:
-        log.error("Ошибка запроса к Shikimori: %s", e)
-        return []
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.error("fetch_history: ошибка запроса: %s", e)
+        return None
+    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+        log.error("fetch_history: не удалось разобрать ответ: %s", e)
+        return None
 
 
-async def fetch_favourites(session: aiohttp.ClientSession) -> dict:
+async def fetch_favourites(session: aiohttp.ClientSession) -> dict | None:
     """
     Запрашиваем избранное с API Shikimori.
     Возвращает словарь вида:
       {"animes": [...], "mangas": [...], "characters": [...], "people": [...], ...}
     Каждый элемент содержит хотя бы "id", "name", "russian", "url".
+    Возвращает None при любой ошибке.
     """
     try:
         async with session.get(
@@ -816,11 +823,14 @@ async def fetch_favourites(session: aiohttp.ClientSession) -> dict:
         ) as resp:
             if resp.status != 200:
                 log.warning("fetch_favourites: API вернул статус %d", resp.status)
-                return {}
+                return None
             return await resp.json()
-    except aiohttp.ClientError as e:
-        log.error("Ошибка запроса избранного к Shikimori: %s", e)
-        return {}
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.error("fetch_favourites: ошибка запроса: %s", e)
+        return None
+    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+        log.error("fetch_favourites: не удалось разобрать ответ: %s", e)
+        return None
 
 
 def build_favourite_message(category: str, item: dict) -> str:
@@ -863,8 +873,8 @@ async def check_and_notify_favourites(bot: Bot, seen: set[str]) -> set[str]:
     async with aiohttp.ClientSession() as session:
         favourites = await fetch_favourites(session)
 
-    if not favourites:
-        log.info("Избранное пусто или запрос не удался.")
+    if favourites is None:
+        log.info("Запрос избранного не удался — пропускаем цикл.")
         return seen
 
     # Категории которые отслеживаем
@@ -950,8 +960,8 @@ async def check_and_notify(bot: Bot, seen_ids: set[int]) -> set[int]:
     async with aiohttp.ClientSession() as session:
         entries = await fetch_history(session)
 
-    if not entries:
-        log.info("История пуста или запрос не удался.")
+    if entries is None:
+        log.info("Запрос истории не удался — пропускаем цикл.")
         return seen_ids
 
     new_entries = [e for e in entries if e["id"] not in seen_ids]
@@ -1016,20 +1026,26 @@ async def polling_loop(bot: Bot) -> None:
         log.info("Первый запуск — инициализируем историю без отправки сообщений.")
         async with aiohttp.ClientSession() as session:
             entries = await fetch_history(session)
-        seen_ids = {e["id"] for e in entries}
-        save_seen_ids(seen_ids)
-        log.info("Инициализировано %d ID истории.", len(seen_ids))
+        if entries is None:
+            log.warning("Не удалось получить историю при инициализации — пропускаем, повторим на следующем цикле.")
+        else:
+            seen_ids = {e["id"] for e in entries}
+            save_seen_ids(seen_ids)
+            log.info("Инициализировано %d ID истории.", len(seen_ids))
 
     if not seen_favs:
         log.info("Инициализируем избранное без отправки сообщений.")
         async with aiohttp.ClientSession() as session:
             favourites = await fetch_favourites(session)
-        for category in ("animes", "mangas", "characters", "people"):
-            for item in (favourites.get(category) or []):
-                if item.get("id") is not None:
-                    seen_favs.add(f"{category}_{item['id']}")
-        save_seen_favourites(seen_favs)
-        log.info("Инициализировано %d записей избранного.", len(seen_favs))
+        if favourites is None:
+            log.warning("Не удалось получить избранное при инициализации — пропускаем, повторим на следующем цикле.")
+        else:
+            for category in ("animes", "mangas", "characters", "people"):
+                for item in (favourites.get(category) or []):
+                    if item.get("id") is not None:
+                        seen_favs.add(f"{category}_{item['id']}")
+            save_seen_favourites(seen_favs)
+            log.info("Инициализировано %d записей избранного.", len(seen_favs))
 
     while True:
         log.info("Проверяем историю и избранное...")
@@ -1147,7 +1163,7 @@ async def cmd_import(message: Message) -> None:
         await message.answer("❌ Ожидается .json файл.")
         return
 
-    tmp_path = SUBS_FILE + ".import_tmp"
+    tmp_path = Path(SUBS_FILE).with_name(Path(SUBS_FILE).name + ".import_tmp")
     try:
         await message.bot.download(message.document, destination=tmp_path)
         raw = Path(tmp_path).read_text(encoding="utf-8")
@@ -1296,8 +1312,10 @@ async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict]:
                         results.extend(data)
                     else:
                         log.warning("fetch_current_rates: статус %d для %s/%s", resp.status, media, status)
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 log.error("fetch_current_rates ошибка (%s/%s): %s", media, status, e)
+            except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+                log.error("fetch_current_rates: не удалось разобрать ответ (%s/%s): %s", media, status, e)
     return results
 
 

@@ -400,9 +400,7 @@ async def test_untracked_category_is_ignored(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_missing_seen_favourites_does_not_send_notifications(
-    monkeypatch
-):
+async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
     import main
 
     # История уже инициализирована
@@ -485,3 +483,60 @@ async def test_missing_seen_favourites_does_not_send_notifications(
     assert called is False
     assert "animes_10" in saved["value"]
 
+
+@pytest.mark.asyncio
+async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
+    import main
+
+    monkeypatch.setattr(
+        main,
+        "load_seen_ids",
+        lambda: {1},
+    )
+
+    monkeypatch.setattr(
+        main,
+        "load_seen_favourites",
+        lambda: set(),
+    )
+
+    async def fake_fetch(session):
+        return None
+
+    monkeypatch.setattr(
+        main,
+        "fetch_favourites",
+        fake_fetch,
+    )
+
+    saved = False
+
+    def fake_save(data):
+        nonlocal saved
+        saved = True
+
+    monkeypatch.setattr(
+        main,
+        "save_seen_favourites",
+        fake_save,
+    )
+
+    class StopLoop(Exception):
+        pass
+
+    async def fake_check(bot, seen):
+        raise StopLoop
+
+    monkeypatch.setattr(
+        main,
+        "check_and_notify",
+        fake_check,
+    )
+
+    class DummyBot:
+        pass
+
+    with pytest.raises(StopLoop):
+        await main.polling_loop(DummyBot())
+
+    assert saved is False
