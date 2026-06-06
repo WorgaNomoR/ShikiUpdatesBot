@@ -57,10 +57,11 @@ CHECK_INTERVAL = 15 * 60           # интервал проверки в сек
 # Пути к файлам данных.
 # По умолчанию создаются в рабочей директории.
 # Чтобы хранить в другом месте — задай переменную окружения DATA_DIR=/путь/к/папке
-_DATA_DIR      = os.environ.get("DATA_DIR", ".")
-SEEN_IDS_FILE  = f"{_DATA_DIR}/seen_ids.json"        # ID обработанных событий
-SUBS_FILE      = f"{_DATA_DIR}/subscribers.json"     # список подписчиков
-SEEN_FAVS_FILE = f"{_DATA_DIR}/seen_favourites.json" # ID избранного
+DATA_DIR       = Path(os.environ.get("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SEEN_IDS_FILE  = DATA_DIR / "seen_ids.json"        # ID обработанных событий
+SUBS_FILE      = DATA_DIR / "subscribers.json"     # список подписчиков
+SEEN_FAVS_FILE = DATA_DIR / "seen_favourites.json" # ID избранного
 
 # ─────────────────────────────────────────────
 #  ФИЛЬТР ПО ТИПУ (kind)
@@ -1148,7 +1149,7 @@ async def cmd_import(message: Message) -> None:
         await message.answer("❌ Ожидается .json файл.")
         return
 
-    tmp_path = Path(SUBS_FILE).with_name(Path(SUBS_FILE).name + ".import_tmp")
+    tmp_path = SUBS_FILE.with_name(SUBS_FILE.name + ".import_tmp")
     try:
         await message.bot.download(message.document, destination=tmp_path)
         raw = Path(tmp_path).read_text(encoding="utf-8")
@@ -1272,12 +1273,12 @@ async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.message.answer("❌ Рассылка отменена.")
 
 
-async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict]:
+async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | None:
     """
     Запрашивает тайтлы в указанных статусах.
     media:    "anime" или "manga"
     statuses: ["watching", "rewatching"] — одинаково для аниме и манги
-    Возвращает объединённый список записей со всех статусов.
+    Возвращает объединённый список записей при успехе или None при любой ошибке.
     """
     results = []
     async with aiohttp.ClientSession() as session:
@@ -1297,10 +1298,13 @@ async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict]:
                         results.extend(data)
                     else:
                         log.warning("fetch_current_rates: статус %d для %s/%s", resp.status, media, status)
+                        return None
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 log.error("fetch_current_rates ошибка (%s/%s): %s", media, status, e)
+                return None
             except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
                 log.error("fetch_current_rates: не удалось разобрать ответ (%s/%s): %s", media, status, e)
+                return None
     return results
 
 
@@ -1332,9 +1336,15 @@ async def cmd_status(message: Message) -> None:
     параллельно, затем собирает ответ с учётом всех комбинаций.
     """
     # Оба запроса параллельно — быстрее
-    anime_task = asyncio.create_task(fetch_current_rates("anime", ["watching", "rewatching"]))
-    manga_task = asyncio.create_task(fetch_current_rates("manga", ["watching", "rewatching"]))
-    anime_list, manga_list = await asyncio.gather(anime_task, manga_task)
+    anime_list, manga_list = await asyncio.gather(
+        fetch_current_rates("anime", ["watching", "rewatching"]),
+        fetch_current_rates("manga", ["watching", "rewatching"]),
+    )
+
+    # Если хотя бы один запрос вернул None — API недоступен
+    if anime_list is None or manga_list is None:
+        await message.answer("⚠️ Не удалось получить данные от Shikimori. Попробуй позже.")
+        return
 
     # Фильтруем аниме по разрешённым видам
     anime_list = [
