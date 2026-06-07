@@ -288,3 +288,60 @@ async def test_status_filters_disallowed_anime_kind(monkeypatch):
     text = msg.calls[0][0]
 
     assert "ничего не смотрит" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_status_anime_failed_manga_ok(monkeypatch):
+    import main
+
+    async def fake_fetch(media, statuses):
+        if media == "anime":
+            return None
+
+        return [
+            {
+                "_status": "watching",
+                "manga": {
+                    "name": "Berserk",
+                },
+            }
+        ]
+
+    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+
+    msg = DummyMessage()
+
+    await main.cmd_status(msg)
+
+    text = msg.calls[0][0]
+
+    assert "не удалось получить данные" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_status_manga_failed_anime_ok(monkeypatch):
+    import main
+
+    async def fake_fetch(media, statuses):
+        if media == "manga":
+            return None
+
+        return [
+            {
+                "_status": "watching",
+                "anime": {
+                    "name": "Ergo Proxy",
+                    "kind": "tv",
+                },
+            }
+        ]
+
+    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+
+    msg = DummyMessage()
+
+    await main.cmd_status(msg)
+
+    text = msg.calls[0][0]
+
+    assert "не удалось получить данные" in text.lower()
