@@ -149,3 +149,25 @@ def test_save_seen_ids_removes_tmp_file(monkeypatch, tmp_path):
     assert file.exists()
     assert not (tmp_path / "seen_ids.json.tmp").exists()
 
+
+def test_atomic_write_creates_parent_directory(tmp_path):
+    from main import _atomic_write
+
+    target = tmp_path / "nested" / "folder" / "file.json"
+
+    _atomic_write(target, '{"ok": true}')
+
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == '{"ok": true}'
+
+
+def test_atomic_write_overwrites_existing_file(tmp_path):
+    from main import _atomic_write
+
+    target = tmp_path / "data.json"
+
+    target.write_text("old", encoding="utf-8")
+
+    _atomic_write(target, "new")
+
+    assert target.read_text(encoding="utf-8") == "new"
