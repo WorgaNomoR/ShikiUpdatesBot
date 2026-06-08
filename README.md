@@ -2,6 +2,7 @@
 
 [![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
+![Docker](https://img.shields.io/badge/-Docker-2496ED?style=flat&logo=docker&logoColor=white)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 Telegram-бот, который следит за аниме и мангой любого пользователя на [Shikimori](https://shikimori.io) и отправляет весёлые уведомления подписчикам.
@@ -48,26 +49,73 @@ pip install -r requirements.txt
 
 ### 3. Создать бота
 
-Написать [@BotFather](https://t.me/BotFather) → `/newbot` → получить токен.
+Напиши [@BotFather](https://t.me/BotFather) → `/newbot` → получи токен.
 
 ### 4. Узнать свой Telegram ID
 
-Написать [@userinfobot](https://t.me/userinfobot) — он пришлёт ваш числовой ID.
+Напиши [@userinfobot](https://t.me/userinfobot) — он пришлёт твой числовой ID.
 
 ### 5. Задать переменные окружения
 
 ```bash
 export BOT_TOKEN="токен_от_BotFather"
-export OWNER_ID="ваш_telegram_id"
+export OWNER_ID="твой_telegram_id"
 ```
 
-Или создать файл `.env` (см. `.env.example`) и загрузить через `python-dotenv`.
+Или создай файл `.env` (см. `.env.example`) и загрузи его через `python-dotenv`.
 
 ### 6. Запустить
 
 ```bash
 python main.py
 ```
+
+## Запуск через Docker
+
+Альтернативный способ запуска — через Docker-контейнер. Это упрощает развёртывание и гарантирует одинаковую среду выполнения на любом сервере.
+
+### 1. Установить Docker
+
+Убедись, что у тебя установлен [Docker](https://docs.docker.com/get-docker/) и [Docker Compose](https://docs.docker.com/compose/install/).
+
+### 2. Создать файл `.env`
+
+Создай файл `.env` в корне проекта со следующим содержимым:
+
+```
+BOT_TOKEN=твой_токен_от_BotFather
+OWNER_ID=твой_telegram_id
+```
+
+### 3. Запустить через docker-compose
+
+```bash
+# Собрать и запустить контейнер
+docker-compose up -d --build
+
+# Просмотреть логи
+docker-compose logs -f
+
+# Остановить контейнер
+docker-compose down
+```
+
+### 4. Обновление
+
+При изменениях в коде:
+
+```bash
+# Пересобрать контейнер
+docker-compose build
+
+# Перезапустить
+docker-compose up -d
+```
+
+### Примечания
+
+- Данные бота (`seen_ids.json`, `subscribers.json`, `seen_favourites.json`) хранятся в папке `./data` на хост-машине и монтируются в контейнер.
+- Для работы в продакшене достаточно только `requirements.txt` — тестовые зависимости (`requirements-dev.txt`) не включаются в рабочий образ.
 
 ## Конфигурация
 
@@ -88,7 +136,7 @@ python main.py
 - `subscribers.json` — список подписчиков
 - `seen_favourites.json` — ID уже обработанных записей избранного
 
-По умолчанию файлы создаются в текущей рабочей директории. Если нужно хранить их в другом месте (например, в папке постоянного хранилища на хостинге), укажите путь через переменную окружения:
+По умолчанию файлы создаются в текущей рабочей директории. Если нужно хранить их в другом месте (например, в папке постоянного хранилища на хостинге), укажи путь через переменную окружения:
 
 ```
 DATA_DIR=/путь/к/папке
@@ -114,12 +162,13 @@ DATA_DIR=/путь/к/папке
 - [aiogram 3.x](https://docs.aiogram.dev/) — Telegram Bot API
 - [aiohttp](https://docs.aiohttp.org/) — HTTP-клиент для Shikimori API
 - [Shikimori API](https://shikimori.io/api/doc) — история, списки пользователя и избранное
+- [Docker](https://www.docker.com/) — контейнеризация для упрощения деплоя
 
 ## Разработка и тестирование
 
 ### Установка зависимостей разработки
 
-Для запуска тестов необходимо установить зависимости:
+Для запуска тестов установи зависимости:
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
