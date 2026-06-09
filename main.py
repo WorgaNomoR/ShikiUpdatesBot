@@ -23,6 +23,7 @@ import os
 import logging
 import re
 import random
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -50,10 +51,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # Задать: export OWNER_ID="123456789"
 OWNER_ID = int(os.environ["OWNER_ID"])
 
-SHIKI_USER     = "WNR"              # ник на Shikimori (для API)
+SHIKI_USER     = "WNR"                   # ник на Shikimori (для API)
 SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь при смене зеркала
-DISPLAY_NAME   = "Ворга"           # отображаемое имя в сообщениях
-CHECK_INTERVAL = 15 * 60           # интервал проверки в секундах (15 минут)
+DISPLAY_NAME   = "Ворга"                 # отображаемое имя в сообщениях
+CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
+ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
 # Пути к файлам данных.
 # По умолчанию создаются в рабочей директории.
 # Чтобы хранить в другом месте — задай переменную окружения DATA_DIR=/путь/к/папке
@@ -1033,11 +1035,41 @@ async def polling_loop(bot: Bot) -> None:
             save_seen_favourites(seen_favs)
             log.info("Инициализировано %d записей избранного.", len(seen_favs))
 
+    last_error_notify_at = 0.0
+
     while True:
-        log.info("Проверяем историю и избранное...")
-        seen_ids  = await check_and_notify(bot, seen_ids)
-        seen_favs = await check_and_notify_favourites(bot, seen_favs)
-        log.info("Следующая проверка через %d мин.", CHECK_INTERVAL // 60)
+        try:
+            log.info("Проверяем историю и избранное...")
+            seen_ids  = await check_and_notify(bot, seen_ids)
+            seen_favs = await check_and_notify_favourites(bot, seen_favs)
+            log.info("Следующая проверка через %d мин.", CHECK_INTERVAL // 60)
+        except asyncio.CancelledError:
+            # Штатная отмена задачи — пробрасываем, не глушим
+            raise
+        except Exception as e:
+            log.exception("Непредвиденная ошибка в цикле проверки, продолжаем: %s", e)
+
+            now = time.monotonic()
+            if now - last_error_notify_at >= ERROR_NOTIFY_INTERVAL:
+                last_error_notify_at = now
+
+                try:
+                    error_text = str(e)
+                    if len(error_text) > 1000:
+                        error_text = error_text[:1000] + "..."
+
+                    await bot.send_message(
+                        OWNER_ID,
+                        "⚠️ ShikiUpdatesBot: ошибка в цикле проверки.\n\n"
+                        f"Тип: {type(e).__name__}\n"
+                        f"Текст: {error_text}\n\n"
+                        "Цикл не остановлен, следующая проверка будет позже.",
+                    )
+                except Exception as notify_error:
+                    log.exception(
+                        "Не удалось отправить уведомление владельцу об ошибке: %s",
+                        notify_error,
+                    )
         await asyncio.sleep(CHECK_INTERVAL)
 
 
@@ -1403,7 +1435,20 @@ async def main() -> None:
     ])
 
     # polling_loop работает параллельно как фоновая задача
-    asyncio.create_task(polling_loop(bot))
+    _polling_task = asyncio.create_task(polling_loop(bot))
+
+    def _on_polling_done(task: asyncio.Task) -> None:
+        """Логируем если polling_loop завершился неожиданно."""
+        if task.cancelled():
+            log.warning("polling_loop: задача отменена.")
+        elif exc := task.exception():
+            log.critical(
+                "polling_loop завершился с необработанной ошибкой: %s",
+                exc,
+                exc_info=exc,
+            )
+
+    _polling_task.add_done_callback(_on_polling_done)
 
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
