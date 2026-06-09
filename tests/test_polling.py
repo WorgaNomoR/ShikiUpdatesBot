@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 @pytest.mark.asyncio
@@ -37,18 +39,15 @@ async def test_first_run_initializes_history_and_favourites(monkeypatch):
     monkeypatch.setattr(main, "fetch_history", fake_history)
     monkeypatch.setattr(main, "fetch_favourites", fake_favourites)
 
-    class StopLoop(Exception):
-        pass
-
     async def fake_check(bot, seen):
-        raise StopLoop
+        raise asyncio.CancelledError
 
     monkeypatch.setattr(main, "check_and_notify", fake_check)
 
     class DummyBot:
         pass
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(asyncio.CancelledError):
         await main.polling_loop(DummyBot())
 
     assert saved_ids["value"] == {1, 2}
@@ -118,11 +117,8 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         fake_send,
     )
 
-    class StopLoop(Exception):
-        pass
-
     async def fake_check(bot, seen):
-        raise StopLoop
+        raise asyncio.CancelledError
 
     monkeypatch.setattr(
         main,
@@ -133,7 +129,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
     class DummyBot:
         pass
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(asyncio.CancelledError):
         await main.polling_loop(DummyBot())
 
     assert called is False
@@ -169,11 +165,8 @@ async def test_favourites_initialization_failure(monkeypatch):
         fake_fetch,
     )
 
-    class StopLoop(Exception):
-        pass
-
     async def fake_check(bot, seen):
-        raise StopLoop
+        raise asyncio.CancelledError
 
     monkeypatch.setattr(
         main,
@@ -184,7 +177,7 @@ async def test_favourites_initialization_failure(monkeypatch):
     class DummyBot:
         pass
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(asyncio.CancelledError):
         await main.polling_loop(DummyBot())
 
     assert save_called is False

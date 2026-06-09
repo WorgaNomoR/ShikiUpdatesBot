@@ -436,11 +436,8 @@ async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
         fake_save,
     )
 
-    class StopLoop(Exception):
-        pass
-
     async def fake_check(bot, seen):
-        raise StopLoop
+        raise asyncio.CancelledError
 
     monkeypatch.setattr(
         main,
@@ -451,7 +448,7 @@ async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
     class DummyBot:
         pass
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(asyncio.CancelledError):
         await main.polling_loop(DummyBot())
 
     assert saved is False
