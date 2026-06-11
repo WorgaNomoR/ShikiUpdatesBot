@@ -1,5 +1,4 @@
 import asyncio
-
 import pytest
 
 @pytest.mark.asyncio
@@ -181,3 +180,93 @@ async def test_favourites_initialization_failure(monkeypatch):
         await main.polling_loop(DummyBot())
 
     assert save_called is False
+
+
+@pytest.mark.asyncio
+async def test_polling_survives_unexpected_exception(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
+    monkeypatch.setattr(main, "load_seen_favourites", lambda: {"animes_1"})
+    monkeypatch.setattr(main, "load_subscribers", lambda: {})
+    monkeypatch.setattr(main, "ERROR_NOTIFY_INTERVAL", 0)
+
+    logged = []
+
+    monkeypatch.setattr(
+        main.log,
+        "exception",
+        lambda *args, **kwargs: logged.append(args),
+    )
+
+    sent = []
+
+    class DummyBot:
+        async def send_message(self, chat_id, text):
+            sent.append((chat_id, text))
+
+    calls = 0
+
+    async def fake_check(bot, seen):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise RuntimeError("boom")
+
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "check_and_notify", fake_check)
+
+    async def fake_check_favs(bot, seen):
+        return seen
+
+    monkeypatch.setattr(
+        main,
+        "check_and_notify_favourites",
+        fake_check_favs,
+    )
+
+    async def fake_sleep(_):
+        pass
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.polling_loop(DummyBot())
+
+    assert calls == 2
+    assert logged
+    assert sent
+
+    chat_id, text = sent[0]
+
+    assert chat_id == main.OWNER_ID
+    assert "RuntimeError" in text
+    assert "boom" in text
+
+
+@pytest.mark.asyncio
+async def test_polling_propagates_cancelled_error(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
+    monkeypatch.setattr(main, "load_seen_favourites", lambda: {"animes_1"})
+    monkeypatch.setattr(main, "load_subscribers", lambda: {})
+
+    async def fake_check(bot, seen):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "check_and_notify", fake_check)
+
+    async def fake_check_favs(bot, seen):
+        return seen
+
+    monkeypatch.setattr(main, "check_and_notify_favourites", fake_check_favs)
+
+    class DummyBot:
+        async def send_message(self, *args, **kwargs):
+            pass
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.polling_loop(DummyBot())
