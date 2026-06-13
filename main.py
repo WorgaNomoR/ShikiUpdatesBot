@@ -65,7 +65,13 @@ ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведо
 #  DATA_DIR=/путь/к/папке.
 # ─────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as e:
+    logging.getLogger(__name__).warning(
+        "Не удалось создать DATA_DIR=%s: %s. "
+        "Файлы будут недоступны до исправления прав/пути.", DATA_DIR, e
+    )
 
 # Состояние уведомлений (что бот уже видел)
 SEEN_IDS_FILE  = DATA_DIR / "seen_ids.json"         # ID обработанных событий истории
