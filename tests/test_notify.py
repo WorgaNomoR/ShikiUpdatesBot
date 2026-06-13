@@ -5,6 +5,11 @@ import pytest
 from main import check_and_notify
 
 
+# Пустой стейт квартала — check_and_notify теперь принимает cur третьим аргументом.
+def _empty_cur():
+    return {"period": "2026-Q2", "events": []}
+
+
 @pytest.mark.asyncio
 async def test_empty_history(monkeypatch):
     async def fake_fetch_history(session):
@@ -22,14 +27,21 @@ async def test_empty_history(monkeypatch):
         lambda ids: saved.append(ids.copy()),
     )
 
+    # check_and_notify в конце зовёт save_stats_current — глушим запись на диск
+    monkeypatch.setattr(
+        "main.save_stats_current",
+        lambda cur: None,
+    )
+
     class DummyBot:
         pass
 
     seen_ids = {1, 2, 3}
 
-    result = await check_and_notify(
+    result, cur = await check_and_notify(
         DummyBot(),
         seen_ids.copy(),
+        _empty_cur(),
     )
 
     assert result == {1, 2, 3}
@@ -59,12 +71,18 @@ async def test_no_new_entries(monkeypatch):
         fake_send,
     )
 
+    monkeypatch.setattr(
+        "main.save_stats_current",
+        lambda cur: None,
+    )
+
     class DummyBot:
         pass
 
     await check_and_notify(
         DummyBot(),
         {100},
+        _empty_cur(),
     )
 
     assert called is False
@@ -123,12 +141,18 @@ async def test_new_relevant_entry(monkeypatch):
         lambda ids: saved.append(ids.copy()),
     )
 
+    monkeypatch.setattr(
+        "main.save_stats_current",
+        lambda cur: None,
+    )
+
     class DummyBot:
         pass
 
-    result = await check_and_notify(
+    result, cur = await check_and_notify(
         DummyBot(),
         set(),
+        _empty_cur(),
     )
 
     assert 123 in result
@@ -169,12 +193,18 @@ async def test_new_irrelevant_entry(monkeypatch):
         fake_send,
     )
 
+    monkeypatch.setattr(
+        "main.save_stats_current",
+        lambda cur: None,
+    )
+
     class DummyBot:
         pass
 
-    result = await check_and_notify(
+    result, cur = await check_and_notify(
         DummyBot(),
         set(),
+        _empty_cur(),
     )
 
     assert 999 in result

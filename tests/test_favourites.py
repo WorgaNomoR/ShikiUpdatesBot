@@ -403,47 +403,33 @@ async def test_untracked_category_is_ignored(monkeypatch):
 async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
     import main
 
-    monkeypatch.setattr(
-        main,
-        "load_seen_ids",
-        lambda: {1},
-    )
-
-    monkeypatch.setattr(
-        main,
-        "load_seen_favourites",
-        lambda: set(),
-    )
+    monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
+    monkeypatch.setattr(main, "load_seen_favourites", lambda: set())
+    monkeypatch.setattr(main, "load_stats_current", lambda: {"period": "2026-Q2", "events": []})
 
     async def fake_fetch(session):
         return None
-
-    monkeypatch.setattr(
-        main,
-        "fetch_favourites",
-        fake_fetch,
-    )
+    monkeypatch.setattr(main, "fetch_favourites", fake_fetch)
 
     saved = False
-
     def fake_save(data):
         nonlocal saved
         saved = True
+    monkeypatch.setattr(main, "save_seen_favourites", fake_save)
 
-    monkeypatch.setattr(
-        main,
-        "save_seen_favourites",
-        fake_save,
-    )
+    # sync_stats_all и rotate_quarter_if_needed делают сетевые вызовы — мокаем
+    async def fake_sync():
+        return main._empty_stats_all() if hasattr(main, "_empty_stats_all") else {}
+    monkeypatch.setattr(main, "sync_stats_all", fake_sync)
 
-    async def fake_check(bot, seen):
+    async def fake_rotate(bot, cur, stats_all):
+        return cur
+    monkeypatch.setattr(main, "rotate_quarter_if_needed", fake_rotate)
+
+    # check_and_notify теперь принимает (bot, seen_ids, cur) и возвращает (seen_ids, cur)
+    async def fake_check(bot, seen, cur):
         raise asyncio.CancelledError
-
-    monkeypatch.setattr(
-        main,
-        "check_and_notify",
-        fake_check,
-    )
+    monkeypatch.setattr(main, "check_and_notify", fake_check)
 
     class DummyBot:
         pass
