@@ -171,3 +171,9 @@ def test_atomic_write_overwrites_existing_file(tmp_path):
     _atomic_write(target, "new")
 
     assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_utcnow_is_naive():
+    import main
+    dt = main._utcnow()
+    assert dt.tzinfo is None

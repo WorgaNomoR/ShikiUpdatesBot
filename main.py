@@ -25,7 +25,7 @@ import re
 import random
 import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -886,10 +886,18 @@ _STATS_ALL_CACHE_TTL: int = 300  # секунд
 #  УТИЛИТЫ — КВАРТАЛ
 # ═══════════════════════════════════════════════════════════════════
 
+def _utcnow() -> datetime:
+    """Наивное UTC-время (без tzinfo) через не-устаревший API.
+    Замена datetime.utcnow(), удалённой в будущих версиях Python.
+    Возвращает тот же naive-UTC, что и раньше — форматы хранения и
+    сравнения дат не меняются.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 def current_quarter(dt: datetime | None = None) -> str:
     """'2026-Q2' для UTC-даты (по умолчанию — сейчас)."""
     if dt is None:
-        dt = datetime.utcnow()
+        dt = _utcnow()
     q = (dt.month - 1) // 3 + 1
     return f"{dt.year}-Q{q}"
 
@@ -897,7 +905,7 @@ def current_quarter(dt: datetime | None = None) -> str:
 def quarter_start(dt: datetime | None = None) -> datetime:
     """Первый день текущего (или переданного) квартала, UTC."""
     if dt is None:
-        dt = datetime.utcnow()
+        dt = _utcnow()
     q = (dt.month - 1) // 3 + 1
     return datetime(dt.year, (q - 1) * 3 + 1, 1)
 
@@ -1126,7 +1134,7 @@ def load_stats_all(use_cache: bool = True) -> dict:
     global _stats_all_cache, _stats_all_cache_ts
 
     if use_cache and _stats_all_cache is not None:
-        age = datetime.utcnow().timestamp() - _stats_all_cache_ts
+        age = _utcnow().timestamp() - _stats_all_cache_ts
         if age < _STATS_ALL_CACHE_TTL:
             return _stats_all_cache
 
@@ -1142,7 +1150,7 @@ def load_stats_all(use_cache: bool = True) -> dict:
         log.warning("load_stats_all: не удалось прочитать файл: %s", e)
 
     _stats_all_cache = data
-    _stats_all_cache_ts = datetime.utcnow().timestamp()
+    _stats_all_cache_ts = _utcnow().timestamp()
     return data
 
 
@@ -1150,10 +1158,10 @@ def save_stats_all(data: dict) -> None:
     """Сохраняем stats_all.json атомарно + обновляем кэш."""
     global _stats_all_cache, _stats_all_cache_ts
     try:
-        data["updated_at"] = datetime.utcnow().isoformat()
+        data["updated_at"] = _utcnow().isoformat()
         _atomic_write(STATS_ALL_FILE, json.dumps(data, ensure_ascii=False, indent=2))
         _stats_all_cache = data
-        _stats_all_cache_ts = datetime.utcnow().timestamp()
+        _stats_all_cache_ts = _utcnow().timestamp()
     except Exception as e:
         log.error("save_stats_all: не удалось записать файл: %s", e)
 
@@ -1491,7 +1499,7 @@ def load_stats_current() -> dict:
         log.warning("load_stats_current: %s", e)
 
     # Истинно первый запуск (или сброс) — фиксируем фактическую дату старта
-    now = datetime.utcnow()
+    now = _utcnow()
     qs = quarter_start(now)
     tracking_since = (now if now > qs else qs).isoformat()
     fresh = _empty_stats_current(current_quarter(now), tracking_since=tracking_since)
@@ -1531,7 +1539,7 @@ def record_current_event(
             "media":       media_type,
             "event":       event_type,
             "score":       score,
-            "recorded_at": datetime.utcnow().isoformat(),
+            "recorded_at": _utcnow().isoformat(),
         })
     except Exception as e:
         log.error("record_current_event: %s", e)
