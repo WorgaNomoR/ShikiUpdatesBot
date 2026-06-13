@@ -217,7 +217,16 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Bot specific
+# Bot specific — файлы состояния и статистики (не коммитить!)
 seen_ids.json
 subscribers.json
+seen_favourites.json
+stats_all.json
+stats_current.json
+quarters/
+
+# Локальные данные при монтировании ./data (Docker / DATA_DIR)
+data/
+
+# Конфиги хостингов
 amvera.yml

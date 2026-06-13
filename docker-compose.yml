@@ -6,5 +6,6 @@ services:
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - OWNER_ID=${OWNER_ID}
+      - DATA_DIR=/data
     volumes:
-      - ./data:/app/data
+      - ./data:/data

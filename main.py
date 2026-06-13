@@ -25,7 +25,7 @@ import re
 import random
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -38,6 +38,7 @@ from aiogram.types import (
     Message, BotCommand, FSInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
 )
+from healthcheck import heartbeat, start_health_server
 
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ — заполни перед запуском
@@ -56,14 +57,32 @@ SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь 
 DISPLAY_NAME   = "Ворга"                 # отображаемое имя в сообщениях
 CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
 ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
-# Пути к файлам данных.
-# По умолчанию создаются в рабочей директории.
-# Чтобы хранить в другом месте — задай переменную окружения DATA_DIR=/путь/к/папке
-DATA_DIR       = Path(os.environ.get("DATA_DIR", "."))
+
+# ─────────────────────────────────────────────
+#  ПУТИ К ФАЙЛАМ ДАННЫХ
+#  По умолчанию всё создаётся в /data.
+#  Чтобы хранить в другом месте — задай переменную окружения
+#  DATA_DIR=/путь/к/папке.
+# ─────────────────────────────────────────────
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-SEEN_IDS_FILE  = DATA_DIR / "seen_ids.json"        # ID обработанных событий
-SUBS_FILE      = DATA_DIR / "subscribers.json"     # список подписчиков
-SEEN_FAVS_FILE = DATA_DIR / "seen_favourites.json" # ID избранного
+
+# Состояние уведомлений (что бот уже видел)
+SEEN_IDS_FILE  = DATA_DIR / "seen_ids.json"         # ID обработанных событий истории
+SUBS_FILE      = DATA_DIR / "subscribers.json"      # список подписчиков
+SEEN_FAVS_FILE = DATA_DIR / "seen_favourites.json"  # ID виденного избранного
+
+# Статистика
+STATS_ALL_FILE     = DATA_DIR / "stats_all.json"      # вся история: тайтлы + агрегаты
+STATS_CURRENT_FILE = DATA_DIR / "stats_current.json"  # события текущего квартала
+QUARTERS_DIR       = DATA_DIR / "quarters"            # замороженные снапшоты кварталов
+
+# ─────────────────────────────────────────────
+#  URL источников статистики
+# ─────────────────────────────────────────────
+GRAPHQL_URL       = f"{SHIKI_BASE_URL}/api/graphql"
+LIST_EXPORT_ANIME = f"{SHIKI_BASE_URL}/{SHIKI_USER}/list_export/animes.json"
+LIST_EXPORT_MANGA = f"{SHIKI_BASE_URL}/{SHIKI_USER}/list_export/mangas.json"
 
 # ─────────────────────────────────────────────
 #  ФИЛЬТР ПО ТИПУ (kind)
@@ -768,6 +787,1358 @@ def build_message(entry: dict) -> str:
 
     return text
 
+# ═══════════════════════════════════════════════════════════════════
+#  СТАТИСТИКА — КОНСТАНТЫ И GRAPHQL
+# ═══════════════════════════════════════════════════════════════════
+
+# Статусы Shikimori, которые мы учитываем
+_STAT_STATUSES: frozenset[str] = frozenset({
+    "planned", "watching", "rewatching", "completed", "on_hold", "dropped",
+})
+
+# Локализация origin (источник адаптации аниме)
+_ORIGIN_RU: dict[str, str] = {
+    "original":      "Оригинал",
+    "manga":         "Манга",
+    "manhwa":        "Манхва",
+    "manhua":        "Маньхуа",
+    "light_novel":   "Ранобэ",
+    "novel":         "Новелла",
+    "visual_novel":  "Визуальная новелла",
+    "game":          "Игра",
+    "card_game":     "Карточная игра",
+    "music":         "Музыка",
+    "book":          "Книга",
+    "web_manga":     "Веб-манга",
+    "web_novel":     "Веб-новелла",
+    "4_koma_manga":  "Ёнкома",
+    "picture_book":  "Иллюстрированная книга",
+    "radio":         "Радио",
+    "other":         "Другое",
+    "unknown":       "Неизвестно",
+}
+
+# Локализация возрастного рейтинга
+_RATING_RU: dict[str, str] = {
+    "none":   "Без рейтинга",
+    "g":      "G",
+    "pg":     "PG",
+    "pg_13":  "PG-13",
+    "r":      "R-17",
+    "r_plus": "R+",
+    "rx":     "Rx (Hentai)",
+}
+
+# GraphQL: метаданные аниме по списку id.
+# censored: false — обязательно, иначе теряются hentai/yaoi/yuri тайтлы.
+_GQL_ANIME = """
+query($ids: String!) {
+  animes(ids: $ids, limit: 50, censored: false) {
+    id
+    url
+    kind
+    score
+    rating
+    origin
+    duration
+    episodes
+    airedOn { year }
+    studios { name }
+    genres { russian name kind }
+  }
+}
+"""
+
+# GraphQL: метаданные манги по списку id.
+_GQL_MANGA = """
+query($ids: String!) {
+  mangas(ids: $ids, limit: 50, censored: false) {
+    id
+    url
+    kind
+    score
+    chapters
+    volumes
+    airedOn { year }
+    publishers { name }
+    genres { russian name kind }
+  }
+}
+"""
+
+# ─────────────────────────────────────────────
+#  In-memory кэш stats_all для команд (TTL 5 минут).
+#  stats_all меняется редко (раз в старт + раз в квартал),
+#  поэтому короткого TTL достаточно, чтобы не читать файл на каждый /stats.
+# ─────────────────────────────────────────────
+_stats_all_cache: dict | None = None
+_stats_all_cache_ts: float = 0.0
+_STATS_ALL_CACHE_TTL: int = 300  # секунд
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  УТИЛИТЫ — КВАРТАЛ
+# ═══════════════════════════════════════════════════════════════════
+
+def current_quarter(dt: datetime | None = None) -> str:
+    """'2026-Q2' для UTC-даты (по умолчанию — сейчас)."""
+    if dt is None:
+        dt = datetime.utcnow()
+    q = (dt.month - 1) // 3 + 1
+    return f"{dt.year}-Q{q}"
+
+
+def quarter_start(dt: datetime | None = None) -> datetime:
+    """Первый день текущего (или переданного) квартала, UTC."""
+    if dt is None:
+        dt = datetime.utcnow()
+    q = (dt.month - 1) // 3 + 1
+    return datetime(dt.year, (q - 1) * 3 + 1, 1)
+
+
+def quarter_label(period: str) -> str:
+    """'2026-Q2' → 'апрель — июнь 2026'. При ошибке возвращает исходную строку."""
+    _names = {
+        "Q1": "январь — март",
+        "Q2": "апрель — июнь",
+        "Q3": "июль — сентябрь",
+        "Q4": "октябрь — декабрь",
+    }
+    try:
+        year, q = period.split("-", 1)
+        return f"{_names.get(q, q)} {year}"
+    except Exception:
+        return period
+
+
+def _quarter_end(period: str) -> datetime | None:
+    """Последний день квартала по строке '2026-Q2' (для отображения диапазона)."""
+    try:
+        year_s, q_s = period.split("-Q", 1)
+        year, q = int(year_s), int(q_s)
+        # Первый месяц следующего квартала минус один день
+        end_month = q * 3  # последний месяц квартала (3,6,9,12)
+        if end_month == 12:
+            return datetime(year, 12, 31)
+        return datetime(year, end_month + 1, 1) - timedelta(days=1)
+    except Exception:
+        return None
+
+
+def tracking_period_label(cur: dict) -> str:
+    """
+    Человекочитаемый диапазон фактического отслеживания текущего квартала.
+    'с 25.04.2026 по 30.06.2026' если бот стартовал в середине,
+    'с 01.04.2026 по 30.06.2026' если с начала.
+    При проблемах с датами — деградирует до quarter_label.
+    """
+    period = cur.get("period") or current_quarter()
+    try:
+        ts_raw = cur.get("tracking_since") or cur.get("period_start")
+        start = datetime.fromisoformat(ts_raw) if ts_raw else None
+        end = _quarter_end(period)
+        if start and end:
+            return f"с {start.strftime('%d.%m.%Y')} по {end.strftime('%d.%m.%Y')}"
+    except Exception:
+        pass
+    return quarter_label(period)
+
+
+def _is_partial_quarter(cur: dict) -> bool:
+    """True, если отслеживание началось позже календарного начала квартала."""
+    try:
+        ts = cur.get("tracking_since")
+        ps = cur.get("period_start")
+        if ts and ps:
+            return datetime.fromisoformat(ts) > datetime.fromisoformat(ps)
+    except Exception:
+        pass
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ЗАГРУЗКА / ЧТЕНИЕ ИСТОЧНИКОВ ДАННЫХ
+# ═══════════════════════════════════════════════════════════════════
+
+async def fetch_list_export(session: aiohttp.ClientSession, media: str) -> list[dict] | None:
+    """
+    Скачиваем публичный экспорт списка пользователя.
+    media: "anime" | "manga"
+    Возвращает список записей или None при любой ошибке.
+
+    Формат записи:
+      {target_title, target_title_ru, target_id, target_type,
+       score, status, rewatches, episodes|volumes|chapters, text}
+    """
+    url = LIST_EXPORT_ANIME if media == "anime" else LIST_EXPORT_MANGA
+    try:
+        async with session.get(
+            url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("fetch_list_export(%s): HTTP %d", media, resp.status)
+                return None
+            data = await resp.json(content_type=None)
+            if not isinstance(data, list):
+                log.warning("fetch_list_export(%s): ответ не список.", media)
+                return None
+            return data
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.error("fetch_list_export(%s): ошибка запроса: %s", media, e)
+        return None
+    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+        log.error("fetch_list_export(%s): не удалось разобрать ответ: %s", media, e)
+        return None
+
+
+async def _gql_request(
+    session: aiohttp.ClientSession, query: str, variables: dict,
+) -> dict | None:
+    """
+    Один GraphQL-запрос. Возвращает поле data или None при ошибке.
+    Частичные данные (data + errors) возвращаются — пусть caller решает.
+    """
+    try:
+        async with session.post(
+            GRAPHQL_URL,
+            headers={**HEADERS, "Content-Type": "application/json"},
+            json={"query": query, "variables": variables},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("_gql_request: HTTP %d", resp.status)
+                return None
+            try:
+                payload = await resp.json(content_type=None)
+            except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+                log.warning("_gql_request: не удалось распарсить ответ: %s", e)
+                return None
+            if "errors" in payload:
+                log.warning("_gql_request: GraphQL errors: %s", payload["errors"])
+            return payload.get("data")
+    except asyncio.TimeoutError:
+        log.warning("_gql_request: таймаут (20 с)")
+        return None
+    except aiohttp.ClientError as e:
+        log.error("_gql_request: ошибка клиента: %s", e)
+        return None
+
+
+def _parse_genres(genres_raw: list, kind_filter: str) -> list[str]:
+    """Имена жанров заданного kind (genre|theme|demographic). Предпочитаем русское."""
+    out = []
+    for g in genres_raw or []:
+        if isinstance(g, dict) and g.get("kind") == kind_filter:
+            name = (g.get("russian") or g.get("name") or "").strip()
+            if name:
+                out.append(name)
+    return out
+
+
+async def fetch_meta_batch(media: str, ids: list[str]) -> dict[str, dict]:
+    """
+    Запрашиваем метаданные тайтлов через GraphQL батчами по 50.
+    media: "anime" | "manga"
+    Возвращает {str(id): meta_dict}. При сбое отдельного батча — пропускаем его,
+    остальные данные сохраняем (частичный результат лучше пустого).
+    """
+    clean = list({str(i).strip() for i in ids if str(i).strip()})
+    if not clean:
+        return {}
+
+    query = _GQL_ANIME if media == "anime" else _GQL_MANGA
+    result: dict[str, dict] = {}
+
+    async with aiohttp.ClientSession() as session:
+        # Батчим по 50 (ограничение limit в GraphQL)
+        for i in range(0, len(clean), 50):
+            batch = clean[i:i + 50]
+            data = await _gql_request(session, query, {"ids": ",".join(batch)})
+            key = "animes" if media == "anime" else "mangas"
+            for item in ((data or {}).get(key) or []):
+                try:
+                    item_id = str(item.get("id") or "")
+                    if not item_id:
+                        continue
+                    genres_raw = item.get("genres") or []
+                    meta = {
+                        "url":         (item.get("url") or "").strip(),
+                        "kind":        (item.get("kind") or "").lower(),
+                        "year":        (item.get("airedOn") or {}).get("year"),
+                        "shiki_score": _safe_float(item.get("score")),
+                        "genres":      _parse_genres(genres_raw, "genre"),
+                        "themes":      _parse_genres(genres_raw, "theme"),
+                        "demographic": _parse_genres(genres_raw, "demographic"),
+                    }
+                    if media == "anime":
+                        origin_raw = (item.get("origin") or "").strip()
+                        rating_raw = (item.get("rating") or "").strip()
+                        meta.update({
+                            "duration":       item.get("duration"),   # мин/эп
+                            "episodes_total": item.get("episodes"),
+                            "rating":         _RATING_RU.get(rating_raw, rating_raw or None),
+                            "origin":         _ORIGIN_RU.get(origin_raw, origin_raw or None),
+                            "studios":        [s["name"] for s in (item.get("studios") or []) if s.get("name")],
+                        })
+                    else:
+                        meta.update({
+                            "chapters_total": item.get("chapters"),
+                            "volumes_total":  item.get("volumes"),
+                            "publishers":     [p["name"] for p in (item.get("publishers") or []) if p.get("name")],
+                        })
+                    result[item_id] = meta
+                except Exception as e:
+                    log.warning("fetch_meta_batch(%s): ошибка парсинга id=%s: %s",
+                                media, item.get("id"), e)
+
+            # Пауза между батчами — не триггерим rate limit (5 req/sec)
+            if i + 50 < len(clean):
+                await asyncio.sleep(0.5)
+
+    log.info("fetch_meta_batch(%s): получено %d/%d тайтлов.", media, len(result), len(clean))
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  stats_all.json — ЗАГРУЗКА / СОХРАНЕНИЕ
+# ═══════════════════════════════════════════════════════════════════
+
+def _empty_stats_all() -> dict:
+    """Пустая структура stats_all.json."""
+    return {
+        "updated_at": None,
+        "anime": {"titles": {}, "aggregates": {}},
+        "manga": {"titles": {}, "aggregates": {}},
+    }
+
+
+def load_stats_all(use_cache: bool = True) -> dict:
+    """
+    Загружаем stats_all.json (с коротким in-memory кэшем).
+    При ошибке — пустая структура, бот не падает.
+    """
+    global _stats_all_cache, _stats_all_cache_ts
+
+    if use_cache and _stats_all_cache is not None:
+        age = datetime.utcnow().timestamp() - _stats_all_cache_ts
+        if age < _STATS_ALL_CACHE_TTL:
+            return _stats_all_cache
+
+    data = _empty_stats_all()
+    try:
+        if STATS_ALL_FILE.exists():
+            raw = json.loads(STATS_ALL_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and "anime" in raw and "manga" in raw:
+                data = raw
+            else:
+                log.warning("load_stats_all: неожиданная структура, сбрасываем.")
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning("load_stats_all: не удалось прочитать файл: %s", e)
+
+    _stats_all_cache = data
+    _stats_all_cache_ts = datetime.utcnow().timestamp()
+    return data
+
+
+def save_stats_all(data: dict) -> None:
+    """Сохраняем stats_all.json атомарно + обновляем кэш."""
+    global _stats_all_cache, _stats_all_cache_ts
+    try:
+        data["updated_at"] = datetime.utcnow().isoformat()
+        _atomic_write(STATS_ALL_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+        _stats_all_cache = data
+        _stats_all_cache_ts = datetime.utcnow().timestamp()
+    except Exception as e:
+        log.error("save_stats_all: не удалось записать файл: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ПОСТРОЕНИЕ titles{} ИЗ list_export + МЕТАДАННЫХ
+# ═══════════════════════════════════════════════════════════════════
+
+def _safe_int(value, default: int = 0) -> int:
+    """Аккуратно приводим к int — score/episodes из экспорта бывают строками."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float | None = None) -> float | None:
+    """Приводим к float — GraphQL score приходит как строка '8.73'. None если не вышло."""
+    try:
+        f = float(value)
+        return f if f > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _merge_title_record(media: str, export_row: dict, meta: dict | None) -> dict:
+    """
+    Собираем одну запись titles{} из строки экспорта и метаданных GraphQL.
+    meta может быть None — тогда метаданные пустые, но пользовательские данные есть.
+    """
+    meta = meta or {}
+    record = {
+        "title":    export_row.get("target_title_ru") or export_row.get("target_title") or "???",
+        "title_en": export_row.get("target_title") or "",
+        "score":    _safe_int(export_row.get("score")),       # 0 = без оценки
+        "status":   (export_row.get("status") or "").lower(),
+        "rewatches": _safe_int(export_row.get("rewatches")),
+        "url":       meta.get("url") or "",
+        "kind":      meta.get("kind") or "",
+        "year":      meta.get("year"),
+        "shiki_score": meta.get("shiki_score"),
+        "genres":      meta.get("genres") or [],
+        "themes":      meta.get("themes") or [],
+        "demographic": meta.get("demographic") or [],
+    }
+    if media == "anime":
+        record.update({
+            "episodes_watched": _safe_int(export_row.get("episodes")),
+            "episodes_total":   meta.get("episodes_total"),
+            "duration":         meta.get("duration"),
+            "rating":           meta.get("rating"),
+            "origin":           meta.get("origin"),
+            "studios":          meta.get("studios") or [],
+        })
+    else:
+        record.update({
+            "chapters_read":  _safe_int(export_row.get("chapters")),
+            "volumes_read":   _safe_int(export_row.get("volumes")),
+            "chapters_total": meta.get("chapters_total"),
+            "volumes_total":  meta.get("volumes_total"),
+            "publishers":     meta.get("publishers") or [],
+        })
+    return record
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ПЕРЕСЧЁТ АГРЕГАТОВ
+# ═══════════════════════════════════════════════════════════════════
+
+def _bump(counter: dict, key, n: int = 1) -> None:
+    """counter[key] += n, с защитой от None/пустых ключей."""
+    if key is None or key == "":
+        return
+    counter[str(key)] = counter.get(str(key), 0) + n
+
+
+def recompute_aggregates(media: str, titles: dict, existing_by_quarter: dict | None = None) -> dict:
+    """
+    Полный пересчёт агрегатов из titles{}.
+    by_quarter не вычисляется отсюда (он накапливается при ротации квартала) —
+    передаём существующий, чтобы не потерять.
+
+    Все жанрово-оценочные агрегаты считаются ТОЛЬКО по completed.
+    Счётчики статусов (total_*) — по всем записям.
+    """
+    agg: dict = {
+        "total_completed":  0,
+        "total_dropped":    0,
+        "total_watching":   0,
+        "total_planned":    0,
+        "total_on_hold":    0,
+        "total_rewatching": 0,
+        "score_dist":   {},
+        "genres":       {},
+        "themes":       {},
+        "demographic":  {},
+        "kinds":        {},
+        "by_year":      {},
+        "by_quarter":   existing_by_quarter or {},
+        "avg_shiki_completed": None,  # средний рейтинг Shikimori по завершённым с оценкой
+    }
+    if media == "anime":
+        agg.update({
+            "studios": {}, "origins": {}, "ratings": {},
+            "total_episodes_watched": 0,
+            "total_hours_watched":    0.0,
+        })
+    else:
+        agg.update({
+            "publishers": {},
+            "total_chapters_read": 0,
+            "total_volumes_read":  0,
+        })
+
+    status_counter = {
+        "completed":  "total_completed",
+        "dropped":    "total_dropped",
+        "watching":   "total_watching",
+        "planned":    "total_planned",
+        "on_hold":    "total_on_hold",
+        "rewatching": "total_rewatching",
+    }
+
+    total_minutes = 0
+    shiki_scores: list[float] = []   # рейтинги Shikimori по completed с личной оценкой
+
+    for rec in titles.values():
+        status = rec.get("status", "")
+        # Счётчик статусов
+        if status in status_counter:
+            agg[status_counter[status]] += 1
+
+        # Жанровые/оценочные агрегаты — только completed
+        if status != "completed":
+            continue
+
+        _bump(agg["score_dist"], rec.get("score", 0))
+        # Рейтинг Shikimori — собираем только если есть личная оценка (для честного сравнения)
+        if _safe_int(rec.get("score")) > 0 and isinstance(rec.get("shiki_score"), (int, float)):
+            shiki_scores.append(float(rec["shiki_score"]))
+        for g in rec.get("genres", []):
+            _bump(agg["genres"], g)
+        for t in rec.get("themes", []):
+            _bump(agg["themes"], t)
+        for d in rec.get("demographic", []):
+            _bump(agg["demographic"], d)
+        _bump(agg["kinds"], rec.get("kind"))
+        if rec.get("year"):
+            _bump(agg["by_year"], rec.get("year"))
+
+        if media == "anime":
+            for s in rec.get("studios", []):
+                _bump(agg["studios"], s)
+            _bump(agg["origins"], rec.get("origin"))
+            _bump(agg["ratings"], rec.get("rating"))
+
+            eps = _safe_int(rec.get("episodes_watched"))
+            agg["total_episodes_watched"] += eps
+            dur = rec.get("duration")
+            if isinstance(dur, int) and dur > 0 and eps > 0:
+                total_minutes += dur * eps
+        else:
+            for p in rec.get("publishers", []):
+                _bump(agg["publishers"], p)
+            agg["total_chapters_read"] += _safe_int(rec.get("chapters_read"))
+            agg["total_volumes_read"]  += _safe_int(rec.get("volumes_read"))
+
+    if media == "anime":
+        agg["total_hours_watched"] = round(total_minutes / 60, 1)
+
+    if shiki_scores:
+        agg["avg_shiki_completed"] = round(sum(shiki_scores) / len(shiki_scores), 2)
+
+    return agg
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  СИНХРОНИЗАЦИЯ stats_all С list_export
+# ═══════════════════════════════════════════════════════════════════
+
+async def sync_stats_all() -> dict:
+    """
+    Главная функция актуализации stats_all.
+
+    1. Скачиваем list_export для аниме и манги.
+    2. Сверяем с titles{} в stats_all — находим новые/изменившиеся записи
+       (новый id, либо изменился score/status/episodes/chapters).
+    3. Для записей, у которых ещё нет метаданных (новый id) — батч GraphQL.
+       Для существ, у которых поменялся только пользовательский стейт —
+       обновляем поля из экспорта, метаданные не перезапрашиваем.
+    4. Пересчитываем агрегаты, сохраняем.
+
+    Вызывается при старте бота. Никаких уведомлений не шлёт.
+    Возвращает обновлённый stats_all (или текущий при сбое экспорта).
+    """
+    stats = load_stats_all(use_cache=False)
+
+    async with aiohttp.ClientSession() as session:
+        export_anime = await fetch_list_export(session, "anime")
+        export_manga = await fetch_list_export(session, "manga")
+
+    if export_anime is None and export_manga is None:
+        log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
+        return stats
+
+    changed = False
+
+    for media, export in (("anime", export_anime), ("manga", export_manga)):
+        if export is None:
+            log.info("sync_stats_all: экспорт %s недоступен, пропускаем эту половину.", media)
+            continue
+
+        titles = stats[media]["titles"]
+
+        # Релевантные строки экспорта: с валидным id и известным статусом
+        valid_rows: dict[str, dict] = {}
+        for row in export:
+            tid = str(row.get("target_id") or "")
+            status = (row.get("status") or "").lower()
+            if tid and status in _STAT_STATUSES:
+                valid_rows[tid] = row
+
+        # ID, которым нужны метаданные (отсутствуют в titles)
+        new_ids = [tid for tid in valid_rows if tid not in titles]
+
+        # Подтягиваем метаданные для новых
+        meta_map: dict[str, dict] = {}
+        if new_ids:
+            log.info("sync_stats_all(%s): новых тайтлов для обогащения: %d", media, len(new_ids))
+            try:
+                meta_map = await fetch_meta_batch(media, new_ids)
+            except Exception as e:
+                log.error("sync_stats_all(%s): fetch_meta_batch упал: %s", media, e)
+
+        # Обновляем / создаём записи
+        for tid, row in valid_rows.items():
+            if tid in titles:
+                # Существующая запись — обновляем только пользовательский стейт,
+                # метаданные (genres/studios/...) уже есть, не трогаем.
+                rec = titles[tid]
+                new_score  = _safe_int(row.get("score"))
+                new_status = (row.get("status") or "").lower()
+                new_rew    = _safe_int(row.get("rewatches"))
+                if media == "anime":
+                    new_progress = _safe_int(row.get("episodes"))
+                    if (rec.get("score") != new_score or rec.get("status") != new_status
+                            or rec.get("episodes_watched") != new_progress
+                            or rec.get("rewatches") != new_rew):
+                        rec["score"] = new_score
+                        rec["status"] = new_status
+                        rec["episodes_watched"] = new_progress
+                        rec["rewatches"] = new_rew
+                        changed = True
+                else:
+                    new_ch = _safe_int(row.get("chapters"))
+                    new_vol = _safe_int(row.get("volumes"))
+                    if (rec.get("score") != new_score or rec.get("status") != new_status
+                            or rec.get("chapters_read") != new_ch
+                            or rec.get("volumes_read") != new_vol
+                            or rec.get("rewatches") != new_rew):
+                        rec["score"] = new_score
+                        rec["status"] = new_status
+                        rec["chapters_read"] = new_ch
+                        rec["volumes_read"] = new_vol
+                        rec["rewatches"] = new_rew
+                        changed = True
+            else:
+                # Новая запись
+                titles[tid] = _merge_title_record(media, row, meta_map.get(tid))
+                changed = True
+
+        # Удаляем записи, которых больше нет в экспорте (тайтл убран из списка)
+        removed = [tid for tid in titles if tid not in valid_rows]
+        for tid in removed:
+            del titles[tid]
+            changed = True
+        if removed:
+            log.info("sync_stats_all(%s): удалено отсутствующих в экспорте: %d", media, len(removed))
+
+        # Пересчитываем агрегаты (сохраняя by_quarter)
+        existing_bq = stats[media].get("aggregates", {}).get("by_quarter")
+        stats[media]["aggregates"] = recompute_aggregates(media, titles, existing_bq)
+
+    if changed:
+        save_stats_all(stats)
+        log.info("sync_stats_all: stats_all.json обновлён.")
+    else:
+        log.info("sync_stats_all: изменений нет.")
+
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  stats_current.json — СОБЫТИЯ ТЕКУЩЕГО КВАРТАЛА
+# ═══════════════════════════════════════════════════════════════════
+
+def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict:
+    """
+    Пустая структура текущего квартала.
+    period_start — календарное начало квартала (для метки периода).
+    tracking_since — реальная дата, с которой бот начал собирать события.
+      При ротации = начало квартала (полные данные).
+      При первом запуске в середине квартала = дата запуска (данные неполные).
+      Если None — берётся календарное начало квартала.
+    """
+    qs = quarter_start().isoformat()
+    return {
+        "period": period,
+        "period_start": qs,
+        "tracking_since": tracking_since or qs,
+        "last_report_sent": None,
+        "events": [],   # [{id, media, event, score, recorded_at}]
+    }
+
+
+def load_stats_current() -> dict:
+    """
+    Загружаем события текущего квартала. При ошибке/отсутствии — пустой квартал.
+
+    Если файла ещё нет (истинно первый запуск), фиксируем tracking_since = max(
+    начало квартала, сейчас). Это даёт честную дату «статистика собирается с …»,
+    когда бота впервые запустили в середине квартала. Дата сразу сохраняется,
+    чтобы не сбрасывалась при последующих перезапусках.
+    """
+    try:
+        if STATS_CURRENT_FILE.exists():
+            data = json.loads(STATS_CURRENT_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "period" in data and "events" in data:
+                # Бэкофилл для файлов, созданных до появления поля tracking_since
+                if "tracking_since" not in data:
+                    data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
+                return data
+            log.warning("load_stats_current: неожиданная структура, сбрасываем.")
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning("load_stats_current: %s", e)
+
+    # Истинно первый запуск (или сброс) — фиксируем фактическую дату старта
+    now = datetime.utcnow()
+    qs = quarter_start(now)
+    tracking_since = (now if now > qs else qs).isoformat()
+    fresh = _empty_stats_current(current_quarter(now), tracking_since=tracking_since)
+    save_stats_current(fresh)
+    log.info("load_stats_current: создан новый stats_current, отслеживание с %s.", tracking_since)
+    return fresh
+
+
+def save_stats_current(data: dict) -> None:
+    try:
+        _atomic_write(STATS_CURRENT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception as e:
+        log.error("save_stats_current: %s", e)
+
+
+def record_current_event(
+    cur: dict, entry: dict, event_type: str, media_type: str, score: int | None,
+) -> dict:
+    """
+    Фиксируем событие истории в stats_current (для хронологии квартала).
+    Учитываем только значимые для статистики типы.
+    Дедупликация: один (id, event_type) на квартал.
+    """
+    if event_type not in ("completed", "dropped", "planned", "rewatching"):
+        return cur
+    try:
+        target = entry.get("target") or {}
+        tid = str(target.get("id") or "")
+        if not tid:
+            return cur
+        # Дедуп
+        for ev in cur.get("events", []):
+            if ev.get("id") == tid and ev.get("event") == event_type:
+                return cur
+        cur.setdefault("events", []).append({
+            "id":          tid,
+            "media":       media_type,
+            "event":       event_type,
+            "score":       score,
+            "recorded_at": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        log.error("record_current_event: %s", e)
+    return cur
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ФОРМАТИРОВАНИЕ — ВСПОМОГАТЕЛЬНОЕ
+# ═══════════════════════════════════════════════════════════════════
+
+def _top_dict(counter: dict, n: int) -> list[tuple[str, int]]:
+    """Топ-N пар (ключ, count) по убыванию."""
+    return sorted(counter.items(), key=lambda x: x[1], reverse=True)[:n]
+
+
+def _fmt_counter(counter: dict, n: int, sep: str = "  ·  ") -> str:
+    """'Экшен (34) · Драма (28)'."""
+    return sep.join(f"{h(k)} ({v})" for k, v in _top_dict(counter, n))
+
+
+def _fmt_score_dist(dist: dict) -> str:
+    """Распределение оценок без нулей (0 = без оценки): '10×8 · 9×15'."""
+    pairs = [(int(s), c) for s, c in dist.items() if _safe_int(s) > 0]
+    if not pairs:
+        return "нет оценок"
+    return "  ·  ".join(f"{s}×{c}" for s, c in sorted(pairs, reverse=True))
+
+
+def _avg_score_from_dist(dist: dict) -> float | None:
+    """Средняя оценка из распределения (игнорируя 0 = без оценки)."""
+    total = count = 0
+    for s, c in dist.items():
+        sv = _safe_int(s)
+        if sv > 0:
+            total += sv * c
+            count += c
+    return round(total / count, 2) if count else None
+
+
+def _title_link_from_rec(tid: str, rec: dict) -> str:
+    """HTML-ссылка из записи titles{}."""
+    title = h(rec.get("title") or "???")
+    url = (rec.get("url") or "").strip()
+    return f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
+
+
+def _pct_diff(curr: int, prev: int) -> str:
+    """'↑ 25% (9 → 12)'."""
+    if prev == 0:
+        return f"+{curr}" if curr else "~"
+    delta = curr - prev
+    if delta == 0:
+        return f"→ без изменений ({curr})"
+    pct = round(abs(delta) / prev * 100)
+    return f"{'↑' if delta > 0 else '↓'} {pct}% ({prev} → {curr})"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  /stats all — АГРЕГИРОВАННАЯ СТАТИСТИКА ЗА ВСЁ ВРЕМЯ
+# ═══════════════════════════════════════════════════════════════════
+
+def build_stats_all_messages(stats: dict) -> list[str]:
+    """
+    Список сообщений для /stats all, разбитый по темам: [аниме], [манга].
+    Каждое самостоятельно проходит лимит Telegram.
+    """
+    a_agg = (stats.get("anime") or {}).get("aggregates") or {}
+    m_agg = (stats.get("manga") or {}).get("aggregates") or {}
+
+    updated = stats.get("updated_at") or ""
+    upd_str = ""
+    if updated:
+        try:
+            upd_str = datetime.fromisoformat(updated).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+
+    # Пустая статистика — одно короткое сообщение
+    if a_agg.get("total_completed", 0) == 0 and m_agg.get("total_completed", 0) == 0:
+        return ["📊 <b>СТАТИСТИКА ЗА ВСЁ ВРЕМЯ</b>\n\n"
+                "<i>Статистика ещё не собрана. Дай боту немного времени.</i>"]
+
+    # ── Аниме ───────────────────────────────────
+    a: list[str] = ["📊 <b>СТАТИСТИКА ЗА ВСЁ ВРЕМЯ</b>"]
+    if upd_str:
+        a.append(f"<i>актуально на {upd_str}</i>")
+    a.append("")
+    a.append("🎬 <b>━━━ АНИМЕ ━━━</b>")
+    a.append(f"✅ Завершено: <b>{a_agg.get('total_completed', 0)}</b>")
+    a.append(
+        f"🗑️ Брошено: {a_agg.get('total_dropped', 0)}  ·  "
+        f"▶️ Смотрит: {a_agg.get('total_watching', 0)}  ·  "
+        f"📋 В планах: {a_agg.get('total_planned', 0)}"
+    )
+    avg_a = _avg_score_from_dist(a_agg.get("score_dist", {}))
+    if avg_a is not None:
+        line = f"⭐ Средняя оценка: <b>{avg_a}</b>"
+        avg_shiki_a = a_agg.get("avg_shiki_completed")
+        if isinstance(avg_shiki_a, (int, float)):
+            diff = round(avg_a - avg_shiki_a, 1)
+            sign = "+" if diff >= 0 else ""
+            line += f"  <i>(Shikimori: {round(avg_shiki_a, 1)}, {sign}{diff})</i>"
+        a.append(line)
+    sd = _fmt_score_dist(a_agg.get("score_dist", {}))
+    if sd != "нет оценок":
+        a.append(f"📊 {sd}")
+    eps = a_agg.get("total_episodes_watched", 0)
+    hrs = a_agg.get("total_hours_watched", 0)
+    if eps:
+        a.append(f"📺 Эпизодов просмотрено: <b>{eps}</b>  (~{hrs} ч.)")
+    if a_agg.get("genres"):
+        a.append(f"🎭 Жанры: {_fmt_counter(a_agg['genres'], 5)}")
+    if a_agg.get("themes"):
+        a.append(f"🏷️ Темы: {_fmt_counter(a_agg['themes'], 5)}")
+    if a_agg.get("studios"):
+        a.append(f"🎨 Студии: {_fmt_counter(a_agg['studios'], 5)}")
+    if a_agg.get("origins"):
+        a.append(f"📺 Источники: {_fmt_counter(a_agg['origins'], 4)}")
+    if a_agg.get("ratings"):
+        a.append(f"🔞 Рейтинги: {_fmt_counter(a_agg['ratings'], 4)}")
+
+    # ── Манга ───────────────────────────────────
+    m: list[str] = ["📚 <b>━━━ МАНГА ━━━</b>"]
+    m.append(f"✅ Прочитано: <b>{m_agg.get('total_completed', 0)}</b>")
+    m.append(
+        f"🗑️ Брошено: {m_agg.get('total_dropped', 0)}  ·  "
+        f"📖 Читает: {m_agg.get('total_watching', 0)}  ·  "
+        f"📋 В планах: {m_agg.get('total_planned', 0)}"
+    )
+    avg_m = _avg_score_from_dist(m_agg.get("score_dist", {}))
+    if avg_m is not None:
+        line = f"⭐ Средняя оценка: <b>{avg_m}</b>"
+        avg_shiki_m = m_agg.get("avg_shiki_completed")
+        if isinstance(avg_shiki_m, (int, float)):
+            diff = round(avg_m - avg_shiki_m, 1)
+            sign = "+" if diff >= 0 else ""
+            line += f"  <i>(Shikimori: {round(avg_shiki_m, 1)}, {sign}{diff})</i>"
+        m.append(line)
+    sd_m = _fmt_score_dist(m_agg.get("score_dist", {}))
+    if sd_m != "нет оценок":
+        m.append(f"📊 {sd_m}")
+    ch = m_agg.get("total_chapters_read", 0)
+    vol = m_agg.get("total_volumes_read", 0)
+    if ch:
+        m.append(f"📖 Глав прочитано: <b>{ch}</b>  ·  томов: {vol}")
+    if m_agg.get("genres"):
+        m.append(f"🎭 Жанры: {_fmt_counter(m_agg['genres'], 5)}")
+    if m_agg.get("themes"):
+        m.append(f"🏷️ Темы: {_fmt_counter(m_agg['themes'], 5)}")
+    if m_agg.get("publishers"):
+        m.append(f"🏢 Издатели: {_fmt_counter(m_agg['publishers'], 5)}")
+
+    return ["\n".join(a), "\n".join(m)]
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  КВАРТАЛЬНЫЙ ОТЧЁТ И /stats (ТЕКУЩИЙ КВАРТАЛ)
+# ═══════════════════════════════════════════════════════════════════
+
+def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[dict]:
+    """
+    Возвращает записи titles{} для тайтлов, у которых в текущем квартале
+    было событие event ("completed"|"dropped"), джойня события с stats_all.
+    Для completed подставляем score из события (на момент завершения).
+    """
+    titles = (stats_all.get(media) or {}).get("titles") or {}
+    out = []
+    seen = set()
+    for ev in cur.get("events", []):
+        if ev.get("media") != media or ev.get("event") != event:
+            continue
+        tid = ev.get("id")
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        rec = titles.get(tid)
+        if rec:
+            merged = dict(rec)
+            # score события приоритетнее (актуально на момент завершения квартала)
+            if event == "completed" and ev.get("score") is not None:
+                merged["score"] = ev["score"]
+            out.append(merged)
+        else:
+            # Метаданных нет (тайтл не успел попасть в stats_all) — минимальная запись
+            out.append({
+                "title": "???", "url": "", "score": ev.get("score") or 0,
+                "genres": [], "themes": [], "demographic": [],
+            })
+    return out
+
+
+def _build_quarter_section(records: list[dict], media: str) -> list[str]:
+    """Строки секции (аниме/манга) для отчётов на основе titles-записей квартала."""
+    lines: list[str] = []
+    if not records:
+        return lines
+
+    # Оценки
+    scores = [r["score"] for r in records if _safe_int(r.get("score")) > 0]
+    if scores:
+        avg_personal = round(sum(scores) / len(scores), 1)
+        # Средний рейтинг Shikimori по тем же тайтлам (у которых есть оценка)
+        shiki = [r["shiki_score"] for r in records
+                 if _safe_int(r.get("score")) > 0 and isinstance(r.get("shiki_score"), (int, float))]
+        score_line = f"⭐ Средняя оценка: <b>{avg_personal}</b>"
+        if shiki:
+            avg_shiki = round(sum(shiki) / len(shiki), 1)
+            diff = round(avg_personal - avg_shiki, 1)
+            sign = "+" if diff >= 0 else ""
+            score_line += f"  <i>(Shikimori: {avg_shiki}, {sign}{diff})</i>"
+        lines.append(score_line)
+        dist: dict = {}
+        for s in scores:
+            _bump(dist, s)
+        lines.append(f"📊 {_fmt_score_dist(dist)}")
+
+    # Топ по оценке
+    top = sorted(
+        [r for r in records if _safe_int(r.get("score")) > 0],
+        key=lambda r: r["score"], reverse=True,
+    )[:3]
+    if top:
+        lines.append("")
+        lines.append("🏆 <b>Топ по оценке:</b>")
+        for i, r in enumerate(top, 1):
+            title = h(r.get("title") or "???")
+            url = (r.get("url") or "").strip()
+            link = f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
+            lines.append(f"  {i}. {link} — ⭐{r['score']}")
+
+    # Хронология по году
+    years = [(r["year"], r.get("title") or "???") for r in records
+             if isinstance(r.get("year"), int) and r["year"] > 1900]
+    if years:
+        oldest = min(years, key=lambda x: x[0])
+        newest = max(years, key=lambda x: x[0])
+        avg_y = round(sum(y for y, _ in years) / len(years))
+        lines.append("")
+        if oldest[0] == newest[0]:
+            lines.append(f"🗓️ Год выпуска: <b>{oldest[0]}</b>")
+        else:
+            lines.append(
+                f"🗓️ Хронология: <b>{oldest[0]}</b> ({h(oldest[1])}) → "
+                f"<b>{newest[0]}</b> ({h(newest[1])}),  ср. {avg_y}"
+            )
+
+    # Жанры/темы из записей квартала
+    genres: dict = {}
+    themes: dict = {}
+    for r in records:
+        for g in r.get("genres", []):
+            _bump(genres, g)
+        for t in r.get("themes", []):
+            _bump(themes, t)
+
+    if media == "anime":
+        studios: dict = {}
+        origins: dict = {}
+        total_eps = 0
+        total_min = 0
+        for r in records:
+            for s in r.get("studios", []):
+                _bump(studios, s)
+            _bump(origins, r.get("origin"))
+            eps = _safe_int(r.get("episodes_watched"))
+            total_eps += eps
+            dur = r.get("duration")
+            if isinstance(dur, int) and dur > 0 and eps > 0:
+                total_min += dur * eps
+        if total_eps:
+            lines.append(f"📺 Эпизодов: <b>{total_eps}</b>  (~{round(total_min / 60, 1)} ч.)")
+        if studios:
+            lines.append(f"🎨 Студии: {_fmt_counter(studios, 3)}")
+        if origins:
+            lines.append(f"📺 Источники: {_fmt_counter(origins, 3)}")
+    else:
+        publishers: dict = {}
+        total_ch = 0
+        for r in records:
+            for p in r.get("publishers", []):
+                _bump(publishers, p)
+            total_ch += _safe_int(r.get("chapters_read"))
+        if total_ch:
+            lines.append(f"📖 Глав прочитано: <b>{total_ch}</b>")
+        if publishers:
+            lines.append(f"🏢 Издатели: {_fmt_counter(publishers, 3)}")
+
+    if genres:
+        lines.append("")
+        lines.append(f"🎭 Жанры: {_fmt_counter(genres, 5)}")
+    if themes:
+        lines.append(f"🏷️ Темы: {_fmt_counter(themes, 3)}")
+
+    return lines
+
+
+def _anime_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, header: str) -> str:
+    """Готовый текст блока АНИМЕ (одно сообщение)."""
+    lines: list[str] = [header]
+    lines.append(f"✅ Завершено: <b>{len(comp)}</b>")
+    if drop:
+        lines.append(f"🗑️ Брошено: {len(drop)}")
+    if plan:
+        lines.append(f"📋 В планируемое: {plan}")
+    section = _build_quarter_section(comp, "anime")
+    if section:
+        lines.extend(section)
+    elif not drop and not plan:
+        lines.append("<i>Пока ничего не завершено.</i>")
+    return "\n".join(lines)
+
+
+def _manga_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, header: str) -> str:
+    """Готовый текст блока МАНГА (одно сообщение)."""
+    lines: list[str] = [header]
+    lines.append(f"✅ Прочитано: <b>{len(comp)}</b>")
+    if drop:
+        lines.append(f"🗑️ Брошено: {len(drop)}")
+    if plan:
+        lines.append(f"📋 В планируемое: {plan}")
+    section = _build_quarter_section(comp, "manga")
+    if section:
+        lines.extend(section)
+    elif not drop and not plan:
+        lines.append("<i>Пока ничего не завершено.</i>")
+    return "\n".join(lines)
+
+
+def build_current_stats_messages(cur: dict, stats_all: dict) -> list[str]:
+    """
+    Список сообщений для /stats (текущий квартал), разбитый по темам:
+      [0] аниме, [1] манга, [2] подвал с подсказкой про /stats all.
+    Каждое сообщение самостоятельное и проходит лимит Telegram отдельно.
+    """
+    title_label = tracking_period_label(cur)
+
+    comp_a = _quarter_titles(cur, stats_all, "anime", "completed")
+    drop_a = _quarter_titles(cur, stats_all, "anime", "dropped")
+    comp_m = _quarter_titles(cur, stats_all, "manga", "completed")
+    drop_m = _quarter_titles(cur, stats_all, "manga", "dropped")
+
+    plan_a = sum(1 for e in cur.get("events", []) if e["media"] == "anime" and e["event"] == "planned")
+    plan_m = sum(1 for e in cur.get("events", []) if e["media"] == "manga" and e["event"] == "planned")
+
+    header = f"📊 <b>Статистика {h(title_label)}</b>"
+    if _is_partial_quarter(cur):
+        header += "\n<i>⚠️ Квартал отслеживается не с самого начала — данные неполные.</i>"
+
+    msgs: list[str] = []
+    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, "🎬 <b>━━━ АНИМЕ ━━━</b>"))
+    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, "📚 <b>━━━ МАНГА ━━━</b>"))
+    msgs.append("<i>Полная статистика за всё время: /stats all</i>")
+    return msgs
+
+
+def build_quarterly_report_messages(cur: dict, stats_all: dict, prev_quarter: dict | None) -> list[str]:
+    """
+    Список сообщений квартального отчёта для владельца, по темам:
+      [0] заголовок + аниме, [1] манга, [2] сравнение + достижения.
+    """
+    title_label = tracking_period_label(cur)
+
+    comp_a = _quarter_titles(cur, stats_all, "anime", "completed")
+    drop_a = _quarter_titles(cur, stats_all, "anime", "dropped")
+    comp_m = _quarter_titles(cur, stats_all, "manga", "completed")
+    drop_m = _quarter_titles(cur, stats_all, "manga", "dropped")
+
+    plan_a = sum(1 for e in cur.get("events", []) if e["media"] == "anime" and e["event"] == "planned")
+    plan_m = sum(1 for e in cur.get("events", []) if e["media"] == "manga" and e["event"] == "planned")
+
+    header = f"📊 <b>КВАРТАЛЬНЫЙ ОТЧЁТ</b>\n<b>{h(title_label)}</b>"
+    if _is_partial_quarter(cur):
+        header += "\n<i>⚠️ Квартал отслеживался не с самого начала — данные неполные.</i>"
+
+    msgs: list[str] = []
+
+    # Сообщение 1: заголовок + аниме
+    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, "🎬 <b>━━━ АНИМЕ ━━━</b>"))
+
+    # Сообщение 2: манга
+    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, "📚 <b>━━━ МАНГА ━━━</b>"))
+
+    # Сообщение 3: сравнение + достижения
+    extra: list[str] = []
+    if prev_quarter:
+        prev_a = prev_quarter.get("anime_completed", 0)
+        prev_m = prev_quarter.get("manga_completed", 0)
+        prev_label = quarter_label(prev_quarter.get("period") or "прошлый квартал")
+        extra.append(f"📈 <b>Сравнение с {h(prev_label)}:</b>")
+        extra.append(f"🎬 Аниме: {_pct_diff(len(comp_a), prev_a)}")
+        extra.append(f"📚 Манга: {_pct_diff(len(comp_m), prev_m)}")
+
+    all_comp = comp_a + comp_m
+    ach: list[str] = []
+    tens = [r for r in all_comp if r.get("score") == 10]
+    if len(tens) >= 3:
+        ach.append(f"💎 Десятку поставил {len(tens)} раза — строгий критик!")
+    elif len(tens) == 1:
+        ach.append("💎 Один безоговорочный шедевр за квартал.")
+    total_drops = len(drop_a) + len(drop_m)
+    if total_drops == 0 and all_comp:
+        ach.append("🎯 Ни одного дропа — железная воля или идеальный вкус!")
+    elif total_drops >= 5:
+        ach.append(f"🗑️ {total_drops} дропов — знает, чего не хочет.")
+    low = [r for r in all_comp if 0 < _safe_int(r.get("score")) <= 3]
+    if low:
+        n = len(low)
+        ach.append(f"🧟 Домучил {n} тайтл{'а' if n < 5 else 'ов'} с оценкой ≤3 — стойкость.")
+
+    if ach:
+        if extra:
+            extra.append("")
+        extra.append("🏆 <b>Достижения:</b>")
+        extra.extend(f"• {a}" for a in ach)
+
+    if extra:
+        msgs.append("\n".join(extra))
+
+    return msgs
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  РОТАЦИЯ КВАРТАЛА
+# ═══════════════════════════════════════════════════════════════════
+
+async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict) -> dict:
+    """
+    Проверяем смену квартала. Если сменился:
+      1. Защита last_report_sent от двойной отправки.
+      2. Синхронизируем stats_all (чтобы метаданные завершённых были свежими).
+      3. Строим отчёт, сохраняем снапшот quarters/<period>.json.
+      4. Обновляем by_quarter в агрегатах stats_all.
+      5. Отправляем отчёт владельцу.
+      6. Сбрасываем stats_current на новый период.
+    Возвращает (возможно новый) stats_current.
+    """
+    now_period = current_quarter()
+    if cur.get("period") == now_period:
+        return cur  # квартал не сменился
+
+    old_period = cur.get("period", "???")
+
+    if cur.get("last_report_sent") == now_period:
+        # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
+        log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
+        fresh = _empty_stats_current(now_period)
+        fresh["last_report_sent"] = now_period
+        save_stats_current(fresh)
+        return fresh
+
+    log.info("rotate_quarter: квартал сменился %s → %s.", old_period, now_period)
+
+    # Свежие метаданные перед отчётом
+    try:
+        stats_all = await sync_stats_all()
+    except Exception as e:
+        log.error("rotate_quarter: sync_stats_all упал: %s", e)
+
+    # Сравнение с прошлым кварталом (читаем снапшот предыдущего, если есть)
+    prev_quarter = _load_prev_quarter_summary(old_period)
+
+    try:
+        report_msgs = build_quarterly_report_messages(cur, stats_all, prev_quarter)
+    except Exception as e:
+        log.error("rotate_quarter: build_quarterly_report_messages упал: %s", e)
+        report_msgs = [f"⚠️ Отчёт за {h(quarter_label(old_period))} не удалось сформировать: {h(str(e))}"]
+
+    # Снапшот квартала
+    _save_quarter_snapshot(old_period, cur, stats_all)
+
+    # Обновляем by_quarter в агрегатах
+    try:
+        _update_by_quarter(stats_all, old_period, cur)
+        save_stats_all(stats_all)
+    except Exception as e:
+        log.error("rotate_quarter: обновление by_quarter: %s", e)
+
+    # Новый текущий квартал
+    fresh = _empty_stats_current(now_period)
+    fresh["last_report_sent"] = now_period
+    save_stats_current(fresh)
+
+    # Отправка отчёта владельцу — по сообщению на тему
+    for msg in report_msgs:
+        await _send_long(bot, OWNER_ID, msg)
+        await asyncio.sleep(0.4)
+    log.info("rotate_quarter: отчёт за %s отправлен владельцу (%d сообщ.).", old_period, len(report_msgs))
+
+    return fresh
+
+
+def _load_prev_quarter_summary(period: str) -> dict | None:
+    """Краткая сводка предыдущего квартала из снапшота для сравнения."""
+    try:
+        path = QUARTERS_DIR / f"{period}.json"
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {
+                "period": data.get("period"),
+                "anime_completed": data.get("anime_completed", 0),
+                "manga_completed": data.get("manga_completed", 0),
+            }
+    except Exception as e:
+        log.warning("_load_prev_quarter_summary(%s): %s", period, e)
+    return None
+
+
+def _save_quarter_snapshot(period: str, cur: dict, stats_all: dict) -> None:
+    """Сохраняем замороженный снапшот квартала в quarters/<period>.json."""
+    try:
+        QUARTERS_DIR.mkdir(parents=True, exist_ok=True)
+        comp_a = _quarter_titles(cur, stats_all, "anime", "completed")
+        comp_m = _quarter_titles(cur, stats_all, "manga", "completed")
+        snapshot = {
+            "period": period,
+            "anime_completed": len(comp_a),
+            "manga_completed": len(comp_m),
+            "events": cur.get("events", []),
+            "anime_titles": comp_a,
+            "manga_titles": comp_m,
+        }
+        _atomic_write(QUARTERS_DIR / f"{period}.json",
+                      json.dumps(snapshot, ensure_ascii=False, indent=2))
+        log.info("Снапшот квартала %s сохранён.", period)
+    except Exception as e:
+        log.error("_save_quarter_snapshot(%s): %s", period, e)
+
+
+def _update_by_quarter(stats_all: dict, period: str, cur: dict) -> None:
+    """Добавляем сводку квартала в aggregates.by_quarter для аниме и манги."""
+    for media in ("anime", "manga"):
+        comp = _quarter_titles(cur, stats_all, media, "completed")
+        scores = [r["score"] for r in comp if _safe_int(r.get("score")) > 0]
+        avg = round(sum(scores) / len(scores), 2) if scores else None
+        bq = stats_all[media].setdefault("aggregates", {}).setdefault("by_quarter", {})
+        entry = {"completed": len(comp), "avg_score": avg}
+        if media == "anime":
+            entry["episodes_watched"] = sum(_safe_int(r.get("episodes_watched")) for r in comp)
+        else:
+            entry["chapters_read"] = sum(_safe_int(r.get("chapters_read")) for r in comp)
+        bq[period] = entry
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ОТПРАВКА ДЛИННЫХ СООБЩЕНИЙ
+# ═══════════════════════════════════════════════════════════════════
+
+async def _send_long(bot: Bot, chat_id: int, text: str) -> None:
+    """Отправка с разбивкой по строкам если > 4000 символов (не рвём HTML-теги)."""
+    MAX = 4000
+    try:
+        if len(text) <= MAX:
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+            return
+        chunks: list[str] = []
+        buf = ""
+        for line in text.splitlines(keepends=True):
+            if len(buf) + len(line) > MAX:
+                if buf:
+                    chunks.append(buf)
+                buf = line
+            else:
+                buf += line
+        if buf:
+            chunks.append(buf)
+        for chunk in chunks:
+            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        log.error("_send_long: не удалось отправить (chat_id=%d): %s", chat_id, e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  КОМАНДА /stats  [all]
+# ═══════════════════════════════════════════════════════════════════
+
+async def cmd_stats(message: Message) -> None:
+    """
+    /stats      — статистика за текущий квартал.
+    /stats all  — агрегированная статистика за всё время.
+    Доступна всем подписчикам. Не делает сетевых запросов (читает файлы) —
+    мгновенно и не может упасть из-за недоступности API.
+    """
+    arg = ""
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            arg = parts[1].strip().lower()
+
+    try:
+        stats_all = load_stats_all()
+    except Exception as e:
+        log.error("cmd_stats: load_stats_all: %s", e)
+        await message.answer("⚠️ Не удалось загрузить статистику, попробуй позже.")
+        return
+
+    try:
+        if arg in ("all", "всё", "все"):
+            msgs = build_stats_all_messages(stats_all)
+        else:
+            cur = load_stats_current()
+            msgs = build_current_stats_messages(cur, stats_all)
+    except Exception as e:
+        log.error("cmd_stats: ошибка формирования: %s", e)
+        await message.answer("⚠️ Не удалось сформировать статистику, попробуй позже.")
+        return
+
+    # Отправляем по сообщению на тему (аниме / манга / подвал)
+    for msg in msgs:
+        if not msg or not msg.strip():
+            continue
+        await _send_long(message.bot, message.chat.id, msg)
+        await asyncio.sleep(0.3)
 
 # ═══════════════════════════════════════════════════════════════
 #  ОСНОВНАЯ ЛОГИКА
@@ -937,26 +2308,27 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
         log.info("Отписано %d пользователей, заблокировавших бота.", len(to_remove))
 
 
-async def check_and_notify(bot: Bot, seen_ids: set[int]) -> set[int]:
+async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set[int], dict]:
     """
     Главная функция проверки:
     1. Загружаем историю с Shikimori
     2. Фильтруем новые записи (которых нет в seen_ids)
     3. Для каждой новой — формируем сообщение и шлём во все чаты
     4. Обновляем seen_ids и возвращаем его
+    5. Параллельно фиксируем значимые события в cur (статистика квартала)
     """
     async with aiohttp.ClientSession() as session:
         entries = await fetch_history(session)
 
     if entries is None:
         log.info("Запрос истории не удался — пропускаем цикл.")
-        return seen_ids
+        return seen_ids, cur
 
     new_entries = [e for e in entries if e["id"] not in seen_ids]
 
     if not new_entries:
         log.info("Новых записей нет.")
-        return seen_ids
+        return seen_ids, cur
 
     log.info("Найдено новых записей: %d", len(new_entries))
 
@@ -984,6 +2356,13 @@ async def check_and_notify(bot: Bot, seen_ids: set[int]) -> set[int]:
             "Обрабатываем entry id=%d (%s / kind=%s): %s",
             entry_id, media_type, kind, entry.get("description", ""),
         )
+
+        # Фиксируем событие в статистике квартала (до отправки — независимо от неё)
+        description = entry.get("description", "") or ""
+        event_type  = classify_event(description)
+        score       = extract_score(description) if event_type == "completed" else None
+        cur = record_current_event(cur, entry, event_type, media_type, score)
+
         text = build_message(entry)
         await send_to_all_chats(bot, text)
 
@@ -991,7 +2370,8 @@ async def check_and_notify(bot: Bot, seen_ids: set[int]) -> set[int]:
         await asyncio.sleep(1)
 
     save_seen_ids(seen_ids)
-    return seen_ids
+    save_stats_current(cur)
+    return seen_ids, cur
 
 
 async def polling_loop(bot: Bot) -> None:
@@ -1005,6 +2385,7 @@ async def polling_loop(bot: Bot) -> None:
     """
     seen_ids  = load_seen_ids()
     seen_favs = load_seen_favourites()
+    cur = load_stats_current()
     log.info(
         "Бот запущен. Отображаемое имя: %s | Подписчиков: %d | Виденных ID: %d | Интервал: %d сек.",
         DISPLAY_NAME, len(load_subscribers()), len(seen_ids), CHECK_INTERVAL,
@@ -1035,13 +2416,34 @@ async def polling_loop(bot: Bot) -> None:
             save_seen_favourites(seen_favs)
             log.info("Инициализировано %d записей избранного.", len(seen_favs))
 
+    # Актуализируем полную статистику из list_export (не зависит от seen_ids,
+    # строится сразу даже на первом запуске — данные берутся не из history).
+    log.info("Синхронизируем статистику за всё время (stats_all)...")
+    try:
+        stats_all = await sync_stats_all()
+    except Exception as e:
+        log.exception("Не удалось синхронизировать stats_all при старте: %s", e)
+        stats_all = load_stats_all()
+
+    # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
+    try:
+        cur = await rotate_quarter_if_needed(bot, cur, stats_all)
+    except Exception as e:
+        log.exception("Ошибка ротации квартала при старте: %s", e)
+
     last_error_notify_at = 0.0
 
     while True:
         try:
             log.info("Проверяем историю и избранное...")
-            seen_ids  = await check_and_notify(bot, seen_ids)
-            seen_favs = await check_and_notify_favourites(bot, seen_favs)
+            seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
+            seen_favs     = await check_and_notify_favourites(bot, seen_favs)
+
+            # Проверяем смену квартала (раз в цикл, дёшево).
+            # Внутри — защита last_report_sent от повторной отправки.
+            cur = await rotate_quarter_if_needed(bot, cur, load_stats_all())
+
+            heartbeat()  # отметить успешный цикл для healthcheck-watchdog
             log.info("Следующая проверка через %d мин.", CHECK_INTERVAL // 60)
         except asyncio.CancelledError:
             # Штатная отмена задачи — пробрасываем, не глушим
@@ -1421,6 +2823,7 @@ async def main() -> None:
     dp.message.register(cmd_status,    Command("status"))
     dp.message.register(cmd_broadcast, Command("broadcast"))
     dp.message.register(cmd_cancel,    Command("cancel"))
+    dp.message.register(cmd_stats,     Command("stats"))
 
     # FSM-обработчики для /broadcast
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
@@ -1432,6 +2835,7 @@ async def main() -> None:
         BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
         BotCommand(command="stop",   description="Отписаться 😢"),
         BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
+        BotCommand(command="stats",  description="Статистика за квартал 📊"),
     ])
 
     # polling_loop работает параллельно как фоновая задача
@@ -1449,6 +2853,9 @@ async def main() -> None:
             )
 
     _polling_task.add_done_callback(_on_polling_done)
+
+    # Healthcheck-сервер (для хостингов с обязательным портом + watchdog)
+    await start_health_server(check_interval=CHECK_INTERVAL)
 
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
