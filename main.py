@@ -832,7 +832,7 @@ _RATING_RU: dict[str, str] = {
     "pg_13":  "PG-13",
     "r":      "R-17",
     "r_plus": "R+",
-    "rx":     "Rx (Hentai)",
+    "rx":     "Rx",
 }
 
 # GraphQL: метаданные аниме по списку id.
@@ -1396,6 +1396,8 @@ async def sync_stats_all() -> dict:
             except Exception as e:
                 log.error("sync_stats_all(%s): fetch_meta_batch упал: %s", media, e)
 
+        skipped_irrelevant = 0
+
         # Обновляем / создаём записи
         for tid, row in valid_rows.items():
             if tid in titles:
@@ -1429,9 +1431,38 @@ async def sync_stats_all() -> dict:
                         rec["rewatches"] = new_rew
                         changed = True
             else:
-                # Новая запись
-                titles[tid] = _merge_title_record(media, row, meta_map.get(tid))
+                # Новая запись. Фильтруем по kind тем же критерием, что и
+                # уведомления (is_relevant): спецвыпуски, клипы, PV и т.п.
+                # не должны попадать в статистику.
+                # kind берём только из метаданных — в list_export его нет.
+                meta = meta_map.get(tid)
+                kind = (meta or {}).get("kind", "")
+                # Если метаданные пришли и kind явно нерелевантный — пропускаем.
+                # Если метаданные НЕ пришли (kind пустой, сбой API) — заносим
+                # запись, чтобы не потерять реальный тайтл; отфильтруется
+                # при следующей синхронизации, когда метаданные подтянутся.
+                if kind and not is_relevant(media, kind):
+                    skipped_irrelevant += 1
+                    continue
+                titles[tid] = _merge_title_record(media, row, meta)
                 changed = True
+
+        if skipped_irrelevant:
+            log.info("sync_stats_all(%s): пропущено нерелевантных по kind: %d",
+                     media, skipped_irrelevant)
+
+        # Чистка существующих записей, чей kind не проходит фильтр
+        # (самоочистка при изменении критерия или после обновления метаданных).
+        stale_kind = [
+            tid for tid, rec in titles.items()
+            if rec.get("kind") and not is_relevant(media, rec["kind"])
+        ]
+        for tid in stale_kind:
+            del titles[tid]
+            changed = True
+        if stale_kind:
+            log.info("sync_stats_all(%s): удалено нерелевантных по kind из titles: %d",
+                     media, len(stale_kind))
 
         # Удаляем записи, которых больше нет в экспорте (тайтл убран из списка)
         removed = [tid for tid in titles if tid not in valid_rows]
@@ -1556,8 +1587,57 @@ def _top_dict(counter: dict, n: int) -> list[tuple[str, int]]:
 
 
 def _fmt_counter(counter: dict, n: int, sep: str = "  ·  ") -> str:
-    """'Экшен (34) · Драма (28)'."""
+    """'Экшен (34) · Драма (28)'. Оставлено для совместимости/коротких строк."""
     return sep.join(f"{h(k)} ({v})" for k, v in _top_dict(counter, n))
+
+
+def _section_header(emoji: str, title: str) -> str:
+    """Акцентированный заголовок архиблока: '━━━━━ 🎬 АНИМЕ ━━━━━' (жирный)."""
+    line = "━" * 5
+    return f"<b>{line} {emoji} {h(title)} {line}</b>"
+
+
+def _fmt_mono_rows(pairs: list[tuple[str, int]], show_percent: bool = False,
+                   total: int = 0) -> str:
+    """
+    Моноширинный блок с выровненными колонками и точками-лидерами:
+        Экшен ······· 66  46%
+        Триллер ····· 45  31%
+    pairs — [(имя, число), ...] (уже отсортированные, обрезанные).
+    show_percent — добавить долю от total (только если total > 0).
+    Возвращает строку в <code>...</code> или '' если pairs пуст.
+
+    Кириллица и латиница в моноширинном Telegram занимают 1 знак,
+    поэтому выравнивание по len() корректно.
+    """
+    if not pairs:
+        return ""
+    name_w = max(len(name) for name, _ in pairs)
+    num_w  = max(len(str(c)) for _, c in pairs)
+    rows = []
+    for name, count in pairs:
+        dots = "·" * (name_w - len(name) + 1)
+        num_str = str(count).rjust(num_w)
+        line = f"{name} {dots} {num_str}"
+        if show_percent and total > 0:
+            line += f"  {round(count / total * 100)}%"
+        rows.append(line)
+    return f"<code>{h(chr(10).join(rows))}</code>"
+
+
+def _top_block(emoji: str, title: str, counter: dict, n: int,
+               show_percent: bool = False, total: int = 0) -> list[str]:
+    """
+    Полный блок топа: заголовок-строка + моноширинные колонки.
+    Возвращает список строк (для extend) или [] если counter пуст.
+    """
+    pairs = _top_dict(counter, n)
+    if not pairs:
+        return []
+    body = _fmt_mono_rows(pairs, show_percent=show_percent, total=total)
+    if not body:
+        return []
+    return [f"{emoji} <b>{h(title)}</b>", body]
 
 
 def _fmt_score_dist(dist: dict) -> str:
@@ -1622,16 +1702,20 @@ def build_stats_all_messages(stats: dict) -> list[str]:
         return ["📊 <b>СТАТИСТИКА ЗА ВСЁ ВРЕМЯ</b>\n\n"
                 "<i>Статистика ещё не собрана. Дай боту немного времени.</i>"]
 
+    a_total = a_agg.get("total_completed", 0)
+    m_total = m_agg.get("total_completed", 0)
+
     # ── Аниме ───────────────────────────────────
     a: list[str] = ["📊 <b>СТАТИСТИКА ЗА ВСЁ ВРЕМЯ</b>"]
     if upd_str:
         a.append(f"<i>актуально на {upd_str}</i>")
     a.append("")
-    a.append("🎬 <b>━━━ АНИМЕ ━━━</b>")
-    a.append(f"✅ Завершено: <b>{a_agg.get('total_completed', 0)}</b>")
+    a.append(_section_header("🎬", "АНИМЕ"))
+    a.append("")
+    a.append(f"✅ Завершено: <b>{a_total}</b>")
     a.append(
-        f"🗑️ Брошено: {a_agg.get('total_dropped', 0)}  ·  "
-        f"▶️ Смотрит: {a_agg.get('total_watching', 0)}  ·  "
+        f"🗑 Брошено: {a_agg.get('total_dropped', 0)}   "
+        f"▶️ Смотрит: {a_agg.get('total_watching', 0)}   "
         f"📋 В планах: {a_agg.get('total_planned', 0)}"
     )
     avg_a = _avg_score_from_dist(a_agg.get("score_dist", {}))
@@ -1641,7 +1725,7 @@ def build_stats_all_messages(stats: dict) -> list[str]:
         if isinstance(avg_shiki_a, (int, float)):
             diff = round(avg_a - avg_shiki_a, 1)
             sign = "+" if diff >= 0 else ""
-            line += f"  <i>(Shikimori: {round(avg_shiki_a, 1)}, {sign}{diff})</i>"
+            line += f"   <i>Shikimori: {round(avg_shiki_a, 1)} ({sign}{diff})</i>"
         a.append(line)
     sd = _fmt_score_dist(a_agg.get("score_dist", {}))
     if sd != "нет оценок":
@@ -1649,24 +1733,25 @@ def build_stats_all_messages(stats: dict) -> list[str]:
     eps = a_agg.get("total_episodes_watched", 0)
     hrs = a_agg.get("total_hours_watched", 0)
     if eps:
-        a.append(f"📺 Эпизодов просмотрено: <b>{eps}</b>  (~{hrs} ч.)")
-    if a_agg.get("genres"):
-        a.append(f"🎭 Жанры: {_fmt_counter(a_agg['genres'], 5)}")
-    if a_agg.get("themes"):
-        a.append(f"🏷️ Темы: {_fmt_counter(a_agg['themes'], 5)}")
-    if a_agg.get("studios"):
-        a.append(f"🎨 Студии: {_fmt_counter(a_agg['studios'], 5)}")
-    if a_agg.get("origins"):
-        a.append(f"📺 Источники: {_fmt_counter(a_agg['origins'], 4)}")
-    if a_agg.get("ratings"):
-        a.append(f"🔞 Рейтинги: {_fmt_counter(a_agg['ratings'], 4)}")
+        a.append(f"📺 Эпизодов: <b>{eps}</b>  (~{hrs} ч.)")
+
+    for block in (
+        _top_block("🎭", "Жанры",      a_agg.get("genres", {}),  8, show_percent=True, total=a_total),
+        _top_block("🏷", "Темы",       a_agg.get("themes", {}),  8, show_percent=True, total=a_total),
+        _top_block("🎨", "Студии",     a_agg.get("studios", {}), 6),
+        _top_block("📚", "Источники",  a_agg.get("origins", {}), 99),
+        _top_block("🔞", "Рейтинги",   a_agg.get("ratings", {}), 99),
+    ):
+        if block:
+            a.append("")
+            a.extend(block)
 
     # ── Манга ───────────────────────────────────
-    m: list[str] = ["📚 <b>━━━ МАНГА ━━━</b>"]
-    m.append(f"✅ Прочитано: <b>{m_agg.get('total_completed', 0)}</b>")
+    m: list[str] = [_section_header("📚", "МАНГА"), ""]
+    m.append(f"✅ Прочитано: <b>{m_total}</b>")
     m.append(
-        f"🗑️ Брошено: {m_agg.get('total_dropped', 0)}  ·  "
-        f"📖 Читает: {m_agg.get('total_watching', 0)}  ·  "
+        f"🗑 Брошено: {m_agg.get('total_dropped', 0)}   "
+        f"📖 Читает: {m_agg.get('total_watching', 0)}   "
         f"📋 В планах: {m_agg.get('total_planned', 0)}"
     )
     avg_m = _avg_score_from_dist(m_agg.get("score_dist", {}))
@@ -1676,7 +1761,7 @@ def build_stats_all_messages(stats: dict) -> list[str]:
         if isinstance(avg_shiki_m, (int, float)):
             diff = round(avg_m - avg_shiki_m, 1)
             sign = "+" if diff >= 0 else ""
-            line += f"  <i>(Shikimori: {round(avg_shiki_m, 1)}, {sign}{diff})</i>"
+            line += f"   <i>Shikimori: {round(avg_shiki_m, 1)} ({sign}{diff})</i>"
         m.append(line)
     sd_m = _fmt_score_dist(m_agg.get("score_dist", {}))
     if sd_m != "нет оценок":
@@ -1684,13 +1769,16 @@ def build_stats_all_messages(stats: dict) -> list[str]:
     ch = m_agg.get("total_chapters_read", 0)
     vol = m_agg.get("total_volumes_read", 0)
     if ch:
-        m.append(f"📖 Глав прочитано: <b>{ch}</b>  ·  томов: {vol}")
-    if m_agg.get("genres"):
-        m.append(f"🎭 Жанры: {_fmt_counter(m_agg['genres'], 5)}")
-    if m_agg.get("themes"):
-        m.append(f"🏷️ Темы: {_fmt_counter(m_agg['themes'], 5)}")
-    if m_agg.get("publishers"):
-        m.append(f"🏢 Издатели: {_fmt_counter(m_agg['publishers'], 5)}")
+        m.append(f"📖 Глав: <b>{ch}</b>  ·  томов: {vol}")
+
+    for block in (
+        _top_block("🎭", "Жанры",     m_agg.get("genres", {}),     8, show_percent=True, total=m_total),
+        _top_block("🏷", "Темы",      m_agg.get("themes", {}),     8, show_percent=True, total=m_total),
+        _top_block("🏢", "Издатели",  m_agg.get("publishers", {}), 6),
+    ):
+        if block:
+            m.append("")
+            m.extend(block)
 
     return ["\n".join(a), "\n".join(m)]
 
@@ -1795,6 +1883,8 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
         for t in r.get("themes", []):
             _bump(themes, t)
 
+    n_comp = len(records)  # база для процентов
+
     if media == "anime":
         studios: dict = {}
         origins: dict = {}
@@ -1811,10 +1901,16 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
                 total_min += dur * eps
         if total_eps:
             lines.append(f"📺 Эпизодов: <b>{total_eps}</b>  (~{round(total_min / 60, 1)} ч.)")
-        if studios:
-            lines.append(f"🎨 Студии: {_fmt_counter(studios, 3)}")
-        if origins:
-            lines.append(f"📺 Источники: {_fmt_counter(origins, 3)}")
+
+        for block in (
+            _top_block("🎭", "Жанры",     genres,  8, show_percent=True, total=n_comp),
+            _top_block("🏷", "Темы",      themes,  8, show_percent=True, total=n_comp),
+            _top_block("🎨", "Студии",    studios, 6),
+            _top_block("📚", "Источники", origins, 99),
+        ):
+            if block:
+                lines.append("")
+                lines.extend(block)
     else:
         publishers: dict = {}
         total_ch = 0
@@ -1824,24 +1920,25 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
             total_ch += _safe_int(r.get("chapters_read"))
         if total_ch:
             lines.append(f"📖 Глав прочитано: <b>{total_ch}</b>")
-        if publishers:
-            lines.append(f"🏢 Издатели: {_fmt_counter(publishers, 3)}")
 
-    if genres:
-        lines.append("")
-        lines.append(f"🎭 Жанры: {_fmt_counter(genres, 5)}")
-    if themes:
-        lines.append(f"🏷️ Темы: {_fmt_counter(themes, 3)}")
+        for block in (
+            _top_block("🎭", "Жанры",    genres,     8, show_percent=True, total=n_comp),
+            _top_block("🏷", "Темы",     themes,     8, show_percent=True, total=n_comp),
+            _top_block("🏢", "Издатели", publishers, 6),
+        ):
+            if block:
+                lines.append("")
+                lines.extend(block)
 
     return lines
 
 
 def _anime_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, header: str) -> str:
     """Готовый текст блока АНИМЕ (одно сообщение)."""
-    lines: list[str] = [header]
+    lines: list[str] = [header, ""]
     lines.append(f"✅ Завершено: <b>{len(comp)}</b>")
     if drop:
-        lines.append(f"🗑️ Брошено: {len(drop)}")
+        lines.append(f"🗑 Брошено: {len(drop)}")
     if plan:
         lines.append(f"📋 В планируемое: {plan}")
     section = _build_quarter_section(comp, "anime")
@@ -1854,10 +1951,10 @@ def _anime_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, heade
 
 def _manga_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, header: str) -> str:
     """Готовый текст блока МАНГА (одно сообщение)."""
-    lines: list[str] = [header]
+    lines: list[str] = [header, ""]
     lines.append(f"✅ Прочитано: <b>{len(comp)}</b>")
     if drop:
-        lines.append(f"🗑️ Брошено: {len(drop)}")
+        lines.append(f"🗑 Брошено: {len(drop)}")
     if plan:
         lines.append(f"📋 В планируемое: {plan}")
     section = _build_quarter_section(comp, "manga")
@@ -1889,8 +1986,8 @@ def build_current_stats_messages(cur: dict, stats_all: dict) -> list[str]:
         header += "\n<i>⚠️ Квартал отслеживается не с самого начала — данные неполные.</i>"
 
     msgs: list[str] = []
-    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, "🎬 <b>━━━ АНИМЕ ━━━</b>"))
-    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, "📚 <b>━━━ МАНГА ━━━</b>"))
+    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, _section_header("🎬", "АНИМЕ")))
+    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, _section_header("📚", "МАНГА")))
     msgs.append("<i>Полная статистика за всё время: /stats all</i>")
     return msgs
 
@@ -1917,10 +2014,10 @@ def build_quarterly_report_messages(cur: dict, stats_all: dict, prev_quarter: di
     msgs: list[str] = []
 
     # Сообщение 1: заголовок + аниме
-    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, "🎬 <b>━━━ АНИМЕ ━━━</b>"))
+    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, _section_header("🎬", "АНИМЕ")))
 
     # Сообщение 2: манга
-    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, "📚 <b>━━━ МАНГА ━━━</b>"))
+    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, _section_header("📚", "МАНГА")))
 
     # Сообщение 3: сравнение + достижения
     extra: list[str] = []
