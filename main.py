@@ -1677,11 +1677,79 @@ def _fmt_kinds(kinds: dict, labels: dict) -> str:
 
 
 def _fmt_score_dist(dist: dict) -> str:
-    """Распределение оценок без нулей (0 = без оценки): '10×8 · 9×15'."""
+    """Распределение оценок без нулей (0 = без оценки): '10×8 · 9×15'.
+    Оставлено для обратной совместимости; в отчётах теперь используется
+    вертикальный блок _score_dist_block.
+    """
     pairs = [(int(s), c) for s, c in dist.items() if _safe_int(s) > 0]
     if not pairs:
         return "нет оценок"
     return "  ·  ".join(f"{s}×{c}" for s, c in sorted(pairs, reverse=True))
+
+
+def _score_dist_block(dist: dict) -> list[str]:
+    """
+    Вертикальный блок распределения оценок:
+        📊 Оценки
+        ★10 ·· 5
+         ★9 ·· 8
+         ★8 · 19
+    Оценка помечена ★, точки — лидеры к количеству (как в остальных блоках).
+    Порядок — по убыванию оценки (10 → 1), не по количеству.
+    Возвращает [] если оценок нет.
+    """
+    pairs = [(_safe_int(s), c) for s, c in dist.items() if _safe_int(s) > 0]
+    if not pairs:
+        return []
+    pairs.sort(key=lambda x: x[0], reverse=True)
+    # Ключ — '★N', выровняем по ширине самой длинной метки (★10 шире ★9)
+    rows = [(f"★{score}", count) for score, count in pairs]
+    body = _fmt_mono_rows(rows)
+    return ["📊 <b>Оценки</b>", body] if body else []
+
+
+def _status_block_anime(agg: dict) -> list[str]:
+    """Вертикальный блок статусов для аниме."""
+    rows = [
+        ("Завершено", agg.get("total_completed", 0)),
+        ("Брошено",   agg.get("total_dropped", 0)),
+        ("Смотрю",    agg.get("total_watching", 0)),
+        ("В планах",  agg.get("total_planned", 0)),
+        ("Отложено",  agg.get("total_on_hold", 0)),
+    ]
+    rows = [(n, c) for n, c in rows if c]  # скрываем нулевые
+    body = _fmt_mono_rows(rows)
+    return ["📦 <b>Статусы</b>", body] if body else []
+
+
+def _status_block_manga(agg: dict) -> list[str]:
+    """Вертикальный блок статусов для манги."""
+    rows = [
+        ("Прочитано", agg.get("total_completed", 0)),
+        ("Брошено",   agg.get("total_dropped", 0)),
+        ("Читаю",     agg.get("total_watching", 0)),
+        ("В планах",  agg.get("total_planned", 0)),
+        ("Отложено",  agg.get("total_on_hold", 0)),
+    ]
+    rows = [(n, c) for n, c in rows if c]
+    body = _fmt_mono_rows(rows)
+    return ["📦 <b>Статусы</b>", body] if body else []
+
+
+def _kinds_block(kinds: dict, labels: dict) -> list[str]:
+    """Вертикальный блок типов (Сериалы/Фильмы/OVA или Манга/Манхва/...)."""
+    if not kinds:
+        return []
+    pairs = []
+    for key, name in labels.items():
+        cnt = kinds.get(key, 0)
+        if cnt:
+            pairs.append((name, cnt))
+    for key, cnt in kinds.items():
+        if key not in labels and cnt:
+            pairs.append((str(key), cnt))
+    body = _fmt_mono_rows(pairs)
+    return ["🎞 <b>Типы</b>", body] if body else []
 
 
 def _avg_score_from_dist(dist: dict) -> float | None:
@@ -1748,33 +1816,29 @@ def build_stats_all_messages(stats: dict) -> list[str]:
     a.append("")
     a.append(_section_header("🎬", "АНИМЕ"))
     a.append("")
-    a.append(f"✅ Завершено: <b>{a_total}</b>")
-    kinds_a = _fmt_kinds(a_agg.get("kinds", {}), _KIND_RU_ANIME)
-    if kinds_a:
-        a.append(f"🎞 {kinds_a}")
-    a.append(
-        f"🗑 Брошено: {a_agg.get('total_dropped', 0)}   "
-        f"▶️ Смотрит: {a_agg.get('total_watching', 0)}   "
-        f"📋 В планах: {a_agg.get('total_planned', 0)}"
-    )
+
+    # Акцент сверху: сколько посмотрено · эпизоды/время, средняя оценка
+    eps = a_agg.get("total_episodes_watched", 0)
+    hrs = a_agg.get("total_hours_watched", 0)
+    top_line = f"✅ Завершено: <b>{a_total}</b>"
+    if eps:
+        top_line += f"   ·   📺 {eps} эп (~{hrs} ч)"
+    a.append(top_line)
     avg_a = _avg_score_from_dist(a_agg.get("score_dist", {}))
     if avg_a is not None:
-        line = f"⭐ Средняя оценка: <b>{avg_a}</b>"
+        line = f"⭐ Средняя: <b>{avg_a}</b>"
         avg_shiki_a = a_agg.get("avg_shiki_completed")
         if isinstance(avg_shiki_a, (int, float)):
             diff = round(avg_a - avg_shiki_a, 1)
             sign = "+" if diff >= 0 else ""
             line += f"   <i>Shikimori: {round(avg_shiki_a, 1)} ({sign}{diff})</i>"
         a.append(line)
-    sd = _fmt_score_dist(a_agg.get("score_dist", {}))
-    if sd != "нет оценок":
-        a.append(f"📊 {sd}")
-    eps = a_agg.get("total_episodes_watched", 0)
-    hrs = a_agg.get("total_hours_watched", 0)
-    if eps:
-        a.append(f"📺 Эпизодов: <b>{eps}</b>  (~{hrs} ч.)")
 
+    # Детализация блоками
     for block in (
+        _status_block_anime(a_agg),
+        _kinds_block(a_agg.get("kinds", {}), _KIND_RU_ANIME),
+        _score_dist_block(a_agg.get("score_dist", {})),
         _top_block("🎭", "Жанры",      a_agg.get("genres", {}),      8, show_percent=True, total=a_total),
         _top_block("🏷", "Темы",       a_agg.get("themes", {}),      8, show_percent=True, total=a_total),
         _top_block("👥", "Аудитория",  a_agg.get("demographic", {}), 99, show_percent=True, total=a_total),
@@ -1788,33 +1852,27 @@ def build_stats_all_messages(stats: dict) -> list[str]:
 
     # ── Манга ───────────────────────────────────
     m: list[str] = [_section_header("📚", "МАНГА"), ""]
-    m.append(f"✅ Прочитано: <b>{m_total}</b>")
-    kinds_m = _fmt_kinds(m_agg.get("kinds", {}), _KIND_RU_MANGA)
-    if kinds_m:
-        m.append(f"📕 {kinds_m}")
-    m.append(
-        f"🗑 Брошено: {m_agg.get('total_dropped', 0)}   "
-        f"📖 Читает: {m_agg.get('total_watching', 0)}   "
-        f"📋 В планах: {m_agg.get('total_planned', 0)}"
-    )
+
+    ch = m_agg.get("total_chapters_read", 0)
+    vol = m_agg.get("total_volumes_read", 0)
+    top_line = f"✅ Прочитано: <b>{m_total}</b>"
+    if ch:
+        top_line += f"   ·   📖 {ch} гл · {vol} томов"
+    m.append(top_line)
     avg_m = _avg_score_from_dist(m_agg.get("score_dist", {}))
     if avg_m is not None:
-        line = f"⭐ Средняя оценка: <b>{avg_m}</b>"
+        line = f"⭐ Средняя: <b>{avg_m}</b>"
         avg_shiki_m = m_agg.get("avg_shiki_completed")
         if isinstance(avg_shiki_m, (int, float)):
             diff = round(avg_m - avg_shiki_m, 1)
             sign = "+" if diff >= 0 else ""
             line += f"   <i>Shikimori: {round(avg_shiki_m, 1)} ({sign}{diff})</i>"
         m.append(line)
-    sd_m = _fmt_score_dist(m_agg.get("score_dist", {}))
-    if sd_m != "нет оценок":
-        m.append(f"📊 {sd_m}")
-    ch = m_agg.get("total_chapters_read", 0)
-    vol = m_agg.get("total_volumes_read", 0)
-    if ch:
-        m.append(f"📖 Глав: <b>{ch}</b>  ·  томов: {vol}")
 
     for block in (
+        _status_block_manga(m_agg),
+        _kinds_block(m_agg.get("kinds", {}), _KIND_RU_MANGA),
+        _score_dist_block(m_agg.get("score_dist", {})),
         _top_block("🎭", "Жанры",     m_agg.get("genres", {}),      8, show_percent=True, total=m_total),
         _top_block("🏷", "Темы",      m_agg.get("themes", {}),      8, show_percent=True, total=m_total),
         _top_block("👥", "Аудитория", m_agg.get("demographic", {}), 99, show_percent=True, total=m_total),
@@ -1886,7 +1944,10 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
         dist: dict = {}
         for s in scores:
             _bump(dist, s)
-        lines.append(f"📊 {_fmt_score_dist(dist)}")
+        block = _score_dist_block(dist)
+        if block:
+            lines.append("")
+            lines.extend(block)
 
     # Топ по оценке
     top = sorted(
