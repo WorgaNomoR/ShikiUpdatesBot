@@ -661,17 +661,17 @@ def classify_event(description: str) -> str:
     Возвращаем ключ из суб-словаря MESSAGES[media_type].
 
     Реальные значения description (проверено на живом API):
-      "добавлено в список"  -> planned
-      "просматриваю"        -> watching
+      "добавлено в список"       -> planned
+      "просматриваю"             -> watching
       "изменена оценка с X на Y" -> score_changed
-      "смотрю"               -> watching
-      "читаю"               -> watching
-      "пересматриваю"       -> rewatching
-      "перечитываю"         -> rewatching
-      "брошено"             -> dropped
-      "просмотрено"         -> completed  (без оценки)
-      "прочитано"           -> completed  (без оценки)
-      "оценено на 9"        -> completed  (с оценкой, парсим отдельно)
+      "смотрю"                   -> watching
+      "читаю"                    -> watching
+      "пересматриваю"            -> rewatching
+      "перечитываю"              -> rewatching
+      "брошено"                  -> dropped
+      "просмотрено"              -> completed  (без оценки)
+      "прочитано"                -> completed  (без оценки)
+      "оценено на 9"             -> completed  (с оценкой, парсим отдельно)
     """
     desc = _strip_html(description).lower()
 
@@ -804,24 +804,24 @@ _STAT_STATUSES: frozenset[str] = frozenset({
 
 # Локализация origin (источник адаптации аниме)
 _ORIGIN_RU: dict[str, str] = {
-    "original":      "Оригинал",
-    "manga":         "Манга",
-    "manhwa":        "Манхва",
-    "manhua":        "Маньхуа",
-    "light_novel":   "Ранобэ",
-    "novel":         "Новелла",
-    "visual_novel":  "Визуальная новелла",
-    "game":          "Игра",
-    "card_game":     "Карточная игра",
-    "music":         "Музыка",
-    "book":          "Книга",
-    "web_manga":     "Веб-манга",
-    "web_novel":     "Веб-новелла",
-    "4_koma_manga":  "Ёнкома",
-    "picture_book":  "Иллюстрированная книга",
-    "radio":         "Радио",
-    "other":         "Другое",
-    "unknown":       "Неизвестно",
+    "original":         "Оригинал",
+    "manga":            "Манга",
+    "manhwa":           "Манхва",
+    "manhua":           "Маньхуа",
+    "light_novel":      "Ранобэ",
+    "novel":            "Новелла",
+    "visual_novel":     "Визуальная новелла",
+    "game":             "Игра",
+    "card_game":        "Карточная игра",
+    "music":            "Музыка",
+    "book":             "Книга",
+    "web_manga":        "Веб-манга",
+    "web_novel":        "Веб-новелла",
+    "four_koma_manga":  "Ёнкома",
+    "picture_book":     "Иллюстрированная книга",
+    "radio":            "Радио",
+    "other":            "Другое",
+    "unknown":          "Неизвестно",
 }
 
 # Локализация возрастного рейтинга
@@ -833,6 +833,22 @@ _RATING_RU: dict[str, str] = {
     "r":      "R-17",
     "r_plus": "R+",
     "rx":     "Rx",
+}
+
+# Локализация kind для разбивки в шапке статистики
+_KIND_RU_ANIME: dict[str, str] = {
+    "tv":    "Сериалы",
+    "movie": "Фильмы",
+    "ova":   "OVA",
+    "ona":   "ONA",
+}
+
+_KIND_RU_MANGA: dict[str, str] = {
+    "manga":  "Манга",
+    "manhwa": "Манхва",
+    "manhua": "Маньхуа",
+    "novel":  "Новеллы",
+    "ranobe": "Ранобэ",
 }
 
 # GraphQL: метаданные аниме по списку id.
@@ -1640,6 +1656,26 @@ def _top_block(emoji: str, title: str, counter: dict, n: int,
     return [f"{emoji} <b>{h(title)}</b>", body]
 
 
+def _fmt_kinds(kinds: dict, labels: dict) -> str:
+    """Разбивка по типам: 'Сериалы 95 · Фильмы 12 · OVA 8'.
+    Порядок — как в labels (tv/movie/ova/ona), неизвестные kind в конце.
+    Возвращает '' если данных нет.
+    """
+    if not kinds:
+        return ""
+    parts = []
+    # Сначала известные типы в порядке labels
+    for key, name in labels.items():
+        cnt = kinds.get(key, 0)
+        if cnt:
+            parts.append(f"{name} {cnt}")
+    # Затем неизвестные (на случай если API подкинет новый kind)
+    for key, cnt in kinds.items():
+        if key not in labels and cnt:
+            parts.append(f"{h(key)} {cnt}")
+    return "  ·  ".join(parts)
+
+
 def _fmt_score_dist(dist: dict) -> str:
     """Распределение оценок без нулей (0 = без оценки): '10×8 · 9×15'."""
     pairs = [(int(s), c) for s, c in dist.items() if _safe_int(s) > 0]
@@ -1713,6 +1749,9 @@ def build_stats_all_messages(stats: dict) -> list[str]:
     a.append(_section_header("🎬", "АНИМЕ"))
     a.append("")
     a.append(f"✅ Завершено: <b>{a_total}</b>")
+    kinds_a = _fmt_kinds(a_agg.get("kinds", {}), _KIND_RU_ANIME)
+    if kinds_a:
+        a.append(f"🎞 {kinds_a}")
     a.append(
         f"🗑 Брошено: {a_agg.get('total_dropped', 0)}   "
         f"▶️ Смотрит: {a_agg.get('total_watching', 0)}   "
@@ -1736,11 +1775,12 @@ def build_stats_all_messages(stats: dict) -> list[str]:
         a.append(f"📺 Эпизодов: <b>{eps}</b>  (~{hrs} ч.)")
 
     for block in (
-        _top_block("🎭", "Жанры",      a_agg.get("genres", {}),  8, show_percent=True, total=a_total),
-        _top_block("🏷", "Темы",       a_agg.get("themes", {}),  8, show_percent=True, total=a_total),
-        _top_block("🎨", "Студии",     a_agg.get("studios", {}), 6),
-        _top_block("📚", "Источники",  a_agg.get("origins", {}), 99),
-        _top_block("🔞", "Рейтинги",   a_agg.get("ratings", {}), 99),
+        _top_block("🎭", "Жанры",      a_agg.get("genres", {}),      8, show_percent=True, total=a_total),
+        _top_block("🏷", "Темы",       a_agg.get("themes", {}),      8, show_percent=True, total=a_total),
+        _top_block("👥", "Аудитория",  a_agg.get("demographic", {}), 99, show_percent=True, total=a_total),
+        _top_block("🎨", "Студии",     a_agg.get("studios", {}),     6),
+        _top_block("📚", "Источники",  a_agg.get("origins", {}),     99),
+        _top_block("🔞", "Рейтинги",   a_agg.get("ratings", {}),     99),
     ):
         if block:
             a.append("")
@@ -1749,6 +1789,9 @@ def build_stats_all_messages(stats: dict) -> list[str]:
     # ── Манга ───────────────────────────────────
     m: list[str] = [_section_header("📚", "МАНГА"), ""]
     m.append(f"✅ Прочитано: <b>{m_total}</b>")
+    kinds_m = _fmt_kinds(m_agg.get("kinds", {}), _KIND_RU_MANGA)
+    if kinds_m:
+        m.append(f"📕 {kinds_m}")
     m.append(
         f"🗑 Брошено: {m_agg.get('total_dropped', 0)}   "
         f"📖 Читает: {m_agg.get('total_watching', 0)}   "
@@ -1772,9 +1815,10 @@ def build_stats_all_messages(stats: dict) -> list[str]:
         m.append(f"📖 Глав: <b>{ch}</b>  ·  томов: {vol}")
 
     for block in (
-        _top_block("🎭", "Жанры",     m_agg.get("genres", {}),     8, show_percent=True, total=m_total),
-        _top_block("🏷", "Темы",      m_agg.get("themes", {}),     8, show_percent=True, total=m_total),
-        _top_block("🏢", "Издатели",  m_agg.get("publishers", {}), 6),
+        _top_block("🎭", "Жанры",     m_agg.get("genres", {}),      8, show_percent=True, total=m_total),
+        _top_block("🏷", "Темы",      m_agg.get("themes", {}),      8, show_percent=True, total=m_total),
+        _top_block("👥", "Аудитория", m_agg.get("demographic", {}), 99, show_percent=True, total=m_total),
+        _top_block("🏢", "Издатели",  m_agg.get("publishers", {}),  6),
     ):
         if block:
             m.append("")
@@ -1874,14 +1918,17 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
                 f"<b>{newest[0]}</b> ({h(newest[1])}),  ср. {avg_y}"
             )
 
-    # Жанры/темы из записей квартала
+    # Жанры/темы/аудитория из записей квартала
     genres: dict = {}
     themes: dict = {}
+    demographic: dict = {}
     for r in records:
         for g in r.get("genres", []):
             _bump(genres, g)
         for t in r.get("themes", []):
             _bump(themes, t)
+        for d in r.get("demographic", []):
+            _bump(demographic, d)
 
     n_comp = len(records)  # база для процентов
 
@@ -1903,10 +1950,11 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
             lines.append(f"📺 Эпизодов: <b>{total_eps}</b>  (~{round(total_min / 60, 1)} ч.)")
 
         for block in (
-            _top_block("🎭", "Жанры",     genres,  8, show_percent=True, total=n_comp),
-            _top_block("🏷", "Темы",      themes,  8, show_percent=True, total=n_comp),
-            _top_block("🎨", "Студии",    studios, 6),
-            _top_block("📚", "Источники", origins, 99),
+            _top_block("🎭", "Жанры",     genres,      8, show_percent=True, total=n_comp),
+            _top_block("🏷", "Темы",      themes,      8, show_percent=True, total=n_comp),
+            _top_block("👥", "Аудитория", demographic, 99, show_percent=True, total=n_comp),
+            _top_block("🎨", "Студии",    studios,     6),
+            _top_block("📚", "Источники", origins,     99),
         ):
             if block:
                 lines.append("")
@@ -1922,9 +1970,10 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
             lines.append(f"📖 Глав прочитано: <b>{total_ch}</b>")
 
         for block in (
-            _top_block("🎭", "Жанры",    genres,     8, show_percent=True, total=n_comp),
-            _top_block("🏷", "Темы",     themes,     8, show_percent=True, total=n_comp),
-            _top_block("🏢", "Издатели", publishers, 6),
+            _top_block("🎭", "Жанры",     genres,      8, show_percent=True, total=n_comp),
+            _top_block("🏷", "Темы",      themes,      8, show_percent=True, total=n_comp),
+            _top_block("👥", "Аудитория", demographic, 99, show_percent=True, total=n_comp),
+            _top_block("🏢", "Издатели",  publishers,  6),
         ):
             if block:
                 lines.append("")
