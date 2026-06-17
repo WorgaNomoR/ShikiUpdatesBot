@@ -2323,10 +2323,71 @@ async def _send_long(bot: Bot, chat_id: int, text: str) -> None:
 #  КОМАНДА /stats  [all]
 # ═══════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+#  /stats — МЕНЮ С КНОПКАМИ (расширяемое)
+#
+#  Чтобы добавить новый вид отчёта:
+#    1. Написать async-builder, возвращающий list[str] (сообщения).
+#    2. Добавить запись в _STATS_MENU: (callback_key, label, builder, row).
+#  Всё остальное (клавиатура, обработка нажатия) работает автоматически.
+#
+#  row — номер ряда кнопки. Кнопки с одинаковым row встают в один ряд
+#  (горизонтальная группа), с разным — в разные ряды (вертикаль).
+# ═══════════════════════════════════════════════════════════════
+
+async def _stats_report_current() -> list[str]:
+    """Отчёт за текущий квартал."""
+    stats_all = load_stats_all()
+    cur = load_stats_current()
+    return build_current_stats_messages(cur, stats_all)
+
+
+async def _stats_report_all() -> list[str]:
+    """Отчёт за всё время."""
+    stats_all = load_stats_all()
+    return build_stats_all_messages(stats_all)
+
+
+# Реестр вариантов отчёта. Кортеж: (ключ callback_data, подпись кнопки, builder, ряд)
+# callback_data будет вида "stats:<ключ>".
+_STATS_MENU: list[tuple[str, str, "callable", int]] = [
+    ("current", "📆 За текущий квартал", _stats_report_current, 0),
+    ("all",     "📚 За всё время",       _stats_report_all,     1),
+]
+
+# Быстрый доступ к builder по ключу
+_STATS_BUILDERS: dict[str, "callable"] = {key: b for key, _, b, _ in _STATS_MENU}
+
+
+def _stats_menu_kb() -> InlineKeyboardMarkup:
+    """
+    Строит клавиатуру меню из _STATS_MENU.
+    Кнопки группируются по полю row: одинаковый row → один ряд.
+    Порядок рядов — по возрастанию номера row.
+    """
+    rows: dict[int, list[InlineKeyboardButton]] = {}
+    for key, label, _builder, row in _STATS_MENU:
+        rows.setdefault(row, []).append(
+            InlineKeyboardButton(text=label, callback_data=f"stats:{key}")
+        )
+    keyboard = [rows[r] for r in sorted(rows)]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def _send_stats_reports(bot: Bot, chat_id: int, msgs: list[str]) -> None:
+    """Отправляет список сообщений отчёта в чат (по сообщению на тему)."""
+    for msg in msgs:
+        if not msg or not msg.strip():
+            continue
+        await _send_long(bot, chat_id, msg)
+        await asyncio.sleep(0.3)
+
+
 async def cmd_stats(message: Message) -> None:
     """
-    /stats      — статистика за текущий квартал.
-    /stats all  — агрегированная статистика за всё время.
+    /stats      — показывает меню выбора отчёта (кнопки).
+    /stats all  — сразу полный отчёт за всё время (быстрый путь, без меню).
+
     Доступна всем подписчикам. Не делает сетевых запросов (читает файлы) —
     мгновенно и не может упасть из-за недоступности API.
     """
@@ -2336,30 +2397,62 @@ async def cmd_stats(message: Message) -> None:
         if len(parts) > 1:
             arg = parts[1].strip().lower()
 
-    try:
-        stats_all = load_stats_all()
-    except Exception as e:
-        log.error("cmd_stats: load_stats_all: %s", e)
-        await message.answer("⚠️ Не удалось загрузить статистику, попробуй позже.")
+    # Быстрый путь: /stats all — сразу полный отчёт, минуя меню (совместимость)
+    if arg in ("all", "всё", "все"):
+        try:
+            msgs = await _stats_report_all()
+        except Exception as e:
+            log.error("cmd_stats: формирование all: %s", e)
+            await message.answer("⚠️ Не удалось сформировать статистику, попробуй позже.")
+            return
+        await _send_stats_reports(message.bot, message.chat.id, msgs)
         return
 
-    try:
-        if arg in ("all", "всё", "все"):
-            msgs = build_stats_all_messages(stats_all)
-        else:
-            cur = load_stats_current()
-            msgs = build_current_stats_messages(cur, stats_all)
-    except Exception as e:
-        log.error("cmd_stats: ошибка формирования: %s", e)
-        await message.answer("⚠️ Не удалось сформировать статистику, попробуй позже.")
+    # Иначе — показываем меню с кнопками
+    await message.answer(
+        "📊 <b>Какую статистику показать?</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_stats_menu_kb(),
+    )
+
+
+async def stats_menu_cb(callback: CallbackQuery) -> None:
+    """
+    Обработчик нажатия кнопки в меню /stats.
+    callback_data: "stats:<ключ>" — ключ ищется в _STATS_BUILDERS.
+    После выбора: убираем сообщение с кнопками и шлём выбранный отчёт.
+    """
+    data = callback.data or ""
+    key = data.split(":", 1)[1] if ":" in data else ""
+    builder = _STATS_BUILDERS.get(key)
+
+    if builder is None:
+        await callback.answer("Неизвестный вариант.", show_alert=False)
         return
 
-    # Отправляем по сообщению на тему (аниме / манга / подвал)
-    for msg in msgs:
-        if not msg or not msg.strip():
-            continue
-        await _send_long(message.bot, message.chat.id, msg)
-        await asyncio.sleep(0.3)
+    await callback.answer()
+
+    # Удаляем сообщение с кнопками — оно больше не нужно.
+    # delete() может упасть (сообщение старое/уже удалено) — не критично.
+    try:
+        await callback.message.delete()
+    except Exception as e:
+        log.debug("stats_menu_cb: не удалось удалить меню: %s", e)
+        # Фолбэк: хотя бы убрать кнопки, чтобы повторно не нажимали
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    # Строим и шлём отчёт
+    try:
+        msgs = await builder()
+    except Exception as e:
+        log.error("stats_menu_cb: формирование (%s): %s", key, e)
+        await callback.message.answer("⚠️ Не удалось сформировать статистику, попробуй позже.")
+        return
+
+    await _send_stats_reports(callback.message.bot, callback.message.chat.id, msgs)
 
 # ═══════════════════════════════════════════════════════════════
 #  ОСНОВНАЯ ЛОГИКА
@@ -3051,12 +3144,15 @@ async def main() -> None:
     dp.callback_query.register(broadcast_confirm_cb, F.data == "broadcast_send",   BroadcastStates.waiting_confirm)
     dp.callback_query.register(broadcast_cancel_cb,  F.data == "broadcast_cancel", BroadcastStates.waiting_confirm)
 
+    # Кнопки меню /stats (callback_data вида "stats:<ключ>")
+    dp.callback_query.register(stats_menu_cb, F.data.startswith("stats:"))
+
     # Публичные команды в меню "/" — команды владельца не показываем
     await bot.set_my_commands([
         BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
         BotCommand(command="stop",   description="Отписаться 😢"),
         BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
-        BotCommand(command="stats",  description="Статистика за квартал 📊"),
+        BotCommand(command="stats",  description="Статистика: квартал или всё время 📊"),
     ])
 
     # polling_loop работает параллельно как фоновая задача
