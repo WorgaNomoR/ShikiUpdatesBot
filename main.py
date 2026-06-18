@@ -307,6 +307,10 @@ MESSAGES = {
             "📺 {n} прошёл путь <b>{title}</b> до конца. Без комментариев.",
             "🎌 <b>{title}</b> — пройдено. Оценка — не для слабонервных, видимо.",
             "🤐 Закончил <b>{title}</b> и молчит. Либо шедевр, либо травма.",
+            "✅ {n} досмотрел <b>{title}</b>. Без оценки — иногда и так бывает.",
+            "🏁 <b>{title}</b> завершено. {n} оценку не поставил, и это его право.",
+            "📺 {n} закрыл <b>{title}</b>. Молча, но с чувством выполненного долга.",
+            "🎬 <b>{title}</b> досмотрено. Оценка? Может, позже. Может, никогда.",
         ],
 
         # ⭐ Оценка 1–3
@@ -426,6 +430,10 @@ MESSAGES = {
             "📚 {n} прошёл <b>{title}</b> до конца. Оценка засекречена.",
             "🎌 <b>{title}</b> прочитана. {n} не спешит раскрываться.",
             "🤐 Дочитал и молчит. <b>{title}</b> явно оставила след.",
+            "✅ {n} дочитал <b>{title}</b>. Оценку оставил при себе.",
+            "🏁 <b>{title}</b> закрыта. {n} перевернул последнюю страницу без вердикта.",
+            "📖 {n} добил <b>{title}</b>. Без оценки — бывает и так.",
+            "📚 <b>{title}</b> прочитано. Оценку {n} приберёг, видимо."
         ],
 
         # ⭐ Оценка 1–3
@@ -1197,6 +1205,7 @@ def _empty_stats_all() -> dict:
         "updated_at": None,
         "anime": {"titles": {}, "aggregates": {}},
         "manga": {"titles": {}, "aggregates": {}},
+        "favourites": {"anime": [], "manga": [], "characters": [], "people": []},
     }
 
 
@@ -1416,6 +1425,66 @@ def recompute_aggregates(media: str, titles: dict, existing_by_quarter: dict | N
 #  СИНХРОНИЗАЦИЯ stats_all С list_export
 # ═══════════════════════════════════════════════════════════════════
 
+async def _collect_favourites(session: aiohttp.ClientSession, stats: dict) -> dict:
+    """
+    Собирает избранное в структуру stats["favourites"].
+
+    Для аниме/манги джойнит оценку и название из titles{} (если тайтл там есть);
+    если нет — берёт название из ответа API. Персонажи/люди — имя+ссылка из API.
+
+    fetch_favourites возвращает None при сбое — тогда оставляем прежнее
+    избранное (не затираем хорошие данные пустотой при ошибке сети).
+
+    Категории API (мн. число) → ключи stats: animes→anime, mangas→manga.
+    """
+    fav = await fetch_favourites(session)
+    if fav is None:
+        log.info("_collect_favourites: запрос избранного не удался — оставляем прежнее.")
+        return stats
+
+    # Карта: API-категория → (ключ stats, ключ titles в stats или None)
+    cat_map = {
+        "animes":     ("anime", "anime"),
+        "mangas":     ("manga", "manga"),
+        "characters": ("characters", None),
+        "people":     ("people", None),
+    }
+
+    result: dict[str, list] = {"anime": [], "manga": [], "characters": [], "people": []}
+
+    for api_cat, (out_key, media_key) in cat_map.items():
+        items = fav.get(api_cat) or []
+        titles = stats.get(media_key, {}).get("titles", {}) if media_key else {}
+        for item in items:
+            iid = item.get("id")
+            if iid is None:
+                continue
+            tid = str(iid)
+            api_name = item.get("russian") or item.get("name") or "???"
+            api_url = (item.get("url") or "").strip()
+
+            if media_key and tid in titles:
+                # Джойн с архивом: берём название и оценку оттуда
+                rec = titles[tid]
+                entry = {
+                    "id": tid,
+                    "title": rec.get("title") or api_name,
+                    "url": rec.get("url") or api_url,
+                }
+                score = _safe_int(rec.get("score"))
+                if score > 0:
+                    entry["score"] = score
+            else:
+                # Нет в архиве (или персонаж/человек) — только имя+ссылка
+                entry = {"id": tid, "title": api_name, "url": api_url}
+            result[out_key].append(entry)
+
+    stats["favourites"] = result
+    counts = {k: len(v) for k, v in result.items() if v}
+    log.info("_collect_favourites: собрано избранное: %s", counts or "пусто")
+    return stats
+
+
 async def sync_stats_all() -> dict:
     """
     Главная функция актуализации stats_all.
@@ -1549,6 +1618,17 @@ async def sync_stats_all() -> dict:
         # Пересчитываем агрегаты (сохраняя by_quarter)
         existing_bq = stats[media].get("aggregates", {}).get("by_quarter")
         stats[media]["aggregates"] = recompute_aggregates(media, titles, existing_bq)
+
+    # Собираем избранное (джойн с уже построенными titles)
+    try:
+        async with aiohttp.ClientSession() as session:
+            before = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
+            stats = await _collect_favourites(session, stats)
+            after = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
+            if before != after:
+                changed = True
+    except Exception as e:
+        log.error("sync_stats_all: сбор избранного упал: %s", e)
 
     if changed:
         save_stats_all(stats)
@@ -1840,10 +1920,53 @@ def _pct_diff(curr: int, prev: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  /stats all — АГРЕГИРОВАННАЯ СТАТИСТИКА ЗА ВСЁ ВРЕМЯ
+#  /favs — ИЗБРАННОЕ (ЛЮБИМОЕ)
 # ═══════════════════════════════════════════════════════════════════
 
-def build_stats_all_messages(stats: dict) -> list[str]:
+def _fav_lines(items: list[dict]) -> list[str]:
+    """Строки одного блока избранного: '• <ссылка> — ⭐9' (оценка опц.)."""
+    lines = []
+    for it in items:
+        title = h(it.get("title") or "???")
+        url = (it.get("url") or "").strip()
+        name = f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
+        score = it.get("score")
+        if isinstance(score, int) and score > 0:
+            lines.append(f"  • {name} — ⭐{score}")
+        else:
+            lines.append(f"  • {name}")
+    return lines
+
+
+def build_favourites_messages(stats: dict) -> list[str]:
+    """
+    Сообщение со списком любимого: аниме, манга, персонажи, люди.
+    Пустые категории не показываются. Если избранного нет совсем —
+    короткое сообщение-заглушка.
+    """
+    fav = stats.get("favourites") or {}
+    blocks = [
+        ("🎬", "Аниме",     fav.get("anime") or []),
+        ("📚", "Манга",     fav.get("manga") or []),
+        ("👤", "Персонажи", fav.get("characters") or []),
+        ("🎨", "Люди индустрии", fav.get("people") or []),
+    ]
+
+    if not any(items for _, _, items in blocks):
+        return ["❤️ <b>ЛЮБИМОЕ</b>\n\n<i>Список любимого пока пуст.</i>"]
+
+    out: list[str] = ["❤️ <b>ЛЮБИМОЕ</b>"]
+    for emoji, title, items in blocks:
+        if not items:
+            continue
+        out.append("")
+        out.append(f"{emoji} <b>{title}</b> ({len(items)})")
+        out.extend(_fav_lines(items))
+
+    return ["\n".join(out)]
+
+
+
     """
     Список сообщений для /stats all, разбитый по темам: [аниме], [манга].
     Каждое самостоятельно проходит лимит Telegram.
@@ -2136,7 +2259,7 @@ def _manga_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, heade
 def build_current_stats_messages(cur: dict, stats_all: dict) -> list[str]:
     """
     Список сообщений для /stats (текущий квартал), разбитый по темам:
-      [0] аниме, [1] манга, [2] подвал с подсказкой про /stats all.
+      [0] аниме, [1] манга.
     Каждое сообщение самостоятельное и проходит лимит Telegram отдельно.
     """
     title_label = tracking_period_label(cur)
@@ -2156,7 +2279,6 @@ def build_current_stats_messages(cur: dict, stats_all: dict) -> list[str]:
     msgs: list[str] = []
     msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, _section_header("🎬", "АНИМЕ")))
     msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, _section_header("📚", "МАНГА")))
-    msgs.append("<i>Полная статистика за всё время: /stats all</i>")
     return msgs
 
 
@@ -2406,6 +2528,12 @@ async def _stats_report_all() -> list[str]:
     return build_stats_all_messages(stats_all)
 
 
+async def _stats_report_favourites() -> list[str]:
+    """Отчёт по избранному (любимое). Переиспользуем для /favs и для кнопки."""
+    stats_all = load_stats_all()
+    return build_favourites_messages(stats_all)
+
+
 # Реестр вариантов отчёта. Кортеж: (ключ callback_data, подпись кнопки, builder, ряд)
 # callback_data будет вида "stats:<ключ>".
 _STATS_MENU: list[tuple[str, str, "callable", int]] = [
@@ -2511,6 +2639,21 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
         return
 
     await _send_stats_reports(callback.message.bot, callback.message.chat.id, msgs)
+
+
+async def cmd_favs(message: Message) -> None:
+    """
+    /favs — показывает избранное (любимое аниме и манга).
+    Одна категория, выбирать нечего — показываем сразу, без меню.
+    Доступна всем. Не делает сетевых запросов (читает файлы).
+    """
+    try:
+        msgs = await _stats_report_favourites()
+    except Exception as e:
+        log.error("cmd_favs: формирование: %s", e)
+        await message.answer("⚠️ Не удалось загрузить избранное, попробуй позже.")
+        return
+    await _send_stats_reports(message.bot, message.chat.id, msgs)
 
 # ═══════════════════════════════════════════════════════════════
 #  ОСНОВНАЯ ЛОГИКА
@@ -3196,6 +3339,7 @@ async def main() -> None:
     dp.message.register(cmd_broadcast, Command("broadcast"))
     dp.message.register(cmd_cancel,    Command("cancel"))
     dp.message.register(cmd_stats,     Command("stats"))
+    dp.message.register(cmd_favs,      Command("favs"))
 
     # FSM-обработчики для /broadcast
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
@@ -3208,9 +3352,10 @@ async def main() -> None:
     # Публичные команды в меню "/" — команды владельца не показываем
     await bot.set_my_commands([
         BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
-        BotCommand(command="stop",   description="Отписаться 😢"),
         BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
         BotCommand(command="stats",  description="Статистика: квартал или всё время 📊"),
+        BotCommand(command="favs",   description="Избранное ❤️"),
+        BotCommand(command="stop",   description="Отписаться 😢"),
     ])
 
     # polling_loop работает параллельно как фоновая задача
