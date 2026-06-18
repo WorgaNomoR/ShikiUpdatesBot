@@ -219,6 +219,27 @@ def h(text: str) -> str:
     return html.escape(str(text))
 
 
+def _rel_url(url: str) -> str:
+    """
+    Приводим URL к относительному виду ('/animes/123-name').
+
+    GraphQL Shikimori отдаёт ПОЛНЫЙ url ('https://shikimori.io/animes/...'),
+    а REST history — относительный. Весь код формирования ссылок приклеивает
+    SHIKI_BASE_URL спереди, поэтому полный url давал бы двойной домен и битую
+    ссылку. Нормализуем к относительному при сохранении — один источник истины.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    # Отрезаем схему+домен, если url полный
+    for prefix in ("https://", "http://"):
+        if url.startswith(prefix):
+            rest = url[len(prefix):]
+            slash = rest.find("/")
+            return rest[slash:] if slash != -1 else ""
+    return url
+
+
 # ═══════════════════════════════════════════════════════════════
 #  БАНК СООБЩЕНИЙ
 #
@@ -1158,7 +1179,7 @@ async def fetch_meta_batch(media: str, ids: list[str]) -> dict[str, dict]:
                         continue
                     genres_raw = item.get("genres") or []
                     meta = {
-                        "url":         (item.get("url") or "").strip(),
+                        "url":         _rel_url(item.get("url")),
                         "kind":        (item.get("kind") or "").lower(),
                         "year":        (item.get("airedOn") or {}).get("year"),
                         "shiki_score": _safe_float(item.get("score")),
@@ -1461,7 +1482,7 @@ async def _collect_favourites(session: aiohttp.ClientSession, stats: dict) -> di
                 continue
             tid = str(iid)
             api_name = item.get("russian") or item.get("name") or "???"
-            api_url = (item.get("url") or "").strip()
+            api_url = _rel_url(item.get("url"))
 
             if media_key and tid in titles:
                 # Джойн с архивом: берём название и оценку оттуда
@@ -1469,7 +1490,7 @@ async def _collect_favourites(session: aiohttp.ClientSession, stats: dict) -> di
                 entry = {
                     "id": tid,
                     "title": rec.get("title") or api_name,
-                    "url": rec.get("url") or api_url,
+                    "url": _rel_url(rec.get("url")) or api_url,
                 }
                 score = _safe_int(rec.get("score"))
                 if score > 0:
@@ -1904,7 +1925,7 @@ def _avg_score_from_dist(dist: dict) -> float | None:
 def _title_link_from_rec(tid: str, rec: dict) -> str:
     """HTML-ссылка из записи titles{}."""
     title = h(rec.get("title") or "???")
-    url = (rec.get("url") or "").strip()
+    url = _rel_url(rec.get("url"))
     return f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
 
 
@@ -1928,7 +1949,7 @@ def _fav_lines(items: list[dict]) -> list[str]:
     lines = []
     for it in items:
         title = h(it.get("title") or "???")
-        url = (it.get("url") or "").strip()
+        url = _rel_url(it.get("url"))
         name = f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
         score = it.get("score")
         if isinstance(score, int) and score > 0:
@@ -2144,7 +2165,7 @@ def _build_quarter_section(records: list[dict], media: str) -> list[str]:
         lines.append("🏆 <b>Топ по оценке:</b>")
         for i, r in enumerate(top, 1):
             title = h(r.get("title") or "???")
-            url = (r.get("url") or "").strip()
+            url = _rel_url(r.get("url"))
             link = f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
             lines.append(f"  {i}. {link} — ⭐{r['score']}")
 
