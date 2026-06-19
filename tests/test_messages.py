@@ -130,7 +130,7 @@ def test_message_contains_shikimori_link(monkeypatch):
         make_entry("оценено на 8")
     )
 
-    assert "shikimori" in msg.lower()
+    assert '<a href="' in msg
     assert "ergo-proxy" in msg
 
 
@@ -144,4 +144,4 @@ def test_message_without_url(monkeypatch):
         )
     )
 
-    assert "Открыть на Shikimori" not in msg
+    assert '<a href="' not in msg
