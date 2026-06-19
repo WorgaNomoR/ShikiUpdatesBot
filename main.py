@@ -808,6 +808,11 @@ def build_message(entry: dict) -> str:
     """
     Формируем итоговое сообщение для одной записи истории.
     entry — объект из API /api/users/{user}/history.
+
+    Название тайтла кликабельно (ссылка зашита в него), отдельной строки
+    со ссылкой нет — единообразно с /favs и отчётами. Метку времени не
+    добавляем: Telegram сам показывает время сообщения, а наличие новых записей 
+    проверяется каждые 15 минут.
     """
     # Тип медиа и конкретный вид (kind) — нужны для выбора банка сообщений
     media_type, _kind = get_media_info(entry)
@@ -817,7 +822,12 @@ def build_message(entry: dict) -> str:
     target = entry.get("target") or {}
     title_ru = target.get("russian") or ""
     title_en = target.get("name") or "???"
-    title = h(title_ru if title_ru else title_en)
+    title_text = h(title_ru if title_ru else title_en)
+
+    # Зашиваем ссылку в название (если есть url) — кликабельно прямо в тексте
+    target_url = _rel_url(target.get("url"))
+    title = (f'<a href="{SHIKI_BASE_URL}{target_url}">{title_text}</a>'
+             if target_url else title_text)
 
     description = entry.get("description", "") or ""
     event_type = classify_event(description)
@@ -862,21 +872,6 @@ def build_message(entry: dict) -> str:
             title=title,
             score="?",
         )
-
-    # Ссылка на тайтл — target.url приходит как "/animes/123-name" или "/mangas/456-name"
-    target_url = (target.get("url") or "").strip()
-    if target_url:
-        full_url = f"{SHIKI_BASE_URL}{target_url}"
-        text += f'\n🔗 <a href="{full_url}">Открыть на Shikimori</a>'
-
-    # Временна́я метка события
-    created_at = entry.get("created_at", "")
-    if created_at:
-        try:
-            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            text += f"\n<i>🕐 {dt.strftime('%d.%m.%Y %H:%M')} UTC</i>"
-        except ValueError:
-            pass
 
     return text
 
@@ -2761,13 +2756,14 @@ def build_favourite_message(category: str, item: dict) -> str:
 
     title_ru = item.get("russian") or ""
     title_en = item.get("name") or "???"
-    title = h(title_ru if title_ru else title_en)
+    title_text = h(title_ru if title_ru else title_en)
+
+    # Ссылку зашиваем в название — единообразно с /favs и событиями
+    url = _rel_url(item.get("url"))
+    title = (f'<a href="{SHIKI_BASE_URL}{url}">{title_text}</a>'
+             if url else title_text)
 
     text = random.choice(templates).format(n=DISPLAY_NAME, title=title)
-
-    url = (item.get("url") or "").strip()
-    if url:
-        text += f'\n🔗 <a href="{SHIKI_BASE_URL}{url}">Открыть на Shikimori</a>'
 
     return text
 
