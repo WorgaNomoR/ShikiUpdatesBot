@@ -2499,12 +2499,21 @@ def _update_by_quarter(stats_all: dict, period: str, cur: dict) -> None:
 #  ОТПРАВКА ДЛИННЫХ СООБЩЕНИЙ
 # ═══════════════════════════════════════════════════════════════════
 
-async def _send_long(bot: Bot, chat_id: int, text: str) -> None:
-    """Отправка с разбивкой по строкам если > 4000 символов (не рвём HTML-теги)."""
+async def _send_long(bot: Bot, chat_id: int, text: str,
+                     disable_preview: bool = False) -> None:
+    """
+    Отправка с разбивкой по строкам если > 4000 символов (не рвём HTML-теги).
+
+    disable_preview — отключить превью ссылок. По умолчанию False (превью есть):
+    для большинства отчётов первая ссылка ведёт на осмысленный тайтл (топ
+    квартала), и карточка уместна. True используем для /favs, где первая
+    ссылка всегда одна и та же (первое избранное) и превью лишь мешает.
+    """
     MAX = 4000
     try:
         if len(text) <= MAX:
-            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=disable_preview)
             return
         chunks: list[str] = []
         buf = ""
@@ -2518,7 +2527,8 @@ async def _send_long(bot: Bot, chat_id: int, text: str) -> None:
         if buf:
             chunks.append(buf)
         for chunk in chunks:
-            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=disable_preview)
             await asyncio.sleep(0.5)
     except Exception as e:
         log.error("_send_long: не удалось отправить (chat_id=%d): %s", chat_id, e)
@@ -2585,12 +2595,13 @@ def _stats_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def _send_stats_reports(bot: Bot, chat_id: int, msgs: list[str]) -> None:
+async def _send_stats_reports(bot: Bot, chat_id: int, msgs: list[str],
+                              disable_preview: bool = False) -> None:
     """Отправляет список сообщений отчёта в чат (по сообщению на тему)."""
     for msg in msgs:
         if not msg or not msg.strip():
             continue
-        await _send_long(bot, chat_id, msg)
+        await _send_long(bot, chat_id, msg, disable_preview=disable_preview)
         await asyncio.sleep(0.3)
 
 
@@ -2678,7 +2689,7 @@ async def cmd_favs(message: Message) -> None:
         log.error("cmd_favs: формирование: %s", e)
         await message.answer("⚠️ Не удалось загрузить избранное, попробуй позже.")
         return
-    await _send_stats_reports(message.bot, message.chat.id, msgs)
+    await _send_stats_reports(message.bot, message.chat.id, msgs, disable_preview=True)
 
 # ═══════════════════════════════════════════════════════════════
 #  ОСНОВНАЯ ЛОГИКА
