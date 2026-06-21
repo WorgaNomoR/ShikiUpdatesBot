@@ -1,8 +1,3 @@
-import os
-
-os.environ.setdefault("BOT_TOKEN", "test-token")
-os.environ.setdefault("OWNER_ID", "123456")
-
 from main import (
     _strip_html,
     extract_score,

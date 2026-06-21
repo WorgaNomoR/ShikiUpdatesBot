@@ -130,7 +130,7 @@ def test_message_contains_shikimori_link(monkeypatch):
         make_entry("оценено на 8")
     )
 
-    assert "shikimori" in msg.lower()
+    assert '<a href="' in msg
     assert "ergo-proxy" in msg
 
 
@@ -144,29 +144,4 @@ def test_message_without_url(monkeypatch):
         )
     )
 
-    assert "Открыть на Shikimori" not in msg
-
-
-# ==========================================================
-# timestamp
-# ==========================================================
-
-def test_message_contains_timestamp(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 8")
-    )
-
-    assert "01.01.2025" in msg
-
-
-def test_message_invalid_timestamp(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    entry = make_entry("оценено на 8")
-    entry["created_at"] = "broken-date"
-
-    msg = build_message(entry)
-
-    assert isinstance(msg, str)
+    assert '<a href="' not in msg

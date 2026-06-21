@@ -1,6 +1,27 @@
 import asyncio
 import pytest
 
+
+# ─────────────────────────────────────────────────────────────
+#  Хелпер: мокаем всё, что polling_loop вызывает по части статистики.
+#  sync_stats_all и rotate_quarter_if_needed делают сетевые/файловые
+#  вызовы — без моков тесты уходят в реальную сеть и виснут.
+#  load_stats_current читает файл — отдаём пустой стейт квартала.
+# ─────────────────────────────────────────────────────────────
+def _patch_stats(monkeypatch, main):
+    monkeypatch.setattr(main, "load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+
+    async def fake_sync():
+        return main._empty_stats_all()
+
+    monkeypatch.setattr(main, "sync_stats_all", fake_sync)
+
+    async def fake_rotate(bot, cur, stats_all):
+        return cur
+
+    monkeypatch.setattr(main, "rotate_quarter_if_needed", fake_rotate)
+
+
 @pytest.mark.asyncio
 async def test_first_run_initializes_history_and_favourites(monkeypatch):
     import main
@@ -8,6 +29,7 @@ async def test_first_run_initializes_history_and_favourites(monkeypatch):
     monkeypatch.setattr(main, "load_seen_ids", lambda: set())
     monkeypatch.setattr(main, "load_seen_favourites", lambda: set())
     monkeypatch.setattr(main, "load_subscribers", lambda: {})
+    _patch_stats(monkeypatch, main)
 
     saved_ids = {}
     saved_favs = {}
@@ -38,7 +60,7 @@ async def test_first_run_initializes_history_and_favourites(monkeypatch):
     monkeypatch.setattr(main, "fetch_history", fake_history)
     monkeypatch.setattr(main, "fetch_favourites", fake_favourites)
 
-    async def fake_check(bot, seen):
+    async def fake_check(bot, seen, cur):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(main, "check_and_notify", fake_check)
@@ -76,6 +98,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         "load_subscribers",
         lambda: {},
     )
+    _patch_stats(monkeypatch, main)
 
     saved = {}
 
@@ -116,7 +139,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         fake_send,
     )
 
-    async def fake_check(bot, seen):
+    async def fake_check(bot, seen, cur):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(
@@ -133,7 +156,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
 
     assert called is False
     assert "animes_10" in saved["value"]
-   
+
 
 @pytest.mark.asyncio
 async def test_favourites_initialization_failure(monkeypatch):
@@ -142,6 +165,7 @@ async def test_favourites_initialization_failure(monkeypatch):
     monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
     monkeypatch.setattr(main, "load_seen_favourites", lambda: set())
     monkeypatch.setattr(main, "load_subscribers", lambda: {})
+    _patch_stats(monkeypatch, main)
 
     save_called = False
 
@@ -164,7 +188,7 @@ async def test_favourites_initialization_failure(monkeypatch):
         fake_fetch,
     )
 
-    async def fake_check(bot, seen):
+    async def fake_check(bot, seen, cur):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(
@@ -190,6 +214,7 @@ async def test_polling_survives_unexpected_exception(monkeypatch):
     monkeypatch.setattr(main, "load_seen_favourites", lambda: {"animes_1"})
     monkeypatch.setattr(main, "load_subscribers", lambda: {})
     monkeypatch.setattr(main, "ERROR_NOTIFY_INTERVAL", 0)
+    _patch_stats(monkeypatch, main)
 
     logged = []
 
@@ -207,7 +232,7 @@ async def test_polling_survives_unexpected_exception(monkeypatch):
 
     calls = 0
 
-    async def fake_check(bot, seen):
+    async def fake_check(bot, seen, cur):
         nonlocal calls
         calls += 1
 
@@ -253,8 +278,9 @@ async def test_polling_propagates_cancelled_error(monkeypatch):
     monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
     monkeypatch.setattr(main, "load_seen_favourites", lambda: {"animes_1"})
     monkeypatch.setattr(main, "load_subscribers", lambda: {})
+    _patch_stats(monkeypatch, main)
 
-    async def fake_check(bot, seen):
+    async def fake_check(bot, seen, cur):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(main, "check_and_notify", fake_check)
