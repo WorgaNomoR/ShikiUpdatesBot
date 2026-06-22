@@ -1,6 +1,6 @@
 # 🎌 [ShikiUpdatesBot](https://github.com/WorgaNomoR/ShikiUpdatesBot) — Shikimori Activity Tracker
 
-[![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions)
+[![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg?branch=broadcast-cleanup)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![Docker](https://img.shields.io/badge/-Docker-2496ED?style=flat&logo=docker&logoColor=white)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
