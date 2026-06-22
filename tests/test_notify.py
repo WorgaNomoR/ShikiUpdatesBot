@@ -151,7 +151,7 @@ async def test_new_relevant_entry(monkeypatch):
 
     result, cur = await check_and_notify(
         DummyBot(),
-        set(),
+        {999},
         _empty_cur(),
     )
 

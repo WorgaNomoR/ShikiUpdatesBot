@@ -243,7 +243,7 @@ async def test_new_favourite(monkeypatch):
 
     result = await check_and_notify_favourites(
         DummyBot(),
-        set(),
+        {"animes_999"},
     )
 
     assert "animes_1" in result
@@ -293,7 +293,7 @@ async def test_multiple_new_favourites(monkeypatch):
 
     result = await check_and_notify_favourites(
         DummyBot(),
-        set(),
+        {"animes_999"},
     )
 
     assert "animes_1" in result

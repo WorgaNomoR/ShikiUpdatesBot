@@ -57,6 +57,7 @@ SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь 
 DISPLAY_NAME   = "Ворга"                 # отображаемое имя в сообщениях
 CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
 ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
+FULL_SYNC_INTERVAL = 6 * 60 * 60         # как часто пересинкивать stats_all в цикле (6 часов)
 
 # ─────────────────────────────────────────────
 #  ПУТИ К ФАЙЛАМ ДАННЫХ
@@ -1513,8 +1514,9 @@ async def sync_stats_all() -> dict:
        обновляем поля из экспорта, метаданные не перезапрашиваем.
     4. Пересчитываем агрегаты, сохраняем.
 
-    Вызывается при старте бота. Никаких уведомлений не шлёт.
-    Возвращает обновлённый stats_all (или текущий при сбое экспорта).
+    Вызывается при старте бота и периодически из цикла. Уведомлений не шлёт.
+    Возвращает (stats_all, ok): ok=False, если ни один экспорт не скачался
+    (тогда stats_all — прежний, нетронутый); ok=True при частичном/полном успехе.
     """
     stats = load_stats_all(use_cache=False)
 
@@ -1524,7 +1526,7 @@ async def sync_stats_all() -> dict:
 
     if export_anime is None and export_manga is None:
         log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
-        return stats
+        return stats, False
 
     changed = False
 
@@ -1652,7 +1654,7 @@ async def sync_stats_all() -> dict:
     else:
         log.info("sync_stats_all: изменений нет.")
 
-    return stats
+    return stats, True
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1724,6 +1726,27 @@ def record_current_event(
     Учитываем только значимые для статистики типы.
     Дедупликация: один (id, event_type) на квартал.
     """
+    # Смена оценки внутри квартала: обновляем score уже записанного
+    # completed-события того же тайтла. Если completed-события в этом квартале
+    # нет (тайтл завершён в прошлом квартале/до старта отслеживания) —
+    # игнорируем: в текущем отчёте его всё равно нет.
+    if event_type == "score_changed":
+        if score is None:
+            return cur
+        try:
+            tid = str((entry.get("target") or {}).get("id") or "")
+            if not tid:
+                return cur
+            for ev in cur.get("events", []):
+                if ev.get("id") == tid and ev.get("event") == "completed":
+                    if ev.get("score") != score:
+                        ev["score"] = score
+                        log.info("Обновлена оценка в квартале: id=%s → %s", tid, score)
+                    break
+        except Exception as e:
+            log.error("record_current_event(score_changed): %s", e)
+        return cur
+
     if event_type not in ("completed", "dropped", "planned", "rewatching"):
         return cur
     try:
@@ -2401,7 +2424,7 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict) -> dict
 
     # Свежие метаданные перед отчётом
     try:
-        stats_all = await sync_stats_all()
+        stats_all, _ = await sync_stats_all()
     except Exception as e:
         log.error("rotate_quarter: sync_stats_all упал: %s", e)
 
@@ -2785,6 +2808,19 @@ async def check_and_notify_favourites(bot: Bot, seen: set[str]) -> set[str]:
 
     # Категории которые отслеживаем
     tracked = ("animes", "mangas", "characters", "people")
+
+    # baseline пуст (первый запуск либо стартовая инициализация не прошла
+    # из-за 429/сети) — молча фиксируем текущее избранное как baseline,
+    # НИЧЕГО не шлём.
+    if not seen:
+        for category in tracked:
+            for item in (favourites.get(category) or []):
+                if item.get("id") is not None:
+                    seen.add(f"{category}_{item['id']}")
+        save_seen_favourites(seen)
+        log.info("Избранное: baseline инициализирован в цикле (%d), без отправки.", len(seen))
+        return seen
+
     found_new = False
 
     for category in tracked:
@@ -2871,6 +2907,15 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
         log.info("Запрос истории не удался — пропускаем цикл.")
         return seen_ids, cur
 
+    # baseline пуст (первый запуск либо стартовая инициализация не прошла
+    # из-за 429/сети) — молча фиксируем текущую историю как baseline и
+    # НИЧЕГО не шлём. Провал старта становится безобидной доинициализацией.
+    if not seen_ids:
+        seen_ids = {e["id"] for e in entries}
+        save_seen_ids(seen_ids)
+        log.info("История: baseline инициализирован в цикле (%d ID), без отправки.", len(seen_ids))
+        return seen_ids, cur
+
     new_entries = [e for e in entries if e["id"] not in seen_ids]
 
     if not new_entries:
@@ -2907,7 +2952,13 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
         # Фиксируем событие в статистике квартала (до отправки — независимо от неё)
         description = entry.get("description", "") or ""
         event_type  = classify_event(description)
-        score       = extract_score(description) if event_type == "completed" else None
+        if event_type == "completed":
+            score = extract_score(description)
+        elif event_type == "score_changed":
+            chg = extract_score_change(description)
+            score = chg[1] if chg else None
+        else:
+            score = None
         cur = record_current_event(cur, entry, event_type, media_type, score)
 
         text = build_message(entry)
@@ -2919,6 +2970,13 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
     save_seen_ids(seen_ids)
     save_stats_current(cur)
     return seen_ids, cur
+
+
+def _should_full_sync(last_full_sync: float | None, now: float, interval: float) -> bool:
+    """Пора ли пересинкивать stats_all: ещё ни разу успешно в этой сессии
+    (last_full_sync is None ⇒ ретраим каждый цикл, пока не выйдет) либо с
+    последнего успешного синка прошло больше interval секунд."""
+    return last_full_sync is None or (now - last_full_sync) >= interval
 
 
 async def polling_loop(bot: Bot) -> None:
@@ -2967,10 +3025,14 @@ async def polling_loop(bot: Bot) -> None:
     # строится сразу даже на первом запуске — данные берутся не из history).
     log.info("Синхронизируем статистику за всё время (stats_all)...")
     try:
-        stats_all = await sync_stats_all()
+        stats_all, synced_ok = await sync_stats_all()
     except Exception as e:
         log.exception("Не удалось синхронизировать stats_all при старте: %s", e)
         stats_all = load_stats_all()
+        synced_ok = False
+    # Метка последнего успешного полного синка (monotonic). None ⇒ в этой
+    # сессии ещё не синкнулись успешно — цикл будет ретраить каждый раз.
+    last_full_sync = time.monotonic() if synced_ok else None
 
     # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
     try:
@@ -2985,6 +3047,20 @@ async def polling_loop(bot: Bot) -> None:
             log.info("Проверяем историю и избранное...")
             seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
             seen_favs     = await check_and_notify_favourites(bot, seen_favs)
+
+            # Периодический (и ретрай-после-неудачного-старта) ресинк stats_all,
+            # чтобы сбой одного запроса не оставлял статистику протухшей/пустой
+            # до перезапуска. Дёшево: list_export ×2 + избранное, meta — только
+            # по новым id. save_stats_all обновляет кэш, ротация ниже видит свежее.
+            if _should_full_sync(last_full_sync, time.monotonic(), FULL_SYNC_INTERVAL):
+                try:
+                    _, synced_ok = await sync_stats_all()
+                    if synced_ok:
+                        last_full_sync = time.monotonic()
+                    else:
+                        log.warning("stats_all: ресинк не удался (429?), повторим в следующем цикле.")
+                except Exception as e:
+                    log.exception("stats_all: ресинк в цикле упал: %s", e)
 
             # Проверяем смену квартала (раз в цикл, дёшево).
             # Внутри — защита last_report_sent от повторной отправки.
