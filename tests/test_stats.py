@@ -10,13 +10,38 @@
   test_parsers.py   — extract_score, classify_event, _strip_html
   test_favourites.py— build_favourite_message
   test_media.py     — get_media_info
+
+Тесты ветки favourites-fix, unit 2 — metadata-retry в sync_stats_all:
+  - битая мета (пустой kind) дозапрашивается, ваншот пересобирается и
+    вычищается самоочисткой → счётчик «Прочитано» падает (43→39 в проде);
+  - анонс (мета снова пустая) — retry пробуется, но это no-op (запись цела,
+    не плодим запись на диск).
+
+Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
 
 import re
-
 import pytest
-
 import main
+import asyncio
+import copy
+from unittest.mock import AsyncMock
+
+
+def _manga_record(title, kind, status="completed", chapters_read=1):
+    return {
+        "title": title, "title_en": title, "score": 0, "status": status,
+        "rewatches": 0, "url": "", "kind": kind, "year": None,
+        "shiki_score": None, "genres": [], "themes": [], "demographic": [],
+        "chapters_read": chapters_read, "volumes_read": 0,
+        "chapters_total": None, "volumes_total": None, "publishers": [],
+    }
+
+
+def _export_manga_row(tid, status="completed", chapters=1):
+    return {"target_id": tid, "target_type": "Manga", "target_title": "x",
+            "target_title_ru": "x", "score": 0, "status": status,
+            "rewatches": 0, "chapters": chapters, "volumes": 0}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -376,3 +401,91 @@ def test_links_single_domain_in_favourites():
     for href in hrefs:
         assert href.count("shikimori.io") == 1, f"двойной домен: {href}"
         assert href.startswith("https://shikimori.io/"), href
+
+
+@pytest.mark.asyncio
+async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
+    import main
+
+    # stats_all: один нормальный completed-тайтл + один с битой метой (пустой kind)
+    stats = main._empty_stats_all()
+    stats["manga"]["titles"] = {
+        "111":    _manga_record("Нормальная манга", "manga"),
+        "120393": _manga_record("Elfen Lied Tokubetsu-hen", ""),   # битая мета
+    }
+
+    monkeypatch.setattr(main, "load_stats_all",
+                        lambda *a, **k: copy.deepcopy(stats))
+
+    async def fake_export(session, media):
+        if media == "manga":
+            return [_export_manga_row("111"), _export_manga_row("120393")]
+        return []   # аниме пусто
+    monkeypatch.setattr(main, "fetch_list_export", fake_export)
+
+    # GraphQL теперь возвращает настоящий вид ваншота
+    async def fake_meta(media, ids):
+        if media == "manga" and "120393" in ids:
+            return {"120393": {"kind": "one_shot", "url": "/mangas/120393",
+                               "year": 2005}}
+        return {}
+    monkeypatch.setattr(main, "fetch_meta_batch", fake_meta)
+
+    # избранное не трогаем (без сети)
+    async def fake_collect(session, st, fav=None):
+        return st
+    monkeypatch.setattr(main, "_collect_favourites", fake_collect)
+    saved = {}
+    monkeypatch.setattr(main, "save_stats_all", lambda data: saved.update(data))
+
+    result, ok = await main.sync_stats_all()
+
+    assert ok is True
+    titles = result["manga"]["titles"]
+    # Ваншот починен (kind заполнен) и вычищен самоочисткой
+    assert "120393" not in titles
+    assert "111" in titles
+    # «Прочитано» = 1, а не 2 (ваншот больше не считается)
+    assert result["manga"]["aggregates"]["total_completed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
+    import main
+
+    stats = main._empty_stats_all()
+    # planned-тайтл с пустым kind (анонс — вид ещё неизвестен)
+    stats["manga"]["titles"] = {
+        "999": _manga_record("Анонс", "", status="planned", chapters_read=0),
+    }
+    monkeypatch.setattr(main, "load_stats_all",
+                        lambda *a, **k: copy.deepcopy(stats))
+
+    async def fake_export(session, media):
+        if media == "manga":
+            return [_export_manga_row("999", status="planned", chapters=0)]
+        return []
+    monkeypatch.setattr(main, "fetch_list_export", fake_export)
+
+    meta_calls = []
+
+    async def fake_meta(media, ids):
+        meta_calls.append((media, list(ids)))
+        # анонс: GraphQL вернул элемент, но kind по-прежнему пустой
+        if media == "manga" and "999" in ids:
+            return {"999": {"kind": "", "url": "", "year": None}}
+        return {}
+    monkeypatch.setattr(main, "fetch_meta_batch", fake_meta)
+
+    async def fake_collect(session, st, fav=None):
+        return st
+    monkeypatch.setattr(main, "_collect_favourites", fake_collect)
+    monkeypatch.setattr(main, "save_stats_all", lambda *a, **k: None)
+
+    result, ok = await main.sync_stats_all()
+
+    # retry БЫЛ предпринят для безвидового анонса (это и есть фикс Codacy)
+    assert ("manga", ["999"]) in meta_calls
+    # но это no-op: запись цела, kind остался пустым (не выдумали вид)
+    assert "999" in result["manga"]["titles"]
+    assert result["manga"]["titles"]["999"]["kind"] == ""
