@@ -183,7 +183,7 @@ async def test_broadcast_receive_text_cleans_and_stores_preview(monkeypatch):
 
     msg.bot.delete_message.assert_any_await(123, 11)  # промпт A
     msg.bot.delete_message.assert_any_await(123, 12)  # сообщение владельца B
-    state.update_data.assert_any_await(preview_msg_ids=[501])
+    state.update_data.assert_any_await(preview_msg_ids=[501], control_msg_id=600)
     state.set_state.assert_awaited_with(main.BroadcastStates.waiting_confirm)
 
 
@@ -199,7 +199,7 @@ async def test_broadcast_receive_sticker_preview_has_two_ids(monkeypatch):
 
     await main.broadcast_receive(msg, state)
 
-    state.update_data.assert_any_await(preview_msg_ids=[501, 502])
+    state.update_data.assert_any_await(preview_msg_ids=[501, 502], control_msg_id=600)
 
 
 @pytest.mark.asyncio
