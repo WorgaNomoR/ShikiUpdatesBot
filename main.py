@@ -162,9 +162,9 @@ def _confirm_kb() -> InlineKeyboardMarkup:
 async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
     """Best-effort удаление сообщения.
 
-    Глушит штатные «message to delete not found» / уже удалённое / истёкшее окно:
-    чистка чата не должна ронять основной флоу. Это тот же примитив, который
-    переиспользует FSM-импорт ветки backup.
+    Глушит штатные «message to delete not found» / уже удалённое / истёкшее
+    окно: чистка чата не должна ронять основной флоу. Переиспользуемый примитив
+    для любых FSM-флоу, где надо подчистить служебные сообщения.
     """
     try:
         await bot.delete_message(chat_id, message_id)
