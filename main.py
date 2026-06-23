@@ -3241,10 +3241,14 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     await state.clear()
-    prompt_id = data.get("prompt_msg_id")
-    if prompt_id:  # broadcast-флоу: подчищаем промпт и эхо /cancel
-        await _safe_delete(message.bot, message.chat.id, prompt_id)
-        await _safe_delete(message.bot, message.chat.id, message.message_id)
+    # broadcast-флоу: подчищаем всё, что флоу мог создать к этому моменту
+    if data.get("prompt_msg_id") is not None:
+        await _safe_delete(message.bot, message.chat.id, data["prompt_msg_id"])
+        for mid in data.get("preview_msg_ids", []):
+            await _safe_delete(message.bot, message.chat.id, mid)
+        if data.get("control_msg_id") is not None:
+            await _safe_delete(message.bot, message.chat.id, data["control_msg_id"])
+        await _safe_delete(message.bot, message.chat.id, message.message_id)  # эхо /cancel
     await message.answer("❌ Отменено.")
 
 
@@ -3282,11 +3286,14 @@ async def broadcast_receive(message: Message, state: FSMContext) -> None:
     preview_msgs = await _send_broadcast_message(message.bot, message.chat.id, data)
 
     subs_count = len(load_subscribers())
-    await message.answer(
+    control = await message.answer(
         f"👀 Так увидят подписчики ↑\n\nОтправить {subs_count} подписчик(ам)?",
         reply_markup=_confirm_kb(),
     )
-    await state.update_data(preview_msg_ids=[m.message_id for m in preview_msgs])
+    await state.update_data(
+        preview_msg_ids=[m.message_id for m in preview_msgs],
+        control_msg_id=control.message_id,   # ← добавили: чтобы /cancel мог убрать и контрол
+    )
 
 
 async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> None:

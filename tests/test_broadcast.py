@@ -274,3 +274,37 @@ async def test_broadcast_cancel_deletes_preview_and_control(monkeypatch):
     cb.message.bot.delete_message.assert_any_await(123, 501)   # превью
     cb.message.bot.delete_message.assert_any_await(123, 600)   # контрол
     cb.message.bot.send_message.assert_not_called()            # ничего не разослали
+
+
+@pytest.mark.asyncio
+async def test_cmd_cancel_in_confirm_cleans_preview_and_control():
+    """waiting_confirm: /cancel обязан убрать промпт, превью И контрол.
+    FAIL на версии юнита 6, чистившей только промпт."""
+    import main
+    msg = _make_message(message_id=20, chat_id=123)
+    msg.from_user.id = main.OWNER_ID
+    state = _make_state({"prompt_msg_id": 11, "preview_msg_ids": [100], "control_msg_id": 101})
+    state.get_state.return_value = main.BroadcastStates.waiting_confirm
+
+    await main.cmd_cancel(msg, state)
+
+    msg.bot.delete_message.assert_any_await(123, 11)   # промпт
+    msg.bot.delete_message.assert_any_await(123, 100)  # превью
+    msg.bot.delete_message.assert_any_await(123, 101)  # контрол
+    msg.bot.delete_message.assert_any_await(123, 20)   # эхо /cancel
+
+
+@pytest.mark.asyncio
+async def test_cmd_cancel_in_content_cleans_prompt_only():
+    """waiting_content: превью ещё нет — чистим только промпт и эхо."""
+    import main
+    msg = _make_message(message_id=20, chat_id=123)
+    msg.from_user.id = main.OWNER_ID
+    state = _make_state({"prompt_msg_id": 11})
+    state.get_state.return_value = main.BroadcastStates.waiting_content
+
+    await main.cmd_cancel(msg, state)
+
+    msg.bot.delete_message.assert_any_await(123, 11)
+    msg.bot.delete_message.assert_any_await(123, 20)
+    assert msg.bot.delete_message.await_count == 2
