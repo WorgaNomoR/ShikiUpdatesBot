@@ -159,57 +159,53 @@ def _confirm_kb() -> InlineKeyboardMarkup:
     ]])
 
 
-async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> None:
+async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
+    """Best-effort удаление сообщения.
+
+    Глушит штатные «message to delete not found» / уже удалённое / истёкшее
+    окно: чистка чата не должна ронять основной флоу. Переиспользуемый примитив
+    для любых FSM-флоу, где надо подчистить служебные сообщения.
     """
-    Отправляет одно сообщение рассылки в указанный чат.
-    data — словарь, сохранённый в FSM:
-      msg_type  : "text" | "photo" | "video" | "animation" | "document" | "voice" | "sticker"
-      file_id   : str | None
-      user_text : str  (текст сообщения или caption от пользователя)
-    """
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception as e:
+        log.debug("  _safe_delete: пропускаю %s (chat=%s msg=%s)", e, chat_id, message_id)
+
+
+async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> list[Message]:
+    """Отправляет одно сообщение рассылки. Возвращает список фактически
+    отправленных Message (стикер = 2 сообщения: шапка + стикер) — нужно,
+    чтобы превью можно было целиком удалить по id."""
     msg_type  = data["msg_type"]
     user_text = data.get("user_text", "")
     file_id   = data.get("file_id")
+    sent: list[Message] = []
 
     if msg_type == "text":
-        # Текст оборачиваем в цитату
         body = f"\n<blockquote>{h(user_text)}</blockquote>" if user_text else ""
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"{BROADCAST_HEADER}{body}",
-            parse_mode=ParseMode.HTML,
-        )
+        sent.append(await bot.send_message(
+            chat_id=chat_id, text=f"{BROADCAST_HEADER}{body}", parse_mode=ParseMode.HTML,
+        ))
 
     elif msg_type == "sticker":
-        # Стикеры не поддерживают caption — шапка отдельным сообщением
-        await bot.send_message(chat_id=chat_id, text=BROADCAST_HEADER, parse_mode=ParseMode.HTML)
-        await bot.send_sticker(chat_id=chat_id, sticker=file_id)
+        sent.append(await bot.send_message(chat_id=chat_id, text=BROADCAST_HEADER, parse_mode=ParseMode.HTML))
+        sent.append(await bot.send_sticker(chat_id=chat_id, sticker=file_id))
 
     else:
-        # Фото, видео, GIF, документ, голосовое — шапка + текст пользователя в caption
-        if user_text:
-            caption = f"{BROADCAST_HEADER}\n\n{h(user_text)}"
-        else:
-            caption = BROADCAST_HEADER
-
+        caption = f"{BROADCAST_HEADER}\n\n{h(user_text)}" if user_text else BROADCAST_HEADER
         common = dict(chat_id=chat_id, caption=caption, parse_mode=ParseMode.HTML)
-
         if msg_type == "photo":
-            await bot.send_photo(
-                photo=file_id, show_caption_above_media=True, **common,
-            )
+            sent.append(await bot.send_photo(photo=file_id, show_caption_above_media=True, **common))
         elif msg_type == "video":
-            await bot.send_video(
-                video=file_id, show_caption_above_media=True, **common,
-            )
+            sent.append(await bot.send_video(video=file_id, show_caption_above_media=True, **common))
         elif msg_type == "animation":
-            await bot.send_animation(
-                animation=file_id, show_caption_above_media=True, **common,
-            )
+            sent.append(await bot.send_animation(animation=file_id, show_caption_above_media=True, **common))
         elif msg_type == "document":
-            await bot.send_document(document=file_id, **common)
+            sent.append(await bot.send_document(document=file_id, **common))
         elif msg_type == "voice":
-            await bot.send_voice(voice=file_id, **common)
+            sent.append(await bot.send_voice(voice=file_id, **common))
+
+    return sent
 
 
 def h(text: str) -> str:
@@ -3228,12 +3224,14 @@ async def cmd_broadcast(message: Message, state: FSMContext) -> None:
     if message.from_user is None or message.from_user.id != OWNER_ID:
         await message.answer("🚫 Эта команда только для владельца бота.")
         return
+    await _safe_delete(message.bot, message.chat.id, message.message_id)  # убираем саму /broadcast
     await state.set_state(BroadcastStates.waiting_content)
-    await message.answer(
+    prompt = await message.answer(
         "✍️ Пришли сообщение для рассылки.\n"
         "Поддерживаются: текст, фото, видео, GIF, стикер, документ, голосовое.\n\n"
         "/cancel — передумал",
     )
+    await state.update_data(prompt_msg_id=prompt.message_id)
 
 
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
@@ -3241,13 +3239,21 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     if await state.get_state() is None:
         await message.answer("🤷 Нечего отменять.")
         return
+    data = await state.get_data()
     await state.clear()
+    # broadcast-флоу: подчищаем всё, что флоу мог создать к этому моменту
+    if data.get("prompt_msg_id") is not None:
+        await _safe_delete(message.bot, message.chat.id, data["prompt_msg_id"])
+        for mid in data.get("preview_msg_ids", []):
+            await _safe_delete(message.bot, message.chat.id, mid)
+        if data.get("control_msg_id") is not None:
+            await _safe_delete(message.bot, message.chat.id, data["control_msg_id"])
+        await _safe_delete(message.bot, message.chat.id, message.message_id)  # эхо /cancel
     await message.answer("❌ Отменено.")
 
 
 async def broadcast_receive(message: Message, state: FSMContext) -> None:
-    """Получаем сообщение от владельца, сохраняем в FSM и показываем превью."""
-    # Определяем тип и извлекаем нужные данные
+    """Принять контент от владельца, показать превью, убрать служебный мусор."""
     if message.sticker:
         data = {"msg_type": "sticker", "file_id": message.sticker.file_id, "user_text": ""}
     elif message.photo:
@@ -3266,48 +3272,61 @@ async def broadcast_receive(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Такой тип сообщения не поддерживается. Попробуй другой или /cancel.")
         return
 
+    fsm = await state.get_data()
     await state.update_data(**data)
     await state.set_state(BroadcastStates.waiting_confirm)
 
-    # Превью — отправляем владельцу как будет выглядеть
-    await message.answer("👀 Вот как увидят подписчики:")
-    await _send_broadcast_message(message.bot, message.chat.id, data)
+    # Чистим служебное: промпт бота и само сообщение владельца
+    prompt_id = fsm.get("prompt_msg_id")
+    if prompt_id:
+        await _safe_delete(message.bot, message.chat.id, prompt_id)
+    await _safe_delete(message.bot, message.chat.id, message.message_id)
+
+    # Превью — ровно то же, что увидят подписчики (тот же helper)
+    preview_msgs = await _send_broadcast_message(message.bot, message.chat.id, data)
+
     subs_count = len(load_subscribers())
-    await message.answer(
-        f"Отправить {subs_count} подписчик(ам)?",
+    control = await message.answer(
+        f"👀 Так увидят подписчики ↑\n\nОтправить {subs_count} подписчик(ам)?",
         reply_markup=_confirm_kb(),
+    )
+    await state.update_data(
+        preview_msg_ids=[m.message_id for m in preview_msgs],
+        control_msg_id=control.message_id,   # ← добавили: чтобы /cancel мог убрать и контрол
     )
 
 
 async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """Подтверждение рассылки — отправляем всем подписчикам."""
+    """Подтверждение — рассылаем подписчикам, превью убираем, контрол правим в результат."""
     data = await state.get_data()
     await state.clear()
-    # Убираем кнопки с превью-сообщения
-    await callback.message.edit_reply_markup(reply_markup=None)
+    bot, chat_id = callback.message.bot, callback.message.chat.id
+
+    for mid in data.get("preview_msg_ids", []):
+        await _safe_delete(bot, chat_id, mid)
 
     subs = load_subscribers()
     if not subs:
         await callback.answer()
-        await callback.message.answer("📭 Подписчиков нет — некому отправлять.")
+        await callback.message.edit_text("📭 Подписчиков нет — некому отправлять.")
         return
 
     await callback.answer("Отправляю...")
     sent, failed = 0, 0
     to_remove: list[int] = []
 
-    for chat_id, name in subs.items():
+    for cid, name in subs.items():
         try:
-            await _send_broadcast_message(callback.message.bot, chat_id, data)
+            await _send_broadcast_message(bot, cid, data)
             sent += 1
-            log.info("  broadcast → %s (chat_id=%d)", name, chat_id)
+            log.info("  broadcast → %s (chat_id=%d)", name, cid)
         except Exception as e:
             err = str(e).lower()
             if "bot was blocked" in err or "user is deactivated" in err or "chat not found" in err:
-                log.warning("  broadcast ✗ %s (chat_id=%d) заблокировал бота.", name, chat_id)
-                to_remove.append(chat_id)
+                log.warning("  broadcast ✗ %s (chat_id=%d) заблокировал бота.", name, cid)
+                to_remove.append(cid)
             else:
-                log.error("  broadcast ✗ %s (chat_id=%d): %s", name, chat_id, e)
+                log.error("  broadcast ✗ %s (chat_id=%d): %s", name, cid, e)
             failed += 1
         await asyncio.sleep(0.3)
 
@@ -3317,17 +3336,20 @@ async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> No
         save_subscribers(subs)
         log.info("Отписано %d заблокировавших бота.", len(to_remove))
 
-    await callback.message.answer(
+    await callback.message.edit_text(
         f"✅ Отправлено: {sent}" + (f", ошибок: {failed}" if failed else "") + "."
     )
 
 
 async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """Отмена рассылки через кнопку."""
+    """Отмена — ничего не шлём, чистим превью и контрол подчистую."""
+    data = await state.get_data()
     await state.clear()
+    bot, chat_id = callback.message.bot, callback.message.chat.id
     await callback.answer("Отменено.")
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("❌ Рассылка отменена.")
+    for mid in data.get("preview_msg_ids", []):
+        await _safe_delete(bot, chat_id, mid)
+    await _safe_delete(bot, chat_id, callback.message.message_id)
 
 
 async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | None:
