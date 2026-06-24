@@ -188,7 +188,7 @@ async def test_favourites_empty_response(monkeypatch):
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         set(),
     )
@@ -282,10 +282,16 @@ async def test_new_favourite(monkeypatch):
         fake_sleep,
     )
 
+    # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
+    monkeypatch.setattr("main.load_stats_all",
+                        lambda *a, **k: {"anime": {"titles": {}}, "manga": {"titles": {}}})
+    monkeypatch.setattr("main.save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr("main.save_seen_favourites", lambda *a, **k: None)
+
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         {"animes_999"},
     )
@@ -332,10 +338,16 @@ async def test_multiple_new_favourites(monkeypatch):
         fake_sleep,
     )
 
+    # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
+    monkeypatch.setattr("main.load_stats_all",
+                        lambda *a, **k: {"anime": {"titles": {}}, "manga": {"titles": {}}})
+    monkeypatch.setattr("main.save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr("main.save_seen_favourites", lambda *a, **k: None)
+
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         {"animes_999"},
     )
@@ -385,7 +397,7 @@ async def test_favourite_without_id_is_ignored(monkeypatch):
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         set(),
     )
@@ -434,7 +446,7 @@ async def test_untracked_category_is_ignored(monkeypatch):
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         set(),
     )
@@ -483,6 +495,11 @@ async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
 
     assert saved is False
 
+
+# ═══════════════════════════════════════════════════════════════
+#  Ветка favourites-fix: категории (ранобэ + слияние индустрии),
+#  джойн ссылок, пересборка stats["favourites"] при found_new.
+# ═══════════════════════════════════════════════════════════════
 
 def test_collect_favourites_merges_industry_and_adds_ranobe():
     import main

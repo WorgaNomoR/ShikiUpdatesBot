@@ -395,7 +395,7 @@ async def test_check_favourites_empty_baseline_does_not_spam(monkeypatch):
     monkeypatch.setattr(main, "send_to_all_chats", fake_send)
     monkeypatch.setattr(main, "save_seen_favourites", lambda s: saved.update(keys=set(s)))
 
-    seen = await main.check_and_notify_favourites(bot=None, seen=set())
+    seen, _ = await main.check_and_notify_favourites(bot=None, seen=set())
 
     expected = {"animes_100", "animes_101", "mangas_200"}
     assert sent == []
@@ -420,7 +420,7 @@ async def test_check_favourites_failed_fetch_keeps_state(monkeypatch):
     monkeypatch.setattr(main, "save_seen_favourites", lambda s: save_calls.append(s))
 
     baseline = {"animes_1"}
-    seen = await main.check_and_notify_favourites(bot=None, seen=set(baseline))
+    seen, _ = await main.check_and_notify_favourites(bot=None, seen=set(baseline))
 
     assert sent == []
     assert seen == baseline
