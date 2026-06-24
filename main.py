@@ -123,6 +123,23 @@ MANGA_KINDS: frozenset[str] = frozenset({
 # ─────────────────────────────────────────────
 HISTORY_URL    = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/history?limit=50"
 FAVOURITES_URL = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/favourites"
+
+# Все категории избранного, которые отдаёт API Shikimori (мн. число).
+# Один источник правды — используется в инициализации baseline, в цикле
+# уведомлений и при сборе /favs. characters/people/mangakas/seyu/producers —
+# люди и персонажи; animes/mangas/ranobe — произведения.
+_FAV_CATEGORIES: tuple[str, ...] = (
+    "animes", "mangas", "ranobe",
+    "characters", "people", "mangakas", "seyu", "producers",
+)
+
+# Подмножество _FAV_CATEGORIES, которое во фронтенде сливается в один блок
+# «Люди индустрии». Один человек может лежать сразу в нескольких ролях
+# (например, и seyu, и producers) — по этим категориям дедупим по id.
+_INDUSTRY_CATEGORIES: frozenset[str] = frozenset(
+    {"people", "mangakas", "seyu", "producers"}
+)
+
 HEADERS = {
     "User-Agent": f"ShikimoriWatcherBot/1.0 (TelegramBot; monitoring {SHIKI_USER})",
     "Accept": "application/json",
@@ -1218,7 +1235,8 @@ def _empty_stats_all() -> dict:
         "updated_at": None,
         "anime": {"titles": {}, "aggregates": {}},
         "manga": {"titles": {}, "aggregates": {}},
-        "favourites": {"anime": [], "manga": [], "characters": [], "people": []},
+        "favourites": {"anime": [], "manga": [], "ranobe": [],
+                       "characters": [], "people": []},
     }
 
 
@@ -1438,32 +1456,61 @@ def recompute_aggregates(media: str, titles: dict, existing_by_quarter: dict | N
 #  СИНХРОНИЗАЦИЯ stats_all С list_export
 # ═══════════════════════════════════════════════════════════════════
 
-async def _collect_favourites(session: aiohttp.ClientSession, stats: dict) -> dict:
+async def _collect_favourites(
+    session: "aiohttp.ClientSession | None",
+    stats: dict,
+    fav: dict | None = None,
+) -> dict:
     """
     Собирает избранное в структуру stats["favourites"].
 
-    Для аниме/манги джойнит оценку и название из titles{} (если тайтл там есть);
-    если нет — берёт название из ответа API. Персонажи/люди — имя+ссылка из API.
+    fav: если передан готовый ответ API (например, уже скачанный в
+    check_and_notify_favourites) — используем его и НЕ ходим в сеть повторно.
+    Если None — фетчим сами через session.
+
+    Для аниме/манги/ранобэ джойнит оценку и название из titles{} (если тайтл
+    там есть); если нет — берёт название из ответа API. Персонажи/люди —
+    имя+ссылка из API (в titles{} их нет, ссылки/оценки не будет — это ок).
 
     fetch_favourites возвращает None при сбое — тогда оставляем прежнее
     избранное (не затираем хорошие данные пустотой при ошибке сети).
 
-    Категории API (мн. число) → ключи stats: animes→anime, mangas→manga.
+    Категоризация Shikimori ненадёжна (режиссёры лежат в mangakas, и т.п.),
+    поэтому people+mangakas+seyu+producers сливаем в один блок "people"
+    («Люди индустрии»). Ранобэ — отдельный блок, но джойнит по namespace манги.
     """
-    fav = await fetch_favourites(session)
+    if fav is None:
+        if session is None:
+            # Защита от вызова с обоими None: fetch_favourites(None) упал бы
+            # внутри на session.get(...). В норме не случается (sync_stats_all
+            # передаёт session, check_and_notify_favourites — готовый fav).
+            log.error("_collect_favourites: переданы и fav=None, и session=None — оставляем прежнее.")
+            return stats
+        fav = await fetch_favourites(session)
     if fav is None:
         log.info("_collect_favourites: запрос избранного не удался — оставляем прежнее.")
         return stats
 
-    # Карта: API-категория → (ключ stats, ключ titles в stats или None)
+    # API-категория → (выходной ключ stats, ключ titles для джойна или None).
+    # ranobe джойнит по titles манги: id ранобэ лежат в namespace манги,
+    # и если тайтл есть в списке пользователя — подтянем ссылку/оценку.
     cat_map = {
-        "animes":     ("anime", "anime"),
-        "mangas":     ("manga", "manga"),
+        "animes":     ("anime",      "anime"),
+        "mangas":     ("manga",      "manga"),
+        "ranobe":     ("ranobe",     "manga"),
         "characters": ("characters", None),
-        "people":     ("people", None),
+        "people":     ("people",     None),
+        "mangakas":   ("people",     None),
+        "seyu":       ("people",     None),
+        "producers":  ("people",     None),
     }
 
-    result: dict[str, list] = {"anime": [], "manga": [], "characters": [], "people": []}
+    result: dict[str, list] = {
+        "anime": [], "manga": [], "ranobe": [], "characters": [], "people": [],
+    }
+    # Защита от дублей в слитом блоке людей (на случай, если Shikimori положит
+    # одного человека в несколько категорий — в норме не случается).
+    seen_people: set[str] = set()
 
     for api_cat, (out_key, media_key) in cat_map.items():
         items = fav.get(api_cat) or []
@@ -1473,6 +1520,12 @@ async def _collect_favourites(session: aiohttp.ClientSession, stats: dict) -> di
             if iid is None:
                 continue
             tid = str(iid)
+            if out_key == "people":
+                if tid in seen_people:
+                    continue
+                seen_people.add(tid)
+            # russian бывает пустой строкой (не null) — фолбэк на name,
+            # иначе получим пустую жирную строку.
             api_name = item.get("russian") or item.get("name") or "???"
             api_url = _rel_url(item.get("url"))
 
@@ -1544,23 +1597,53 @@ async def sync_stats_all() -> dict:
         # ID, которым нужны метаданные (отсутствуют в titles)
         new_ids = [tid for tid in valid_rows if tid not in titles]
 
-        # Подтягиваем метаданные для новых
+        # Ремонт битой меты (Codacy / баг «ваншоты не фильтруются»):
+        # записи с пустым kind — это тайтлы, у которых мета не доехала при
+        # первом заносе (GraphQL не вернул элемент → ВСЕ мета-поля пусты разом).
+        # Они навсегда оставались в titles{} (new_ids их не видит, самоочистка
+        # пропускает пустой kind) и, если completed, врали в счётчике.
+        # Дозапрашиваем их повторно. Анонсы (вид ещё неизвестен) вернут снова
+        # пустой kind — это обрабатывается как no-op ниже, без записи на диск.
+        retry_ids = [
+            tid for tid in valid_rows
+            if tid in titles and not (titles[tid].get("kind") or "")
+        ]
+
+        # Подтягиваем метаданные: для новых + для ремонта битых
+        need_meta = new_ids + retry_ids
         meta_map: dict[str, dict] = {}
-        if new_ids:
-            log.info("sync_stats_all(%s): новых тайтлов для обогащения: %d", media, len(new_ids))
+        if need_meta:
+            log.info("sync_stats_all(%s): тайтлов для обогащения: %d (новых %d, ремонт %d)",
+                     media, len(need_meta), len(new_ids), len(retry_ids))
             try:
-                meta_map = await fetch_meta_batch(media, new_ids)
+                meta_map = await fetch_meta_batch(media, need_meta)
             except Exception as e:
                 log.error("sync_stats_all(%s): fetch_meta_batch упал: %s", media, e)
 
         skipped_irrelevant = 0
+        repaired = 0
 
         # Обновляем / создаём записи
         for tid, row in valid_rows.items():
             if tid in titles:
+                rec = titles[tid]
+
+                # Ремонт битой меты: запись с пустым kind, и сейчас GraphQL
+                # вернул непустой kind → пересобираем ЦЕЛИКОМ (url/year/жанры/
+                # kind — всё, что побилось вместе с kind). Дальнейшая
+                # самоочистка по kind вынесет ставшие нерелевантными (ваншоты).
+                # Если мета снова пустая (анонс) — не трогаем, no-op (без
+                # changed), чтобы не сохранять файл каждые 6 часов впустую.
+                if not (rec.get("kind") or ""):
+                    fresh = meta_map.get(tid)
+                    if fresh and (fresh.get("kind") or ""):
+                        titles[tid] = _merge_title_record(media, row, fresh)
+                        repaired += 1
+                        changed = True
+                        continue
+
                 # Существующая запись — обновляем только пользовательский стейт,
                 # метаданные (genres/studios/...) уже есть, не трогаем.
-                rec = titles[tid]
                 new_score  = _safe_int(row.get("score"))
                 new_status = (row.get("status") or "").lower()
                 new_rew    = _safe_int(row.get("rewatches"))
@@ -1607,6 +1690,9 @@ async def sync_stats_all() -> dict:
         if skipped_irrelevant:
             log.info("sync_stats_all(%s): пропущено нерелевантных по kind: %d",
                      media, skipped_irrelevant)
+        if repaired:
+            log.info("sync_stats_all(%s): дозапрошена битая мета (kind был пуст): %d",
+                     media, repaired)
 
         # Чистка существующих записей, чей kind не проходит фильтр
         # (самоочистка при изменении критерия или после обновления метаданных).
@@ -1981,9 +2067,10 @@ def build_favourites_messages(stats: dict) -> list[str]:
     """
     fav = stats.get("favourites") or {}
     blocks = [
-        ("🎬", "Аниме",     fav.get("anime") or []),
-        ("📚", "Манга",     fav.get("manga") or []),
-        ("👤", "Персонажи", fav.get("characters") or []),
+        ("🎬", "Аниме",          fav.get("anime") or []),
+        ("📚", "Манга",          fav.get("manga") or []),
+        ("📖", "Ранобэ",         fav.get("ranobe") or []),
+        ("👤", "Персонажи",      fav.get("characters") or []),
         ("🎨", "Люди индустрии", fav.get("people") or []),
     ]
 
@@ -2760,15 +2847,23 @@ async def fetch_favourites(session: aiohttp.ClientSession) -> dict | None:
 def build_favourite_message(category: str, item: dict) -> str:
     """
     Формируем сообщение об добавлении в избранное.
-    category: "animes" | "mangas" | "characters" | "people"
+    category: одна из _FAV_CATEGORIES (animes/mangas/ranobe/characters/
+              people/mangakas/seyu/producers)
     item:     объект из API с полями id, name, russian, url и др.
+              url может быть подставлен из titles{} вызывающей стороной
+              (Favourites API сам отдаёт url=null).
     """
-    # Категория API → ключ банка сообщений
+    # Категория API → ключ банка сообщений.
+    # ranobe переиспользует банк манги; вся индустрия — банк person.
     cat_map = {
         "animes":     "anime",
         "mangas":     "manga",
+        "ranobe":     "manga",
         "characters": "character",
         "people":     "person",
+        "mangakas":   "person",
+        "seyu":       "person",
+        "producers":  "person",
     }
     bank_key = cat_map.get(category, "anime")
     templates = MESSAGES["favourites"].get(bank_key, MESSAGES["favourites"]["anime"])
@@ -2787,39 +2882,53 @@ def build_favourite_message(category: str, item: dict) -> str:
     return text
 
 
-async def check_and_notify_favourites(bot: Bot, seen: set[str]) -> set[str]:
+async def check_and_notify_favourites(
+    bot: Bot, seen: set[str],
+) -> tuple[set[str], bool]:
     """
     Проверяем избранное:
     1. Загружаем текущий список с Shikimori
     2. Находим новые элементы (которых нет в seen)
     3. Отправляем уведомления и обновляем seen
+    4. Если что-то новое нашли — пересобираем stats["favourites"] из УЖЕ
+       скачанного списка (без повторного запроса к API), чтобы /favs показывал
+       свежее сразу, не дожидаясь 6-часового ресинка.
+
     Ключ в seen: "{category}_{id}", например "animes_5114".
+    Возвращает (seen, found_new).
     """
     async with aiohttp.ClientSession() as session:
         favourites = await fetch_favourites(session)
 
     if favourites is None:
         log.info("Запрос избранного не удался — пропускаем цикл.")
-        return seen
-
-    # Категории которые отслеживаем
-    tracked = ("animes", "mangas", "characters", "people")
+        return seen, False
 
     # baseline пуст (первый запуск либо стартовая инициализация не прошла
     # из-за 429/сети) — молча фиксируем текущее избранное как baseline,
     # НИЧЕГО не шлём.
     if not seen:
-        for category in tracked:
+        for category in _FAV_CATEGORIES:
             for item in (favourites.get(category) or []):
                 if item.get("id") is not None:
                     seen.add(f"{category}_{item['id']}")
         save_seen_favourites(seen)
         log.info("Избранное: baseline инициализирован в цикле (%d), без отправки.", len(seen))
-        return seen
+        return seen, False
+
+    # Архив для джойна ссылок в уведомлениях: Favourites API отдаёт url=null,
+    # поэтому тянем ссылку из titles{} по id (как в /favs). Чтение из кэша —
+    # дёшево; запись (save_stats_all) только если ниже нашлось новое.
+    stats = load_stats_all()
+    # API-категория → ключ titles для джойна ссылки (остальные ссылки не имеют)
+    url_join_media = {"animes": "anime", "mangas": "manga", "ranobe": "manga"}
 
     found_new = False
+    # ID людей индустрии, по которым уже отправили уведомление в этом цикле —
+    # чтобы один человек в нескольких ролях не дал дубль сообщений.
+    notified_people: set[str] = set()
 
-    for category in tracked:
+    for category in _FAV_CATEGORIES:
         items = favourites.get(category) or []
         for item in items:
             item_id = item.get("id")
@@ -2829,20 +2938,49 @@ async def check_and_notify_favourites(bot: Bot, seen: set[str]) -> set[str]:
             if key in seen:
                 continue
 
-            # Новый элемент в избранном
+            # Новый элемент в избранном. seen-ключ роли фиксируем всегда (даже
+            # если уведомление ниже подавим как дубль), иначе он будет считаться
+            # «новым» в каждом следующем цикле.
             seen.add(key)
             found_new = True
+
+            # Дедуп слитого блока «Люди индустрии»: один человек может лежать
+            # сразу в нескольких ролях (seyu + producers) — шлём одно
+            # уведомление на person id за цикл.
+            if category in _INDUSTRY_CATEGORIES:
+                if str(item_id) in notified_people:
+                    continue
+                notified_people.add(str(item_id))
+
             log.info("Новое в избранном: %s (id=%s)", category, item_id)
+
+            # Подтягиваем ссылку из архива (баг: API отдаёт url=null).
+            # Если тайтла нет в titles{} (или это персонаж/человек) — ссылки
+            # не будет, и это ок (graceful: жирный текст без ссылки).
+            media_key = url_join_media.get(category)
+            if media_key:
+                rec = stats.get(media_key, {}).get("titles", {}).get(str(item_id))
+                rec_url = (rec or {}).get("url")
+                if rec_url:
+                    item = {**item, "url": rec_url}  # копия — не мутируем исходный
 
             text = build_favourite_message(category, item)
             await send_to_all_chats(bot, text)
             await asyncio.sleep(1)
 
-    if not found_new:
+    if found_new:
+        # Пересобираем stats["favourites"] из уже скачанного списка — /favs
+        # станет свежим в этом же цикле, без второго запроса к API.
+        try:
+            stats = await _collect_favourites(None, stats, fav=favourites)
+            save_stats_all(stats)
+        except Exception as e:
+            log.error("check_and_notify_favourites: не удалось обновить stats_all: %s", e)
+    else:
         log.info("Изменений в избранном нет.")
 
     save_seen_favourites(seen)
-    return seen
+    return seen, found_new
 
 
 async def send_to_all_chats(bot: Bot, text: str) -> None:
@@ -3010,7 +3148,7 @@ async def polling_loop(bot: Bot) -> None:
         if favourites is None:
             log.warning("Не удалось получить избранное при инициализации — пропускаем, повторим на следующем цикле.")
         else:
-            for category in ("animes", "mangas", "characters", "people"):
+            for category in _FAV_CATEGORIES:
                 for item in (favourites.get(category) or []):
                     if item.get("id") is not None:
                         seen_favs.add(f"{category}_{item['id']}")
@@ -3042,7 +3180,7 @@ async def polling_loop(bot: Bot) -> None:
         try:
             log.info("Проверяем историю и избранное...")
             seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
-            seen_favs     = await check_and_notify_favourites(bot, seen_favs)
+            seen_favs, _  = await check_and_notify_favourites(bot, seen_favs)
 
             # Периодический (и ретрай-после-неудачного-старта) ресинк stats_all,
             # чтобы сбой одного запроса не оставлял статистику протухшей/пустой

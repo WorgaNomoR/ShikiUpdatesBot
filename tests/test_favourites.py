@@ -1,5 +1,6 @@
 import asyncio
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -9,6 +10,49 @@ from main import (
     load_seen_favourites,
     save_seen_favourites,
 )
+
+
+# Срез реального ответа /favourites: все 8 категорий, url=null везде,
+# у TeddyLoid russian="" (должен фолбэкнуться на name).
+FAV_SAMPLE = {
+    "animes": [
+        {"id": 226, "name": "Elfen Lied", "russian": "Эльфийская песнь", "url": None},
+    ],
+    "mangas": [
+        {"id": 21525, "name": "Akatsuki no Yona", "russian": "Йона на заре", "url": None},
+    ],
+    "ranobe": [
+        {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero. Жизнь с нуля", "url": None},
+    ],
+    "characters": [],
+    "people": [
+        {"id": 30805, "name": "TeddyLoid", "russian": "", "url": None},
+    ],
+    "mangakas": [
+        {"id": 32649, "name": "Tappei Nagatsuki", "russian": "Таппэй Нагацуки", "url": None},
+    ],
+    "seyu": [
+        {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None},
+    ],
+    "producers": [
+        {"id": 38963, "name": "Masahiro Shinohara", "russian": "Масахиро Синохара", "url": None},
+    ],
+}
+
+
+def _stats_with_titles():
+    """stats_all с парой тайтлов для проверки джойна ссылок/оценок."""
+    import main
+    stats = main._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "226": {"title": "Эльфийская песнь", "url": "/animes/226-elfen-lied",
+                "score": 9, "kind": "tv", "status": "completed"},
+    }
+    stats["manga"]["titles"] = {
+        "21525": {"title": "Йона на заре", "url": "/mangas/21525-akatsuki-no-yona",
+                  "score": 8, "kind": "manga", "status": "completed"},
+    }
+    return stats
 
 
 # ============================================================
@@ -144,7 +188,7 @@ async def test_favourites_empty_response(monkeypatch):
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         set(),
     )
@@ -238,10 +282,16 @@ async def test_new_favourite(monkeypatch):
         fake_sleep,
     )
 
+    # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
+    monkeypatch.setattr("main.load_stats_all",
+                        lambda *a, **k: {"anime": {"titles": {}}, "manga": {"titles": {}}})
+    monkeypatch.setattr("main.save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr("main.save_seen_favourites", lambda *a, **k: None)
+
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         {"animes_999"},
     )
@@ -288,10 +338,16 @@ async def test_multiple_new_favourites(monkeypatch):
         fake_sleep,
     )
 
+    # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
+    monkeypatch.setattr("main.load_stats_all",
+                        lambda *a, **k: {"anime": {"titles": {}}, "manga": {"titles": {}}})
+    monkeypatch.setattr("main.save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr("main.save_seen_favourites", lambda *a, **k: None)
+
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         {"animes_999"},
     )
@@ -341,7 +397,7 @@ async def test_favourite_without_id_is_ignored(monkeypatch):
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         set(),
     )
@@ -390,7 +446,7 @@ async def test_untracked_category_is_ignored(monkeypatch):
     class DummyBot:
         pass
 
-    result = await check_and_notify_favourites(
+    result, _ = await check_and_notify_favourites(
         DummyBot(),
         set(),
     )
@@ -438,3 +494,188 @@ async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
         await main.polling_loop(DummyBot())
 
     assert saved is False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Ветка favourites-fix: категории (ранобэ + слияние индустрии),
+#  джойн ссылок, пересборка stats["favourites"] при found_new.
+# ═══════════════════════════════════════════════════════════════
+
+def test_collect_favourites_merges_industry_and_adds_ranobe():
+    import main
+    stats = main._empty_stats_all()
+    out = asyncio.run(main._collect_favourites(None, stats, fav=FAV_SAMPLE))
+    fav = out["favourites"]
+
+    # Ранобэ — отдельный блок
+    assert len(fav["ranobe"]) == 1
+    assert fav["ranobe"][0]["id"] == "74697"
+
+    # people + mangakas + seyu + producers слиты в один блок (4 человека)
+    assert len(fav["people"]) == 4
+    ids = {p["id"] for p in fav["people"]}
+    assert ids == {"30805", "32649", "34785", "38963"}
+
+    # Персонажи отдельно и пусты в этом срезе
+    assert fav["characters"] == []
+
+
+def test_collect_favourites_empty_russian_falls_back_to_name():
+    import main
+    stats = main._empty_stats_all()
+    out = asyncio.run(main._collect_favourites(None, stats, fav=FAV_SAMPLE))
+    teddy = next(p for p in out["favourites"]["people"] if p["id"] == "30805")
+    # russian был "" — заголовок не должен быть пустым, берём name
+    assert teddy["title"] == "TeddyLoid"
+
+
+def test_collect_favourites_url_join_from_titles():
+    import main
+    stats = _stats_with_titles()
+    out = asyncio.run(main._collect_favourites(None, stats, fav=FAV_SAMPLE))
+    anime = out["favourites"]["anime"][0]
+    assert anime["url"] == "/animes/226-elfen-lied"   # ссылка подтянута из titles
+    assert anime["score"] == 9                          # и оценка
+
+
+def test_build_favourites_messages_has_ranobe_and_industry_blocks():
+    import main
+    stats = main._empty_stats_all()
+    stats["favourites"]["ranobe"] = [{"id": "1", "title": "Ранобэ-тайтл", "url": ""}]
+    stats["favourites"]["people"] = [{"id": "2", "title": "Человек", "url": ""}]
+    msg = main.build_favourites_messages(stats)[0]
+    assert "Ранобэ" in msg
+    assert "Люди индустрии" in msg
+
+
+def test_build_favourite_message_ranobe_uses_manga_bank():
+    import main
+    item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
+    text = main.build_favourite_message("ranobe", item)
+    manga_bank = [t.format(n=main.DISPLAY_NAME, title="Re:Zero")
+                  for t in main.MESSAGES["favourites"]["manga"]]
+    assert text in manga_bank
+
+
+def test_build_favourite_message_industry_uses_person_bank():
+    import main
+    item = {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None}
+    for cat in ("seyu", "mangakas", "producers", "people"):
+        text = main.build_favourite_message(cat, item)
+        person_bank = [t.format(n=main.DISPLAY_NAME, title="Риэ Такахаси")
+                       for t in main.MESSAGES["favourites"]["person"]]
+        assert text in person_bank, f"категория {cat} ушла не в банк person"
+
+
+@pytest.mark.asyncio
+async def test_check_and_notify_favourites_joins_url_in_notification(monkeypatch):
+    """Баг 1: уведомление о новом аниме должно содержать ссылку из titles{}."""
+    import main
+
+    fav = {k: [] for k in main._FAV_CATEGORIES}
+    fav["animes"] = [{"id": 226, "name": "Elfen Lied",
+                      "russian": "Эльфийская песнь", "url": None}]
+
+    sent = []
+    monkeypatch.setattr(main, "fetch_favourites", AsyncMock(return_value=fav))
+    monkeypatch.setattr(main, "send_to_all_chats",
+                        AsyncMock(side_effect=lambda bot, text: sent.append(text)))
+    monkeypatch.setattr(main, "load_stats_all", lambda *a, **k: _stats_with_titles())
+    monkeypatch.setattr(main, "save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr(main, "save_seen_favourites", lambda *a, **k: None)
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
+
+    # baseline: всё уже виденное, КРОМЕ нового аниме 226
+    seen = {f"{c}_{i['id']}" for c in main._FAV_CATEGORIES
+            for i in fav.get(c, []) if i["id"] != 226}
+    seen.add("animes_999")  # чтобы baseline не был пустым
+
+    new_seen, found_new = await main.check_and_notify_favourites(None, seen)
+
+    assert found_new is True
+    assert len(sent) == 1
+    assert 'href="https://shikimori.io/animes/226-elfen-lied"' in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_check_and_notify_favourites_refreshes_stats(monkeypatch):
+    """Unit 3: при found_new stats["favourites"] пересобирается из скачанного
+    списка — без повторного fetch_favourites."""
+    import main
+
+    fav = {k: [] for k in main._FAV_CATEGORIES}
+    fav["mangas"] = [{"id": 21525, "name": "Akatsuki no Yona",
+                      "russian": "Йона на заре", "url": None}]
+
+    saved = {}
+    monkeypatch.setattr(main, "fetch_favourites", AsyncMock(return_value=fav))
+    monkeypatch.setattr(main, "send_to_all_chats", AsyncMock())
+    monkeypatch.setattr(main, "load_stats_all", lambda *a, **k: _stats_with_titles())
+    monkeypatch.setattr(main, "save_stats_all",
+                        lambda data: saved.update(data))
+    monkeypatch.setattr(main, "save_seen_favourites", lambda *a, **k: None)
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
+
+    seen = {"mangas_1"}  # непустой baseline, нового тайтла там нет
+
+    _, found_new = await main.check_and_notify_favourites(None, seen)
+
+    assert found_new is True
+    # stats сохранён и manga-блок избранного содержит новый тайтл с джойном ссылки
+    assert saved, "save_stats_all не вызван"
+    manga_favs = saved["favourites"]["manga"]
+    assert any(e["id"] == "21525" and e["url"] == "/mangas/21525-akatsuki-no-yona"
+               for e in manga_favs)
+    # fetch_favourites вызван РОВНО один раз (нет второго запроса при пересборке)
+    assert main.fetch_favourites.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_check_and_notify_favourites_no_new_returns_false(monkeypatch):
+    import main
+
+    fav = {k: [] for k in main._FAV_CATEGORIES}
+    fav["animes"] = [{"id": 226, "name": "Elfen Lied",
+                      "russian": "Эльфийская песнь", "url": None}]
+
+    monkeypatch.setattr(main, "fetch_favourites", AsyncMock(return_value=fav))
+    monkeypatch.setattr(main, "send_to_all_chats", AsyncMock())
+    monkeypatch.setattr(main, "load_stats_all", lambda *a, **k: _stats_with_titles())
+    monkeypatch.setattr(main, "save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr(main, "save_seen_favourites", lambda *a, **k: None)
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
+
+    seen = {"animes_226", "animes_999"}  # 226 уже виден
+    _, found_new = await main.check_and_notify_favourites(None, seen)
+    assert found_new is False
+
+
+@pytest.mark.asyncio
+async def test_check_and_notify_favourites_dedups_industry_people(monkeypatch):
+    """Один человек в нескольких ролях (seyu + producers) → ОДНО уведомление,
+    но обе ролевые seen-записи зафиксированы."""
+    import main
+
+    fav = {k: [] for k in main._FAV_CATEGORIES}
+    person = {"id": 34785, "name": "Rie Takahashi",
+              "russian": "Риэ Такахаси", "url": None}
+    fav["seyu"] = [person]
+    fav["producers"] = [person]  # тот же человек во второй роли
+
+    sent = []
+    monkeypatch.setattr(main, "fetch_favourites", AsyncMock(return_value=fav))
+    monkeypatch.setattr(main, "send_to_all_chats",
+                        AsyncMock(side_effect=lambda bot, text: sent.append(text)))
+    monkeypatch.setattr(main, "load_stats_all",
+                        lambda *a, **k: {"anime": {"titles": {}}, "manga": {"titles": {}}})
+    monkeypatch.setattr(main, "save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr(main, "save_seen_favourites", lambda *a, **k: None)
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
+
+    seen = {"animes_999"}  # непустой baseline без этого человека
+    new_seen, found_new = await main.check_and_notify_favourites(None, seen)
+
+    assert found_new is True
+    assert len(sent) == 1                      # одно сообщение, не два
+    assert "seyu_34785" in new_seen            # обе роли отмечены виденными,
+    assert "producers_34785" in new_seen       # иначе зацикливание на «новом»
