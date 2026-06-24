@@ -133,6 +133,13 @@ _FAV_CATEGORIES: tuple[str, ...] = (
     "characters", "people", "mangakas", "seyu", "producers",
 )
 
+# Подмножество _FAV_CATEGORIES, которое во фронтенде сливается в один блок
+# «Люди индустрии». Один человек может лежать сразу в нескольких ролях
+# (например, и seyu, и producers) — по этим категориям дедупим по id.
+_INDUSTRY_CATEGORIES: frozenset[str] = frozenset(
+    {"people", "mangakas", "seyu", "producers"}
+)
+
 HEADERS = {
     "User-Agent": f"ShikimoriWatcherBot/1.0 (TelegramBot; monitoring {SHIKI_USER})",
     "Accept": "application/json",
@@ -1473,6 +1480,12 @@ async def _collect_favourites(
     («Люди индустрии»). Ранобэ — отдельный блок, но джойнит по namespace манги.
     """
     if fav is None:
+        if session is None:
+            # Защита от вызова с обоими None: fetch_favourites(None) упал бы
+            # внутри на session.get(...). В норме не случается (sync_stats_all
+            # передаёт session, check_and_notify_favourites — готовый fav).
+            log.error("_collect_favourites: переданы и fav=None, и session=None — оставляем прежнее.")
+            return stats
         fav = await fetch_favourites(session)
     if fav is None:
         log.info("_collect_favourites: запрос избранного не удался — оставляем прежнее.")
@@ -2911,6 +2924,9 @@ async def check_and_notify_favourites(
     url_join_media = {"animes": "anime", "mangas": "manga", "ranobe": "manga"}
 
     found_new = False
+    # ID людей индустрии, по которым уже отправили уведомление в этом цикле —
+    # чтобы один человек в нескольких ролях не дал дубль сообщений.
+    notified_people: set[str] = set()
 
     for category in _FAV_CATEGORIES:
         items = favourites.get(category) or []
@@ -2922,9 +2938,20 @@ async def check_and_notify_favourites(
             if key in seen:
                 continue
 
-            # Новый элемент в избранном
+            # Новый элемент в избранном. seen-ключ роли фиксируем всегда (даже
+            # если уведомление ниже подавим как дубль), иначе он будет считаться
+            # «новым» в каждом следующем цикле.
             seen.add(key)
             found_new = True
+
+            # Дедуп слитого блока «Люди индустрии»: один человек может лежать
+            # сразу в нескольких ролях (seyu + producers) — шлём одно
+            # уведомление на person id за цикл.
+            if category in _INDUSTRY_CATEGORIES:
+                if str(item_id) in notified_people:
+                    continue
+                notified_people.add(str(item_id))
+
             log.info("Новое в избранном: %s (id=%s)", category, item_id)
 
             # Подтягиваем ссылку из архива (баг: API отдаёт url=null).

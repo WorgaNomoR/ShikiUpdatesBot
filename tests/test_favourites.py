@@ -648,3 +648,34 @@ async def test_check_and_notify_favourites_no_new_returns_false(monkeypatch):
     seen = {"animes_226", "animes_999"}  # 226 уже виден
     _, found_new = await main.check_and_notify_favourites(None, seen)
     assert found_new is False
+
+
+@pytest.mark.asyncio
+async def test_check_and_notify_favourites_dedups_industry_people(monkeypatch):
+    """Один человек в нескольких ролях (seyu + producers) → ОДНО уведомление,
+    но обе ролевые seen-записи зафиксированы."""
+    import main
+
+    fav = {k: [] for k in main._FAV_CATEGORIES}
+    person = {"id": 34785, "name": "Rie Takahashi",
+              "russian": "Риэ Такахаси", "url": None}
+    fav["seyu"] = [person]
+    fav["producers"] = [person]  # тот же человек во второй роли
+
+    sent = []
+    monkeypatch.setattr(main, "fetch_favourites", AsyncMock(return_value=fav))
+    monkeypatch.setattr(main, "send_to_all_chats",
+                        AsyncMock(side_effect=lambda bot, text: sent.append(text)))
+    monkeypatch.setattr(main, "load_stats_all",
+                        lambda *a, **k: {"anime": {"titles": {}}, "manga": {"titles": {}}})
+    monkeypatch.setattr(main, "save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr(main, "save_seen_favourites", lambda *a, **k: None)
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
+
+    seen = {"animes_999"}  # непустой baseline без этого человека
+    new_seen, found_new = await main.check_and_notify_favourites(None, seen)
+
+    assert found_new is True
+    assert len(sent) == 1                      # одно сообщение, не два
+    assert "seyu_34785" in new_seen            # обе роли отмечены виденными,
+    assert "producers_34785" in new_seen       # иначе зацикливание на «новом»

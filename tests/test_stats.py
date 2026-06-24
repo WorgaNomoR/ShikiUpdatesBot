@@ -11,11 +11,8 @@
   test_favourites.py— build_favourite_message
   test_media.py     — get_media_info
 
-Тесты ветки favourites-fix, unit 2 — metadata-retry в sync_stats_all:
-  - битая мета (пустой kind) дозапрашивается, ваншот пересобирается и
-    вычищается самоочисткой → счётчик «Прочитано» падает (43→39 в проде);
-  - анонс (мета снова пустая) — retry пробуется, но это no-op (запись цела,
-    не плодим запись на диск).
+Тесты ветки favourites-fix (unit 2, metadata-retry) — в конце файла,
+под своим секционным заголовком.
 
 Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
@@ -23,9 +20,7 @@
 import re
 import pytest
 import main
-import asyncio
 import copy
-from unittest.mock import AsyncMock
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
@@ -403,10 +398,15 @@ def test_links_single_domain_in_favourites():
         assert href.startswith("https://shikimori.io/"), href
 
 
+# ════════════════════════════════════════════════════════════════
+#  favourites-fix (unit 2): metadata-retry в sync_stats_all
+#  Битая мета (пустой kind) дозапрашивается, ваншот пересобирается и
+#  вычищается самоочисткой (43→39 в проде). Анонс (мета снова пустая) —
+#  retry пробуется, но это no-op (запись цела, без записи на диск).
+# ════════════════════════════════════════════════════════════════
+
 @pytest.mark.asyncio
 async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
-    import main
-
     # stats_all: один нормальный completed-тайтл + один с битой метой (пустой kind)
     stats = main._empty_stats_all()
     stats["manga"]["titles"] = {
@@ -451,8 +451,6 @@ async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
-    import main
-
     stats = main._empty_stats_all()
     # planned-тайтл с пустым kind (анонс — вид ещё неизвестен)
     stats["manga"]["titles"] = {
