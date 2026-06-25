@@ -5,10 +5,9 @@ import aiohttp
 import pytest
 
 from main import (
-    fetch_history,
     fetch_favourites,
+    fetch_history,
 )
-
 
 # ============================================================
 # fetch_history()

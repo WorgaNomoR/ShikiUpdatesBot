@@ -17,10 +17,12 @@
 Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
 
-import re
-import pytest
-import main
 import copy
+import re
+
+import pytest
+
+import main
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
