@@ -306,7 +306,8 @@ async def test_collect_favourites_join_with_titles(monkeypatch):
         }
     monkeypatch.setattr(main, "fetch_favourites", fake_fetch)
 
-    class S: pass
+    class S:
+        pass
     stats = await main._collect_favourites(S(), stats)
     fa = {e["id"]: e for e in stats["favourites"]["anime"]}
 
@@ -324,7 +325,8 @@ async def test_collect_favourites_api_fail_keeps_previous(monkeypatch):
         return None  # сбой API
     monkeypatch.setattr(main, "fetch_favourites", fake_fetch)
 
-    class S: pass
+    class S: 
+        pass
     stats = await main._collect_favourites(S(), stats)
     # Прежнее избранное не затёрто
     assert stats["favourites"]["anime"] == [{"id": "1", "title": "Старое", "url": "/animes/1"}]

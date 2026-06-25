@@ -146,8 +146,6 @@ async def test_import_valid_subscribers(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_import_temp_file_removed(monkeypatch, tmp_path):
-    temp_files_before = set(tmp_path.glob("*"))
-
     monkeypatch.setattr(main, "SUBS_FILE", tmp_path / "subs.json")
 
     bot = DummyBot(
