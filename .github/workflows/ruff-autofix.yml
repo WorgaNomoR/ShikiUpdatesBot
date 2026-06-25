@@ -1,0 +1,24 @@
+name: ruff-autofix
+on:
+  push:
+    branches-ignore: [main]   # main защищён, туда бот не пушит
+
+permissions:
+  contents: write             # чтобы бот мог закоммитить фикс
+
+jobs:
+  ruff-autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: check --fix
+      - name: Commit fixes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -am "style: ruff autofix"
+            git push
+          fi
