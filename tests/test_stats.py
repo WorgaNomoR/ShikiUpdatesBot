@@ -509,15 +509,46 @@ def test_stats_menu_kb_has_close_button():
 
 
 @pytest.mark.asyncio
-async def test_stats_menu_close_deletes_menu():
-    """stats:close → меню удаляется, отчёт НЕ строится и НЕ шлётся."""
+async def test_cmd_stats_menu_is_reply():
+    """Меню /stats шлётся ответом (reply) на команду — иначе ❌ Закрыть
+    не сможет удалить саму команду (рвётся reply_to_message)."""
+
+    message = AsyncMock()
+    message.text = "/stats"
+
+    await main.cmd_stats(message)
+
+    message.reply.assert_awaited_once()
+    message.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_close_deletes_menu_and_command():
+    """stats:close удаляет и меню, и команду /stats (reply_to_message)."""
 
     callback = AsyncMock()
     callback.data = "stats:close"
     callback.message = AsyncMock()
+    callback.message.reply_to_message = AsyncMock()
 
     await main.stats_menu_cb(callback)
 
-    callback.answer.assert_awaited_once_with()      # ack без алерта
-    callback.message.delete.assert_awaited_once()   # меню удалено
-    callback.message.answer.assert_not_called()     # отчёта/ошибки нет
+    callback.answer.assert_awaited_once_with()
+    callback.message.delete.assert_awaited_once()
+    callback.message.reply_to_message.delete.assert_awaited_once()
+    callback.message.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_close_without_reply_does_not_crash():
+    """reply_to_message=None → закрытие удаляет только меню, без падения."""
+
+    callback = AsyncMock()
+    callback.data = "stats:close"
+    callback.message = AsyncMock()
+    callback.message.reply_to_message = None
+
+    await main.stats_menu_cb(callback)
+
+    callback.message.delete.assert_awaited_once()
+    callback.answer.assert_awaited_once_with()

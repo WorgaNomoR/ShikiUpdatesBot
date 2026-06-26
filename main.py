@@ -2744,8 +2744,10 @@ async def cmd_stats(message: Message) -> None:
         await _send_stats_reports(message.bot, message.chat.id, msgs)
         return
 
-    # Иначе — показываем меню с кнопками
-    await message.answer(
+    # Иначе — показываем меню с кнопками. Отправляем ОТВЕТОМ на команду
+    # (reply): так у меню появляется reply_to_message — само сообщение /stats,
+    # и кнопка ❌ Закрыть сможет удалить заодно и команду.
+    await message.reply(
         "📊 <b>Какую статистику показать?</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=_stats_menu_kb(),
@@ -2765,6 +2767,7 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
     # Обрабатываем до lookup'а, иначе ключ ушёл бы в ветку 'Неизвестный вариант'.
     if key == "close":
         await callback.answer()
+        # Убираем сообщение с кнопками...
         try:
             await callback.message.delete()
         except Exception as e:
@@ -2773,6 +2776,15 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
                 await callback.message.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
+        # ...и саму команду /stats, на которую меню отвечало (reply_to_message),
+        # чтобы чат остался чистым. В личке бот вправе удалять входящие сообщения;
+        # если нельзя (старое/группа без прав) — просто логируем и идём дальше.
+        cmd_msg = callback.message.reply_to_message
+        if cmd_msg is not None:
+            try:
+                await cmd_msg.delete()
+            except Exception as e:
+                log.debug("stats_menu_cb: не удалось удалить команду /stats: %s", e)
         return
 
     builder = _STATS_BUILDERS.get(key)
