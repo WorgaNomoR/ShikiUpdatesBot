@@ -2767,19 +2767,24 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
     # Обрабатываем до lookup'а, иначе ключ ушёл бы в ветку 'Неизвестный вариант'.
     if key == "close":
         await callback.answer()
+        # callback.message может быть None (сообщение старше 48 ч) или
+        # InaccessibleMessage — тогда удалять нечего, тихо выходим.
+        msg = callback.message
+        if msg is None:
+            return
         # Убираем сообщение с кнопками...
         try:
-            await callback.message.delete()
+            await msg.delete()
         except Exception as e:
             log.debug("stats_menu_cb: не удалось удалить меню при закрытии: %s", e)
             try:
-                await callback.message.edit_reply_markup(reply_markup=None)
+                await msg.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
         # ...и саму команду /stats, на которую меню отвечало (reply_to_message),
-        # чтобы чат остался чистым. В личке бот вправе удалять входящие сообщения;
-        # если нельзя (старое/группа без прав) — просто логируем и идём дальше.
-        cmd_msg = callback.message.reply_to_message
+        # чтобы чат остался чистым. getattr — на случай InaccessibleMessage без
+        # этого поля. В личке бот вправе удалять входящие; если нельзя — лог и дальше.
+        cmd_msg = getattr(msg, "reply_to_message", None)
         if cmd_msg is not None:
             try:
                 await cmd_msg.delete()
