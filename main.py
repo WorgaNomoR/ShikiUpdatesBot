@@ -59,7 +59,11 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 
 SHIKI_USER     = "WNR"                   # ник на Shikimori (для API)
 SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь при смене зеркала
-DISPLAY_NAME   = "Ворга"                 # отображаемое имя в сообщениях
+
+# Отображаемое имя в сообщениях. Опционально через env DISPLAY_NAME;
+# по умолчанию — ник профиля (SHIKI_USER). Пустая строка/пробелы → фолбэк.
+DISPLAY_NAME   = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
+
 CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
 ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
 FULL_SYNC_INTERVAL = 6 * 60 * 60         # как часто пересинкивать stats_all в цикле (6 часов)
@@ -2698,6 +2702,10 @@ def _stats_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=label, callback_data=f"stats:{key}")
         )
     keyboard = [rows[r] for r in sorted(rows)]
+    # Кнопка закрытия меню — отдельным рядом снизу. Это не вариант отчёта
+    # (builder'а нет), поэтому не в _STATS_MENU: ключ "close" обрабатывается
+    # в stats_menu_cb до lookup'а builder'а.
+    keyboard.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="stats:close")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -2752,6 +2760,21 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
     """
     data = callback.data or ""
     key = data.split(":", 1)[1] if ":" in data else ""
+
+    # ❌ Закрыть — не вариант отчёта (builder'а нет): просто убираем меню.
+    # Обрабатываем до lookup'а, иначе ключ ушёл бы в ветку 'Неизвестный вариант'.
+    if key == "close":
+        await callback.answer()
+        try:
+            await callback.message.delete()
+        except Exception as e:
+            log.debug("stats_menu_cb: не удалось удалить меню при закрытии: %s", e)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        return
+
     builder = _STATS_BUILDERS.get(key)
 
     if builder is None:

@@ -23,6 +23,7 @@ import re
 import pytest
 
 import main
+from unittest.mock import AsyncMock
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
@@ -491,3 +492,32 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
     # но это no-op: запись цела, kind остался пустым (не выдумали вид)
     assert "999" in result["manga"]["titles"]
     assert result["manga"]["titles"]["999"]["kind"] == ""
+
+
+# ════════════════════════════════════════════════════════════════
+#  polish
+# ════════════════════════════════════════════════════════════════
+
+def test_stats_menu_kb_has_close_button():
+    """Меню /stats содержит кнопку ❌ Закрыть с callback_data 'stats:close'."""
+
+    kb = main._stats_menu_kb()
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    close = [b for b in buttons if b.callback_data == "stats:close"]
+    assert len(close) == 1, "ожидал ровно одну кнопку закрытия"
+    assert "Закры" in close[0].text
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_close_deletes_menu():
+    """stats:close → меню удаляется, отчёт НЕ строится и НЕ шлётся."""
+
+    callback = AsyncMock()
+    callback.data = "stats:close"
+    callback.message = AsyncMock()
+
+    await main.stats_menu_cb(callback)
+
+    callback.answer.assert_awaited_once_with()      # ack без алерта
+    callback.message.delete.assert_awaited_once()   # меню удалено
+    callback.message.answer.assert_not_called()     # отчёта/ошибки нет
