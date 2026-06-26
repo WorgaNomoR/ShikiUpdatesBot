@@ -28,7 +28,8 @@ def _reset_healthcheck_state():
 # ============================================================
 
 def test_grace_period_before_first_heartbeat():
-    """До первого пульса бот считается живым (грейс-период старта)."""
+    """До первого пульса бот считается живым (грейс-период старта).
+    Это и есть защита от рестарт-петли при недоступном владельце."""
     assert healthcheck._has_beaten is False
     assert healthcheck._seconds_since_heartbeat() is None
     assert healthcheck._is_healthy() is True
