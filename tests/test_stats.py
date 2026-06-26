@@ -19,11 +19,11 @@
 
 import copy
 import re
+from unittest.mock import AsyncMock
 
 import pytest
 
 import main
-from unittest.mock import AsyncMock
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
