@@ -90,7 +90,7 @@ async def test_threshold_computed_from_interval(monkeypatch):
             started["called"] = True
 
     class FakeRunner:
-        def __init__(self, app):
+        def __init__(self, app, **kwargs):
             pass
 
         async def setup(self):
@@ -120,7 +120,7 @@ async def test_threshold_default_misses(monkeypatch):
             pass
 
     class FakeRunner:
-        def __init__(self, app):
+        def __init__(self, app, **kwargs):
             pass
 
         async def setup(self):
@@ -146,7 +146,7 @@ async def test_port_read_from_env_when_none(monkeypatch):
             pass
 
     class FakeRunner:
-        def __init__(self, app):
+        def __init__(self, app, **kwargs):
             pass
 
         async def setup(self):
@@ -173,7 +173,7 @@ async def test_invalid_env_port_falls_back_to_8080(monkeypatch):
             pass
 
     class FakeRunner:
-        def __init__(self, app):
+        def __init__(self, app, **kwargs):
             pass
 
         async def setup(self):
@@ -191,7 +191,7 @@ async def test_invalid_env_port_falls_back_to_8080(monkeypatch):
 async def test_start_server_failure_returns_none(monkeypatch):
     """Если сервер не поднялся — возвращаем None, не роняем бот."""
     class FakeRunner:
-        def __init__(self, app):
+        def __init__(self, app, **kwargs):
             pass
 
         async def setup(self):
@@ -236,3 +236,32 @@ async def test_root_endpoint_returns_200():
     """GET / всегда отдаёт 200 — признак открытого порта."""
     resp = await healthcheck._handle_root(request=None)
     assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_health_server_disables_access_log(monkeypatch):
+    """AppRunner создаётся с access_log=None — иначе каждый опрос liveness-пробы
+    (раз в минуту) спамит в лог строкой GET /health 200 (access-лог aiohttp)."""
+    captured = {}
+
+    class FakeSite:
+        def __init__(self, runner, host, port):
+            pass
+
+        async def start(self):
+            pass
+
+    class FakeRunner:
+        def __init__(self, app, **kwargs):
+            captured.update(kwargs)
+
+        async def setup(self):
+            pass
+
+    monkeypatch.setattr(healthcheck.web, "AppRunner", FakeRunner)
+    monkeypatch.setattr(healthcheck.web, "TCPSite", FakeSite)
+
+    await healthcheck.start_health_server(check_interval=900, port=12345)
+
+    assert "access_log" in captured, "AppRunner вызван без access_log"
+    assert captured["access_log"] is None

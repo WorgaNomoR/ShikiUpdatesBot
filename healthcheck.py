@@ -139,7 +139,9 @@ async def start_health_server(
     app.router.add_get("/", _handle_root)
 
     try:
-        runner = web.AppRunner(app)
+        # access_log=None — гасим access-лог aiohttp: liveness-проба бьёт по
+        # /health раз в минуту, иначе это ~1440 строк "GET /health 200" в сутки.
+        runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, host="0.0.0.0", port=port)
         await site.start()
