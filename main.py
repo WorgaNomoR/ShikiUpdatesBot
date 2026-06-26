@@ -19,13 +19,13 @@ See the GNU General Public License for more details.
 import asyncio
 import html
 import json
-import os
 import logging
-import re
+import os
 import random
+import re
 import time
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -35,9 +35,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, BotCommand, FSInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    BotCommand,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
+
 from healthcheck import heartbeat, start_health_server
 
 # ─────────────────────────────────────────────
@@ -54,7 +59,11 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 
 SHIKI_USER     = "WNR"                   # ник на Shikimori (для API)
 SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь при смене зеркала
-DISPLAY_NAME   = "Ворга"                 # отображаемое имя в сообщениях
+
+# Отображаемое имя в сообщениях. Опционально через env DISPLAY_NAME;
+# по умолчанию — ник профиля (SHIKI_USER). Пустая строка/пробелы → фолбэк.
+DISPLAY_NAME   = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
+
 CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
 ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
 FULL_SYNC_INTERVAL = 6 * 60 * 60         # как часто пересинкивать stats_all в цикле (6 часов)
@@ -2693,6 +2702,10 @@ def _stats_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=label, callback_data=f"stats:{key}")
         )
     keyboard = [rows[r] for r in sorted(rows)]
+    # Кнопка закрытия меню — отдельным рядом снизу. Это не вариант отчёта
+    # (builder'а нет), поэтому не в _STATS_MENU: ключ "close" обрабатывается
+    # в stats_menu_cb до lookup'а builder'а.
+    keyboard.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="stats:close")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -2731,8 +2744,10 @@ async def cmd_stats(message: Message) -> None:
         await _send_stats_reports(message.bot, message.chat.id, msgs)
         return
 
-    # Иначе — показываем меню с кнопками
-    await message.answer(
+    # Иначе — показываем меню с кнопками. Отправляем ОТВЕТОМ на команду
+    # (reply): так у меню появляется reply_to_message — само сообщение /stats,
+    # и кнопка ❌ Закрыть сможет удалить заодно и команду.
+    await message.reply(
         "📊 <b>Какую статистику показать?</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=_stats_menu_kb(),
@@ -2747,6 +2762,36 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
     """
     data = callback.data or ""
     key = data.split(":", 1)[1] if ":" in data else ""
+
+    # ❌ Закрыть — не вариант отчёта (builder'а нет): просто убираем меню.
+    # Обрабатываем до lookup'а, иначе ключ ушёл бы в ветку 'Неизвестный вариант'.
+    if key == "close":
+        await callback.answer()
+        # callback.message может быть None (сообщение старше 48 ч) или
+        # InaccessibleMessage — тогда удалять нечего, тихо выходим.
+        msg = callback.message
+        if msg is None:
+            return
+        # Убираем сообщение с кнопками...
+        try:
+            await msg.delete()
+        except Exception as e:
+            log.debug("stats_menu_cb: не удалось удалить меню при закрытии: %s", e)
+            try:
+                await msg.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        # ...и саму команду /stats, на которую меню отвечало (reply_to_message),
+        # чтобы чат остался чистым. getattr — на случай InaccessibleMessage без
+        # этого поля. В личке бот вправе удалять входящие; если нельзя — лог и дальше.
+        cmd_msg = getattr(msg, "reply_to_message", None)
+        if cmd_msg is not None:
+            try:
+                await cmd_msg.delete()
+            except Exception as e:
+                log.debug("stats_menu_cb: не удалось удалить команду /stats: %s", e)
+        return
+
     builder = _STATS_BUILDERS.get(key)
 
     if builder is None:

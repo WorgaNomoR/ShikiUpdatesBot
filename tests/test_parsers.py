@@ -1,10 +1,9 @@
 from main import (
     _strip_html,
+    classify_event,
     extract_score,
     extract_score_change,
-    classify_event,
 )
-
 
 # ==========================================================
 # _strip_html

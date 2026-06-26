@@ -17,10 +17,13 @@
 Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
 
-import re
-import pytest
-import main
 import copy
+import re
+from unittest.mock import AsyncMock
+
+import pytest
+
+import main
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
@@ -307,7 +310,7 @@ async def test_collect_favourites_join_with_titles(monkeypatch):
     monkeypatch.setattr(main, "fetch_favourites", fake_fetch)
 
     class S:
-      pass
+        pass
     stats = await main._collect_favourites(S(), stats)
     fa = {e["id"]: e for e in stats["favourites"]["anime"]}
 
@@ -325,8 +328,8 @@ async def test_collect_favourites_api_fail_keeps_previous(monkeypatch):
         return None  # сбой API
     monkeypatch.setattr(main, "fetch_favourites", fake_fetch)
 
-    class S:
-      pass
+    class S: 
+        pass
     stats = await main._collect_favourites(S(), stats)
     # Прежнее избранное не затёрто
     assert stats["favourites"]["anime"] == [{"id": "1", "title": "Старое", "url": "/animes/1"}]
@@ -489,3 +492,75 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
     # но это no-op: запись цела, kind остался пустым (не выдумали вид)
     assert "999" in result["manga"]["titles"]
     assert result["manga"]["titles"]["999"]["kind"] == ""
+
+
+# ════════════════════════════════════════════════════════════════
+#  polish
+# ════════════════════════════════════════════════════════════════
+
+def test_stats_menu_kb_has_close_button():
+    """Меню /stats содержит кнопку ❌ Закрыть с callback_data 'stats:close'."""
+
+    kb = main._stats_menu_kb()
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    close = [b for b in buttons if b.callback_data == "stats:close"]
+    assert len(close) == 1, "ожидал ровно одну кнопку закрытия"
+    assert "Закры" in close[0].text
+
+
+@pytest.mark.asyncio
+async def test_cmd_stats_menu_is_reply():
+    """Меню /stats шлётся ответом (reply) на команду — иначе ❌ Закрыть
+    не сможет удалить саму команду (рвётся reply_to_message)."""
+
+    message = AsyncMock()
+    message.text = "/stats"
+
+    await main.cmd_stats(message)
+
+    message.reply.assert_awaited_once()
+    message.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_close_deletes_menu_and_command():
+    """stats:close удаляет и меню, и команду /stats (reply_to_message)."""
+
+    callback = AsyncMock()
+    callback.data = "stats:close"
+    callback.message = AsyncMock()
+    callback.message.reply_to_message = AsyncMock()
+
+    await main.stats_menu_cb(callback)
+
+    callback.answer.assert_awaited_once_with()
+    callback.message.delete.assert_awaited_once()
+    callback.message.reply_to_message.delete.assert_awaited_once()
+    callback.message.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_close_without_reply_does_not_crash():
+    """reply_to_message=None → закрытие удаляет только меню, без падения."""
+
+    callback = AsyncMock()
+    callback.data = "stats:close"
+    callback.message = AsyncMock()
+    callback.message.reply_to_message = None
+
+    await main.stats_menu_cb(callback)
+
+    callback.message.delete.assert_awaited_once()
+    callback.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_close_handles_none_message():
+    """callback.message=None (сообщение старше 48 ч) → close не падает."""
+ 
+    callback = AsyncMock()
+    callback.data = "stats:close"
+    callback.message = None
+
+    await main.stats_menu_cb(callback)
+    callback.answer.assert_awaited_once_with()

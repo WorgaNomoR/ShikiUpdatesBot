@@ -11,7 +11,6 @@ from main import (
     save_seen_favourites,
 )
 
-
 # Срез реального ответа /favourites: все 8 категорий, url=null везде,
 # у TeddyLoid russian="" (должен фолбэкнуться на name).
 FAV_SAMPLE = {

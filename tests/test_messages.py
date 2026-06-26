@@ -1,6 +1,6 @@
 import random
 
-from main import h, build_message
+from main import build_message, h
 
 
 def fixed_choice(seq):
