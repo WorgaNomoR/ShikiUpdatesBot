@@ -557,8 +557,9 @@ async def test_stats_menu_close_without_reply_does_not_crash():
 @pytest.mark.asyncio
 async def test_stats_menu_close_handles_none_message():
     """callback.message=None (сообщение старше 48 ч) → close не падает."""
-    import main
     from unittest.mock import AsyncMock
+
+    import main
 
     callback = AsyncMock()
     callback.data = "stats:close"
