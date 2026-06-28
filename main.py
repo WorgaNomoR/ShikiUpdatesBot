@@ -3577,8 +3577,8 @@ async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(BackupStates.waiting_import_file)
     prompt = await callback.message.edit_text(
         "📥 Пришли <b>.zip</b>-архив бэкапа (как файл-документ).\n\n"
-        "Восстановлю подписчиков, текущий квартал и снапшоты кварталов; "
-        "остальное из архива проигнорирую.\n\n/cancel — отмена",
+        "Возьму из него только нужное — подписчиков, текущий квартал и снапшоты "
+        "кварталов. Лишнее в архиве не помешает, спокойно пропущу.\n\n/cancel — отмена",
         parse_mode=ParseMode.HTML,
     )
     await state.update_data(prompt_msg_id=prompt.message_id)
