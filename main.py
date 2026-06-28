@@ -18,12 +18,14 @@ See the GNU General Public License for more details.
 
 import asyncio
 import html
+import io
 import json
 import logging
 import os
 import random
 import re
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -36,8 +38,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     CallbackQuery,
-    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -53,7 +55,7 @@ from healthcheck import heartbeat, start_health_server
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # Твой Telegram ID — узнать у @userinfobot.
-# Нужен для команд только для владельца (/subs, /export, /import, /broadcast).
+# Нужен для команд только для владельца (/subs, /backup, /broadcast).
 # Задать: export OWNER_ID="123456789"
 OWNER_ID = int(os.environ["OWNER_ID"])
 
@@ -67,6 +69,7 @@ DISPLAY_NAME   = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
 CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
 ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
 FULL_SYNC_INTERVAL = 6 * 60 * 60         # как часто пересинкивать stats_all в цикле (6 часов)
+WEEKLY_BACKUP_INTERVAL = 7 * 24 * 60 * 60  # интервал еженедельного авто-бэкапа состояния (по last_backup_at)
 
 # ─────────────────────────────────────────────
 #  ПУТИ К ФАЙЛАМ ДАННЫХ
@@ -1767,6 +1770,7 @@ def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict
         "period_start": qs,
         "tracking_since": tracking_since or qs,
         "last_report_sent": None,
+        "last_backup_at": None,   # время последнего авто-бэкапа (для еженедельной отправки)
         "events": [],   # [{id, media, event, score, recorded_at}]
     }
 
@@ -1787,6 +1791,8 @@ def load_stats_current() -> dict:
                 # Бэкофилл для файлов, созданных до появления поля tracking_since
                 if "tracking_since" not in data:
                     data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
+                # Бэкофилл для файлов до появления last_backup_at (еженедельный авто-бэкап)
+                data.setdefault("last_backup_at", None)
                 return data
             log.warning("load_stats_current: неожиданная структура, сбрасываем.")
     except (json.JSONDecodeError, OSError, ValueError) as e:
@@ -2550,6 +2556,15 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict) -> dict
         await asyncio.sleep(0.4)
     log.info("rotate_quarter: отчёт за %s отправлен владельцу (%d сообщ.).", old_period, len(report_msgs))
 
+    # Снапшот состояния по случаю ротации (страховка + сбрасывает недельный таймер)
+    fresh["last_backup_at"] = time.time()
+    save_stats_current(fresh)
+    await send_backup(
+        bot,
+        f"🗓️ Ротация квартала: {h(quarter_label(old_period))} → "
+        f"{h(quarter_label(now_period))}.\nСнапшот состояния.\n\n{BACKUP_TAG}",
+    )
+
     return fresh
 
 
@@ -3245,6 +3260,9 @@ async def polling_loop(bot: Bot) -> None:
             # Внутри — защита last_report_sent от повторной отправки.
             cur = await rotate_quarter_if_needed(bot, cur, load_stats_all())
 
+            # Еженедельный авто-бэкап состояния (по last_backup_at в stats_current).
+            cur = await _weekly_backup_if_due(bot, cur)
+
             heartbeat()  # отметить успешный цикл для healthcheck-watchdog
             log.info("Следующая проверка через %d мин.", CHECK_INTERVAL // 60)
         except asyncio.CancelledError:
@@ -3278,6 +3296,367 @@ async def polling_loop(bot: Bot) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  РЕЗЕРВНОЕ КОПИРОВАНИЕ (/backup) — ЭКСПОРТ / ИМПОРТ + АВТО-БЭКАП
+# ═══════════════════════════════════════════════════════════════
+#
+#  Экспорт = zip всего DATA_DIR (минус *.tmp-огрызки _atomic_write).
+#  Импорт  = по белому списку (subscribers, stats_current, quarters/*);
+#            всё прочее в архиве намеренно отбрасывается — seen_ids,
+#            seen_favourites и stats_all регенерируются сами, тащить их
+#            обратно незачем. Асимметрия экспорт(всё)/импорт(бел.список)
+#            сознательная: архив — и страховка состояния, и зонд внутрь
+#            эфемерного контейнера (apply.build без тома на /data).
+#  Доставка — всегда владельцу (OWNER_ID); в subscribers лежат chat_id.
+
+BACKUP_TAG = "#backup"
+
+# Бэкап при остановке (SIGTERM-триггер): дополняет событийные бэкапы, ловит
+# «последнюю милю» перед смертью контейнера на редеплое. Дебаунс — не слать,
+# если только что уже бэкапили; короткий таймаут — лучше не успеть, чем зависнуть.
+SHUTDOWN_BACKUP_DEBOUNCE = 60   # с: не дублировать shutdown-бэкап после свежего
+SHUTDOWN_BACKUP_TIMEOUT  = 8    # с: жёсткий потолок отправки в окне graceful-shutdown
+_last_backup_sent_at: float | None = None   # monotonic-метка последнего успешного бэкапа
+
+# Файлы DATA_DIR, которые восстанавливаем при импорте (см. асимметрию выше).
+_IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
+    "subscribers.json", "stats_current.json",
+})
+# Каталог снапшотов кварталов: разрешаем quarters/<period>.json.
+_IMPORT_ALLOWED_DIR = "quarters"
+
+
+class BackupStates(StatesGroup):
+    waiting_import_file = State()   # ждём .zip-архив от владельца
+
+
+def _subscriber_link(chat_id: int, name: str) -> str:
+    """Имя, обёрнутое в ссылку на профиль (tg://user?id=...).
+    Telegram открывает карточку пользователя по такой ссылке — владельцу
+    удобно сразу перейти к тому, кто подписался/отписался."""
+    return f'<a href="tg://user?id={chat_id}">{h(name)}</a>'
+
+
+def _backup_filename() -> str:
+    """Имя архива с меткой времени UTC — чтобы файлы не перезатирались в чате."""
+    return f"shikibot-backup-{_utcnow().strftime('%Y%m%d-%H%M%S')}.zip"
+
+
+def _build_backup_zip() -> bytes:
+    """Зипуем весь DATA_DIR в память. Исключаем *.tmp (недописанные хвосты
+    _atomic_write). arcname — путь относительно DATA_DIR, чтобы структура
+    (включая quarters/) восстановилась один-в-один. Возвращаем bytes —
+    готовый архив для BufferedInputFile, без временных файлов на диске."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(DATA_DIR.rglob("*")):
+            if not path.is_file() or path.name.endswith(".tmp"):
+                continue
+            zf.write(path, path.relative_to(DATA_DIR).as_posix())
+    return buf.getvalue()
+
+
+async def send_backup(bot: Bot, caption: str) -> bool:
+    """Собрать архив DATA_DIR и отправить владельцу. caption уже содержит
+    #backup. Любой сбой глушим и логируем: бэкап — фоновая страховка, он не
+    должен ронять вызывающий флоу (подписку, ротацию, цикл)."""
+    global _last_backup_sent_at
+    try:
+        data = _build_backup_zip()
+    except Exception as e:
+        log.error("send_backup: не удалось собрать архив: %s", e)
+        return False
+    try:
+        await bot.send_document(
+            OWNER_ID,
+            document=BufferedInputFile(data, filename=_backup_filename()),
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        log.info("send_backup: архив отправлен владельцу (%d байт).", len(data))
+        _last_backup_sent_at = time.monotonic()
+        return True
+    except Exception as e:
+        log.error("send_backup: не удалось отправить владельцу: %s", e)
+        return False
+
+
+async def _shutdown_backup(bot: Bot) -> None:
+    """Финальный бэкап при остановке. aiogram сам ловит SIGTERM/SIGINT и эмитит
+    событие shutdown, к которому мы цепляемся (dp.shutdown.register). SIGTERM от
+    хостинга = плановый редеплой/рестарт. Это ДОПОЛНЕНИЕ к событийным авто-бэкапам,
+    а не замена: ловит «последнюю милю» перед смертью контейнера. Дебаунс — если
+    бэкап уходил только что, второй не шлём. Короткий таймаут — лучше не успеть,
+    чем зависнуть и быть убитым жёстко на полпути. SIGKILL/OOM/слишком короткий
+    grace этим не покрыть by design — на то и событийные бэкапы (две сети внахлёст).
+    Бонус: само сообщение — сигнал владельцу «бот гасится», на проде нетипично."""
+    if (_last_backup_sent_at is not None
+            and time.monotonic() - _last_backup_sent_at < SHUTDOWN_BACKUP_DEBOUNCE):
+        log.info("_shutdown_backup: недавний бэкап свежий, на shutdown не дублирую.")
+        return
+    caption = (f"🔻 Бот завершает работу (SIGTERM). Финальный снапшот состояния.\n\n"
+               f"{BACKUP_TAG}")
+    try:
+        await asyncio.wait_for(send_backup(bot, caption), timeout=SHUTDOWN_BACKUP_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("_shutdown_backup: отправка не уложилась в %d с — выходим без бэкапа.",
+                    SHUTDOWN_BACKUP_TIMEOUT)
+
+
+def _is_allowed_import_member(name: str) -> bool:
+    """Разрешено ли имя из архива к восстановлению?
+    Бел.список: subscribers.json, stats_current.json, quarters/<имя>.json.
+    Глушим zip-slip: '..'-сегменты, абсолютные пути и бэкслеши отвергаем."""
+    if not name or name.endswith("/"):
+        return False
+    if name.startswith("/") or "\\" in name or ".." in name.split("/"):
+        return False
+    if name in _IMPORT_ALLOWED_FILES:
+        return True
+    parts = name.split("/")
+    return (
+        len(parts) == 2
+        and parts[0] == _IMPORT_ALLOWED_DIR
+        and parts[1].endswith(".json")
+    )
+
+
+def _valid_import_payload(name: str, obj) -> bool:
+    """Грубая проверка структуры восстанавливаемого файла: чтобы синтаксически
+    валидный, но мусорный по смыслу JSON не затёр рабочее состояние. Проверяем
+    ровно ту форму, которую ждут загрузчики (load_subscribers/load_stats_current
+    и чтение снапшотов), не строже — иначе отвергли бы легитимные старые файлы."""
+    if name == "subscribers.json":
+        subs = obj.get("subscribers") if isinstance(obj, dict) else None
+        if not isinstance(subs, dict):
+            return False
+        try:                       # ключи — chat_id, должны приводиться к int
+            for k in subs:
+                int(k)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if name == "stats_current.json":
+        return (isinstance(obj, dict) and "period" in obj
+                and isinstance(obj.get("events"), list))
+    if name.startswith(_IMPORT_ALLOWED_DIR + "/"):
+        return isinstance(obj, dict) and "period" in obj
+    return False
+
+
+def restore_backup_zip(raw: bytes) -> dict:
+    """Восстанавливаем состояние из архива по белому списку.
+    Каждый разрешённый член сперва валидируем как JSON и только потом пишем
+    атомарно (_atomic_write) в DATA_DIR — частичное/битое состояние не льём.
+    Возвращаем {'restored': [...], 'skipped': [...]}.
+    Бросаем ValueError, если архив битый или в нём нет ни одного валидного
+    файла из белого списка."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"битый zip-архив: {e}") from e
+
+    restored: list[str] = []
+    skipped: list[str] = []
+    pending: dict[str, str] = {}
+    with zf:
+        for info in zf.infolist():
+            name = info.filename
+            if info.is_dir():
+                continue
+            if not _is_allowed_import_member(name):
+                skipped.append(name)
+                continue
+            try:
+                payload = zf.read(name).decode("utf-8")
+                obj = json.loads(payload)   # синтаксически валидный JSON?
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                log.warning("restore_backup_zip: пропускаю битый %s: %s", name, e)
+                skipped.append(name)
+                continue
+            if not _valid_import_payload(name, obj):   # и похож на ожидаемую структуру?
+                log.warning("restore_backup_zip: %s не похож на ожидаемый формат — пропускаю.", name)
+                skipped.append(name)
+                continue
+            pending[name] = payload
+
+    if not pending:
+        raise ValueError("в архиве нет валидных файлов из белого списка")
+
+    for name, payload in pending.items():
+        _atomic_write(DATA_DIR / name, payload)
+        restored.append(name)
+    log.info("restore_backup_zip: восстановлено %d, пропущено %d.",
+             len(restored), len(skipped))
+    return {"restored": restored, "skipped": skipped}
+
+
+async def _backup_after_subscription(
+    bot: Bot, chat_id: int, name: str, subscribed: bool,
+) -> None:
+    """Авто-бэкап на (от)подписку: владельцу уходит свежий архив состояния,
+    в подписи — кто и что сделал (имя кликабельно, ведёт в профиль) и сколько
+    подписчиков осталось. «Два в одном»: индикация события + страховка списка."""
+    subs = load_subscribers()
+    head = (f"➕ Новый подписчик: {_subscriber_link(chat_id, name)}"
+            if subscribed else
+            f"➖ Отписался: {_subscriber_link(chat_id, name)}")
+    caption = f"{head}\nВсего подписчиков: <b>{len(subs)}</b>\n\n{BACKUP_TAG}"
+    await send_backup(bot, caption)
+
+
+async def _weekly_backup_if_due(bot: Bot, cur: dict) -> dict:
+    """Еженедельный авто-бэкап состояния по метке last_backup_at в stats_current.
+    Первый раз (метки нет) — только проставляем время, не шлём: иначе на каждом
+    рестарте эфемерного хоста улетал бы бэкап. Первый плановый уйдёт через
+    WEEKLY_BACKUP_INTERVAL аптайма; под/отписки и ротация бэкапят независимо."""
+    now = time.time()
+    last = cur.get("last_backup_at")
+    if last is None:
+        cur["last_backup_at"] = now
+        save_stats_current(cur)
+        return cur
+    if (now - last) < WEEKLY_BACKUP_INTERVAL:
+        return cur
+    caption = (f"🗓️ Еженедельный бэкап состояния.\n"
+               f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}")
+    if await send_backup(bot, caption):
+        cur["last_backup_at"] = now
+        save_stats_current(cur)
+    return cur
+
+
+def _backup_menu_kb() -> InlineKeyboardMarkup:
+    """Инлайн-меню /backup: экспорт и импорт."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📤 Экспорт", callback_data="backup:export"),
+            InlineKeyboardButton(text="📥 Импорт",  callback_data="backup:import"),
+        ],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="backup:close")],
+    ])
+
+
+async def cmd_backup(message: Message) -> None:
+    """Меню резервного копирования (только для владельца)."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+    # Отправляем ОТВЕТОМ на команду (reply): у меню появляется reply_to_message
+    # = само сообщение /backup, и кнопка ❌ Закрыть удалит заодно и команду.
+    await message.reply(
+        "💾 <b>Резервное копирование</b>\n\n"
+        "📤 <b>Экспорт</b> — пришлю zip-архив всего состояния "
+        "(подписчики, статистика, кварталы).\n"
+        "📥 <b>Импорт</b> — восстановлю из архива подписчиков, текущий квартал "
+        "и снапшоты кварталов.",
+        reply_markup=_backup_menu_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def backup_export_cb(callback: CallbackQuery) -> None:
+    """Кнопка «Экспорт» — собираем и шлём архив, меню убираем."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    await callback.answer("Собираю архив...")
+    bot, chat_id = callback.message.bot, callback.message.chat.id
+    await _safe_delete(bot, chat_id, callback.message.message_id)
+    caption = (f"📤 Экспорт состояния.\n"
+               f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}")
+    if not await send_backup(bot, caption):
+        await bot.send_message(chat_id, "❌ Не удалось собрать/отправить архив — см. логи.")
+
+
+async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Кнопка «Импорт» — входим в FSM ожидания .zip-файла."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(BackupStates.waiting_import_file)
+    prompt = await callback.message.edit_text(
+        "📥 Пришли <b>.zip</b>-архив бэкапа (как файл-документ).\n\n"
+        "Возьму из него только нужное — подписчиков, текущий квартал и снапшоты "
+        "кварталов. Лишнее в архиве не помешает, спокойно пропущу.\n\n/cancel — отмена",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.update_data(prompt_msg_id=prompt.message_id)
+
+
+async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Кнопка «❌ Закрыть» — убираем меню и саму команду /backup. Тот же
+    отработанный паттерн, что и ❌ Закрыть в /stats: меню отправлено reply'ем
+    на команду, поэтому reply_to_message = сообщение /backup, и его тоже чистим."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    await state.clear()   # защитно: Закрыть снимает любое повисшее FSM-состояние
+    await callback.answer()
+    msg = callback.message
+    if msg is None:   # сообщение старше 48 ч / InaccessibleMessage — удалять нечего
+        return
+    try:
+        await msg.delete()
+    except Exception as e:
+        log.debug("backup_close_cb: не удалось удалить меню: %s", e)
+        try:
+            await msg.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    cmd_msg = getattr(msg, "reply_to_message", None)
+    if cmd_msg is not None:
+        try:
+            await cmd_msg.delete()
+        except Exception as e:
+            log.debug("backup_close_cb: не удалось удалить команду /backup: %s", e)
+
+
+async def backup_receive(message: Message, state: FSMContext) -> None:
+    """Принять .zip от владельца, восстановить по белому списку, отчитаться."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        return
+    doc = message.document
+    if not doc or not (doc.file_name or "").lower().endswith(".zip"):
+        await message.answer("📎 Жду <b>.zip</b>-архив бэкапа. Или /cancel.",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    fsm = await state.get_data()
+    await state.clear()
+    prompt_id = fsm.get("prompt_msg_id")
+    if prompt_id:
+        await _safe_delete(message.bot, message.chat.id, prompt_id)
+
+    try:
+        buf = io.BytesIO()
+        await message.bot.download(doc, destination=buf)
+        raw = buf.getvalue()
+    except Exception as e:
+        await message.answer(f"❌ Не удалось скачать файл: {h(str(e))}",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        result = restore_backup_zip(raw)
+    except ValueError as e:
+        await message.answer(f"❌ Архив не восстановлен: {h(str(e))}",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    restored, skipped = result["restored"], result["skipped"]
+    lines = [f"✅ Восстановлено файлов: <b>{len(restored)}</b>"]
+    lines += [f"  • <code>{h(n)}</code>" for n in restored]
+    if "subscribers.json" in restored:
+        lines.append(f"\n👥 Подписчиков теперь: <b>{len(load_subscribers())}</b>")
+    if skipped:
+        lines.append(f"\n⏭️ Пропущено (вне белого списка/битые): {len(skipped)}")
+    await _safe_delete(message.bot, message.chat.id, message.message_id)
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+
+# ═══════════════════════════════════════════════════════════════
 #  КОМАНДЫ БОТА
 # ═══════════════════════════════════════════════════════════════
 
@@ -3296,6 +3675,7 @@ async def cmd_start(message: Message) -> None:
     subs[chat_id] = name
     save_subscribers(subs)
     log.info("Новый подписчик: %s (chat_id=%d). Всего: %d.", name, chat_id, len(subs))
+    await _backup_after_subscription(message.bot, chat_id, name, subscribed=True)
     reply = (
         f"✅ Подписка оформлена, {name}!\n"
         f"Теперь ты будешь получать уведомления об активности {DISPLAY_NAME} на Shikimori. \U0001f3cc\n\n"
@@ -3319,6 +3699,7 @@ async def cmd_stop(message: Message) -> None:
     subs.pop(chat_id)
     save_subscribers(subs)
     log.info("Отписался: %s (chat_id=%d). Осталось: %d.", name, chat_id, len(subs))
+    await _backup_after_subscription(message.bot, chat_id, name, subscribed=False)
     reply = (
         f"👋 Ты отписан, {name}. Жаль терять такого зрителя!\n"
         "Если передумаешь — /start"
@@ -3343,63 +3724,6 @@ async def cmd_subs(message: Message) -> None:
         lines.append(f"{i}. {h(uname)} (<code>{cid}</code>)")
     sep = "\n"
     await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
-
-
-async def cmd_export(message: Message) -> None:
-    """Отправить subscribers.json владельцу."""
-    if message.from_user is None or message.from_user.id != OWNER_ID:
-        await message.answer("🚫 Эта команда только для владельца бота.")
-        return
-
-    path = Path(SUBS_FILE)
-    if not path.exists() or path.stat().st_size == 0:
-        await message.answer("📭 Файл подписчиков пуст или не существует.")
-        return
-
-    subs = load_subscribers()
-    await message.answer_document(
-        document=FSInputFile(path, filename="subscribers.json"),
-        caption=f"📤 Экспорт подписчиков — {len(subs)} чел.",
-    )
-    log.info("Экспорт subscribers.json отправлен владельцу.")
-
-
-async def cmd_import(message: Message) -> None:
-    """
-    Загрузить subscribers.json из присланного файла.
-    Использование: отправить файл боту с подписью /import
-    (или переслать команду отдельным сообщением — бот попросит прислать файл).
-    """
-    if message.from_user is None or message.from_user.id != OWNER_ID:
-        await message.answer("🚫 Эта команда только для владельца бота.")
-        return
-
-    if not message.document:
-        await message.answer(
-            "📎 Пришли файл <code>subscribers.json</code> боту с подписью <code>/import</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if not (message.document.file_name or "").endswith(".json"):
-        await message.answer("❌ Ожидается .json файл.")
-        return
-
-    tmp_path = SUBS_FILE.with_name(SUBS_FILE.name + ".import_tmp")
-    try:
-        await message.bot.download(message.document, destination=tmp_path)
-        raw = Path(tmp_path).read_text(encoding="utf-8")
-        data = json.loads(raw)
-        subs = {int(k): v for k, v in data.get("subscribers", {}).items()}
-    except Exception as e:
-        await message.answer(f"❌ Не удалось прочитать файл: {e}")
-        return
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    save_subscribers(subs)
-    log.info("Импортировано %d подписчиков от владельца.", len(subs))
-    await message.answer(f"✅ Импортировано подписчиков: {len(subs)}")
 
 
 async def cmd_broadcast(message: Message, state: FSMContext) -> None:
@@ -3646,8 +3970,7 @@ async def main() -> None:
     dp.message.register(cmd_start,     Command("start"))
     dp.message.register(cmd_stop,      Command("stop"))
     dp.message.register(cmd_subs,      Command("subs"))
-    dp.message.register(cmd_export,    Command("export"))
-    dp.message.register(cmd_import,    Command("import"))
+    dp.message.register(cmd_backup,    Command("backup"))
     dp.message.register(cmd_status,    Command("status"))
     dp.message.register(cmd_broadcast, Command("broadcast"))
     dp.message.register(cmd_cancel,    Command("cancel"))
@@ -3658,6 +3981,12 @@ async def main() -> None:
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
     dp.callback_query.register(broadcast_confirm_cb, F.data == "broadcast_send",   BroadcastStates.waiting_confirm)
     dp.callback_query.register(broadcast_cancel_cb,  F.data == "broadcast_cancel", BroadcastStates.waiting_confirm)
+
+    # FSM-обработчик и кнопки для /backup
+    dp.message.register(backup_receive, BackupStates.waiting_import_file)
+    dp.callback_query.register(backup_export_cb, F.data == "backup:export")
+    dp.callback_query.register(backup_import_cb, F.data == "backup:import")
+    dp.callback_query.register(backup_close_cb,  F.data == "backup:close")
 
     # Кнопки меню /stats (callback_data вида "stats:<ключ>")
     dp.callback_query.register(stats_menu_cb, F.data.startswith("stats:"))
@@ -3689,6 +4018,9 @@ async def main() -> None:
 
     # Healthcheck-сервер (для хостингов с обязательным портом + watchdog)
     await start_health_server(check_interval=CHECK_INTERVAL)
+
+    # Финальный бэкап при остановке (aiogram ловит SIGTERM/SIGINT → emit_shutdown)
+    dp.shutdown.register(_shutdown_backup)
 
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
