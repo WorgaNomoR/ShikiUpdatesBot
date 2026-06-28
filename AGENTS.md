@@ -17,7 +17,7 @@
 
 ## Key patterns and conventions
 - Environment variables: `BOT_TOKEN`, `OWNER_ID` are required at runtime. Optional `DATA_DIR` (default `/data`) controls persistent file location; optional `PORT` (default `8080`) controls the healthcheck server port.
-- The bot stores state in JSON files under `DATA_DIR`: `seen_ids.json`, `subscribers.json`, `seen_favourites.json`, `stats_all.json`, `stats_current.json`, and snapshots in `quarters/`.
+- The bot stores state in JSON files under `DATA_DIR`: `seen_ids.json`, `subscribers.json`, `seen_favourites.json`, `stats_all.json`, `stats_current.json`, and snapshots in `quarters/`; `stats_current.json` additionally holds `last_backup_at`, the weekly auto-backup marker.
 - All file writes go through `_atomic_write()` (temp file + `os.replace()`) for crash safety.
 - All Telegram messages use `ParseMode.HTML`; user-facing strings from the API are escaped via `h()` (`html.escape`).
 - **Stability is the top priority.** Every function must be exception-safe: unexpected or missing data must never crash the bot. Network fetches return `None` on any error (not empty collections) to distinguish API failures from genuinely empty results. Statistics degrade gracefully — a failed export or GraphQL call yields a report without enriched metadata rather than a crash.
@@ -26,6 +26,7 @@
 - The bot's lifecycle is managed by `asyncio`: `polling_loop` runs as a background task created in `main()`, alongside `dp.start_polling` and the healthcheck server.
 - Use `pytest tests/` to validate changes; `tests/conftest.py` provides default env vars (incl. a temp `DATA_DIR`) for test execution.
 - Preserve existing behaviour for Shikimori event filtering, favourite notifications, and statistics aggregation when modifying logic.
+- `/backup` (owner-only) zips the whole `DATA_DIR` for export and restores a whitelist (`subscribers.json`, `stats_current.json`, `quarters/*.json`) on import; the owner also receives automatic backups (tag `#backup`) on subscribe/unsubscribe, quarter rotation, and weekly (via the `last_backup_at` marker). Replaces the former `/export` and `/import`.
 
 ## Gotchas discovered the hard way (read before touching stats/links)
 - **GraphQL vs REST URL formats differ.** GraphQL Shikimori returns FULL urls (`https://shikimori.io/animes/123`), while REST history returns RELATIVE (`/animes/123`). All link-building code prepends `SHIKI_BASE_URL`, so a full url would produce a double-domain broken link. `_rel_url()` normalizes any url to relative form — it is applied at the source (`fetch_meta_batch`) and defensively at every render point. When adding new link rendering, run urls through `_rel_url()`.

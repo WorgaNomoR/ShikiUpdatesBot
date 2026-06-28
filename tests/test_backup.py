@@ -1,0 +1,496 @@
+"""
+Тесты ветки backup: /backup (экспорт/импорт zip) + авто-бэкап состояния.
+
+Дисциплина: каждый тест падает на непропатченном коде и проходит на
+пропатченном. Полные aiogram-объекты — через unittest.mock; узкая поверхность —
+ручными стабами. Файлы DATA_DIR редиректятся в tmp_path фикстурой backup_env.
+"""
+import io
+import json
+import time
+import zipfile
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+import main
+
+
+# ─────────────────────────────────────────────────────────────
+#  Фикстуры
+# ─────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def backup_env(tmp_path, monkeypatch):
+    """Редиректим пути состояния в tmp_path, чтобы тесты не трогали /data."""
+    data = tmp_path / "data"
+    quarters = data / "quarters"
+    quarters.mkdir(parents=True)
+    monkeypatch.setattr(main, "DATA_DIR", data)
+    monkeypatch.setattr(main, "SUBS_FILE", data / "subscribers.json")
+    monkeypatch.setattr(main, "STATS_CURRENT_FILE", data / "stats_current.json")
+    monkeypatch.setattr(main, "STATS_ALL_FILE", data / "stats_all.json")
+    monkeypatch.setattr(main, "SEEN_IDS_FILE", data / "seen_ids.json")
+    monkeypatch.setattr(main, "SEEN_FAVS_FILE", data / "seen_favourites.json")
+    monkeypatch.setattr(main, "QUARTERS_DIR", quarters)
+    monkeypatch.setattr(main, "OWNER_ID", 999)
+    return data
+
+
+def _zip_bytes(members: dict[str, str]) -> bytes:
+    """Собрать zip из {arcname: text-content} в bytes."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in members.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────
+#  Сборка архива
+# ─────────────────────────────────────────────────────────────
+
+def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
+    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
+    (backup_env / "stats_current.json").write_text('{"period": "2026-Q2"}', encoding="utf-8")
+    (backup_env / "subscribers.json.tmp").write_text("garbage", encoding="utf-8")
+    (backup_env / "quarters" / "2026-Q1.json").write_text('{"period": "2026-Q1"}', encoding="utf-8")
+
+    raw = main._build_backup_zip()
+    names = set(zipfile.ZipFile(io.BytesIO(raw)).namelist())
+
+    assert "subscribers.json" in names
+    assert "stats_current.json" in names
+    assert "quarters/2026-Q1.json" in names          # вложенность сохранена
+    assert "subscribers.json.tmp" not in names       # *.tmp исключён
+
+
+# ─────────────────────────────────────────────────────────────
+#  Белый список импорта / zip-slip
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("name", [
+    "subscribers.json",
+    "stats_current.json",
+    "quarters/2026-Q1.json",
+    "quarters/2025-Q4.json",
+])
+def test_is_allowed_import_member_accepts_whitelist(name):
+    assert main._is_allowed_import_member(name) is True
+
+
+@pytest.mark.parametrize("name", [
+    "seen_ids.json",                 # регенерируется — не восстанавливаем
+    "seen_favourites.json",
+    "stats_all.json",
+    "quarters/evil.txt",             # не .json
+    "quarters/sub/deep.json",        # глубже одного уровня
+    "../etc/passwd",                 # zip-slip
+    "/abs/path.json",                # абсолютный
+    "quarters/../subscribers.json",  # '..'-сегмент
+    "weird\\back.json",              # бэкслеш
+    "",                              # пусто
+    "nested/",                       # каталог
+])
+def test_is_allowed_import_member_rejects_junk_and_zip_slip(name):
+    assert main._is_allowed_import_member(name) is False
+
+
+# ─────────────────────────────────────────────────────────────
+#  Восстановление
+# ─────────────────────────────────────────────────────────────
+
+def test_restore_round_trip(backup_env):
+    raw = _zip_bytes({
+        "subscribers.json": '{"subscribers": {"123": "Alice"}}',
+        "stats_current.json": '{"period": "2026-Q2", "events": []}',
+        "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
+        "seen_ids.json": '{"seen_ids": [1, 2, 3]}',   # должен быть отброшен
+    })
+    result = main.restore_backup_zip(raw)
+
+    assert set(result["restored"]) == {
+        "subscribers.json", "stats_current.json", "quarters/2026-Q1.json",
+    }
+    assert "seen_ids.json" in result["skipped"]
+    # файлы реально записаны
+    assert main.load_subscribers() == {123: "Alice"}
+    assert (backup_env / "quarters" / "2026-Q1.json").exists()
+    assert not (backup_env / "seen_ids.json").exists()
+
+
+def test_restore_skips_corrupt_json(backup_env):
+    raw = _zip_bytes({
+        "subscribers.json": '{"subscribers": {"1": "Bob"}}',
+        "stats_current.json": "{ это не json",   # битый — пропускаем
+    })
+    result = main.restore_backup_zip(raw)
+    assert "subscribers.json" in result["restored"]
+    assert "stats_current.json" in result["skipped"]
+    assert not (backup_env / "stats_current.json").exists()
+
+
+def test_restore_bad_zip_raises(backup_env):
+    with pytest.raises(ValueError):
+        main.restore_backup_zip(b"this is not a zip")
+
+
+def test_restore_no_valid_members_raises(backup_env):
+    raw = _zip_bytes({"seen_ids.json": "{}", "junk.txt": "x"})
+    with pytest.raises(ValueError):
+        main.restore_backup_zip(raw)
+
+
+def test_restore_partial_corrupt_does_not_write_before_validation(backup_env):
+    # битый stats_current не должен оставить полузаписанный файл
+    raw = _zip_bytes({"stats_current.json": "{bad"})
+    with pytest.raises(ValueError):
+        main.restore_backup_zip(raw)
+    assert not (backup_env / "stats_current.json").exists()
+
+
+# ─────────────────────────────────────────────────────────────
+#  send_backup
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_send_backup_success_sends_to_owner_with_tag(backup_env):
+    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
+    bot = AsyncMock()
+    ok = await main.send_backup(bot, f"тест {main.BACKUP_TAG}")
+    assert ok is True
+    bot.send_document.assert_awaited_once()
+    args, kwargs = bot.send_document.call_args
+    assert args[0] == main.OWNER_ID                  # доставка владельцу
+    assert main.BACKUP_TAG in kwargs["caption"]
+    assert isinstance(kwargs["document"], main.BufferedInputFile)
+
+
+@pytest.mark.asyncio
+async def test_send_backup_swallows_send_errors(backup_env):
+    bot = AsyncMock()
+    bot.send_document.side_effect = RuntimeError("telegram down")
+    ok = await main.send_backup(bot, "x")
+    assert ok is False   # сбой не пробрасывается
+
+
+# ─────────────────────────────────────────────────────────────
+#  Ссылка на профиль
+# ─────────────────────────────────────────────────────────────
+
+def test_subscriber_link_wraps_name_in_tg_profile_link():
+    link = main._subscriber_link(42, "Алиса")
+    assert 'href="tg://user?id=42"' in link
+    assert ">Алиса<" in link
+
+
+def test_subscriber_link_escapes_html_in_name():
+    link = main._subscriber_link(1, "<b>x</b>")
+    assert "&lt;b&gt;" in link   # имя экранировано
+
+
+# ─────────────────────────────────────────────────────────────
+#  Авто-бэкап на под/отписку
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_backup_after_subscription_subscribe(backup_env, monkeypatch):
+    (backup_env / "subscribers.json").write_text(
+        '{"subscribers": {"7": "Neo"}}', encoding="utf-8")
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+    bot = AsyncMock()
+
+    await main._backup_after_subscription(bot, 7, "Neo", subscribed=True)
+
+    sent.assert_awaited_once()
+    caption = sent.call_args.args[1]
+    assert "➕" in caption
+    assert 'tg://user?id=7' in caption
+    assert main.BACKUP_TAG in caption
+
+
+@pytest.mark.asyncio
+async def test_backup_after_subscription_unsubscribe(backup_env, monkeypatch):
+    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+
+    await main._backup_after_subscription(AsyncMock(), 5, "Trinity", subscribed=False)
+
+    caption = sent.call_args.args[1]
+    assert "➖" in caption
+    assert 'tg://user?id=5' in caption
+
+
+# ─────────────────────────────────────────────────────────────
+#  Еженедельный авто-бэкап
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_weekly_backup_first_time_marks_without_sending(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+    cur = {"period": "2026-Q2", "events": []}   # нет last_backup_at
+
+    out = await main._weekly_backup_if_due(AsyncMock(), cur)
+
+    sent.assert_not_awaited()
+    assert isinstance(out["last_backup_at"], float)
+
+
+@pytest.mark.asyncio
+async def test_weekly_backup_not_due_does_nothing(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+    ts = time.time()
+    cur = {"period": "2026-Q2", "events": [], "last_backup_at": ts}
+
+    out = await main._weekly_backup_if_due(AsyncMock(), cur)
+
+    sent.assert_not_awaited()
+    assert out["last_backup_at"] == ts
+
+
+@pytest.mark.asyncio
+async def test_weekly_backup_due_sends_and_updates(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+    old = time.time() - main.WEEKLY_BACKUP_INTERVAL - 100
+    cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
+
+    out = await main._weekly_backup_if_due(AsyncMock(), cur)
+
+    sent.assert_awaited_once()
+    assert out["last_backup_at"] > old
+
+
+@pytest.mark.asyncio
+async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monkeypatch):
+    monkeypatch.setattr(main, "send_backup", AsyncMock(return_value=False))
+    old = time.time() - main.WEEKLY_BACKUP_INTERVAL - 100
+    cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
+
+    out = await main._weekly_backup_if_due(AsyncMock(), cur)
+
+    assert out["last_backup_at"] == old   # не сдвигаем метку, если не ушло
+
+
+# ─────────────────────────────────────────────────────────────
+#  Команда /backup и интеграция в под/отписку
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cmd_backup_rejects_non_owner(backup_env):
+    msg = MagicMock()
+    msg.from_user.id = 1  # не владелец
+    msg.answer = AsyncMock()
+    await main.cmd_backup(msg)
+    msg.answer.assert_awaited_once()
+    # меню не показано (нет reply_markup)
+    assert "reply_markup" not in msg.answer.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_cmd_backup_owner_shows_menu(backup_env):
+    msg = MagicMock()
+    msg.from_user.id = main.OWNER_ID
+    msg.reply = AsyncMock()
+    await main.cmd_backup(msg)
+    kwargs = msg.reply.call_args.kwargs
+    assert "reply_markup" in kwargs   # инлайн-меню есть
+
+
+@pytest.mark.asyncio
+async def test_cmd_start_triggers_auto_backup(backup_env, monkeypatch):
+    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user.full_name = "Morpheus"
+    msg.from_user.id = 555
+    msg.answer = AsyncMock()
+    msg.bot = AsyncMock()
+
+    await main.cmd_start(msg)
+
+    assert main.load_subscribers() == {555: "Morpheus"}   # подписка сохранена
+    sent.assert_awaited_once()                            # бэкап ушёл
+
+
+# ─────────────────────────────────────────────────────────────
+#  Структура stats_current
+# ─────────────────────────────────────────────────────────────
+
+def test_empty_stats_current_has_last_backup_at():
+    fresh = main._empty_stats_current("2026-Q2")
+    assert "last_backup_at" in fresh
+    assert fresh["last_backup_at"] is None
+
+
+def test_load_stats_current_backfills_last_backup_at(backup_env):
+    # файл старого формата без last_backup_at
+    main.STATS_CURRENT_FILE.write_text(json.dumps({
+        "period": "2026-Q2",
+        "period_start": "2026-04-01T00:00:00",
+        "tracking_since": "2026-04-01T00:00:00",
+        "last_report_sent": None,
+        "events": [],
+    }), encoding="utf-8")
+    data = main.load_stats_current()
+    assert data["last_backup_at"] is None
+
+# ─────────────────────────────────────────────────────────────
+#  Бэкап при остановке (SIGTERM) + monotonic-метка для дебаунса
+# ─────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _reset_backup_clock(monkeypatch):
+    """Сбрасываем monotonic-метку последнего бэкапа между тестами (изоляция)."""
+    monkeypatch.setattr(main, "_last_backup_sent_at", None)
+
+
+@pytest.mark.asyncio
+async def test_send_backup_sets_last_backup_clock(backup_env):
+    bot = AsyncMock()
+    assert main._last_backup_sent_at is None
+    await main.send_backup(bot, f"x {main.BACKUP_TAG}")
+    assert isinstance(main._last_backup_sent_at, float)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_backup_sends_when_no_recent(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr(main, "_last_backup_sent_at", None)
+    await main._shutdown_backup(AsyncMock())
+    sent.assert_awaited_once()
+    caption = sent.call_args.args[1]
+    assert main.BACKUP_TAG in caption
+    assert "SIGTERM" in caption
+
+
+@pytest.mark.asyncio
+async def test_shutdown_backup_debounced_when_recent(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr(main, "_last_backup_sent_at", main.time.monotonic())
+    await main._shutdown_backup(AsyncMock())
+    sent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
+    monkeypatch.setattr(main, "_last_backup_sent_at", None)
+    monkeypatch.setattr(main, "SHUTDOWN_BACKUP_TIMEOUT", 0.01)
+
+    async def _slow(_bot, _caption):
+        await main.asyncio.sleep(0.2)
+        return True
+
+    monkeypatch.setattr(main, "send_backup", _slow)
+    await main._shutdown_backup(AsyncMock())   # не должно бросить
+
+
+# ─────────────────────────────────────────────────────────────
+#  Кнопка «Закрыть» в меню /backup (паттерн как у /stats)
+# ─────────────────────────────────────────────────────────────
+
+def test_backup_menu_has_close_button():
+    kb = main._backup_menu_kb()
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "backup:close" in datas
+
+
+@pytest.mark.asyncio
+async def test_backup_close_deletes_menu_and_command(backup_env):
+    cmd_msg = MagicMock()
+    cmd_msg.delete = AsyncMock()
+    menu = MagicMock()
+    menu.delete = AsyncMock()
+    menu.reply_to_message = cmd_msg
+    cb = MagicMock()
+    cb.from_user.id = main.OWNER_ID
+    cb.message = menu
+    cb.answer = AsyncMock()
+
+    await main.backup_close_cb(cb, AsyncMock())
+
+    menu.delete.assert_awaited_once()
+    cmd_msg.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_backup_close_handles_missing_message(backup_env):
+    cb = MagicMock()
+    cb.from_user.id = main.OWNER_ID
+    cb.message = None
+    cb.answer = AsyncMock()
+    await main.backup_close_cb(cb, AsyncMock())   # не должно бросить
+
+
+@pytest.mark.asyncio
+async def test_backup_close_rejects_non_owner(backup_env):
+    cb = MagicMock()
+    cb.from_user.id = 1
+    cb.message = MagicMock()
+    cb.message.delete = AsyncMock()
+    cb.answer = AsyncMock()
+    await main.backup_close_cb(cb, AsyncMock())
+    cb.message.delete.assert_not_awaited()
+
+
+# ─────────────────────────────────────────────────────────────
+#  Проверка СТРУКТУРЫ при импорте (не только well-formed JSON)
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("payload", [
+    '{"foo": "bar"}',                # нет ключа subscribers
+    '[1, 2, 3]',                     # список вместо объекта (роняет load_subscribers)
+    '{"subscribers": [1, 2, 3]}',    # subscribers не словарь
+    '{"subscribers": {"abc": "x"}}', # ключ не приводится к int (не chat_id)
+])
+def test_restore_rejects_malformed_subscribers(backup_env, payload):
+    raw = _zip_bytes({"subscribers.json": payload})
+    with pytest.raises(ValueError):          # единственный файл невалиден → нечего восстанавливать
+        main.restore_backup_zip(raw)
+    assert not (backup_env / "subscribers.json").exists()
+
+
+def test_restore_skips_bad_shape_keeps_good(backup_env):
+    raw = _zip_bytes({
+        "subscribers.json": '{"subscribers": {"5": "Ok"}}',
+        "stats_current.json": '{"period": "2026-Q2"}',   # нет events-списка → пропуск
+    })
+    result = main.restore_backup_zip(raw)
+    assert "subscribers.json" in result["restored"]
+    assert "stats_current.json" in result["skipped"]
+    assert not (backup_env / "stats_current.json").exists()
+
+
+def test_restore_rejects_quarter_without_period(backup_env):
+    raw = _zip_bytes({"quarters/x.json": '{"events": []}'})
+    with pytest.raises(ValueError):
+        main.restore_backup_zip(raw)
+
+
+def test_valid_import_payload_accepts_canonical_shapes():
+    assert main._valid_import_payload("subscribers.json", {"subscribers": {"1": "A"}})
+    assert main._valid_import_payload("stats_current.json", {"period": "2026-Q2", "events": []})
+    assert main._valid_import_payload("quarters/2026-Q1.json", {"period": "2026-Q1"})
+
+
+@pytest.mark.asyncio
+async def test_backup_close_clears_fsm_state(backup_env):
+    state = AsyncMock()
+    menu = MagicMock()
+    menu.delete = AsyncMock()
+    menu.reply_to_message = None
+    cb = MagicMock()
+    cb.from_user.id = main.OWNER_ID
+    cb.message = menu
+    cb.answer = AsyncMock()
+    await main.backup_close_cb(cb, state)
+    state.clear.assert_awaited_once()
