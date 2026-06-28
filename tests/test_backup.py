@@ -493,3 +493,37 @@ async def test_backup_close_clears_fsm_state(backup_env):
     cb.answer = AsyncMock()
     await main.backup_close_cb(cb, state)
     state.clear.assert_awaited_once()
+
+
+# ─────────────────────────────────────────────────────────────
+#  Замечания ревью: ротация-бэкап покрыт + вложенный каталог создаётся
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr(main, "sync_stats_all", AsyncMock(return_value=({}, True)))
+    monkeypatch.setattr(main, "build_quarterly_report_messages", lambda *a, **k: [])
+    monkeypatch.setattr(main, "_save_quarter_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_update_by_quarter", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_load_prev_quarter_summary", lambda *a, **k: None)
+    monkeypatch.setattr(main, "save_stats_all", lambda *a, **k: None)
+
+    old_cur = {"period": "2025-Q1", "events": []}   # заведомо прошлый квартал → ротация
+    await main.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
+
+    sent.assert_awaited_once()
+    assert main.BACKUP_TAG in sent.call_args.args[1]
+
+
+def test_restore_creates_missing_quarters_dir(backup_env):
+    # эмулируем свежий том: каталога quarters/ ещё нет (кейс из «HIGH RISK» Codacy)
+    import shutil
+    shutil.rmtree(backup_env / "quarters")
+    assert not (backup_env / "quarters").exists()
+    raw = _zip_bytes({"quarters/2026-Q1.json": '{"period": "2026-Q1"}'})
+    result = main.restore_backup_zip(raw)
+    assert "quarters/2026-Q1.json" in result["restored"]
+    # _atomic_write сам создаёт parent — краша на свежем томе нет
+    assert (backup_env / "quarters" / "2026-Q1.json").exists()
