@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import backup
 import main
 import stats
 import storage
@@ -27,7 +28,7 @@ def backup_env(tmp_path, monkeypatch):
     data = tmp_path / "data"
     quarters = data / "quarters"
     quarters.mkdir(parents=True)
-    monkeypatch.setattr(main, "DATA_DIR", data)
+    monkeypatch.setattr("backup.DATA_DIR", data)
     monkeypatch.setattr(storage, "SUBS_FILE", data / "subscribers.json")
     monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
     monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
@@ -35,6 +36,7 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
     monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
     monkeypatch.setattr(main, "OWNER_ID", 999)
+    monkeypatch.setattr("backup.OWNER_ID", 999)
     return data
 
 
@@ -164,7 +166,7 @@ async def test_send_backup_success_sends_to_owner_with_tag(backup_env):
     args, kwargs = bot.send_document.call_args
     assert args[0] == main.OWNER_ID                  # доставка владельцу
     assert main.BACKUP_TAG in kwargs["caption"]
-    assert isinstance(kwargs["document"], main.BufferedInputFile)
+    assert isinstance(kwargs["document"], backup.BufferedInputFile)
 
 
 @pytest.mark.asyncio
@@ -199,7 +201,7 @@ async def test_backup_after_subscription_subscribe(backup_env, monkeypatch):
     (backup_env / "subscribers.json").write_text(
         '{"subscribers": {"7": "Neo"}}', encoding="utf-8")
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr("backup.send_backup", sent)
     bot = AsyncMock()
 
     await main._backup_after_subscription(bot, 7, "Neo", subscribed=True)
@@ -215,7 +217,7 @@ async def test_backup_after_subscription_subscribe(backup_env, monkeypatch):
 async def test_backup_after_subscription_unsubscribe(backup_env, monkeypatch):
     (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr("backup.send_backup", sent)
 
     await main._backup_after_subscription(AsyncMock(), 5, "Trinity", subscribed=False)
 
@@ -231,7 +233,7 @@ async def test_backup_after_subscription_unsubscribe(backup_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_weekly_backup_first_time_marks_without_sending(backup_env, monkeypatch):
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr("backup.send_backup", sent)
     cur = {"period": "2026-Q2", "events": []}   # нет last_backup_at
 
     out = await main._weekly_backup_if_due(AsyncMock(), cur)
@@ -243,7 +245,7 @@ async def test_weekly_backup_first_time_marks_without_sending(backup_env, monkey
 @pytest.mark.asyncio
 async def test_weekly_backup_not_due_does_nothing(backup_env, monkeypatch):
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr("backup.send_backup", sent)
     ts = time.time()
     cur = {"period": "2026-Q2", "events": [], "last_backup_at": ts}
 
@@ -256,8 +258,8 @@ async def test_weekly_backup_not_due_does_nothing(backup_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_weekly_backup_due_sends_and_updates(backup_env, monkeypatch):
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
-    old = time.time() - main.WEEKLY_BACKUP_INTERVAL - 100
+    monkeypatch.setattr("backup.send_backup", sent)
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
     cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
 
     out = await main._weekly_backup_if_due(AsyncMock(), cur)
@@ -268,8 +270,8 @@ async def test_weekly_backup_due_sends_and_updates(backup_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monkeypatch):
-    monkeypatch.setattr(main, "send_backup", AsyncMock(return_value=False))
-    old = time.time() - main.WEEKLY_BACKUP_INTERVAL - 100
+    monkeypatch.setattr("backup.send_backup", AsyncMock(return_value=False))
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
     cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
 
     out = await main._weekly_backup_if_due(AsyncMock(), cur)
@@ -306,7 +308,7 @@ async def test_cmd_backup_owner_shows_menu(backup_env):
 async def test_cmd_start_triggers_auto_backup(backup_env, monkeypatch):
     (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
+    monkeypatch.setattr("backup.send_backup", sent)
 
     msg = MagicMock()
     msg.chat.id = 555
@@ -350,22 +352,22 @@ def test_load_stats_current_backfills_last_backup_at(backup_env):
 @pytest.fixture(autouse=True)
 def _reset_backup_clock(monkeypatch):
     """Сбрасываем monotonic-метку последнего бэкапа между тестами (изоляция)."""
-    monkeypatch.setattr(main, "_last_backup_sent_at", None)
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
 
 
 @pytest.mark.asyncio
 async def test_send_backup_sets_last_backup_clock(backup_env):
     bot = AsyncMock()
-    assert main._last_backup_sent_at is None
+    assert backup._last_backup_sent_at is None
     await main.send_backup(bot, f"x {main.BACKUP_TAG}")
-    assert isinstance(main._last_backup_sent_at, float)
+    assert isinstance(backup._last_backup_sent_at, float)
 
 
 @pytest.mark.asyncio
 async def test_shutdown_backup_sends_when_no_recent(backup_env, monkeypatch):
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
-    monkeypatch.setattr(main, "_last_backup_sent_at", None)
+    monkeypatch.setattr("backup.send_backup", sent)
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
     await main._shutdown_backup(AsyncMock())
     sent.assert_awaited_once()
     caption = sent.call_args.args[1]
@@ -376,22 +378,22 @@ async def test_shutdown_backup_sends_when_no_recent(backup_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_shutdown_backup_debounced_when_recent(backup_env, monkeypatch):
     sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "send_backup", sent)
-    monkeypatch.setattr(main, "_last_backup_sent_at", main.time.monotonic())
+    monkeypatch.setattr("backup.send_backup", sent)
+    monkeypatch.setattr("backup._last_backup_sent_at", main.time.monotonic())
     await main._shutdown_backup(AsyncMock())
     sent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
-    monkeypatch.setattr(main, "_last_backup_sent_at", None)
-    monkeypatch.setattr(main, "SHUTDOWN_BACKUP_TIMEOUT", 0.01)
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
+    monkeypatch.setattr("backup.SHUTDOWN_BACKUP_TIMEOUT", 0.01)
 
     async def _slow(_bot, _caption):
         await main.asyncio.sleep(0.2)
         return True
 
-    monkeypatch.setattr(main, "send_backup", _slow)
+    monkeypatch.setattr("backup.send_backup", _slow)
     await main._shutdown_backup(AsyncMock())   # не должно бросить
 
 
