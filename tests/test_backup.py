@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import main
+import stats
 import storage
 
 # ─────────────────────────────────────────────────────────────
@@ -32,7 +33,7 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
     monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
     monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
-    monkeypatch.setattr(main, "QUARTERS_DIR", quarters)
+    monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
     monkeypatch.setattr(main, "OWNER_ID", 999)
     return data
 

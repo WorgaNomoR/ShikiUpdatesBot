@@ -470,15 +470,16 @@ async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatc
     """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,
     save не вызывается. Гарантия «429 не ломает stats_all»."""
     import main
+    import stats
     preserved = {"_sentinel": "keep-me"}
     saved = []
 
     async def fake_export(session, media):
         return None
 
-    monkeypatch.setattr(main, "fetch_list_export", fake_export)
-    monkeypatch.setattr(main, "load_stats_all", lambda use_cache=True: preserved)
-    monkeypatch.setattr(main, "save_stats_all", lambda d: saved.append(d))
+    monkeypatch.setattr(stats, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.load_stats_all", lambda use_cache=True: preserved)
+    monkeypatch.setattr("stats.save_stats_all", lambda d: saved.append(d))
 
     stats, ok = await main.sync_stats_all()
 

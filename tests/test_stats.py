@@ -307,7 +307,7 @@ async def test_collect_favourites_join_with_titles(monkeypatch):
             ],
             "mangas": [], "characters": [], "people": [],
         }
-    monkeypatch.setattr(main, "fetch_favourites", fake_fetch)
+    monkeypatch.setattr("stats.fetch_favourites", fake_fetch)
 
     class S:
         pass
@@ -326,7 +326,7 @@ async def test_collect_favourites_api_fail_keeps_previous(monkeypatch):
 
     async def fake_fetch(session):
         return None  # сбой API
-    monkeypatch.setattr(main, "fetch_favourites", fake_fetch)
+    monkeypatch.setattr("stats.fetch_favourites", fake_fetch)
 
     class S: 
         pass
@@ -376,7 +376,7 @@ def test_smoke_empty_stats_no_crash():
 
 @pytest.mark.asyncio
 async def test_smoke_async_report_builders(monkeypatch):
-    monkeypatch.setattr(main, "load_stats_all", lambda: _populated_stats())
+    monkeypatch.setattr("stats.load_stats_all", lambda: _populated_stats())
     monkeypatch.setattr(main, "load_stats_current", lambda: {
         "period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
         "tracking_since": "2026-04-01T00:00:00", "events": []})
@@ -419,14 +419,14 @@ async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
         "120393": _manga_record("Elfen Lied Tokubetsu-hen", ""),   # битая мета
     }
 
-    monkeypatch.setattr(main, "load_stats_all",
+    monkeypatch.setattr("stats.load_stats_all",
                         lambda *a, **k: copy.deepcopy(stats))
 
     async def fake_export(session, media):
         if media == "manga":
             return [_export_manga_row("111"), _export_manga_row("120393")]
         return []   # аниме пусто
-    monkeypatch.setattr(main, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
 
     # GraphQL теперь возвращает настоящий вид ваншота
     async def fake_meta(media, ids):
@@ -434,14 +434,14 @@ async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
             return {"120393": {"kind": "one_shot", "url": "/mangas/120393",
                                "year": 2005}}
         return {}
-    monkeypatch.setattr(main, "fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
 
     # избранное не трогаем (без сети)
     async def fake_collect(session, st, fav=None):
         return st
-    monkeypatch.setattr(main, "_collect_favourites", fake_collect)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
     saved = {}
-    monkeypatch.setattr(main, "save_stats_all", lambda data: saved.update(data))
+    monkeypatch.setattr("stats.save_stats_all", lambda data: saved.update(data))
 
     result, ok = await main.sync_stats_all()
 
@@ -461,14 +461,14 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
     stats["manga"]["titles"] = {
         "999": _manga_record("Анонс", "", status="planned", chapters_read=0),
     }
-    monkeypatch.setattr(main, "load_stats_all",
+    monkeypatch.setattr("stats.load_stats_all",
                         lambda *a, **k: copy.deepcopy(stats))
 
     async def fake_export(session, media):
         if media == "manga":
             return [_export_manga_row("999", status="planned", chapters=0)]
         return []
-    monkeypatch.setattr(main, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
 
     meta_calls = []
 
@@ -478,12 +478,12 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
         if media == "manga" and "999" in ids:
             return {"999": {"kind": "", "url": "", "year": None}}
         return {}
-    monkeypatch.setattr(main, "fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
 
     async def fake_collect(session, st, fav=None):
         return st
-    monkeypatch.setattr(main, "_collect_favourites", fake_collect)
-    monkeypatch.setattr(main, "save_stats_all", lambda *a, **k: None)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda *a, **k: None)
 
     result, ok = await main.sync_stats_all()
 
