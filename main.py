@@ -19,8 +19,6 @@ See the GNU General Public License for more details.
 import asyncio
 import io
 import json
-import logging
-import os
 import random
 import re
 import time
@@ -44,6 +42,25 @@ from aiogram.types import (
     Message,
 )
 
+from config import (
+    BOT_TOKEN,
+    CHECK_INTERVAL,
+    DATA_DIR,
+    DISPLAY_NAME,
+    ERROR_NOTIFY_INTERVAL,
+    FULL_SYNC_INTERVAL,
+    OWNER_ID,
+    QUARTERS_DIR,
+    SEEN_FAVS_FILE,
+    SEEN_IDS_FILE,
+    SHIKI_BASE_URL,
+    SHIKI_USER,
+    STATS_ALL_FILE,
+    STATS_CURRENT_FILE,
+    SUBS_FILE,
+    WEEKLY_BACKUP_INTERVAL,
+    log,
+)
 from healthcheck import heartbeat, start_health_server
 from utils import (
     _is_partial_quarter,
@@ -57,55 +74,6 @@ from utils import (
     quarter_start,
     tracking_period_label,
 )
-
-# ─────────────────────────────────────────────
-#  НАСТРОЙКИ — заполни перед запуском
-# ─────────────────────────────────────────────
-# Токен читается из переменной окружения BOT_TOKEN — не храни его в коде!
-# Задать: export BOT_TOKEN="токен_от_BotFather"
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-
-# Твой Telegram ID — узнать у @userinfobot.
-# Нужен для команд только для владельца (/subs, /backup, /broadcast).
-# Задать: export OWNER_ID="123456789"
-OWNER_ID = int(os.environ["OWNER_ID"])
-
-SHIKI_USER     = "WNR"                   # ник на Shikimori (для API)
-SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь при смене зеркала
-
-# Отображаемое имя в сообщениях. Опционально через env DISPLAY_NAME;
-# по умолчанию — ник профиля (SHIKI_USER). Пустая строка/пробелы → фолбэк.
-DISPLAY_NAME   = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
-
-CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
-ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
-FULL_SYNC_INTERVAL = 6 * 60 * 60         # как часто пересинкивать stats_all в цикле (6 часов)
-WEEKLY_BACKUP_INTERVAL = 7 * 24 * 60 * 60  # интервал еженедельного авто-бэкапа состояния (по last_backup_at)
-
-# ─────────────────────────────────────────────
-#  ПУТИ К ФАЙЛАМ ДАННЫХ
-#  По умолчанию всё создаётся в /data.
-#  Чтобы хранить в другом месте — задай переменную окружения
-#  DATA_DIR=/путь/к/папке.
-# ─────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-try:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-except OSError as e:
-    logging.getLogger(__name__).warning(
-        "Не удалось создать DATA_DIR=%s: %s. "
-        "Файлы будут недоступны до исправления прав/пути.", DATA_DIR, e
-    )
-
-# Состояние уведомлений (что бот уже видел)
-SEEN_IDS_FILE  = DATA_DIR / "seen_ids.json"         # ID обработанных событий истории
-SUBS_FILE      = DATA_DIR / "subscribers.json"      # список подписчиков
-SEEN_FAVS_FILE = DATA_DIR / "seen_favourites.json"  # ID виденного избранного
-
-# Статистика
-STATS_ALL_FILE     = DATA_DIR / "stats_all.json"      # вся история: тайтлы + агрегаты
-STATS_CURRENT_FILE = DATA_DIR / "stats_current.json"  # события текущего квартала
-QUARTERS_DIR       = DATA_DIR / "quarters"            # замороженные снапшоты кварталов
 
 # ─────────────────────────────────────────────
 #  URL источников статистики
@@ -167,16 +135,6 @@ HEADERS = {
     "User-Agent": f"ShikimoriWatcherBot/1.0 (TelegramBot; monitoring {SHIKI_USER})",
     "Accept": "application/json",
 }
-
-# ─────────────────────────────────────────────
-#  ЛОГИРОВАНИЕ
-# ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
