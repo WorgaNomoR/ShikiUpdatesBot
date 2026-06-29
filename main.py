@@ -17,7 +17,6 @@ See the GNU General Public License for more details.
 """
 
 import asyncio
-import html
 import io
 import json
 import logging
@@ -26,7 +25,7 @@ import random
 import re
 import time
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 import aiohttp
@@ -46,6 +45,19 @@ from aiogram.types import (
 )
 
 from healthcheck import heartbeat, start_health_server
+from utils import (
+    _is_partial_quarter,
+    _quarter_end,
+    _rel_url,
+    _safe_float,
+    _safe_int,
+    _utcnow,
+    current_quarter,
+    h,
+    quarter_label,
+    quarter_start,
+    tracking_period_label,
+)
 
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ — заполни перед запуском
@@ -235,35 +247,6 @@ async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> list[Me
             sent.append(await bot.send_voice(voice=file_id, **common))
 
     return sent
-
-
-def h(text: str) -> str:
-    """Экранируем спецсимволы HTML — защита от поломки разметки в Telegram.
-    Экранирует: & → &amp;  < → &lt;  > → &gt;
-    Применять ко всем пользовательским данным из API перед вставкой в сообщение.
-    """
-    return html.escape(str(text))
-
-
-def _rel_url(url: str) -> str:
-    """
-    Приводим URL к относительному виду ('/animes/123-name').
-
-    GraphQL Shikimori отдаёт ПОЛНЫЙ url ('https://shikimori.io/animes/...'),
-    а REST history — относительный. Весь код формирования ссылок приклеивает
-    SHIKI_BASE_URL спереди, поэтому полный url давал бы двойной домен и битую
-    ссылку. Нормализуем к относительному при сохранении — один источник истины.
-    """
-    url = (url or "").strip()
-    if not url:
-        return ""
-    # Отрезаем схему+домен, если url полный
-    for prefix in ("https://", "http://"):
-        if url.startswith(prefix):
-            rest = url[len(prefix):]
-            slash = rest.find("/")
-            return rest[slash:] if slash != -1 else ""
-    return url
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1007,94 +990,6 @@ _STATS_ALL_CACHE_TTL: int = 300  # секунд
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  УТИЛИТЫ — КВАРТАЛ
-# ═══════════════════════════════════════════════════════════════════
-
-def _utcnow() -> datetime:
-    """Наивное UTC-время (без tzinfo) через не-устаревший API.
-    Замена datetime.utcnow(), удалённой в будущих версиях Python.
-    Возвращает тот же naive-UTC, что и раньше — форматы хранения и
-    сравнения дат не меняются.
-    """
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-def current_quarter(dt: datetime | None = None) -> str:
-    """'2026-Q2' для UTC-даты (по умолчанию — сейчас)."""
-    if dt is None:
-        dt = _utcnow()
-    q = (dt.month - 1) // 3 + 1
-    return f"{dt.year}-Q{q}"
-
-
-def quarter_start(dt: datetime | None = None) -> datetime:
-    """Первый день текущего (или переданного) квартала, UTC."""
-    if dt is None:
-        dt = _utcnow()
-    q = (dt.month - 1) // 3 + 1
-    return datetime(dt.year, (q - 1) * 3 + 1, 1)
-
-
-def quarter_label(period: str) -> str:
-    """'2026-Q2' → 'апрель — июнь 2026'. При ошибке возвращает исходную строку."""
-    _names = {
-        "Q1": "январь — март",
-        "Q2": "апрель — июнь",
-        "Q3": "июль — сентябрь",
-        "Q4": "октябрь — декабрь",
-    }
-    try:
-        year, q = period.split("-", 1)
-        return f"{_names.get(q, q)} {year}"
-    except Exception:
-        return period
-
-
-def _quarter_end(period: str) -> datetime | None:
-    """Последний день квартала по строке '2026-Q2' (для отображения диапазона)."""
-    try:
-        year_s, q_s = period.split("-Q", 1)
-        year, q = int(year_s), int(q_s)
-        # Первый месяц следующего квартала минус один день
-        end_month = q * 3  # последний месяц квартала (3,6,9,12)
-        if end_month == 12:
-            return datetime(year, 12, 31)
-        return datetime(year, end_month + 1, 1) - timedelta(days=1)
-    except Exception:
-        return None
-
-
-def tracking_period_label(cur: dict) -> str:
-    """
-    Человекочитаемый диапазон фактического отслеживания текущего квартала.
-    'с 25.04.2026 по 30.06.2026' если бот стартовал в середине,
-    'с 01.04.2026 по 30.06.2026' если с начала.
-    При проблемах с датами — деградирует до quarter_label.
-    """
-    period = cur.get("period") or current_quarter()
-    try:
-        ts_raw = cur.get("tracking_since") or cur.get("period_start")
-        start = datetime.fromisoformat(ts_raw) if ts_raw else None
-        end = _quarter_end(period)
-        if start and end:
-            return f"с {start.strftime('%d.%m.%Y')} по {end.strftime('%d.%m.%Y')}"
-    except Exception:
-        pass
-    return quarter_label(period)
-
-
-def _is_partial_quarter(cur: dict) -> bool:
-    """True, если отслеживание началось позже календарного начала квартала."""
-    try:
-        ts = cur.get("tracking_since")
-        ps = cur.get("period_start")
-        if ts and ps:
-            return datetime.fromisoformat(ts) > datetime.fromisoformat(ps)
-    except Exception:
-        pass
-    return False
-
-
-# ═══════════════════════════════════════════════════════════════════
 #  ЗАГРУЗКА / ЧТЕНИЕ ИСТОЧНИКОВ ДАННЫХ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1295,22 +1190,6 @@ def save_stats_all(data: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════
 #  ПОСТРОЕНИЕ titles{} ИЗ list_export + МЕТАДАННЫХ
 # ═══════════════════════════════════════════════════════════════════
-
-def _safe_int(value, default: int = 0) -> int:
-    """Аккуратно приводим к int — score/episodes из экспорта бывают строками."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_float(value, default: float | None = None) -> float | None:
-    """Приводим к float — GraphQL score приходит как строка '8.73'. None если не вышло."""
-    try:
-        f = float(value)
-        return f if f > 0 else default
-    except (TypeError, ValueError):
-        return default
 
 
 def _merge_title_record(media: str, export_row: dict, meta: dict | None) -> dict:
@@ -3653,7 +3532,6 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
         lines.append(f"\n⏭️ Пропущено (вне белого списка/битые): {len(skipped)}")
     await _safe_delete(message.bot, message.chat.id, message.message_id)
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
-
 
 
 # ═══════════════════════════════════════════════════════════════
