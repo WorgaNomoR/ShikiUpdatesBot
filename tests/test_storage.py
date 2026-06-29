@@ -1,6 +1,7 @@
 import json
 
-from main import (
+import utils
+from storage import (
     load_seen_ids,
     load_subscribers,
     save_seen_ids,
@@ -151,7 +152,7 @@ def test_save_seen_ids_removes_tmp_file(monkeypatch, tmp_path):
 
 
 def test_atomic_write_creates_parent_directory(tmp_path):
-    from main import _atomic_write
+    from storage import _atomic_write
 
     target = tmp_path / "nested" / "folder" / "file.json"
 
@@ -162,7 +163,7 @@ def test_atomic_write_creates_parent_directory(tmp_path):
 
 
 def test_atomic_write_overwrites_existing_file(tmp_path):
-    from main import _atomic_write
+    from storage import _atomic_write
 
     target = tmp_path / "data.json"
 
@@ -174,6 +175,5 @@ def test_atomic_write_overwrites_existing_file(tmp_path):
 
 
 def test_utcnow_is_naive():
-    import main
-    dt = main._utcnow()
+    dt = utils._utcnow()
     assert dt.tzinfo is None

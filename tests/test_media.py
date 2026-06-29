@@ -1,4 +1,4 @@
-from main import (
+from shiki_api import (
     get_media_info,
     is_relevant,
 )

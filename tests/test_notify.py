@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from main import check_and_notify
+from handlers import check_and_notify
 
 
 # Пустой стейт квартала — check_and_notify теперь принимает cur третьим аргументом.
@@ -16,20 +16,20 @@ async def test_empty_history(monkeypatch):
         return []
 
     monkeypatch.setattr(
-        "main.fetch_history",
+        "handlers.fetch_history",
         fake_fetch_history,
     )
 
     saved = []
 
     monkeypatch.setattr(
-        "main.save_seen_ids",
+        "handlers.save_seen_ids",
         lambda ids: saved.append(ids.copy()),
     )
 
     # check_and_notify в конце зовёт save_stats_current — глушим запись на диск
     monkeypatch.setattr(
-        "main.save_stats_current",
+        "handlers.save_stats_current",
         lambda cur: None,
     )
 
@@ -56,7 +56,7 @@ async def test_no_new_entries(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        "main.fetch_history",
+        "handlers.fetch_history",
         fake_fetch_history,
     )
 
@@ -67,12 +67,12 @@ async def test_no_new_entries(monkeypatch):
         called = True
 
     monkeypatch.setattr(
-        "main.send_to_all_chats",
+        "handlers.send_to_all_chats",
         fake_send,
     )
 
     monkeypatch.setattr(
-        "main.save_stats_current",
+        "handlers.save_stats_current",
         lambda cur: None,
     )
 
@@ -96,22 +96,22 @@ async def test_new_relevant_entry(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        "main.fetch_history",
+        "handlers.fetch_history",
         fake_fetch_history,
     )
 
     monkeypatch.setattr(
-        "main.get_media_info",
+        "handlers.get_media_info",
         lambda entry: ("anime", "tv"),
     )
 
     monkeypatch.setattr(
-        "main.is_relevant",
+        "handlers.is_relevant",
         lambda media_type, kind: True,
     )
 
     monkeypatch.setattr(
-        "main.build_message",
+        "handlers.build_message",
         lambda entry: "MESSAGE",
     )
 
@@ -121,7 +121,7 @@ async def test_new_relevant_entry(monkeypatch):
         sent.append(text)
 
     monkeypatch.setattr(
-        "main.send_to_all_chats",
+        "handlers.send_to_all_chats",
         fake_send,
     )
 
@@ -137,12 +137,12 @@ async def test_new_relevant_entry(monkeypatch):
     saved = []
 
     monkeypatch.setattr(
-        "main.save_seen_ids",
+        "handlers.save_seen_ids",
         lambda ids: saved.append(ids.copy()),
     )
 
     monkeypatch.setattr(
-        "main.save_stats_current",
+        "handlers.save_stats_current",
         lambda cur: None,
     )
 
@@ -168,17 +168,17 @@ async def test_new_irrelevant_entry(monkeypatch):
         ]
 
     monkeypatch.setattr(
-        "main.fetch_history",
+        "handlers.fetch_history",
         fake_fetch_history,
     )
 
     monkeypatch.setattr(
-        "main.get_media_info",
+        "handlers.get_media_info",
         lambda entry: ("anime", "special"),
     )
 
     monkeypatch.setattr(
-        "main.is_relevant",
+        "handlers.is_relevant",
         lambda media_type, kind: False,
     )
 
@@ -189,12 +189,12 @@ async def test_new_irrelevant_entry(monkeypatch):
         called = True
 
     monkeypatch.setattr(
-        "main.send_to_all_chats",
+        "handlers.send_to_all_chats",
         fake_send,
     )
 
     monkeypatch.setattr(
-        "main.save_stats_current",
+        "handlers.save_stats_current",
         lambda cur: None,
     )
 

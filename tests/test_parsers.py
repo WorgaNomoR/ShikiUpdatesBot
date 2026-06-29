@@ -1,4 +1,4 @@
-from main import (
+from messages import (
     _strip_html,
     classify_event,
     extract_score,
