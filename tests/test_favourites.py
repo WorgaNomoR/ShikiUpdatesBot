@@ -60,7 +60,7 @@ def _stats_with_titles():
 
 def test_load_seen_favourites_missing_file(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        "main.SEEN_FAVS_FILE",
+        "storage.SEEN_FAVS_FILE",
         str(tmp_path / "missing.json"),
     )
 
@@ -83,7 +83,7 @@ def test_load_seen_favourites_valid_json(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(
-        "main.SEEN_FAVS_FILE",
+        "storage.SEEN_FAVS_FILE",
         str(file),
     )
 
@@ -99,7 +99,7 @@ def test_load_seen_favourites_corrupted_json(monkeypatch, tmp_path):
     file.write_text("{", encoding="utf-8")
 
     monkeypatch.setattr(
-        "main.SEEN_FAVS_FILE",
+        "storage.SEEN_FAVS_FILE",
         str(file),
     )
 
@@ -110,7 +110,7 @@ def test_seen_favourites_roundtrip(monkeypatch, tmp_path):
     file = tmp_path / "favs.json"
 
     monkeypatch.setattr(
-        "main.SEEN_FAVS_FILE",
+        "storage.SEEN_FAVS_FILE",
         str(file),
     )
 

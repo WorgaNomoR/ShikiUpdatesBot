@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import main
+import storage
 
 # ─────────────────────────────────────────────────────────────
 #  Фикстуры
@@ -26,11 +27,11 @@ def backup_env(tmp_path, monkeypatch):
     quarters = data / "quarters"
     quarters.mkdir(parents=True)
     monkeypatch.setattr(main, "DATA_DIR", data)
-    monkeypatch.setattr(main, "SUBS_FILE", data / "subscribers.json")
-    monkeypatch.setattr(main, "STATS_CURRENT_FILE", data / "stats_current.json")
-    monkeypatch.setattr(main, "STATS_ALL_FILE", data / "stats_all.json")
-    monkeypatch.setattr(main, "SEEN_IDS_FILE", data / "seen_ids.json")
-    monkeypatch.setattr(main, "SEEN_FAVS_FILE", data / "seen_favourites.json")
+    monkeypatch.setattr(storage, "SUBS_FILE", data / "subscribers.json")
+    monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
+    monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
+    monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
+    monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
     monkeypatch.setattr(main, "QUARTERS_DIR", quarters)
     monkeypatch.setattr(main, "OWNER_ID", 999)
     return data
@@ -331,7 +332,7 @@ def test_empty_stats_current_has_last_backup_at():
 
 def test_load_stats_current_backfills_last_backup_at(backup_env):
     # файл старого формата без last_backup_at
-    main.STATS_CURRENT_FILE.write_text(json.dumps({
+    storage.STATS_CURRENT_FILE.write_text(json.dumps({
         "period": "2026-Q2",
         "period_start": "2026-04-01T00:00:00",
         "tracking_since": "2026-04-01T00:00:00",
