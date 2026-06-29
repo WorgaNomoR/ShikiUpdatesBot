@@ -47,7 +47,6 @@ from aiogram.types import (
 from healthcheck import heartbeat, start_health_server
 from utils import (
     _is_partial_quarter,
-    _quarter_end,
     _rel_url,
     _safe_float,
     _safe_int,
