@@ -3,39 +3,62 @@
 """
 Конфигурация ShikiUpdatesBot.
 
-Нижний уровень: читает окружение, задаёт пути к данным и настраивает
-логирование на импорте. Ничего не импортирует из проекта — зависимости
-строго односторонние (как healthcheck.py): остальные модули тянут константы
-и логгер отсюда.
+Нижний уровень: грузит локальный .env, читает окружение, задаёт пути к данным
+и настраивает логирование на импорте. Ничего не импортирует из проекта —
+зависимости строго односторонние (как healthcheck.py): остальные модули тянут
+константы и логгер отсюда.
 """
 
 import logging
 import os
 from pathlib import Path
 
-# ─────────────────────────────────────────────
-#  НАСТРОЙКИ — заполни перед запуском
-# ─────────────────────────────────────────────
-# Токен читается из переменной окружения BOT_TOKEN — не храни его в коде!
-# Задать: export BOT_TOKEN="токен_от_BotFather"
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+from dotenv import load_dotenv
 
-# Твой Telegram ID — узнать у @userinfobot.
-# Нужен для команд только для владельца (/subs, /backup, /broadcast).
-# Задать: export OWNER_ID="123456789"
-OWNER_ID = int(os.environ["OWNER_ID"])
+# Грузим локальный .env (если есть) ДО любого чтения окружения. override=False:
+# на docker-compose / хостингах переменные уже в окружении — их не перетираем.
+load_dotenv()
 
-SHIKI_USER     = "WNR"                   # ник на Shikimori (для API)
-SHIKI_BASE_URL = "https://shikimori.io"  # домен — меняй здесь при смене зеркала
+
+def _required_env(name: str, hint: str = "") -> str:
+    """Обязательная переменная окружения — внятный fast-fail вместо голого KeyError."""
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        suffix = f" — {hint}" if hint else ""
+        raise RuntimeError(f"Не задана обязательная переменная окружения {name}{suffix}.")
+    return value
+
+
+def _int_env(name: str, default: int) -> int:
+    """Целочисленная переменная окружения: дефолт при отсутствии, понятная ошибка при мусоре."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(
+            f"Переменная окружения {name}={raw!r} должна быть целым числом."
+        ) from e
+
+
+# ─────────────────────────────────────────────
+#  НАСТРОЙКИ (из окружения / .env)
+# ─────────────────────────────────────────────
+BOT_TOKEN = _required_env("BOT_TOKEN", "токен от @BotFather")
+OWNER_ID  = int(_required_env("OWNER_ID", "твой Telegram ID от @userinfobot"))
+
+SHIKI_USER     = _required_env("SHIKI_USER", "ник на Shikimori, напр. WNR")
+SHIKI_BASE_URL = (os.environ.get("SHIKI_BASE_URL") or "https://shikimori.io").strip()
 
 # Отображаемое имя в сообщениях. Опционально через env DISPLAY_NAME;
 # по умолчанию — ник профиля (SHIKI_USER). Пустая строка/пробелы → фолбэк.
 DISPLAY_NAME   = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
 
-CHECK_INTERVAL = 15 * 60                 # интервал проверки в секундах (15 минут)
-ERROR_NOTIFY_INTERVAL = 30 * 60          # не чаще одного уведомления об ошибке в 30 минут
-FULL_SYNC_INTERVAL = 6 * 60 * 60         # как часто пересинкивать stats_all в цикле (6 часов)
-WEEKLY_BACKUP_INTERVAL = 7 * 24 * 60 * 60  # интервал еженедельного авто-бэкапа состояния (по last_backup_at)
+CHECK_INTERVAL        = _int_env("CHECK_INTERVAL", 15 * 60)          # проверка истории, сек (15 мин)
+ERROR_NOTIFY_INTERVAL = _int_env("ERROR_NOTIFY_INTERVAL", 30 * 60)   # антиспам уведомлений об ошибке
+FULL_SYNC_INTERVAL    = _int_env("FULL_SYNC_INTERVAL", 6 * 60 * 60)  # пересинк stats_all в цикле (6 ч)
+WEEKLY_BACKUP_INTERVAL = 7 * 24 * 60 * 60  # еженедельный авто-бэкап состояния (по last_backup_at)
 
 # ─────────────────────────────────────────────
 #  ПУТИ К ФАЙЛАМ ДАННЫХ

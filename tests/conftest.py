@@ -8,6 +8,7 @@ sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("OWNER_ID", "123456")
+os.environ.setdefault("SHIKI_USER", "WNR")
 
 # Изолированная папка данных — чтобы тесты не лезли в реальный /data
 _test_data_dir = Path(tempfile.gettempdir()) / "shikibot_test_data"
