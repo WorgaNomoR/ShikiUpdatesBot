@@ -16,11 +16,7 @@ from aiogram.types import (
 )
 
 from backup import (
-    _build_backup_zip,  # noqa: F401  (re-export for test_backup; reader moved to backup)
-    _is_allowed_import_member,  # noqa: F401  (re-export for test_backup; reader moved to backup)
     _shutdown_backup,
-    _subscriber_link,  # noqa: F401  (re-export for test_backup; reader moved to backup)
-    _valid_import_payload,  # noqa: F401  (re-export for test_backup; reader moved to backup)
     )
 from config import (
     BOT_TOKEN,
@@ -51,31 +47,6 @@ from handlers import (
     stats_menu_cb,
 )
 from healthcheck import start_health_server
-from messages import (
-    MESSAGES,  # noqa: F401  (re-export for test_favourites; reader moved to messages)
-    _avg_score_from_dist,  # noqa: F401  (re-export for test_stats; reader moved to stats)
-    _fmt_kinds,  # noqa: F401  (re-export for test_stats; reader moved to messages)
-    _fmt_mono_rows,  # noqa: F401  (re-export for test_stats; reader moved to messages)
-    _score_dist_block,  # noqa: F401  (re-export for test_stats; reader moved to stats)
-    _section_header,  # noqa: F401  (re-export for test_stats; reader moved to stats)
-    _strip_html,  # noqa: F401  (re-export for test_parsers; reader moved to messages)
-    _top_block,  # noqa: F401  (re-export for test_stats; reader moved to stats)
-    )
-from stats import (
-    _KIND_RU_ANIME,  # noqa: F401  (re-export for test_stats)
-    recompute_aggregates,  # noqa: F401  (re-export for test_stats)
-    )
-from storage import (
-    _atomic_write,  # noqa: F401  (re-export for test_storage; readers moved to storage/backup)
-    _empty_stats_all,  # noqa: F401  (re-export for tests; reader is storage)
-    )
-from utils import (
-    _rel_url,  # noqa: F401  (re-export for tests; reader moved to stats)
-    _safe_float,  # noqa: F401  (re-export for tests; reader moved to shiki_api)
-    _safe_int,  # noqa: F401  (re-export for tests; reader moved to stats)
-    _utcnow,  # noqa: F401  (re-export for test_backup; reader moved to backup)
-    quarter_start,  # noqa: F401  (re-export for tests; reader moved to storage)
-)
 
 # ═══════════════════════════════════════════════════════════════
 #  FSM — состояния для команды /broadcast
