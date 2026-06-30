@@ -434,7 +434,7 @@ async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
     monkeypatch.setattr("stats.fetch_list_export", fake_export)
 
     # GraphQL теперь возвращает настоящий вид ваншота
-    async def fake_meta(media, ids):
+    async def fake_meta(media, ids, session=None):
         if media == "manga" and "120393" in ids:
             return {"120393": {"kind": "one_shot", "url": "/mangas/120393",
                                "year": 2005}}
@@ -477,7 +477,7 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
 
     meta_calls = []
 
-    async def fake_meta(media, ids):
+    async def fake_meta(media, ids, session=None):
         meta_calls.append((media, list(ids)))
         # анонс: GraphQL вернул элемент, но kind по-прежнему пустой
         if media == "manga" and "999" in ids:

@@ -86,6 +86,10 @@ from utils import (
     quarter_label,
 )
 
+# Фиксированная пауза между фазами стартовых фетчей (анти-429, boot-throttle).
+# Без джиттера — предсказуемый ритм (firewall-философия).
+BOOT_PHASE_DELAY = 2.0  # секунд
+
 
 class BroadcastStates(StatesGroup):
     waiting_content = State()   # ждём сообщение от владельца
@@ -709,40 +713,44 @@ async def polling_loop(bot: Bot) -> None:
         DISPLAY_NAME, len(load_subscribers()), len(seen_ids), CHECK_INTERVAL,
     )
 
-    if not seen_ids:
-        log.info("Первый запуск — инициализируем историю без отправки сообщений.")
-        async with aiohttp.ClientSession() as session:
+    # boot-throttle: одна общая ClientSession на все стартовые фетчи (анти-429),
+    # фиксированные паузы между фазами; избранное тянем ОДИН раз и переиспользуем.
+    async with aiohttp.ClientSession() as session:
+        if not seen_ids:
+            log.info("Первый запуск — инициализируем историю без отправки сообщений.")
             entries = await fetch_history(session)
-        if entries is None:
-            log.warning("Не удалось получить историю при инициализации — пропускаем, повторим на следующем цикле.")
-        else:
-            seen_ids = {e["id"] for e in entries}
-            save_seen_ids(seen_ids)
-            log.info("Инициализировано %d ID истории.", len(seen_ids))
+            if entries is None:
+                log.warning("Не удалось получить историю при инициализации — пропускаем, повторим на следующем цикле.")
+            else:
+                seen_ids = {e["id"] for e in entries}
+                save_seen_ids(seen_ids)
+                log.info("Инициализировано %d ID истории.", len(seen_ids))
+            await asyncio.sleep(BOOT_PHASE_DELAY)
 
-    if not seen_favs:
-        log.info("Инициализируем избранное без отправки сообщений.")
-        async with aiohttp.ClientSession() as session:
-            favourites = await fetch_favourites(session)
-        if favourites is None:
-            log.warning("Не удалось получить избранное при инициализации — пропускаем, повторим на следующем цикле.")
-        else:
-            for category in _FAV_CATEGORIES:
-                for item in (favourites.get(category) or []):
-                    if item.get("id") is not None:
-                        seen_favs.add(f"{category}_{item['id']}")
-            save_seen_favourites(seen_favs)
-            log.info("Инициализировано %d записей избранного.", len(seen_favs))
+        # Избранное фетчим ОДИН раз: и для инициализации seen_favs, и для sync (fav=).
+        favourites = await fetch_favourites(session)
+        if not seen_favs:
+            log.info("Инициализируем избранное без отправки сообщений.")
+            if favourites is None:
+                log.warning("Не удалось получить избранное при инициализации — пропускаем, повторим на следующем цикле.")
+            else:
+                for category in _FAV_CATEGORIES:
+                    for item in (favourites.get(category) or []):
+                        if item.get("id") is not None:
+                            seen_favs.add(f"{category}_{item['id']}")
+                save_seen_favourites(seen_favs)
+                log.info("Инициализировано %d записей избранного.", len(seen_favs))
+        await asyncio.sleep(BOOT_PHASE_DELAY)
 
-    # Актуализируем полную статистику из list_export (не зависит от seen_ids,
-    # строится сразу даже на первом запуске — данные берутся не из history).
-    log.info("Синхронизируем статистику за всё время (stats_all)...")
-    try:
-        stats_all, synced_ok = await sync_stats_all()
-    except Exception as e:
-        log.exception("Не удалось синхронизировать stats_all при старте: %s", e)
-        stats_all = load_stats_all()
-        synced_ok = False
+        # Актуализируем полную статистику из list_export на той же сессии,
+        # с уже полученным избранным (fav=) — без повторного фетча favourites.
+        log.info("Синхронизируем статистику за всё время (stats_all)...")
+        try:
+            stats_all, synced_ok = await sync_stats_all(session=session, fav=favourites)
+        except Exception as e:
+            log.exception("Не удалось синхронизировать stats_all при старте: %s", e)
+            stats_all = load_stats_all()
+            synced_ok = False
     # Метка последнего успешного полного синка (monotonic). None ⇒ в этой
     # сессии ещё не синкнулись успешно — цикл будет ретраить каждый раз.
     last_full_sync = time.monotonic() if synced_ok else None

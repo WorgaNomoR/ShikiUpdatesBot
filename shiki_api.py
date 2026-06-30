@@ -259,7 +259,8 @@ async def fetch_list_export(session: aiohttp.ClientSession, media: str) -> list[
         return None
 
 
-async def fetch_meta_batch(media: str, ids: list[str]) -> dict[str, dict]:
+async def fetch_meta_batch(media: str, ids: list[str],
+                           session: "aiohttp.ClientSession | None" = None) -> dict[str, dict]:
     """
     Запрашиваем метаданные тайтлов через GraphQL батчами по 50.
     media: "anime" | "manga"
@@ -269,55 +270,58 @@ async def fetch_meta_batch(media: str, ids: list[str]) -> dict[str, dict]:
     clean = list({str(i).strip() for i in ids if str(i).strip()})
     if not clean:
         return {}
+    if session is None:
+        # boot-throttle: своя короткоживущая сессия, если не передали общую.
+        async with aiohttp.ClientSession() as own:
+            return await fetch_meta_batch(media, ids, session=own)
 
     query = _GQL_ANIME if media == "anime" else _GQL_MANGA
     result: dict[str, dict] = {}
 
-    async with aiohttp.ClientSession() as session:
-        # Батчим по 50 (ограничение limit в GraphQL)
-        for i in range(0, len(clean), 50):
-            batch = clean[i:i + 50]
-            data = await _gql_request(session, query, {"ids": ",".join(batch)})
-            key = "animes" if media == "anime" else "mangas"
-            for item in ((data or {}).get(key) or []):
-                try:
-                    item_id = str(item.get("id") or "")
-                    if not item_id:
-                        continue
-                    genres_raw = item.get("genres") or []
-                    meta = {
-                        "url":         _rel_url(item.get("url")),
-                        "kind":        (item.get("kind") or "").lower(),
-                        "year":        (item.get("airedOn") or {}).get("year"),
-                        "shiki_score": _safe_float(item.get("score")),
-                        "genres":      _parse_genres(genres_raw, "genre"),
-                        "themes":      _parse_genres(genres_raw, "theme"),
-                        "demographic": _parse_genres(genres_raw, "demographic"),
-                    }
-                    if media == "anime":
-                        origin_raw = (item.get("origin") or "").strip()
-                        rating_raw = (item.get("rating") or "").strip()
-                        meta.update({
-                            "duration":       item.get("duration"),   # мин/эп
-                            "episodes_total": item.get("episodes"),
-                            "rating":         _RATING_RU.get(rating_raw, rating_raw or None),
-                            "origin":         _ORIGIN_RU.get(origin_raw, origin_raw or None),
-                            "studios":        [s["name"] for s in (item.get("studios") or []) if s.get("name")],
-                        })
-                    else:
-                        meta.update({
-                            "chapters_total": item.get("chapters"),
-                            "volumes_total":  item.get("volumes"),
-                            "publishers":     [p["name"] for p in (item.get("publishers") or []) if p.get("name")],
-                        })
-                    result[item_id] = meta
-                except Exception as e:
-                    log.warning("fetch_meta_batch(%s): ошибка парсинга id=%s: %s",
-                                media, item.get("id"), e)
+    # Батчим по 50 (ограничение limit в GraphQL)
+    for i in range(0, len(clean), 50):
+        batch = clean[i:i + 50]
+        data = await _gql_request(session, query, {"ids": ",".join(batch)})
+        key = "animes" if media == "anime" else "mangas"
+        for item in ((data or {}).get(key) or []):
+            try:
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                genres_raw = item.get("genres") or []
+                meta = {
+                    "url":         _rel_url(item.get("url")),
+                    "kind":        (item.get("kind") or "").lower(),
+                    "year":        (item.get("airedOn") or {}).get("year"),
+                    "shiki_score": _safe_float(item.get("score")),
+                    "genres":      _parse_genres(genres_raw, "genre"),
+                    "themes":      _parse_genres(genres_raw, "theme"),
+                    "demographic": _parse_genres(genres_raw, "demographic"),
+                }
+                if media == "anime":
+                    origin_raw = (item.get("origin") or "").strip()
+                    rating_raw = (item.get("rating") or "").strip()
+                    meta.update({
+                        "duration":       item.get("duration"),   # мин/эп
+                        "episodes_total": item.get("episodes"),
+                        "rating":         _RATING_RU.get(rating_raw, rating_raw or None),
+                        "origin":         _ORIGIN_RU.get(origin_raw, origin_raw or None),
+                        "studios":        [s["name"] for s in (item.get("studios") or []) if s.get("name")],
+                    })
+                else:
+                    meta.update({
+                        "chapters_total": item.get("chapters"),
+                        "volumes_total":  item.get("volumes"),
+                        "publishers":     [p["name"] for p in (item.get("publishers") or []) if p.get("name")],
+                    })
+                result[item_id] = meta
+            except Exception as e:
+                log.warning("fetch_meta_batch(%s): ошибка парсинга id=%s: %s",
+                            media, item.get("id"), e)
 
-            # Пауза между батчами — не триггерим rate limit (5 req/sec)
-            if i + 50 < len(clean):
-                await asyncio.sleep(0.5)
+        # Пауза между батчами — не триггерим rate limit (5 req/sec)
+        if i + 50 < len(clean):
+            await asyncio.sleep(0.5)
 
     log.info("fetch_meta_batch(%s): получено %d/%d тайтлов.", media, len(result), len(clean))
     return result

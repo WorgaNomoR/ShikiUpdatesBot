@@ -18,7 +18,7 @@ import utils
 def _patch_stats(monkeypatch, main):
     monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
 
-    async def fake_sync():
+    async def fake_sync(session=None, fav=None):
         # sync_stats_all теперь возвращает кортеж (stats, ok).
         return storage._empty_stats_all(), True
 
@@ -471,3 +471,53 @@ async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatc
     assert ok is False
     assert stats is preserved
     assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_boot_fetches_favourites_once_and_threads_session(monkeypatch):
+    """boot-throttle: на старте избранное тянется ОДИН раз и отдаётся в sync (fav=),
+    а sync получает ту же общую сессию (не None)."""
+    import main  # noqa: F401
+
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda favs: None)
+
+    fav_calls = []
+
+    async def fake_favourites(session):
+        fav_calls.append(session)
+        return {"animes": [{"id": 10}], "mangas": [], "characters": [], "people": []}
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_favourites)
+
+    captured = {}
+
+    async def fake_sync(session=None, fav=None):
+        captured["session"] = session
+        captured["fav"] = fav
+        return storage._empty_stats_all(), True
+
+    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
+
+    async def fake_rotate(bot, cur, stats_all):
+        return cur
+
+    monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
+
+    async def fake_check(bot, seen, cur):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
+
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(object())
+
+    # избранное запрошено РОВНО один раз (а не дважды: init + внутри sync)
+    assert len(fav_calls) == 1
+    # та же сессия проброшена в sync (общая, не None), избранное передано через fav=
+    assert captured["session"] is not None
+    assert captured["session"] is fav_calls[0]
+    assert captured["fav"] is not None and "animes" in captured["fav"]

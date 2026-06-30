@@ -315,7 +315,10 @@ async def _collect_favourites(
     return stats
 
 
-async def sync_stats_all() -> dict:
+async def sync_stats_all(
+    session: "aiohttp.ClientSession | None" = None,
+    fav: dict | None = None,
+) -> dict:
     """
     Главная функция актуализации stats_all.
 
@@ -331,11 +334,16 @@ async def sync_stats_all() -> dict:
     Возвращает (stats_all, ok): ok=False, если ни один экспорт не скачался
     (тогда stats_all — прежний, нетронутый); ok=True при частичном/полном успехе.
     """
+    # boot-throttle: переданную сессию переиспользуем (одну на весь старт),
+    # иначе открываем свою короткоживущую и рекурсивно прогоняем тело.
+    if session is None:
+        async with aiohttp.ClientSession() as own:
+            return await sync_stats_all(session=own, fav=fav)
+
     stats = load_stats_all(use_cache=False)
 
-    async with aiohttp.ClientSession() as session:
-        export_anime = await fetch_list_export(session, "anime")
-        export_manga = await fetch_list_export(session, "manga")
+    export_anime = await fetch_list_export(session, "anime")
+    export_manga = await fetch_list_export(session, "manga")
 
     if export_anime is None and export_manga is None:
         log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
@@ -380,7 +388,7 @@ async def sync_stats_all() -> dict:
             log.info("sync_stats_all(%s): тайтлов для обогащения: %d (новых %d, ремонт %d)",
                      media, len(need_meta), len(new_ids), len(retry_ids))
             try:
-                meta_map = await fetch_meta_batch(media, need_meta)
+                meta_map = await fetch_meta_batch(media, need_meta, session=session)
             except Exception as e:
                 log.error("sync_stats_all(%s): fetch_meta_batch упал: %s", media, e)
 
@@ -485,12 +493,11 @@ async def sync_stats_all() -> dict:
 
     # Собираем избранное (джойн с уже построенными titles)
     try:
-        async with aiohttp.ClientSession() as session:
-            before = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
-            stats = await _collect_favourites(session, stats)
-            after = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
-            if before != after:
-                changed = True
+        before = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
+        stats = await _collect_favourites(session, stats, fav=fav)
+        after = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
+        if before != after:
+            changed = True
     except Exception as e:
         log.error("sync_stats_all: сбор избранного упал: %s", e)
 
