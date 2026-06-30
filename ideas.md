@@ -130,3 +130,12 @@
   NB: send_to_all_chats — notification-домен (её зовёт check_and_notify), не
   broadcast, так что с ним бы и не уехала. Нужна разгрузка handlers — см.
   fsm_common в 🧭, не broadcast.py.
+
+- **Схлопывание «избыточного» init-блока polling_loop.**
+  Причина: после boot-throttle перестало быть избыточным. init теперь несёт
+  реальный смысл — общая ClientSession на старте + фетч favourites один раз для
+  sync(fav=); схлопывание увело бы первый baseline в цикловые check_and_notify*
+  (каждая со своей сессией) → менее throttled старт + двойной фетч favourites.
+  А baseline в check_and_notify* — не дубль, а намеренная 429-резильентность
+  (fallback, если стартовый фетч упал из-за 429/сети). Слоистость init=primary /
+  check=fallback оставляем. Дедуп-фолд закрыт частью 1 (общий хелпер отписки).
