@@ -22,7 +22,6 @@ from config import (
     BOT_TOKEN,
     CHECK_INTERVAL,
     DISPLAY_NAME,
-    log,
 )
 from handlers import (
     BackupStates,
@@ -43,7 +42,7 @@ from handlers import (
     cmd_status,
     cmd_stop,
     cmd_subs,
-    polling_loop,
+    probe_owner_and_start,
     stats_menu_cb,
 )
 from healthcheck import start_health_server
@@ -92,26 +91,15 @@ async def main() -> None:
     ])
 
     # polling_loop работает параллельно как фоновая задача
-    _polling_task = asyncio.create_task(polling_loop(bot))
-
-    def _on_polling_done(task: asyncio.Task) -> None:
-        """Логируем если polling_loop завершился неожиданно."""
-        if task.cancelled():
-            log.warning("polling_loop: задача отменена.")
-        elif exc := task.exception():
-            log.critical(
-                "polling_loop завершился с необработанной ошибкой: %s",
-                exc,
-                exc_info=exc,
-            )
-
-    _polling_task.add_done_callback(_on_polling_done)
-
     # Healthcheck-сервер (для хостингов с обязательным портом + watchdog)
     await start_health_server(check_interval=CHECK_INTERVAL)
 
     # Финальный бэкап при остановке (aiogram ловит SIGTERM/SIGINT → emit_shutdown)
     dp.shutdown.register(_shutdown_backup)
+
+    # owner-reachability gate: пробуем достучаться до владельца. Доставилось →
+    # запускаем фоновый цикл; нет → апдейт-поллинг всё равно жив, /start добудит.
+    await probe_owner_and_start(bot)
 
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 

@@ -822,6 +822,51 @@ async def polling_loop(bot: Bot) -> None:
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+# ───────────────────────────────────────────────────────────────
+#  ЗАПУСК ФОНОВОГО ЦИКЛА + ПРОБА ДОСТУПНОСТИ ВЛАДЕЛЬЦА (owner-gate)
+# ───────────────────────────────────────────────────────────────
+
+_polling_task: "asyncio.Task | None" = None
+
+
+def _on_polling_done(task: "asyncio.Task") -> None:
+    """Логируем, если polling_loop завершился неожиданно."""
+    if task.cancelled():
+        log.warning("polling_loop: задача отменена.")
+    elif exc := task.exception():
+        log.critical(
+            "polling_loop завершился с необработанной ошибкой: %s", exc, exc_info=exc,
+        )
+
+
+def start_polling_loop(bot: Bot) -> bool:
+    """Идемпотентно запускает фоновый цикл. True — запустили сейчас, False — уже жив."""
+    global _polling_task
+    if _polling_task is not None and not _polling_task.done():
+        return False
+    _polling_task = asyncio.create_task(polling_loop(bot))
+    _polling_task.add_done_callback(_on_polling_done)
+    return True
+
+
+async def probe_owner_and_start(bot: Bot) -> None:
+    """owner-reachability gate. Шлёт владельцу '🟢 Бот запущен' — проба аварийного
+    канала + легитимный сигнал рестарта (без дебаунса). Доставилось → стартуем
+    фоновый цикл; не доставилось (владелец заблокировал бота / TelegramForbiddenError
+    и т.п.) → WARNING, цикл НЕ стартуем. Апдейт-поллинг (dp.start_polling) жив всегда:
+    бот отвечает на команды, владелец /start добудит цикл без рестарта контейнера."""
+    try:
+        await bot.send_message(OWNER_ID, "🟢 Бот запущен")
+    except Exception as e:
+        log.warning(
+            "Владелец недоступен при старте (%s: %s) — фоновый цикл не запущен. "
+            "Разбудить: владелец шлёт /start.", type(e).__name__, e,
+        )
+        return
+    if start_polling_loop(bot):
+        log.info("Владелец на связи — фоновый цикл запущен.")
+
+
 # ═══════════════════════════════════════════════════════════════
 #  РЕЗЕРВНОЕ КОПИРОВАНИЕ (/backup) — ЭКСПОРТ / ИМПОРТ + АВТО-БЭКАП
 # ═══════════════════════════════════════════════════════════════
@@ -983,7 +1028,11 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 async def cmd_start(message: Message) -> None:
-    """Подписаться на уведомления."""
+    """Подписаться на уведомления (для владельца — заодно добудить фоновый цикл)."""
+    if message.from_user is not None and message.from_user.id == OWNER_ID:
+        if start_polling_loop(message.bot):
+            log.info("Фоновый цикл добужен владельцем через /start.")
+
     subs = load_subscribers()
     chat_id = message.chat.id
     name = message.from_user.full_name if message.from_user else str(chat_id)
