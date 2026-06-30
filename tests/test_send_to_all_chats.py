@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+import handlers
 from handlers import send_to_all_chats
 
 
@@ -188,3 +189,23 @@ async def test_generic_error_does_not_remove_user(monkeypatch):
     )
 
     assert saved == []
+
+
+# ── _is_blocked_error: единый детектор «получатель недоступен» ──────
+
+@pytest.mark.parametrize("msg", [
+    "Forbidden: bot was blocked by the user",
+    "Forbidden: user is deactivated",
+    "Bad Request: chat not found",
+])
+def test_is_blocked_error_true(msg):
+    assert handlers._is_blocked_error(Exception(msg)) is True
+
+
+@pytest.mark.parametrize("msg", [
+    "Too Many Requests: retry after 5",
+    "Internal Server Error",
+    "",
+])
+def test_is_blocked_error_false(msg):
+    assert handlers._is_blocked_error(Exception(msg)) is False

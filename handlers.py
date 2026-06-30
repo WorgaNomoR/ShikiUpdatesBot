@@ -566,6 +566,25 @@ async def check_and_notify_favourites(
     return seen, found_new
 
 
+def _is_blocked_error(exc: Exception) -> bool:
+    """True, если ошибка отправки означает, что получатель недоступен
+    (заблокировал бота / удалён / чат не найден) — повод его отписать."""
+    err = str(exc).lower()
+    return ("bot was blocked" in err
+            or "user is deactivated" in err
+            or "chat not found" in err)
+
+
+def _unsubscribe_blocked(subs: dict[int, str], to_remove: list[int]) -> None:
+    """Удаляет заблокировавших из subs и сохраняет актуальный список."""
+    if not to_remove:
+        return
+    for cid in to_remove:
+        subs.pop(cid, None)
+    save_subscribers(subs)
+    log.info("Отписано %d пользователей, заблокировавших бота.", len(to_remove))
+
+
 async def send_to_all_chats(bot: Bot, text: str) -> None:
     """
     Отправляем одно сообщение всем подписчикам.
@@ -591,8 +610,7 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
             )
             log.info("  → Отправлено подписчику %s (chat_id=%d)", name, chat_id)
         except Exception as e:
-            err = str(e).lower()
-            if "bot was blocked" in err or "user is deactivated" in err or "chat not found" in err:
+            if _is_blocked_error(e):
                 log.warning("  ✗ %s (chat_id=%d) заблокировал бота — отписываем.", name, chat_id)
                 to_remove.append(chat_id)
             else:
@@ -600,12 +618,7 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
         # Небольшая пауза между отправками — не триггерим flood control
         await asyncio.sleep(0.3)
 
-    # Удаляем заблокировавших — сохраняем актуальный список
-    if to_remove:
-        for cid in to_remove:
-            subs.pop(cid, None)
-        save_subscribers(subs)
-        log.info("Отписано %d пользователей, заблокировавших бота.", len(to_remove))
+    _unsubscribe_blocked(subs, to_remove)
 
 
 async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set[int], dict]:
@@ -1199,8 +1212,7 @@ async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> No
             sent += 1
             log.info("  broadcast → %s (chat_id=%d)", name, cid)
         except Exception as e:
-            err = str(e).lower()
-            if "bot was blocked" in err or "user is deactivated" in err or "chat not found" in err:
+            if _is_blocked_error(e):
                 log.warning("  broadcast ✗ %s (chat_id=%d) заблокировал бота.", name, cid)
                 to_remove.append(cid)
             else:
@@ -1208,11 +1220,7 @@ async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> No
             failed += 1
         await asyncio.sleep(0.3)
 
-    if to_remove:
-        for cid in to_remove:
-            subs.pop(cid, None)
-        save_subscribers(subs)
-        log.info("Отписано %d заблокировавших бота.", len(to_remove))
+    _unsubscribe_blocked(subs, to_remove)
 
     await callback.message.edit_text(
         f"✅ Отправлено: {sent}" + (f", ошибок: {failed}" if failed else "") + "."
