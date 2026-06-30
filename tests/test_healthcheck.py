@@ -27,6 +27,34 @@ def _reset_healthcheck_state():
 #  Пульс и определение «жив / не жив»
 # ============================================================
 
+@pytest.fixture
+def fake_web(monkeypatch):
+    """Заглушки aiohttp web.AppRunner/TCPSite — не открываем реальный порт.
+    Возвращает captured: port (TCPSite), started (bool), runner_kwargs (kwargs AppRunner)."""
+    captured = {"port": None, "started": False, "runner_kwargs": {}}
+
+    class FakeSite:
+        def __init__(self, runner, host, port):
+            captured["port"] = port
+
+        async def start(self):
+            captured["started"] = True
+
+    class FakeRunner:
+        def __init__(self, app, **kwargs):
+            captured["runner_kwargs"] = kwargs
+
+        async def setup(self):
+            pass
+
+        async def cleanup(self):
+            pass
+
+    monkeypatch.setattr(healthcheck.web, "AppRunner", FakeRunner)
+    monkeypatch.setattr(healthcheck.web, "TCPSite", FakeSite)
+    return captured
+
+
 def test_grace_period_before_first_heartbeat():
     """До первого пульса бот считается живым (грейс-период старта).
     Это и есть защита от рестарт-петли при недоступном владельце."""
@@ -77,114 +105,38 @@ def test_seconds_since_heartbeat_none_without_beat():
 # ============================================================
 
 @pytest.mark.asyncio
-async def test_threshold_computed_from_interval(monkeypatch):
+async def test_threshold_computed_from_interval(fake_web):
     """Порог = check_interval * misses; сервер реально не поднимаем."""
-    started = {}
-
-    # Подменяем web.TCPSite.start, чтобы не открывать настоящий порт
-    class FakeSite:
-        def __init__(self, runner, host, port):
-            started["port"] = port
-
-        async def start(self):
-            started["called"] = True
-
-    class FakeRunner:
-        def __init__(self, app, **kwargs):
-            pass
-
-        async def setup(self):
-            pass
-
-        async def cleanup(self):
-            pass
-
-    monkeypatch.setattr(healthcheck.web, "AppRunner", FakeRunner)
-    monkeypatch.setattr(healthcheck.web, "TCPSite", FakeSite)
-
     await healthcheck.start_health_server(check_interval=900, misses=3, port=12345)
 
     assert healthcheck._health_threshold == 2700  # 900 * 3
-    assert started.get("called") is True
-    assert started.get("port") == 12345
+    assert fake_web["started"] is True
+    assert fake_web["port"] == 12345
 
 
 @pytest.mark.asyncio
-async def test_threshold_default_misses(monkeypatch):
+async def test_threshold_default_misses(fake_web):
     """По умолчанию misses=3."""
-    class FakeSite:
-        def __init__(self, runner, host, port):
-            pass
-
-        async def start(self):
-            pass
-
-    class FakeRunner:
-        def __init__(self, app, **kwargs):
-            pass
-
-        async def setup(self):
-            pass
-
-    monkeypatch.setattr(healthcheck.web, "AppRunner", FakeRunner)
-    monkeypatch.setattr(healthcheck.web, "TCPSite", FakeSite)
-
     await healthcheck.start_health_server(check_interval=600, port=12346)
     assert healthcheck._health_threshold == 1800  # 600 * 3
 
 
 @pytest.mark.asyncio
-async def test_port_read_from_env_when_none(monkeypatch):
+async def test_port_read_from_env_when_none(fake_web, monkeypatch):
     """port=None → берётся из переменной окружения PORT."""
-    used = {}
-
-    class FakeSite:
-        def __init__(self, runner, host, port):
-            used["port"] = port
-
-        async def start(self):
-            pass
-
-    class FakeRunner:
-        def __init__(self, app, **kwargs):
-            pass
-
-        async def setup(self):
-            pass
-
-    monkeypatch.setattr(healthcheck.web, "AppRunner", FakeRunner)
-    monkeypatch.setattr(healthcheck.web, "TCPSite", FakeSite)
     monkeypatch.setenv("PORT", "9999")
 
     await healthcheck.start_health_server(check_interval=900, port=None)
-    assert used.get("port") == 9999
+    assert fake_web["port"] == 9999
 
 
 @pytest.mark.asyncio
-async def test_invalid_env_port_falls_back_to_8080(monkeypatch):
+async def test_invalid_env_port_falls_back_to_8080(fake_web, monkeypatch):
     """Некорректный PORT в env → дефолт 8080, без падения."""
-    used = {}
-
-    class FakeSite:
-        def __init__(self, runner, host, port):
-            used["port"] = port
-
-        async def start(self):
-            pass
-
-    class FakeRunner:
-        def __init__(self, app, **kwargs):
-            pass
-
-        async def setup(self):
-            pass
-
-    monkeypatch.setattr(healthcheck.web, "AppRunner", FakeRunner)
-    monkeypatch.setattr(healthcheck.web, "TCPSite", FakeSite)
     monkeypatch.setenv("PORT", "not-a-number")
 
     await healthcheck.start_health_server(check_interval=900, port=None)
-    assert used.get("port") == 8080
+    assert fake_web["port"] == 8080
 
 
 @pytest.mark.asyncio
@@ -239,29 +191,10 @@ async def test_root_endpoint_returns_200():
 
 
 @pytest.mark.asyncio
-async def test_health_server_disables_access_log(monkeypatch):
+async def test_health_server_disables_access_log(fake_web):
     """AppRunner создаётся с access_log=None — иначе каждый опрос liveness-пробы
     (раз в минуту) спамит в лог строкой GET /health 200 (access-лог aiohttp)."""
-    captured = {}
-
-    class FakeSite:
-        def __init__(self, runner, host, port):
-            pass
-
-        async def start(self):
-            pass
-
-    class FakeRunner:
-        def __init__(self, app, **kwargs):
-            captured.update(kwargs)
-
-        async def setup(self):
-            pass
-
-    monkeypatch.setattr(healthcheck.web, "AppRunner", FakeRunner)
-    monkeypatch.setattr(healthcheck.web, "TCPSite", FakeSite)
-
     await healthcheck.start_health_server(check_interval=900, port=12345)
 
-    assert "access_log" in captured, "AppRunner вызван без access_log"
-    assert captured["access_log"] is None
+    assert "access_log" in fake_web["runner_kwargs"], "AppRunner вызван без access_log"
+    assert fake_web["runner_kwargs"]["access_log"] is None

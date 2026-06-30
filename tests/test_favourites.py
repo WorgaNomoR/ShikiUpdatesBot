@@ -45,6 +45,14 @@ FAV_SAMPLE = {
 }
 
 
+@pytest.fixture
+def silence_favourites_io(monkeypatch):
+    """Глушит общую рутину тестов check_and_notify_favourites: запись seen
+    избранного и asyncio.sleep (рассылку каждый тест мокает сам — её инспектируют)."""
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda *a, **k: None)
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+
 def _stats_with_titles():
     """stats_all с парой тайтлов для проверки джойна ссылок/оценок."""
     stats = storage._empty_stats_all()
@@ -565,9 +573,8 @@ def test_build_favourite_message_industry_uses_person_bank():
 
 
 @pytest.mark.asyncio
-async def test_check_and_notify_favourites_joins_url_in_notification(monkeypatch):
+async def test_check_and_notify_favourites_joins_url_in_notification(monkeypatch, silence_favourites_io):
     """Баг 1: уведомление о новом аниме должно содержать ссылку из titles{}."""
-    import main
 
     fav = {k: [] for k in shiki_api._FAV_CATEGORIES}
     fav["animes"] = [{"id": 226, "name": "Elfen Lied",
@@ -579,8 +586,6 @@ async def test_check_and_notify_favourites_joins_url_in_notification(monkeypatch
                         AsyncMock(side_effect=lambda bot, text: sent.append(text)))
     monkeypatch.setattr("handlers.load_stats_all", lambda *a, **k: _stats_with_titles())
     monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
-    monkeypatch.setattr("handlers.save_seen_favourites", lambda *a, **k: None)
-    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
 
     # baseline: всё уже виденное, КРОМЕ нового аниме 226
     seen = {f"{c}_{i['id']}" for c in shiki_api._FAV_CATEGORIES
@@ -595,10 +600,9 @@ async def test_check_and_notify_favourites_joins_url_in_notification(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_check_and_notify_favourites_refreshes_stats(monkeypatch):
+async def test_check_and_notify_favourites_refreshes_stats(monkeypatch, silence_favourites_io):
     """Unit 3: при found_new stats["favourites"] пересобирается из скачанного
     списка — без повторного fetch_favourites."""
-    import main
 
     fav = {k: [] for k in shiki_api._FAV_CATEGORIES}
     fav["mangas"] = [{"id": 21525, "name": "Akatsuki no Yona",
@@ -610,8 +614,6 @@ async def test_check_and_notify_favourites_refreshes_stats(monkeypatch):
     monkeypatch.setattr("handlers.load_stats_all", lambda *a, **k: _stats_with_titles())
     monkeypatch.setattr("handlers.save_stats_all",
                         lambda data: saved.update(data))
-    monkeypatch.setattr("handlers.save_seen_favourites", lambda *a, **k: None)
-    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
 
     seen = {"mangas_1"}  # непустой baseline, нового тайтла там нет
 
@@ -628,8 +630,7 @@ async def test_check_and_notify_favourites_refreshes_stats(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_check_and_notify_favourites_no_new_returns_false(monkeypatch):
-    import main
+async def test_check_and_notify_favourites_no_new_returns_false(monkeypatch, silence_favourites_io):
 
     fav = {k: [] for k in shiki_api._FAV_CATEGORIES}
     fav["animes"] = [{"id": 226, "name": "Elfen Lied",
@@ -639,8 +640,6 @@ async def test_check_and_notify_favourites_no_new_returns_false(monkeypatch):
     monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
     monkeypatch.setattr("handlers.load_stats_all", lambda *a, **k: _stats_with_titles())
     monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
-    monkeypatch.setattr("handlers.save_seen_favourites", lambda *a, **k: None)
-    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
 
     seen = {"animes_226", "animes_999"}  # 226 уже виден
     _, found_new = await handlers.check_and_notify_favourites(None, seen)
@@ -648,10 +647,9 @@ async def test_check_and_notify_favourites_no_new_returns_false(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_check_and_notify_favourites_dedups_industry_people(monkeypatch):
+async def test_check_and_notify_favourites_dedups_industry_people(monkeypatch, silence_favourites_io):
     """Один человек в нескольких ролях (seyu + producers) → ОДНО уведомление,
     но обе ролевые seen-записи зафиксированы."""
-    import main
 
     fav = {k: [] for k in shiki_api._FAV_CATEGORIES}
     person = {"id": 34785, "name": "Rie Takahashi",
@@ -666,8 +664,6 @@ async def test_check_and_notify_favourites_dedups_industry_people(monkeypatch):
     monkeypatch.setattr("handlers.load_stats_all",
                         lambda *a, **k: {"anime": {"titles": {}}, "manga": {"titles": {}}})
     monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
-    monkeypatch.setattr("handlers.save_seen_favourites", lambda *a, **k: None)
-    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
 
     seen = {"animes_999"}  # непустой baseline без этого человека
     new_seen, found_new = await handlers.check_and_notify_favourites(None, seen)
