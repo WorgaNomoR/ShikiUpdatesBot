@@ -11,13 +11,9 @@ import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    BotCommand,
-)
+from aiogram.types import BotCommand
 
-from backup import (
-    _shutdown_backup,
-    )
+from backup import _shutdown_backup
 from config import (
     BOT_TOKEN,
     CHECK_INTERVAL,
@@ -46,10 +42,6 @@ from handlers import (
     stats_menu_cb,
 )
 from healthcheck import start_health_server
-
-# ═══════════════════════════════════════════════════════════════
-#  FSM — состояния для команды /broadcast
-# ═══════════════════════════════════════════════════════════════
 
 
 async def main() -> None:
@@ -90,7 +82,6 @@ async def main() -> None:
         BotCommand(command="stop",   description="Отписаться 😢"),
     ])
 
-    # polling_loop работает параллельно как фоновая задача
     # Healthcheck-сервер (для хостингов с обязательным портом + watchdog)
     await start_health_server(check_interval=CHECK_INTERVAL)
 
