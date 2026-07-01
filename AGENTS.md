@@ -1,62 +1,101 @@
 # Agent guidance for ShikiUpdatesBot
 
 ## What this repository is
-- A Telegram bot implemented primarily in `main.py`.
-- Tracks a Shikimori user's history and favourites, then sends notifications to Telegram subscribers.
+- A Telegram bot that tracks a Shikimori user's history and favourites, then sends notifications to Telegram subscribers.
 - Collects statistics (genres, studios, scores, demographics, etc.) and sends the owner an automatic report at the start of each quarter.
 - Exposes `/stats` (button menu: current quarter / all-time) and `/favs` (favourite anime & manga) to all subscribers.
-- Uses `aiogram` for Telegram and `aiohttp` for HTTP requests (both client, for Shikimori, and server, for healthcheck).
-- Contains tests in `tests/` and configuration at the top of `main.py`.
+- Uses `aiogram` for Telegram and `aiohttp` for HTTP (both client, for Shikimori, and server, for healthcheck).
+- Split into focused modules (see Architecture); tests live in `tests/`.
+
+## Architecture (modules)
+The former `main.py` monolith was split into single-responsibility modules with a strictly one-way (acyclic) dependency graph. `main.py` is now a thin entrypoint that wires the handlers into the Dispatcher.
+
+- `config.py` — env / local `.env` loading (`load_dotenv`), data-dir paths, logging, the shared `log`. Foundation: imports nothing project-local.
+- `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_utcnow`, `quarter_*`, `_safe_int`, `_safe_float`.
+- `storage.py` — file persistence: `_atomic_write`, load/save of every JSON state file, the `stats_all` in-memory cache.
+- `shiki_api.py` — Shikimori client + media domain: `fetch_*`, GraphQL, kind filters, `get_media_info`, `is_relevant`, translation dicts.
+- `messages.py` — message bank, history parsers, `build_message` / `build_favourite_message`, presentation formatters.
+- `stats.py` — aggregation, `sync_stats_all`, current-quarter events, quarter snapshots, the `build_*_messages` report builders.
+- `backup.py` — `/backup` logic: zip build/restore, delivery to the owner, auto-backup triggers, the shutdown hook.
+- `handlers.py` — all aiogram commands & FSM, inline menus, broadcast, the notification cycle (`check_and_notify*`, `polling_loop`), quarter rotation, the owner-reachability gate.
+- `healthcheck.py` — isolated HTTP healthcheck server + heartbeat watchdog. Imports nothing from the app; the dependency is one-way.
+- `main.py` — entrypoint: builds the Bot/Dispatcher, registers handlers, runs the owner-reachability gate + healthcheck + polling.
+
+Dependency graph (each module depends only on those below it; `healthcheck` is fully isolated):
+
+```mermaid
+graph TD
+    main --> handlers
+    main --> backup
+    main --> healthcheck
+    handlers --> backup
+    handlers --> stats
+    handlers --> messages
+    handlers --> shiki_api
+    handlers --> storage
+    stats --> messages
+    stats --> shiki_api
+    stats --> storage
+    messages --> shiki_api
+    backup --> storage
+    storage --> base["config + utils (foundation)"]
+    shiki_api --> base
+    healthcheck["healthcheck (isolated)"]
+```
+
+When adding or moving code, keep dependencies one-directional (import from lower modules only) and pass runtime values (like `CHECK_INTERVAL`) as parameters where that avoids a cycle. `healthcheck.py` is the reference pattern.
 
 ## Important files
-- `main.py` — main entrypoint and implementation: config, message bank, parsers, Shikimori API calls, statistics, command handlers, polling loop.
-- `healthcheck.py` — isolated HTTP healthcheck server with a heartbeat watchdog. Imports nothing from `main.py`; the dependency is one-way (`main.py` calls `heartbeat()` and `start_health_server()`).
 - `README.md` — setup (three deploy tiers), commands, statistics, healthcheck, and test instructions.
-- `requirements.txt` / `requirements-dev.txt` — runtime and development dependencies.
-- `tests/` — pytest-based coverage for storage, notification logic, parser logic, statistics, and Telegram send behavior.
+- `requirements.txt` / `requirements-dev.txt` — runtime and development dependencies (`python-dotenv` is a runtime dep for `.env` loading).
+- `.env.example` — template for the environment variables.
+- `tests/` — pytest coverage for storage, notifications, parsers, statistics, backup, the polling loop, the owner-gate, and Telegram send behaviour.
 
 ## Key patterns and conventions
-- Environment variables: `BOT_TOKEN`, `OWNER_ID` are required at runtime. Optional `DATA_DIR` (default `/data`) controls persistent file location; optional `PORT` (default `8080`) controls the healthcheck server port.
+- Environment variables (read in `config.py`, with local `.env` support via `load_dotenv`; a clear startup error names any missing required one): **required** — `BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`. **Optional with defaults** — `DISPLAY_NAME` (defaults to the `SHIKI_USER` nick), `SHIKI_BASE_URL`, `CHECK_INTERVAL`, `ERROR_NOTIFY_INTERVAL`, `FULL_SYNC_INTERVAL`, `DATA_DIR` (`/data`), `PORT` (`8080`).
 - The bot stores state in JSON files under `DATA_DIR`: `seen_ids.json`, `subscribers.json`, `seen_favourites.json`, `stats_all.json`, `stats_current.json`, and snapshots in `quarters/`; `stats_current.json` additionally holds `last_backup_at`, the weekly auto-backup marker.
 - All file writes go through `_atomic_write()` (temp file + `os.replace()`) for crash safety.
 - All Telegram messages use `ParseMode.HTML`; user-facing strings from the API are escaped via `h()` (`html.escape`).
 - **Stability is the top priority.** Every function must be exception-safe: unexpected or missing data must never crash the bot. Network fetches return `None` on any error (not empty collections) to distinguish API failures from genuinely empty results. Statistics degrade gracefully — a failed export or GraphQL call yields a report without enriched metadata rather than a crash.
 - Statistics data sources: user lists come from the public `list_export` JSON endpoints (no auth); title metadata comes from the GraphQL `animes`/`mangas` batch queries with `censored: false`. Do NOT reintroduce per-title REST calls or OAuth — these were evaluated and rejected.
 - A single relevance filter `is_relevant(media, kind)` governs BOTH notifications and statistics. OVA/ONA are kept; specials/clips/PV are dropped. Do not duplicate or diverge this logic.
-- The bot's lifecycle is managed by `asyncio`: `polling_loop` runs as a background task created in `main()`, alongside `dp.start_polling` and the healthcheck server.
-- Use `pytest tests/` to validate changes; `tests/conftest.py` provides default env vars (incl. a temp `DATA_DIR`) for test execution.
+- **Startup is throttled (anti-429).** `polling_loop` opens one shared `aiohttp.ClientSession` for all startup fetches, with fixed inter-phase delays (`BOOT_PHASE_DELAY`, no jitter) and a single favourites fetch reused by the stats sync (`sync_stats_all(session=…, fav=…)`). `fetch_meta_batch` / `sync_stats_all` take an optional `session` (own short-lived session when omitted).
+- **Owner-reachability gate.** On startup `main()` sends the owner `🟢 Бот запущен` (a restart signal + emergency-channel probe, not debounced). Delivered → `polling_loop` starts as a background task; not delivered → WARNING and the loop is left off. Update-polling stays alive regardless, and the owner re-arms the loop by sending `/start` (idempotent) without a restart. The gate is startup-only; runtime owner-send failures degrade gracefully.
+- Use `pytest tests/` to validate changes; `tests/conftest.py` provides default env vars (incl. a temp `DATA_DIR` and `SHIKI_USER`) and zeroes `BOOT_PHASE_DELAY` for speed.
 - Preserve existing behaviour for Shikimori event filtering, favourite notifications, and statistics aggregation when modifying logic.
 - `/backup` (owner-only) zips the whole `DATA_DIR` for export and restores a whitelist (`subscribers.json`, `stats_current.json`, `quarters/*.json`) on import; the owner also receives automatic backups (tag `#backup`) on subscribe/unsubscribe, quarter rotation, and weekly (via the `last_backup_at` marker). Replaces the former `/export` and `/import`.
 
 ## Gotchas discovered the hard way (read before touching stats/links)
-- **GraphQL vs REST URL formats differ.** GraphQL Shikimori returns FULL urls (`https://shikimori.io/animes/123`), while REST history returns RELATIVE (`/animes/123`). All link-building code prepends `SHIKI_BASE_URL`, so a full url would produce a double-domain broken link. `_rel_url()` normalizes any url to relative form — it is applied at the source (`fetch_meta_batch`) and defensively at every render point. When adding new link rendering, run urls through `_rel_url()`.
-- **Translations are baked into stored records.** `origin` and `rating` are translated via `_ORIGIN_RU`/`_RATING_RU` at fetch time and saved into `titles`. Existing records keep their old value when a dict is edited — fixes apply only to new records (or after wiping the test bot's data). This was deliberately not refactored to "store-raw-translate-on-display" (deemed over-engineering for a rarely-changing dict).
-- **`/stats` and the quarterly report share `_build_quarter_section`.** Editing it changes both at once — convenient, but verify both.
-- **`/stats all` and the quarterly report are built by DIFFERENT code** (`build_stats_all_messages` works from pre-computed aggregates; the quarterly section aggregates a title list on the fly). Shared look comes from common formatters (`_top_block`, `_fmt_mono_rows`, `_section_header`, `_score_dist_block`), not shared builders.
+- **GraphQL vs REST URL formats differ.** GraphQL Shikimori returns FULL urls (`https://shikimori.io/animes/123`), while REST history returns RELATIVE (`/animes/123`). All link-building code prepends `SHIKI_BASE_URL`, so a full url would produce a double-domain broken link. `_rel_url()` (utils) normalizes any url to relative form — applied at the source (`fetch_meta_batch` in `shiki_api.py`) and defensively at every render point. When adding new link rendering, run urls through `_rel_url()`.
+- **Translations are baked into stored records.** `origin` and `rating` are translated via `_ORIGIN_RU`/`_RATING_RU` (`shiki_api.py`) at fetch time and saved into `titles`. Existing records keep their old value when a dict is edited — fixes apply only to new records (or after wiping the test bot's data). This was deliberately not refactored to "store-raw-translate-on-display" (deemed over-engineering for a rarely-changing dict).
+- **`/stats` and the quarterly report share `_build_quarter_section`** (`stats.py`). Editing it changes both at once — convenient, but verify both.
+- **`/stats all` and the quarterly report are built by DIFFERENT code** (`build_stats_all_messages` works from pre-computed aggregates; the quarterly section aggregates a title list on the fly). Shared look comes from common formatters (`_top_block`, `_fmt_mono_rows`, `_section_header`, `_score_dist_block` in `messages.py`), not shared builders.
 - **Link previews are disabled selectively.** `/favs` passes `disable_preview=True` (its first link is always the same favourite); `/stats`, `/status`, and notifications keep previews (a card for the relevant title is desirable).
 
 ## Testing notes (two real prod bugs slipped through — smoke tests now guard against them)
-- `test_stats.py` exists and covers the stats/favourites code added in this branch: utilities (`_safe_int/_safe_float`, `_rel_url`), `is_relevant`, quarter dates, formatters, `recompute_aggregates`, the kind-filter regression (garbage kinds must not inflate a studio counter — the "Studio Deen 11 vs 8" bug), favourites collection, and **smoke tests**: every report builder (`build_stats_all_messages`, `build_current_stats_messages`, `build_favourites_messages`, and the `_stats_report_*` async builders) is called and asserted to return `list[str]`, and rendered links are checked to contain the domain exactly once (no double-domain).
+- `test_stats.py` covers the stats/favourites code: utilities (`_safe_int/_safe_float`, `_rel_url`), `is_relevant`, quarter dates, formatters, `recompute_aggregates`, the kind-filter regression (garbage kinds must not inflate a studio counter — the "Studio Deen 11 vs 8" bug), favourites collection, and **smoke tests**: every report builder (`build_stats_all_messages`, `build_current_stats_messages`, `build_favourites_messages`, and the `_stats_report_*` async builders) is called and asserted to return `list[str]`, and rendered links are checked to contain the domain exactly once (no double-domain).
 - Rationale: two production bugs would have been caught instantly by these smoke tests — (1) `build_stats_all_messages` going undefined after a manual merge clobbered its header, and (2) double-domain broken links from GraphQL full URLs. When adding new report builders or formatters, extend the smoke tests accordingly. Keep `test_stats.py` free of duplication with `test_messages.py` (build_message, h()), `test_parsers.py`, `test_favourites.py` (build_favourite_message), and `test_media.py` (get_media_info).
+- Tests patch symbols where they are looked up: mock the I/O a handler calls as `handlers.<name>` (e.g. `monkeypatch.setattr("handlers.fetch_favourites", …)`), the stats-domain callers as `stats.<name>`, etc. String-form `monkeypatch.setattr("module.name", …)` avoids local-variable shadowing.
 
 ## Typical developer tasks
-- Update message templates or event classification in `main.py` (the message bank near the top).
-- Fix parser edge cases for Shikimori descriptions and score extraction.
-- Extend statistics aggregation or report formatting (functions named `build_*_messages`, `recompute_aggregates`, `_build_quarter_section`, and the `_top_block`/`_fmt_*` formatters).
-- Add a new report type to the `/stats` menu: append one entry to `_STATS_MENU` (callback key, label, async builder, row) — keyboard and dispatch update automatically.
-- Improve notification filtering, storage handling, and broadcast flow.
+- Update message templates or event classification: the message bank and parsers live in `messages.py`.
+- Fix parser edge cases for Shikimori descriptions and score extraction (`messages.py`).
+- Extend statistics aggregation or report formatting: `stats.py` (`build_*_messages`, `recompute_aggregates`, `_build_quarter_section`) and the `_top_block`/`_fmt_*` formatters in `messages.py`.
+- Add a new report type to the `/stats` menu: append one entry to `_STATS_MENU` in `handlers.py` (callback key, label, async builder, row) — keyboard and dispatch update automatically.
+- Improve notification filtering, storage handling, and broadcast flow (`handlers.py` / `storage.py`).
 - Add tests under `tests/` for any new behavior.
 
 ## How to run
 - Install runtime dependencies: `pip install -r requirements.txt`
 - Install test dependencies before running tests: `pip install -r requirements-dev.txt`
+- Set at least the required env vars (`BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`) — via the environment or a local `.env` (see `.env.example`).
 - Run the bot: `python main.py`
 - Run tests: `pytest tests/`
 
 ## Notes for AI agents
-- The codebase is large (`main.py` is several thousand lines). A future refactor into modules (`config`, `messages`, `shiki_api`, `stats`, `handlers`, `storage`, `utils`) is planned but should happen ONLY after the current feature work is merged and stable — and only once `test_stats.py` exists to catch regressions during the split. `healthcheck.py` is the first extracted module and demonstrates the intended pattern: one-way dependencies, parameters instead of imports from `main.py`.
-- When extracting modules, keep dependencies one-directional and pass values (like `CHECK_INTERVAL`) as parameters rather than importing from `main.py`, to avoid circular imports. A planned `utils.py` will hold shared helpers (`_utcnow`, `_safe_int`, `_safe_float`, `quarter_*`) with a matching `test_utils.py`.
+- The module split is done (see Architecture). Keep the dependency graph acyclic and one-directional; `healthcheck.py` is the reference (one-way deps, parameters instead of back-imports).
 - Do not commit actual bot tokens or owner IDs.
-- When changing configuration defaults, document them in both `main.py` and `README.md`.
-- Prefer minimal, behavior-preserving fixes, and verify with existing tests.
+- When changing configuration defaults, document them in both `config.py` and `README.md`.
+- Prefer minimal, behavior-preserving fixes, and verify with `pytest tests/` (ruff runs in CI).
+- Line endings are CRLF (the repo has no `.gitattributes`); keep them to avoid whole-file diffs.
 - Git operations are handled manually by the maintainer — do not push via tooling.
