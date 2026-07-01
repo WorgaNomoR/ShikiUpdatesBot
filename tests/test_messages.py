@@ -1,5 +1,6 @@
 import random
 
+import messages
 from messages import build_message
 from utils import h
 
@@ -146,3 +147,32 @@ def test_message_without_url(monkeypatch):
     )
 
     assert '<a href="' not in msg
+
+
+# ── экранирование DISPLAY_NAME в HTML-шаблонах (Codacy MEDIUM) ──────
+
+def test_display_name_html_constant_is_escaped():
+    """DISPLAY_NAME из env экранируется для HTML — иначе < > & в имени → Telegram 400."""
+    import config
+    assert messages._DISPLAY_NAME_HTML == h(config.DISPLAY_NAME)
+
+
+def test_favourite_message_uses_escaped_name(monkeypatch):
+    monkeypatch.setattr(messages, "_DISPLAY_NAME_HTML", "Ампер&амп;Санд")
+    item = {"id": 1, "name": "X", "russian": "Икс", "url": None}
+    text = messages.build_favourite_message("animes", item)
+    assert "Ампер&амп;Санд" in text
+
+
+def test_broadcast_header_escapes_special_chars(monkeypatch):
+    import importlib
+
+    import config
+    monkeypatch.setattr(config, "DISPLAY_NAME", "A<b>&Co", raising=False)
+    importlib.reload(messages)
+    try:
+        assert "A&lt;b&gt;&amp;Co" in messages.BROADCAST_HEADER
+        assert "A<b>&Co" not in messages.BROADCAST_HEADER
+    finally:
+        monkeypatch.undo()
+        importlib.reload(messages)

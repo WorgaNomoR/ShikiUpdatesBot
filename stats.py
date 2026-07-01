@@ -318,7 +318,7 @@ async def _collect_favourites(
 async def sync_stats_all(
     session: "aiohttp.ClientSession | None" = None,
     fav: dict | None = None,
-) -> dict:
+) -> tuple[dict, bool]:
     """
     Главная функция актуализации stats_all.
 

@@ -335,7 +335,11 @@ MESSAGES = {
     },  # конец "favourites"
 }
 
-BROADCAST_HEADER = f"📢 <b>{DISPLAY_NAME} говорит:</b>"
+# DISPLAY_NAME приходит из окружения — экранируем для HTML-шаблонов, иначе
+# символы < > & в имени ломают разметку (Telegram 400). Логи/plain-ответы
+# используют сырой DISPLAY_NAME, здесь — только для HTML-сообщений.
+_DISPLAY_NAME_HTML = h(DISPLAY_NAME)
+BROADCAST_HEADER = f"📢 <b>{_DISPLAY_NAME_HTML} говорит:</b>"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -491,7 +495,7 @@ def build_message(entry: dict) -> str:
         old_score, new_score = change if change else (None, None)
         template = random.choice(MESSAGES["score_changed"])
         text = template.format(
-            n=DISPLAY_NAME,
+            n=_DISPLAY_NAME_HTML,
             title=title,
             old=old_score if old_score is not None else "?",
             new=new_score if new_score is not None else "?",
@@ -511,7 +515,7 @@ def build_message(entry: dict) -> str:
             key = "completed_score_perfect"
         template = random.choice(bank[key])
         text = template.format(
-            n=DISPLAY_NAME,
+            n=_DISPLAY_NAME_HTML,
             title=title,
             score=score if score is not None else "?",
         )
@@ -519,7 +523,7 @@ def build_message(entry: dict) -> str:
         key = event_type
         template = random.choice(bank[key])
         text = template.format(
-            n=DISPLAY_NAME,
+            n=_DISPLAY_NAME_HTML,
             title=title,
             score="?",
         )
@@ -560,7 +564,7 @@ def build_favourite_message(category: str, item: dict) -> str:
     title = (f'<a href="{SHIKI_BASE_URL}{url}">{title_text}</a>'
              if url else title_text)
 
-    text = random.choice(templates).format(n=DISPLAY_NAME, title=title)
+    text = random.choice(templates).format(n=_DISPLAY_NAME_HTML, title=title)
 
     return text
 
