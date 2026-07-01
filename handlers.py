@@ -157,11 +157,12 @@ async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> list[Me
 #  РОТАЦИЯ КВАРТАЛА
 # ═══════════════════════════════════════════════════════════════════
 
-async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict) -> dict:
+async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
     """
     Проверяем смену квартала. Если сменился:
       1. Защита last_report_sent от двойной отправки.
-      2. Синхронизируем stats_all (чтобы метаданные завершённых были свежими).
+      2. Синхронизируем stats_all (чтобы метаданные завершённых были свежими);
+         на старте пропускаем — polling_loop уже синкнул (resync=False).
       3. Строим отчёт, сохраняем снапшот quarters/<period>.json.
       4. Обновляем by_quarter в агрегатах stats_all.
       5. Отправляем отчёт владельцу.
@@ -184,11 +185,14 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict) -> dict
 
     log.info("rotate_quarter: квартал сменился %s → %s.", old_period, now_period)
 
-    # Свежие метаданные перед отчётом
-    try:
-        stats_all, _ = await sync_stats_all()
-    except Exception as e:
-        log.error("rotate_quarter: sync_stats_all упал: %s", e)
+    # Свежие метаданные перед отчётом. На старте (resync=False) пропускаем:
+    # polling_loop уже синкнул stats_all на общей сессии, а второй синк своей
+    # сессией сразу после первого ловил 429 (boot-burst в день ротации).
+    if resync:
+        try:
+            stats_all, _ = await sync_stats_all()
+        except Exception as e:
+            log.error("rotate_quarter: sync_stats_all упал: %s", e)
 
     # Сравнение с прошлым кварталом (читаем снапшот предыдущего, если есть)
     prev_quarter = _load_prev_quarter_summary(old_period)
@@ -770,7 +774,7 @@ async def polling_loop(bot: Bot) -> None:
 
     # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
     try:
-        cur = await rotate_quarter_if_needed(bot, cur, stats_all)
+        cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
     except Exception as e:
         log.exception("Ошибка ротации квартала при старте: %s", e)
 

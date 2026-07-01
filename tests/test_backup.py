@@ -532,3 +532,36 @@ def test_restore_creates_missing_quarters_dir(backup_env):
     assert "quarters/2026-Q1.json" in result["restored"]
     # _atomic_write сам создаёт parent — краша на свежем томе нет
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
+
+
+async def test_rotation_skips_resync_at_boot(backup_env, monkeypatch):
+    """resync=False (стартовый вызов): НЕ дёргаем sync_stats_all — polling_loop
+    уже дал свежий stats_all; второй синк своей сессией ловил 429 в день ротации."""
+    sync = AsyncMock(return_value=({}, True))
+    monkeypatch.setattr("handlers.sync_stats_all", sync)
+    monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
+
+    old_cur = {"period": "2025-Q1", "events": []}
+    await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {}, resync=False)
+    sync.assert_not_awaited()
+
+
+async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
+    """resync=True (дефолт, цикловой вызов): дёргаем sync_stats_all для свежих метаданных."""
+    sync = AsyncMock(return_value=({}, True))
+    monkeypatch.setattr("handlers.sync_stats_all", sync)
+    monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
+
+    old_cur = {"period": "2025-Q1", "events": []}
+    await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
+    sync.assert_awaited_once()
