@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """
 Healthcheck-сервер для ShikiUpdatesBot.
 
@@ -19,18 +21,6 @@ Healthcheck-сервер для ShikiUpdatesBot.
     await start_health_server(check_interval=CHECK_INTERVAL)
 
 Зависимости: только aiohttp (уже есть в проекте — используется aiohttp.web).
-
-Copyright (C) 2026  WorgaNomoR
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  
-See the GNU General Public License for more details.
 """
 
 import logging
@@ -143,7 +133,9 @@ async def start_health_server(
         # /health раз в минуту, иначе это ~1440 строк "GET /health 200" в сутки.
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        # host=0.0.0.0 намеренно: в контейнере healthcheck должен быть доступен
+        # извне (платформа/оркестратор бьёт liveness-пробу снаружи).
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)  # nosec B104
         await site.start()
         log.info(
             "Healthcheck-сервер запущен на :%d (порог живости %d сек).",

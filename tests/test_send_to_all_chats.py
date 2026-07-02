@@ -2,7 +2,8 @@ import asyncio
 
 import pytest
 
-from main import send_to_all_chats
+import handlers
+from handlers import send_to_all_chats
 
 
 class DummyBot:
@@ -16,14 +17,14 @@ class DummyBot:
 @pytest.mark.asyncio
 async def test_no_subscribers(monkeypatch):
     monkeypatch.setattr(
-        "main.load_subscribers",
+        "handlers.load_subscribers",
         lambda: {},
     )
 
     saved = []
 
     monkeypatch.setattr(
-        "main.save_subscribers",
+        "handlers.save_subscribers",
         lambda subs: saved.append(subs),
     )
 
@@ -43,7 +44,7 @@ async def test_no_subscribers(monkeypatch):
 @pytest.mark.asyncio
 async def test_single_subscriber(monkeypatch):
     monkeypatch.setattr(
-        "main.load_subscribers",
+        "handlers.load_subscribers",
         lambda: {123: "Alice"},
     )
 
@@ -63,7 +64,7 @@ async def test_single_subscriber(monkeypatch):
 @pytest.mark.asyncio
 async def test_multiple_subscribers(monkeypatch):
     monkeypatch.setattr(
-        "main.load_subscribers",
+        "handlers.load_subscribers",
         lambda: {
             111: "Alice",
             222: "Bob",
@@ -86,7 +87,7 @@ async def test_multiple_subscribers(monkeypatch):
 @pytest.mark.asyncio
 async def test_blocked_user_removed(monkeypatch):
     monkeypatch.setattr(
-        "main.load_subscribers",
+        "handlers.load_subscribers",
         lambda: {
             111: "Alice",
             222: "Bob",
@@ -96,7 +97,7 @@ async def test_blocked_user_removed(monkeypatch):
     saved = []
 
     monkeypatch.setattr(
-        "main.save_subscribers",
+        "handlers.save_subscribers",
         lambda subs: saved.append(subs.copy()),
     )
 
@@ -124,7 +125,7 @@ async def test_blocked_user_removed(monkeypatch):
 @pytest.mark.asyncio
 async def test_chat_not_found_removed(monkeypatch):
     monkeypatch.setattr(
-        "main.load_subscribers",
+        "handlers.load_subscribers",
         lambda: {
             111: "Alice",
             222: "Bob",
@@ -134,7 +135,7 @@ async def test_chat_not_found_removed(monkeypatch):
     saved = []
 
     monkeypatch.setattr(
-        "main.save_subscribers",
+        "handlers.save_subscribers",
         lambda subs: saved.append(subs.copy()),
     )
 
@@ -160,7 +161,7 @@ async def test_chat_not_found_removed(monkeypatch):
 @pytest.mark.asyncio
 async def test_generic_error_does_not_remove_user(monkeypatch):
     monkeypatch.setattr(
-        "main.load_subscribers",
+        "handlers.load_subscribers",
         lambda: {
             111: "Alice",
         },
@@ -169,7 +170,7 @@ async def test_generic_error_does_not_remove_user(monkeypatch):
     saved = []
 
     monkeypatch.setattr(
-        "main.save_subscribers",
+        "handlers.save_subscribers",
         lambda subs: saved.append(subs),
     )
 
@@ -188,3 +189,23 @@ async def test_generic_error_does_not_remove_user(monkeypatch):
     )
 
     assert saved == []
+
+
+# ── _is_blocked_error: единый детектор «получатель недоступен» ──────
+
+@pytest.mark.parametrize("msg", [
+    "Forbidden: bot was blocked by the user",
+    "Forbidden: user is deactivated",
+    "Bad Request: chat not found",
+])
+def test_is_blocked_error_true(msg):
+    assert handlers._is_blocked_error(Exception(msg)) is True
+
+
+@pytest.mark.parametrize("msg", [
+    "Too Many Requests: retry after 5",
+    "Internal Server Error",
+    "",
+])
+def test_is_blocked_error_false(msg):
+    assert handlers._is_blocked_error(Exception(msg)) is False

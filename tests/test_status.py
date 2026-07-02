@@ -1,6 +1,7 @@
 import pytest
 
-from main import format_rate_entry
+import handlers
+from messages import format_rate_entry
 
 # ============================================================
 # format_rate_entry()
@@ -129,16 +130,15 @@ class DummyMessage:
 
 @pytest.mark.asyncio
 async def test_status_nothing(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         return []
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 
@@ -147,16 +147,15 @@ async def test_status_nothing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_api_failure(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         return None
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 
@@ -165,7 +164,6 @@ async def test_status_api_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_anime_only(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         if media == "anime":
@@ -180,11 +178,11 @@ async def test_status_anime_only(monkeypatch):
             ]
         return []
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 
@@ -195,7 +193,6 @@ async def test_status_anime_only(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_manga_only(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         if media == "manga":
@@ -209,11 +206,11 @@ async def test_status_manga_only(monkeypatch):
             ]
         return []
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 
@@ -224,7 +221,6 @@ async def test_status_manga_only(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_anime_and_manga(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         if media == "anime":
@@ -247,11 +243,11 @@ async def test_status_anime_and_manga(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 
@@ -263,7 +259,6 @@ async def test_status_anime_and_manga(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_filters_disallowed_anime_kind(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         if media == "anime":
@@ -278,11 +273,11 @@ async def test_status_filters_disallowed_anime_kind(monkeypatch):
             ]
         return []
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 
@@ -291,7 +286,6 @@ async def test_status_filters_disallowed_anime_kind(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_anime_failed_manga_ok(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         if media == "anime":
@@ -306,11 +300,11 @@ async def test_status_anime_failed_manga_ok(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 
@@ -319,7 +313,6 @@ async def test_status_anime_failed_manga_ok(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_status_manga_failed_anime_ok(monkeypatch):
-    import main
 
     async def fake_fetch(media, statuses):
         if media == "manga":
@@ -335,11 +328,11 @@ async def test_status_manga_failed_anime_ok(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(main, "fetch_current_rates", fake_fetch)
+    monkeypatch.setattr("handlers.fetch_current_rates", fake_fetch)
 
     msg = DummyMessage()
 
-    await main.cmd_status(msg)
+    await handlers.cmd_status(msg)
 
     text = msg.calls[0][0]
 

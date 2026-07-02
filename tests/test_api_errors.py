@@ -4,7 +4,7 @@ import json
 import aiohttp
 import pytest
 
-from main import (
+from shiki_api import (
     fetch_favourites,
     fetch_history,
 )

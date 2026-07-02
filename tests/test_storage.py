@@ -1,6 +1,7 @@
 import json
 
-from main import (
+import utils
+from storage import (
     load_seen_ids,
     load_subscribers,
     save_seen_ids,
@@ -9,7 +10,7 @@ from main import (
 
 
 def test_load_seen_ids_missing_file(monkeypatch, tmp_path):
-    monkeypatch.setattr("main.SEEN_IDS_FILE", str(tmp_path / "missing.json"))
+    monkeypatch.setattr("storage.SEEN_IDS_FILE", str(tmp_path / "missing.json"))
 
     assert load_seen_ids() == set()
 
@@ -22,7 +23,7 @@ def test_load_seen_ids_valid_json(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    monkeypatch.setattr("main.SEEN_IDS_FILE", str(file))
+    monkeypatch.setattr("storage.SEEN_IDS_FILE", str(file))
 
     assert load_seen_ids() == {1, 2, 3}
 
@@ -32,7 +33,7 @@ def test_load_seen_ids_corrupted_json(monkeypatch, tmp_path):
 
     file.write_text("{", encoding="utf-8")
 
-    monkeypatch.setattr("main.SEEN_IDS_FILE", str(file))
+    monkeypatch.setattr("storage.SEEN_IDS_FILE", str(file))
 
     assert load_seen_ids() == set()
 
@@ -40,7 +41,7 @@ def test_load_seen_ids_corrupted_json(monkeypatch, tmp_path):
 def test_save_seen_ids(monkeypatch, tmp_path):
     file = tmp_path / "seen_ids.json"
 
-    monkeypatch.setattr("main.SEEN_IDS_FILE", str(file))
+    monkeypatch.setattr("storage.SEEN_IDS_FILE", str(file))
 
     save_seen_ids({1, 2, 3})
 
@@ -52,7 +53,7 @@ def test_save_seen_ids(monkeypatch, tmp_path):
 def test_seen_ids_roundtrip(monkeypatch, tmp_path):
     file = tmp_path / "seen_ids.json"
 
-    monkeypatch.setattr("main.SEEN_IDS_FILE", str(file))
+    monkeypatch.setattr("storage.SEEN_IDS_FILE", str(file))
 
     original = {10, 20, 30}
 
@@ -64,7 +65,7 @@ def test_seen_ids_roundtrip(monkeypatch, tmp_path):
 
 
 def test_load_subscribers_missing_file(monkeypatch, tmp_path):
-    monkeypatch.setattr("main.SUBS_FILE", str(tmp_path / "missing.json"))
+    monkeypatch.setattr("storage.SUBS_FILE", str(tmp_path / "missing.json"))
 
     assert load_subscribers() == {}
 
@@ -84,7 +85,7 @@ def test_load_subscribers_valid_json(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    monkeypatch.setattr("main.SUBS_FILE", str(file))
+    monkeypatch.setattr("storage.SUBS_FILE", str(file))
 
     assert load_subscribers() == {
         123: "Alice",
@@ -97,7 +98,7 @@ def test_load_subscribers_corrupted_json(monkeypatch, tmp_path):
 
     file.write_text("{", encoding="utf-8")
 
-    monkeypatch.setattr("main.SUBS_FILE", str(file))
+    monkeypatch.setattr("storage.SUBS_FILE", str(file))
 
     assert load_subscribers() == {}
 
@@ -105,7 +106,7 @@ def test_load_subscribers_corrupted_json(monkeypatch, tmp_path):
 def test_save_subscribers(monkeypatch, tmp_path):
     file = tmp_path / "subs.json"
 
-    monkeypatch.setattr("main.SUBS_FILE", str(file))
+    monkeypatch.setattr("storage.SUBS_FILE", str(file))
 
     save_subscribers(
         {
@@ -125,7 +126,7 @@ def test_save_subscribers(monkeypatch, tmp_path):
 def test_subscribers_roundtrip(monkeypatch, tmp_path):
     file = tmp_path / "subs.json"
 
-    monkeypatch.setattr("main.SUBS_FILE", str(file))
+    monkeypatch.setattr("storage.SUBS_FILE", str(file))
 
     original = {
         111: "Alice",
@@ -142,7 +143,7 @@ def test_subscribers_roundtrip(monkeypatch, tmp_path):
 def test_save_seen_ids_removes_tmp_file(monkeypatch, tmp_path):
     file = tmp_path / "seen_ids.json"
 
-    monkeypatch.setattr("main.SEEN_IDS_FILE", str(file))
+    monkeypatch.setattr("storage.SEEN_IDS_FILE", str(file))
 
     save_seen_ids({1})
 
@@ -151,7 +152,7 @@ def test_save_seen_ids_removes_tmp_file(monkeypatch, tmp_path):
 
 
 def test_atomic_write_creates_parent_directory(tmp_path):
-    from main import _atomic_write
+    from storage import _atomic_write
 
     target = tmp_path / "nested" / "folder" / "file.json"
 
@@ -162,7 +163,7 @@ def test_atomic_write_creates_parent_directory(tmp_path):
 
 
 def test_atomic_write_overwrites_existing_file(tmp_path):
-    from main import _atomic_write
+    from storage import _atomic_write
 
     target = tmp_path / "data.json"
 
@@ -174,6 +175,5 @@ def test_atomic_write_overwrites_existing_file(tmp_path):
 
 
 def test_utcnow_is_naive():
-    import main
-    dt = main._utcnow()
+    dt = utils._utcnow()
     assert dt.tzinfo is None

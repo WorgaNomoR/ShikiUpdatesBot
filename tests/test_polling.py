@@ -2,6 +2,12 @@ import asyncio
 
 import pytest
 
+import config
+import handlers
+import stats as smod
+import storage
+import utils
+
 
 # ─────────────────────────────────────────────────────────────
 #  Хелпер: мокаем всё, что polling_loop вызывает по части статистики.
@@ -10,41 +16,39 @@ import pytest
 #  load_stats_current читает файл — отдаём пустой стейт квартала.
 # ─────────────────────────────────────────────────────────────
 def _patch_stats(monkeypatch, main):
-    monkeypatch.setattr(main, "load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
 
-    async def fake_sync():
+    async def fake_sync(session=None, fav=None):
         # sync_stats_all теперь возвращает кортеж (stats, ok).
-        return main._empty_stats_all(), True
+        return storage._empty_stats_all(), True
 
-    monkeypatch.setattr(main, "sync_stats_all", fake_sync)
+    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
 
     async def fake_rotate(bot, cur, stats_all):
         return cur
 
-    monkeypatch.setattr(main, "rotate_quarter_if_needed", fake_rotate)
+    monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
 
 
 @pytest.mark.asyncio
 async def test_first_run_initializes_history_and_favourites(monkeypatch):
     import main
 
-    monkeypatch.setattr(main, "load_seen_ids", lambda: set())
-    monkeypatch.setattr(main, "load_seen_favourites", lambda: set())
-    monkeypatch.setattr(main, "load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: set())
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
     _patch_stats(monkeypatch, main)
 
     saved_ids = {}
     saved_favs = {}
 
     monkeypatch.setattr(
-        main,
-        "save_seen_ids",
+        "handlers.save_seen_ids",
         lambda ids: saved_ids.setdefault("value", ids),
     )
 
     monkeypatch.setattr(
-        main,
-        "save_seen_favourites",
+        "handlers.save_seen_favourites",
         lambda favs: saved_favs.setdefault("value", favs),
     )
 
@@ -59,19 +63,19 @@ async def test_first_run_initializes_history_and_favourites(monkeypatch):
             "people": [],
         }
 
-    monkeypatch.setattr(main, "fetch_history", fake_history)
-    monkeypatch.setattr(main, "fetch_favourites", fake_favourites)
+    monkeypatch.setattr("handlers.fetch_history", fake_history)
+    monkeypatch.setattr("handlers.fetch_favourites", fake_favourites)
 
     async def fake_check(bot, seen, cur):
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(main, "check_and_notify", fake_check)
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
 
     class DummyBot:
         pass
 
     with pytest.raises(asyncio.CancelledError):
-        await main.polling_loop(DummyBot())
+        await handlers.polling_loop(DummyBot())
 
     assert saved_ids["value"] == {1, 2}
     assert "animes_10" in saved_favs["value"]
@@ -83,21 +87,18 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
 
     # История уже инициализирована
     monkeypatch.setattr(
-        main,
-        "load_seen_ids",
+        "handlers.load_seen_ids",
         lambda: {1, 2, 3},
     )
 
     # Файл избранного отсутствует
     monkeypatch.setattr(
-        main,
-        "load_seen_favourites",
+        "handlers.load_seen_favourites",
         lambda: set(),
     )
 
     monkeypatch.setattr(
-        main,
-        "load_subscribers",
+        "handlers.load_subscribers",
         lambda: {},
     )
     _patch_stats(monkeypatch, main)
@@ -108,8 +109,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         saved["value"] = seen
 
     monkeypatch.setattr(
-        main,
-        "save_seen_favourites",
+        "handlers.save_seen_favourites",
         fake_save,
     )
 
@@ -124,8 +124,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         }
 
     monkeypatch.setattr(
-        main,
-        "fetch_favourites",
+        "handlers.fetch_favourites",
         fake_fetch,
     )
 
@@ -136,8 +135,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         called = True
 
     monkeypatch.setattr(
-        main,
-        "send_to_all_chats",
+        "handlers.send_to_all_chats",
         fake_send,
     )
 
@@ -145,8 +143,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(
-        main,
-        "check_and_notify",
+        "handlers.check_and_notify",
         fake_check,
     )
 
@@ -154,7 +151,7 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
         pass
 
     with pytest.raises(asyncio.CancelledError):
-        await main.polling_loop(DummyBot())
+        await handlers.polling_loop(DummyBot())
 
     assert called is False
     assert "animes_10" in saved["value"]
@@ -164,9 +161,9 @@ async def test_missing_seen_favourites_does_not_send_notifications(monkeypatch):
 async def test_favourites_initialization_failure(monkeypatch):
     import main
 
-    monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
-    monkeypatch.setattr(main, "load_seen_favourites", lambda: set())
-    monkeypatch.setattr(main, "load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
     _patch_stats(monkeypatch, main)
 
     save_called = False
@@ -176,8 +173,7 @@ async def test_favourites_initialization_failure(monkeypatch):
         save_called = True
 
     monkeypatch.setattr(
-        main,
-        "save_seen_favourites",
+        "handlers.save_seen_favourites",
         fake_save,
     )
 
@@ -185,8 +181,7 @@ async def test_favourites_initialization_failure(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        main,
-        "fetch_favourites",
+        "handlers.fetch_favourites",
         fake_fetch,
     )
 
@@ -194,8 +189,7 @@ async def test_favourites_initialization_failure(monkeypatch):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(
-        main,
-        "check_and_notify",
+        "handlers.check_and_notify",
         fake_check,
     )
 
@@ -203,7 +197,7 @@ async def test_favourites_initialization_failure(monkeypatch):
         pass
 
     with pytest.raises(asyncio.CancelledError):
-        await main.polling_loop(DummyBot())
+        await handlers.polling_loop(DummyBot())
 
     assert save_called is False
 
@@ -212,16 +206,16 @@ async def test_favourites_initialization_failure(monkeypatch):
 async def test_polling_survives_unexpected_exception(monkeypatch):
     import main
 
-    monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
-    monkeypatch.setattr(main, "load_seen_favourites", lambda: {"animes_1"})
-    monkeypatch.setattr(main, "load_subscribers", lambda: {})
-    monkeypatch.setattr(main, "ERROR_NOTIFY_INTERVAL", 0)
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_1"})
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.ERROR_NOTIFY_INTERVAL", 0)
     _patch_stats(monkeypatch, main)
 
     logged = []
 
     monkeypatch.setattr(
-        main.log,
+        config.log,
         "exception",
         lambda *args, **kwargs: logged.append(args),
     )
@@ -243,14 +237,13 @@ async def test_polling_survives_unexpected_exception(monkeypatch):
 
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(main, "check_and_notify", fake_check)
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
 
     async def fake_check_favs(bot, seen):
         return seen
 
     monkeypatch.setattr(
-        main,
-        "check_and_notify_favourites",
+        "handlers.check_and_notify_favourites",
         fake_check_favs,
     )
 
@@ -260,7 +253,7 @@ async def test_polling_survives_unexpected_exception(monkeypatch):
     monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
 
     with pytest.raises(asyncio.CancelledError):
-        await main.polling_loop(DummyBot())
+        await handlers.polling_loop(DummyBot())
 
     assert calls == 2
     assert logged
@@ -268,7 +261,7 @@ async def test_polling_survives_unexpected_exception(monkeypatch):
 
     chat_id, text = sent[0]
 
-    assert chat_id == main.OWNER_ID
+    assert chat_id == config.OWNER_ID
     assert "RuntimeError" in text
     assert "boom" in text
 
@@ -277,27 +270,27 @@ async def test_polling_survives_unexpected_exception(monkeypatch):
 async def test_polling_propagates_cancelled_error(monkeypatch):
     import main
 
-    monkeypatch.setattr(main, "load_seen_ids", lambda: {1})
-    monkeypatch.setattr(main, "load_seen_favourites", lambda: {"animes_1"})
-    monkeypatch.setattr(main, "load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_1"})
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
     _patch_stats(monkeypatch, main)
 
     async def fake_check(bot, seen, cur):
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(main, "check_and_notify", fake_check)
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
 
     async def fake_check_favs(bot, seen):
         return seen
 
-    monkeypatch.setattr(main, "check_and_notify_favourites", fake_check_favs)
+    monkeypatch.setattr("handlers.check_and_notify_favourites", fake_check_favs)
 
     class DummyBot:
         async def send_message(self, *args, **kwargs):
             pass
 
     with pytest.raises(asyncio.CancelledError):
-        await main.polling_loop(DummyBot())
+        await handlers.polling_loop(DummyBot())
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -330,7 +323,6 @@ def _completed_event(tid, score, media="anime"):
 async def test_check_history_empty_baseline_does_not_spam(monkeypatch):
     """check_and_notify с пустым seen_ids: релевантные записи НЕ уходят в чат,
     baseline молча принимается и сохраняется."""
-    import main
     sent, saved = [], {}
 
     async def fake_fetch_history(session):
@@ -339,15 +331,15 @@ async def test_check_history_empty_baseline_does_not_spam(monkeypatch):
     async def fake_send(bot, text):
         sent.append(text)
 
-    monkeypatch.setattr(main, "fetch_history", fake_fetch_history)
-    monkeypatch.setattr(main, "send_to_all_chats", fake_send)
-    monkeypatch.setattr(main, "save_seen_ids", lambda s: saved.update(ids=set(s)))
-    monkeypatch.setattr(main, "build_message", lambda e: "msg")
-    monkeypatch.setattr(main, "record_current_event", lambda cur, *a, **k: cur)
-    monkeypatch.setattr(main, "save_stats_current", lambda c: None)
+    monkeypatch.setattr("handlers.fetch_history", fake_fetch_history)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_ids", lambda s: saved.update(ids=set(s)))
+    monkeypatch.setattr("handlers.build_message", lambda e: "msg")
+    monkeypatch.setattr("handlers.record_current_event", lambda cur, *a, **k: cur)
+    monkeypatch.setattr("handlers.save_stats_current", lambda c: None)
 
-    cur = main._empty_stats_current(main.current_quarter())
-    seen, _ = await main.check_and_notify(bot=None, seen_ids=set(), cur=cur)
+    cur = storage._empty_stats_current(utils.current_quarter())
+    seen, _ = await handlers.check_and_notify(bot=None, seen_ids=set(), cur=cur)
 
     assert sent == []
     assert seen == {10, 11, 12}
@@ -357,7 +349,6 @@ async def test_check_history_empty_baseline_does_not_spam(monkeypatch):
 @pytest.mark.asyncio
 async def test_check_history_failed_fetch_keeps_state(monkeypatch):
     """fetch_history → None (429): 0 отправок, seen_ids не тронут, save не звался."""
-    import main
     sent, save_calls = [], []
 
     async def fake_fetch_history(session):
@@ -366,13 +357,13 @@ async def test_check_history_failed_fetch_keeps_state(monkeypatch):
     async def fake_send(bot, text):
         sent.append(text)
 
-    monkeypatch.setattr(main, "fetch_history", fake_fetch_history)
-    monkeypatch.setattr(main, "send_to_all_chats", fake_send)
-    monkeypatch.setattr(main, "save_seen_ids", lambda s: save_calls.append(s))
+    monkeypatch.setattr("handlers.fetch_history", fake_fetch_history)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_ids", lambda s: save_calls.append(s))
 
     baseline = {1, 2, 3}
-    cur = main._empty_stats_current(main.current_quarter())
-    seen, _ = await main.check_and_notify(bot=None, seen_ids=set(baseline), cur=cur)
+    cur = storage._empty_stats_current(utils.current_quarter())
+    seen, _ = await handlers.check_and_notify(bot=None, seen_ids=set(baseline), cur=cur)
 
     assert sent == []
     assert seen == baseline
@@ -383,7 +374,6 @@ async def test_check_history_failed_fetch_keeps_state(monkeypatch):
 async def test_check_favourites_empty_baseline_does_not_spam(monkeypatch):
     """check_and_notify_favourites с пустым seen: 0 отправок, baseline сохранён.
     (Слой ЦИКЛА — в отличие от loop-теста выше, что проверяет init-блок.)"""
-    import main
     sent, saved = [], {}
 
     async def fake_fetch_favourites(session):
@@ -392,11 +382,11 @@ async def test_check_favourites_empty_baseline_does_not_spam(monkeypatch):
     async def fake_send(bot, text):
         sent.append(text)
 
-    monkeypatch.setattr(main, "fetch_favourites", fake_fetch_favourites)
-    monkeypatch.setattr(main, "send_to_all_chats", fake_send)
-    monkeypatch.setattr(main, "save_seen_favourites", lambda s: saved.update(keys=set(s)))
+    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch_favourites)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda s: saved.update(keys=set(s)))
 
-    seen, _ = await main.check_and_notify_favourites(bot=None, seen=set())
+    seen, _ = await handlers.check_and_notify_favourites(bot=None, seen=set())
 
     expected = {"animes_100", "animes_101", "mangas_200"}
     assert sent == []
@@ -407,7 +397,6 @@ async def test_check_favourites_empty_baseline_does_not_spam(monkeypatch):
 @pytest.mark.asyncio
 async def test_check_favourites_failed_fetch_keeps_state(monkeypatch):
     """fetch_favourites → None: 0 отправок, seen не тронут, save не звался."""
-    import main
     sent, save_calls = [], []
 
     async def fake_fetch_favourites(session):
@@ -416,12 +405,12 @@ async def test_check_favourites_failed_fetch_keeps_state(monkeypatch):
     async def fake_send(bot, text):
         sent.append(text)
 
-    monkeypatch.setattr(main, "fetch_favourites", fake_fetch_favourites)
-    monkeypatch.setattr(main, "send_to_all_chats", fake_send)
-    monkeypatch.setattr(main, "save_seen_favourites", lambda s: save_calls.append(s))
+    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch_favourites)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda s: save_calls.append(s))
 
     baseline = {"animes_1"}
-    seen, _ = await main.check_and_notify_favourites(bot=None, seen=set(baseline))
+    seen, _ = await handlers.check_and_notify_favourites(bot=None, seen=set(baseline))
 
     assert sent == []
     assert seen == baseline
@@ -433,11 +422,10 @@ async def test_check_favourites_failed_fetch_keeps_state(monkeypatch):
 def test_score_change_updates_existing_completed_event():
     """score_changed по тайтлу с completed-событием квартала ⇒ обновляет его score.
     Кейс «Атака титанов: случайно 3 → исправил»."""
-    import main
-    cur = main._empty_stats_current(main.current_quarter())
+    cur = storage._empty_stats_current(utils.current_quarter())
     cur["events"].append(_completed_event(123, 3))
 
-    out = main.record_current_event(cur, {"target": {"id": 123}}, "score_changed", "anime", 9)
+    out = smod.record_current_event(cur, {"target": {"id": 123}}, "score_changed", "anime", 9)
 
     completed = [e for e in out["events"] if e["id"] == "123" and e["event"] == "completed"]
     assert len(completed) == 1
@@ -447,9 +435,8 @@ def test_score_change_updates_existing_completed_event():
 
 def test_score_change_without_completed_is_noop():
     """score_changed по тайтлу вне событий квартала ⇒ ничего не добавляем/не меняем."""
-    import main
-    cur = main._empty_stats_current(main.current_quarter())
-    out = main.record_current_event(cur, {"target": {"id": 999}}, "score_changed", "anime", 9)
+    cur = storage._empty_stats_current(utils.current_quarter())
+    out = smod.record_current_event(cur, {"target": {"id": 999}}, "score_changed", "anime", 9)
     assert out["events"] == []
 
 
@@ -457,31 +444,80 @@ def test_score_change_without_completed_is_noop():
 
 def test_should_full_sync_predicate():
     """None ⇒ ретрай каждый цикл; недавно ⇒ ждём; протухло ⇒ пора."""
-    import main
     iv = 6 * 3600
-    assert main._should_full_sync(None, 1000.0, iv) is True
-    assert main._should_full_sync(1000.0, 1000.0 + 10, iv) is False
-    assert main._should_full_sync(1000.0, 1000.0 + iv, iv) is True
-    assert main._should_full_sync(1000.0, 1000.0 + iv + 1, iv) is True
+    assert handlers._should_full_sync(None, 1000.0, iv) is True
+    assert handlers._should_full_sync(1000.0, 1000.0 + 10, iv) is False
+    assert handlers._should_full_sync(1000.0, 1000.0 + iv, iv) is True
+    assert handlers._should_full_sync(1000.0, 1000.0 + iv + 1, iv) is True
 
 
 @pytest.mark.asyncio
 async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatch):
     """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,
     save не вызывается. Гарантия «429 не ломает stats_all»."""
-    import main
+    import stats
     preserved = {"_sentinel": "keep-me"}
     saved = []
 
     async def fake_export(session, media):
         return None
 
-    monkeypatch.setattr(main, "fetch_list_export", fake_export)
-    monkeypatch.setattr(main, "load_stats_all", lambda use_cache=True: preserved)
-    monkeypatch.setattr(main, "save_stats_all", lambda d: saved.append(d))
+    monkeypatch.setattr(stats, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.load_stats_all", lambda use_cache=True: preserved)
+    monkeypatch.setattr("stats.save_stats_all", lambda d: saved.append(d))
 
-    stats, ok = await main.sync_stats_all()
+    stats, ok = await smod.sync_stats_all()
 
     assert ok is False
     assert stats is preserved
     assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_boot_fetches_favourites_once_and_threads_session(monkeypatch):
+    """boot-throttle: на старте избранное тянется ОДИН раз и отдаётся в sync (fav=),
+    а sync получает ту же общую сессию (не None)."""
+    import main  # noqa: F401
+
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda favs: None)
+
+    fav_calls = []
+
+    async def fake_favourites(session):
+        fav_calls.append(session)
+        return {"animes": [{"id": 10}], "mangas": [], "characters": [], "people": []}
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_favourites)
+
+    captured = {}
+
+    async def fake_sync(session=None, fav=None):
+        captured["session"] = session
+        captured["fav"] = fav
+        return storage._empty_stats_all(), True
+
+    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
+
+    async def fake_rotate(bot, cur, stats_all):
+        return cur
+
+    monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
+
+    async def fake_check(bot, seen, cur):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
+
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(object())
+
+    # избранное запрошено РОВНО один раз (а не дважды: init + внутри sync)
+    assert len(fav_calls) == 1
+    # та же сессия проброшена в sync (общая, не None), избранное передано через fav=
+    assert captured["session"] is not None
+    assert captured["session"] is fav_calls[0]
+    assert captured["fav"] is not None and "animes" in captured["fav"]
