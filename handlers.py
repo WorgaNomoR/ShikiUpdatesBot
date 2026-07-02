@@ -33,6 +33,7 @@ from config import (
     ERROR_NOTIFY_INTERVAL,
     FULL_SYNC_INTERVAL,
     OWNER_ID,
+    SHIKI_USER,
     log,
 )
 from healthcheck import heartbeat
@@ -40,6 +41,7 @@ from messages import (
     BROADCAST_HEADER,
     build_favourite_message,
     build_message,
+    build_startup_snapshot,
     classify_event,
     extract_score,
     extract_score_change,
@@ -866,6 +868,30 @@ def start_polling_loop(bot: Bot) -> bool:
     return True
 
 
+def _build_startup_text() -> str:
+    """Стартовый health-снапшот для owner-gate. При любой ошибке сборки —
+    голое '🟢 Бот запущен': проба доставки (тест аварийного канала + гейт
+    фонового цикла) не должна падать из-за кривого таймстемпа. Все источники —
+    локальные загрузчики (без сети); времена берутся от прошлого запуска, их
+    протухлость и есть диагностика."""
+    try:
+        stats_all = load_stats_all()
+        cur = load_stats_current()
+        return build_startup_snapshot(
+            display_name=DISPLAY_NAME,
+            shiki_user=SHIKI_USER,
+            check_interval_sec=CHECK_INTERVAL,
+            subscriber_count=len(load_subscribers()),
+            seen_ids_count=len(load_seen_ids()),
+            seen_favs_count=len(load_seen_favourites()),
+            stats_updated_at=stats_all.get("updated_at"),
+            last_backup_at=cur.get("last_backup_at"),
+        )
+    except Exception as e:
+        log.warning("Не удалось собрать стартовый снапшот, шлём голый пинг: %s", e)
+        return "🟢 Бот запущен"
+
+
 async def probe_owner_and_start(bot: Bot) -> None:
     """owner-reachability gate. Шлёт владельцу '🟢 Бот запущен' — проба аварийного
     канала + легитимный сигнал рестарта (без дебаунса). Доставилось → стартуем
@@ -873,7 +899,7 @@ async def probe_owner_and_start(bot: Bot) -> None:
     и т.п.) → WARNING, цикл НЕ стартуем. Апдейт-поллинг (dp.start_polling) жив всегда:
     бот отвечает на команды, владелец /start добудит цикл без рестарта контейнера."""
     try:
-        await bot.send_message(OWNER_ID, "🟢 Бот запущен")
+        await bot.send_message(OWNER_ID, _build_startup_text())
     except Exception as e:
         log.warning(
             "Владелец недоступен при старте (%s: %s) — фоновый цикл не запущен. "

@@ -4,9 +4,11 @@
 реализации (правка мутацией). Сетевых/IO-зависимостей нет.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from utils import (
+    _fmt_dt_short,
+    _human_ago,
     _is_partial_quarter,
     _quarter_end,
     _rel_url,
@@ -161,3 +163,23 @@ def test_safe_float_zero_and_negative_use_default():
 def test_safe_float_garbage_uses_default():
     assert _safe_float("x") is None
     assert _safe_float(None, default=2.5) == 2.5
+
+
+# ── _fmt_dt_short / _human_ago: относительное время стартового снапшота ──
+def test_fmt_dt_short_numeric_locale_free():
+    assert _fmt_dt_short(datetime(2026, 7, 2, 14, 30)) == "02.07.2026 14:30"
+    assert _fmt_dt_short(datetime(2026, 1, 9, 8, 5)) == "09.01.2026 08:05"
+    assert _fmt_dt_short(datetime(2026, 12, 31, 23, 59)) == "31.12.2026 23:59"
+
+
+def test_human_ago_buckets():
+    now = datetime(2026, 7, 2, 15, 0, 0)
+    assert _human_ago(now - timedelta(seconds=30), now) == "только что"
+    assert _human_ago(now - timedelta(minutes=5), now) == "5 мин назад"
+    assert _human_ago(now - timedelta(hours=2), now) == "2 ч назад"
+    assert _human_ago(now - timedelta(days=3), now) == "3 д назад"
+
+
+def test_human_ago_future_clamps_to_just_now():
+    now = datetime(2026, 7, 2, 15, 0, 0)
+    assert _human_ago(now + timedelta(hours=1), now) == "только что"

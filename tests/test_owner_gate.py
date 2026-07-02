@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import handlers
+from utils import _utcnow
 
 
 @pytest.fixture(autouse=True)
@@ -85,3 +86,34 @@ async def test_non_owner_start_does_not_touch_loop(monkeypatch, fake_loop):
     msg.bot = MagicMock()
     await handlers.cmd_start(msg)
     assert handlers._polling_task is None                 # обычный юзер цикл не трогает
+
+
+# ── стартовый health-снапшот в пинге owner-gate ──
+def test_build_startup_text_renders_snapshot(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {1: "a", 2: "b", 3: "c"})
+    monkeypatch.setattr(handlers, "load_seen_ids", lambda: set(range(1240)))
+    monkeypatch.setattr(handlers, "load_seen_favourites",
+                        lambda: {f"anime_{i}" for i in range(37)})
+    monkeypatch.setattr(handlers, "load_stats_all",
+                        lambda: {"updated_at": _utcnow().isoformat()})
+    monkeypatch.setattr(handlers, "load_stats_current", lambda: {"last_backup_at": None})
+    txt = handlers._build_startup_text()
+    assert txt.startswith("🟢 Бот запущен")
+    assert "Подписчиков: 3" in txt
+    assert "история 1240" in txt
+
+
+def test_build_startup_text_falls_back_on_error(monkeypatch):
+    def boom():
+        raise RuntimeError("disk gone")
+    monkeypatch.setattr(handlers, "load_stats_all", boom)
+    # сборка снапшота упала -> голый пинг, проба доставки не должна ломаться
+    assert handlers._build_startup_text() == "🟢 Бот запущен"
+
+
+@pytest.mark.asyncio
+async def test_probe_sends_startup_snapshot(monkeypatch, fake_loop):
+    monkeypatch.setattr(handlers, "_build_startup_text", lambda: "🟢 SNAP")
+    bot = AsyncMock()
+    await handlers.probe_owner_and_start(bot)
+    bot.send_message.assert_awaited_once_with(handlers.OWNER_ID, "🟢 SNAP")
