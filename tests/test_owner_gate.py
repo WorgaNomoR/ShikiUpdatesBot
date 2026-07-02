@@ -116,4 +116,4 @@ async def test_probe_sends_startup_snapshot(monkeypatch, fake_loop):
     monkeypatch.setattr(handlers, "_build_startup_text", lambda: "🟢 SNAP")
     bot = AsyncMock()
     await handlers.probe_owner_and_start(bot)
-    bot.send_message.assert_awaited_once_with(handlers.OWNER_ID, "🟢 SNAP")
+    bot.send_message.assert_awaited_once_with(handlers.OWNER_ID, "🟢 SNAP", parse_mode=None)

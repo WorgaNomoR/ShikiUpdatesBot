@@ -811,11 +811,13 @@ def format_rate_entry(item: dict, media: str) -> str:
 
 
 def _parse_iso(value: str | None) -> datetime | None:
-    """ISO-строка (naive UTC от _utcnow) -> datetime; кривое/пустое -> None."""
+    """ISO-строка -> naive-UTC datetime; кривое/пустое -> None. tzinfo срезаем:
+    updated_at от _utcnow всегда naive, но защищаемся от tz-aware входа, иначе
+    _human_ago упадёт на 'naive - aware' вычитании."""
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        return datetime.fromisoformat(value).replace(tzinfo=None)
     except (ValueError, TypeError):
         return None
 
@@ -831,7 +833,7 @@ def _parse_ts(value: float | None) -> datetime | None:
 
 
 def _fmt_moment(dt: datetime | None) -> str:
-    """'2 июл 14:30 (2 ч назад)' или 'нет данных', если времени нет."""
+    """'02.07.2026 14:30 (2 ч назад)' или 'нет данных', если времени нет."""
     if dt is None:
         return "нет данных"
     return f"{_fmt_dt_short(dt)} ({_human_ago(dt)})"
