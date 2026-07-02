@@ -1,8 +1,9 @@
 import random
+import time
 
 import messages
-from messages import build_message
-from utils import h
+from messages import build_message, build_startup_snapshot
+from utils import _utcnow, h
 
 
 def fixed_choice(seq):
@@ -176,3 +177,54 @@ def test_broadcast_header_escapes_special_chars(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(messages)
+# ==========================================================
+# build_startup_snapshot — стартовый health-снапшот (owner-gate)
+# ==========================================================
+def _snap(**over):
+    base = dict(
+        display_name="Пётр", shiki_user="WNR", check_interval_sec=600,
+        subscriber_count=3, seen_ids_count=1240, seen_favs_count=37,
+        stats_updated_at=_utcnow().isoformat(), last_backup_at=time.time(),
+    )
+    base.update(over)
+    return build_startup_snapshot(**base)
+
+
+def test_startup_snapshot_normal_state():
+    txt = _snap()
+    assert txt.startswith("🟢 Бот запущен")
+    assert "Имя: Пётр" in txt and "Шики-логин: WNR" in txt
+    assert "проверка каждые 10 мин" in txt          # 600 сек -> 10 мин
+    assert "Подписчиков: 3" in txt
+    assert "история 1240" in txt and "избранное 37" in txt
+    assert "события за простой догоним" in txt
+    assert "Последняя синхронизация статистики:" in txt
+    assert "нет данных" not in txt                   # обе метки свежие
+
+
+def test_startup_snapshot_full_wipe_collapses_to_banner():
+    txt = _snap(subscriber_count=0, seen_ids_count=0, seen_favs_count=0,
+                stats_updated_at=None, last_backup_at=None)
+    assert "Чистый инстанс" in txt
+    assert "не догоним" in txt
+    assert "нет данных" not in txt                   # схлопнуто в один баннер
+    assert "🗂 Отслеживание:" not in txt             # обычной строки отслеживания нет
+    assert "Последняя синхронизация статистики:" not in txt
+
+
+def test_startup_snapshot_tracking_not_initialized_but_stats_present():
+    # seen_ids пусто, но stats_all есть -> не вайп, а предупреждение
+    txt = _snap(seen_ids_count=0, stats_updated_at=_utcnow().isoformat(),
+                last_backup_at=None)
+    assert "⚠️ Отслеживание не инициализировано" in txt
+    assert "уйдут в тишину" in txt
+    assert "Чистый инстанс" not in txt
+    assert "Последняя синхронизация статистики:" in txt
+    assert "💾 Последний плановый бэкап: нет данных" in txt    # бэкапа не было
+
+
+def test_startup_snapshot_survives_bad_timestamps():
+    txt = _snap(stats_updated_at="не-дата", last_backup_at="тоже-не-число")
+    # кривые метки не роняют билдер, деградируют в 'нет данных'
+    assert "🟢 Бот запущен" in txt
+    assert "нет данных" in txt

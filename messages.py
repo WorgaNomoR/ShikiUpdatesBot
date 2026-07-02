@@ -10,13 +10,14 @@
 
 import random
 import re
+from datetime import datetime, timezone
 
 from config import (
     DISPLAY_NAME,
     SHIKI_BASE_URL,
 )
 from shiki_api import get_media_info
-from utils import _rel_url, _safe_int, h
+from utils import _fmt_dt_short, _human_ago, _rel_url, _safe_int, h
 
 # ═══════════════════════════════════════════════════════════════════
 #  БАНК СООБЩЕНИЙ
@@ -797,3 +798,99 @@ def format_rate_entry(item: dict, media: str) -> str:
     return f"{icon} {title}"
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  СТАРТОВЫЙ HEALTH-СНАПШОТ (owner-gate)
+# ═══════════════════════════════════════════════════════════════════
+#
+#  Пинг '🟢 Бот запущен' уходит ДО первого синка (owner-gate), поэтому
+#  времена берутся от ПРОШЛОГО запуска — их протухлость и есть диагностика.
+#  Полный вайп (нет seen_ids И нет метки stats_all) схлопывается в один
+#  явный баннер вместо трёх «нет данных». Чистая функция: принимает
+#  значения-как-с-диска, возвращает готовый ПЛОСКИЙ текст (без HTML —
+#  шлётся как есть, тем же каналом, что и голый пинг).
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """ISO-строка -> naive-UTC datetime; кривое/пустое -> None. tzinfo срезаем:
+    updated_at от _utcnow всегда naive, но защищаемся от tz-aware входа, иначе
+    _human_ago упадёт на 'naive - aware' вычитании."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_ts(value: float | None) -> datetime | None:
+    """epoch-секунды (time.time) -> наивный-UTC datetime; кривое -> None."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
+
+
+def _fmt_moment(dt: datetime | None) -> str:
+    """'02.07.2026 14:30 (2 ч назад)' или 'нет данных', если времени нет."""
+    if dt is None:
+        return "нет данных"
+    return f"{_fmt_dt_short(dt)} ({_human_ago(dt)})"
+
+
+def build_startup_snapshot(
+    *,
+    display_name: str,
+    shiki_user: str,
+    check_interval_sec: int,
+    subscriber_count: int,
+    seen_ids_count: int,
+    seen_favs_count: int,
+    stats_updated_at: str | None,
+    last_backup_at: float | None,
+) -> str:
+    """Собирает текст стартового пинга владельцу с health-снапшотом.
+
+    Состояния:
+      • норма            — отслеживание активно, свежесть синка/бэкапа;
+      • не инициализ.    — есть stats_all, но нет seen_ids (события за
+                           простой уйдут в тишину — предупреждаем);
+      • полный вайп      — нет seen_ids И нет метки stats_all: один баннер
+                           «чистый инстанс» вместо трёх «нет данных».
+    """
+    minutes = max(1, check_interval_sec // 60)
+    lines = [
+        "🟢 Бот запущен",
+        "",
+        f"👤 Имя: {display_name} · Шики-логин: {shiki_user} · "
+        f"⏱ проверка каждые {minutes} мин",
+        "",
+        f"👥 Подписчиков: {subscriber_count}",
+    ]
+
+    stats_dt = _parse_iso(stats_updated_at)
+
+    # Полный вайп: состояние отсутствует целиком — один громкий сигнал.
+    if seen_ids_count == 0 and stats_dt is None:
+        lines.append("")
+        lines.append("🆕 Чистый инстанс — состояние отсутствует (том пуст / вайп)")
+        lines.append("     Первый запуск: события за прошлый простой не догоним")
+        return "\n".join(lines)
+
+    # Строка отслеживания несёт здоровье-смысл, а не голое число.
+    if seen_ids_count == 0:
+        lines.append(
+            "🗂 ⚠️ Отслеживание не инициализировано — "
+            "события за простой уйдут в тишину"
+        )
+    else:
+        lines.append(
+            f"🗂 Отслеживание: история {seen_ids_count}, "
+            f"избранное {seen_favs_count} — события за простой догоним"
+        )
+
+    lines.append("")
+    lines.append(f"📊 Последняя синхронизация статистики: {_fmt_moment(stats_dt)}")
+    lines.append(f"💾 Последний плановый бэкап: {_fmt_moment(_parse_ts(last_backup_at))}")
+    return "\n".join(lines)

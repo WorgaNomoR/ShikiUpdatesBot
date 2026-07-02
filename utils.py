@@ -55,6 +55,28 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _fmt_dt_short(dt: datetime) -> str:
+    """Дата-время в numeric-форме '02.07.2026 14:30' — локаль-независимо и в
+    той же конвенции, что футер свежести в build_stats_all_messages (%d.%m.%Y).
+    Человеко-читаемость даёт соседнее '(N назад)' от _human_ago."""
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def _human_ago(dt: datetime, now: datetime | None = None) -> str:
+    """Грубое «сколько назад» относительно now (по умолчанию _utcnow):
+    'только что' / 'N мин назад' / 'N ч назад' / 'N д назад'. Оба времени —
+    наивный UTC (как _utcnow). Отрицательная разница (часы вперёд) — 'только что'."""
+    now = now or _utcnow()
+    secs = (now - dt).total_seconds()
+    if secs < 60:
+        return "только что"
+    if secs < 3600:
+        return f"{int(secs // 60)} мин назад"
+    if secs < 86400:
+        return f"{int(secs // 3600)} ч назад"
+    return f"{int(secs // 86400)} д назад"
+
+
 def current_quarter(dt: datetime | None = None) -> str:
     """'2026-Q2' для UTC-даты (по умолчанию — сейчас)."""
     if dt is None:
