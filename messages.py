@@ -863,6 +863,7 @@ def build_startup_snapshot(
         "",
         f"👤 Имя: {display_name} · Шики-логин: {shiki_user} · "
         f"⏱ проверка каждые {minutes} мин",
+        "",
         f"👥 Подписчиков: {subscriber_count}",
     ]
 
@@ -870,6 +871,7 @@ def build_startup_snapshot(
 
     # Полный вайп: состояние отсутствует целиком — один громкий сигнал.
     if seen_ids_count == 0 and stats_dt is None:
+        lines.append("")
         lines.append("🆕 Чистый инстанс — состояние отсутствует (том пуст / вайп)")
         lines.append("     Первый запуск: события за прошлый простой не догоним")
         return "\n".join(lines)
@@ -886,7 +888,7 @@ def build_startup_snapshot(
             f"избранное {seen_favs_count} — события за простой догоним"
         )
 
+    lines.append("")
     lines.append(f"📊 Последняя синхронизация статистики: {_fmt_moment(stats_dt)}")
-    lines.append(f"💾 Последний бэкап: {_fmt_moment(_parse_ts(last_backup_at))}")
+    lines.append(f"💾 Последний плановый бэкап: {_fmt_moment(_parse_ts(last_backup_at))}")
     return "\n".join(lines)
-
