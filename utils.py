@@ -114,7 +114,7 @@ def tracking_period_label(cur: dict) -> str:
         end = _quarter_end(period)
         if start and end:
             return f"с {start.strftime('%d.%m.%Y')} по {end.strftime('%d.%m.%Y')}"
-    except Exception:
+    except (ValueError, TypeError):
         pass
     return quarter_label(period)
 
@@ -126,7 +126,7 @@ def _is_partial_quarter(cur: dict) -> bool:
         ps = cur.get("period_start")
         if ts and ps:
             return datetime.fromisoformat(ts) > datetime.fromisoformat(ps)
-    except Exception:
+    except (ValueError, TypeError):
         pass
     return False
 

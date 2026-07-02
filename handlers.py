@@ -406,8 +406,8 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
             log.debug("stats_menu_cb: не удалось удалить меню при закрытии: %s", e)
             try:
                 await msg.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("stats_menu_cb: не удалось убрать кнопки меню: %s", e)
         # ...и саму команду /stats, на которую меню отвечало (reply_to_message),
         # чтобы чат остался чистым. getattr — на случай InaccessibleMessage без
         # этого поля. В личке бот вправе удалять входящие; если нельзя — лог и дальше.
@@ -436,8 +436,8 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
         # Фолбэк: хотя бы убрать кнопки, чтобы повторно не нажимали
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("stats_menu_cb: не удалось убрать кнопки меню: %s", e)
 
     # Строим и шлём отчёт
     try:
@@ -987,8 +987,8 @@ async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
         log.debug("backup_close_cb: не удалось удалить меню: %s", e)
         try:
             await msg.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("backup_close_cb: не удалось убрать кнопки меню: %s", e)
     cmd_msg = getattr(msg, "reply_to_message", None)
     if cmd_msg is not None:
         try:

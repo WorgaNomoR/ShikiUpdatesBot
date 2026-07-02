@@ -493,7 +493,7 @@ def build_message(entry: dict) -> str:
         # Изменение оценки — берём шаблон из общего банка, не из anime/manga
         change = extract_score_change(description)
         old_score, new_score = change if change else (None, None)
-        template = random.choice(MESSAGES["score_changed"])
+        template = random.choice(MESSAGES["score_changed"])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = template.format(
             n=_DISPLAY_NAME_HTML,
             title=title,
@@ -513,7 +513,7 @@ def build_message(entry: dict) -> str:
             key = "completed_score_high"
         else:
             key = "completed_score_perfect"
-        template = random.choice(bank[key])
+        template = random.choice(bank[key])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = template.format(
             n=_DISPLAY_NAME_HTML,
             title=title,
@@ -521,7 +521,7 @@ def build_message(entry: dict) -> str:
         )
     else:
         key = event_type
-        template = random.choice(bank[key])
+        template = random.choice(bank[key])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = template.format(
             n=_DISPLAY_NAME_HTML,
             title=title,
@@ -564,7 +564,7 @@ def build_favourite_message(category: str, item: dict) -> str:
     title = (f'<a href="{SHIKI_BASE_URL}{url}">{title_text}</a>'
              if url else title_text)
 
-    text = random.choice(templates).format(n=_DISPLAY_NAME_HTML, title=title)
+    text = random.choice(templates).format(n=_DISPLAY_NAME_HTML, title=title)  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
 
     return text
 

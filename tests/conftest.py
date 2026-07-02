@@ -3,10 +3,20 @@ import sys
 import tempfile
 from pathlib import Path
 
+import dotenv
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Тесты не читают локальный .env разработчика — иначе config.load_dotenv()
+# подтянет его переменные (напр. DISPLAY_NAME) и сделает тесты недетерминированными.
+# CI без .env этим не страдал, локальная разработка — да.
+def _no_dotenv(*args, **kwargs):
+    return False
+
+
+dotenv.load_dotenv = _no_dotenv
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("OWNER_ID", "123456")

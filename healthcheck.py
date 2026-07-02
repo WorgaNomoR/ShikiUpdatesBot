@@ -133,7 +133,9 @@ async def start_health_server(
         # /health раз в минуту, иначе это ~1440 строк "GET /health 200" в сутки.
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        # host=0.0.0.0 намеренно: в контейнере healthcheck должен быть доступен
+        # извне (платформа/оркестратор бьёт liveness-пробу снаружи).
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)  # nosec B104
         await site.start()
         log.info(
             "Healthcheck-сервер запущен на :%d (порог живости %d сек).",
