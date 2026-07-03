@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """Тесты handlers.cmd_status — команда /status (текущие просмотры/чтение)."""
 
 import pytest

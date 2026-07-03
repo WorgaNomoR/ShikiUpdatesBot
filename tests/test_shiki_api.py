@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """Тесты shiki_api.py — сетевые фетчи (ошибки/таймауты) и is_relevant.
 
 Мокаем только сетевую границу; is_relevant — чистая функция, не замокана.

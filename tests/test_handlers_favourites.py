@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """Тесты фичи «избранное»: флоу check_and_notify_favourites + сбор
 (_collect_favourites/build_favourites_messages) + seen-хранилище.
 build_favourite_message (leaf messages) вынесен в test_messages.py."""

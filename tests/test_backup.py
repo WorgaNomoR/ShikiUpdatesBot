@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """
 Тесты ветки backup: /backup (экспорт/импорт zip) + авто-бэкап состояния.
 
