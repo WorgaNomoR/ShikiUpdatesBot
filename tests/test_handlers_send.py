@@ -15,6 +15,14 @@ class DummyBot:
     async def send_message(self, chat_id, text, parse_mode=None):
         self.sent.append((chat_id, text))
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """send_to_all_chats троттлит рассылку asyncio.sleep — глушим, чтобы тесты
+    не ждали реальные паузы."""
+    async def _fast(*args, **kwargs):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _fast)
+
 
 @pytest.mark.asyncio
 async def test_no_subscribers(monkeypatch):
@@ -30,10 +38,6 @@ async def test_no_subscribers(monkeypatch):
         lambda subs: saved.append(subs),
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     bot = DummyBot()
 
@@ -50,10 +54,6 @@ async def test_single_subscriber(monkeypatch):
         lambda: {123: "Alice"},
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     bot = DummyBot()
 
@@ -74,16 +74,12 @@ async def test_multiple_subscribers(monkeypatch):
         },
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     bot = DummyBot()
 
     await send_to_all_chats(bot, "hello")
 
-    assert len(bot.sent) == 3
+    assert {c for c, _ in bot.sent} == {111, 222, 333}
 
 
 @pytest.mark.asyncio
@@ -103,10 +99,6 @@ async def test_blocked_user_removed(monkeypatch):
         lambda subs: saved.append(subs.copy()),
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     class BotWithBlockedUser:
         async def send_message(self, chat_id, text, parse_mode=None):
@@ -141,10 +133,6 @@ async def test_chat_not_found_removed(monkeypatch):
         lambda subs: saved.append(subs.copy()),
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     class BotChatNotFound:
         async def send_message(self, chat_id, text, parse_mode=None):
@@ -176,10 +164,6 @@ async def test_generic_error_does_not_remove_user(monkeypatch):
         lambda subs: saved.append(subs),
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     class BotGenericError:
         async def send_message(self, chat_id, text, parse_mode=None):
