@@ -7,207 +7,123 @@ import pytest
 from handlers import check_and_notify
 
 
-# Пустой стейт квартала — check_and_notify теперь принимает cur третьим аргументом.
 def _empty_cur():
     return {"period": "2026-Q2", "events": []}
 
 
-@pytest.mark.asyncio
-async def test_empty_history(monkeypatch):
-    async def fake_fetch_history(session):
-        return []
+class DummyBot:
+    pass
 
-    monkeypatch.setattr(
-        "handlers.fetch_history",
-        fake_fetch_history,
-    )
 
-    saved = []
-
-    monkeypatch.setattr(
-        "handlers.save_seen_ids",
-        lambda ids: saved.append(ids.copy()),
-    )
-
-    # check_and_notify в конце зовёт save_stats_current — глушим запись на диск
-    monkeypatch.setattr(
-        "handlers.save_stats_current",
-        lambda cur: None,
-    )
-
-    class DummyBot:
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """check_and_notify троттлит рассылку asyncio.sleep — глушим паузы."""
+    async def _fast(*args, **kwargs):
         pass
+    monkeypatch.setattr(asyncio, "sleep", _fast)
 
-    seen_ids = {1, 2, 3}
 
-    result, cur = await check_and_notify(
-        DummyBot(),
-        seen_ids.copy(),
-        _empty_cur(),
-    )
+def _patch_history(monkeypatch, entries):
+    async def _fetch(session):
+        return entries
+    monkeypatch.setattr("handlers.fetch_history", _fetch)
+
+
+def _capture_sends(monkeypatch):
+    sent = []
+    async def _send(bot, text):
+        sent.append(text)
+    monkeypatch.setattr("handlers.send_to_all_chats", _send)
+    return sent
+
+
+def _capture_saves(monkeypatch):
+    saved = []
+    monkeypatch.setattr("handlers.save_seen_ids", lambda ids: saved.append(set(ids)))
+    monkeypatch.setattr("handlers.save_stats_current", lambda cur: None)
+    return saved
+
+
+@pytest.mark.asyncio
+async def test_failed_fetch_skips_cycle(monkeypatch):
+    # упавший фетч (None, напр. 429) -> цикл пропущен: не шлём и не сохраняем
+    _patch_history(monkeypatch, None)
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, cur = await check_and_notify(DummyBot(), {5}, _empty_cur())
+
+    assert result == {5}     # seen_ids не тронут
+    assert saved == []       # ничего не сохранили
+    assert sent == []        # ничего не слали
+
+
+@pytest.mark.asyncio
+async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
+    # пустой seen_ids -> baseline из текущей истории, НИЧЕГО не шлём
+    _patch_history(monkeypatch, [{"id": 1}, {"id": 2}])
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, cur = await check_and_notify(DummyBot(), set(), _empty_cur())
+
+    assert result == {1, 2}
+    assert saved == [{1, 2}]     # baseline сохранён
+    assert sent == []            # без отправки
+
+
+@pytest.mark.asyncio
+async def test_empty_history_keeps_seen(monkeypatch):
+    _patch_history(monkeypatch, [])
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, cur = await check_and_notify(DummyBot(), {1, 2, 3}, _empty_cur())
 
     assert result == {1, 2, 3}
     assert saved == []
+    assert sent == []
 
 
 @pytest.mark.asyncio
-async def test_no_new_entries(monkeypatch):
-    async def fake_fetch_history(session):
-        return [
-            {"id": 100},
-        ]
+async def test_no_new_entries_no_send(monkeypatch):
+    _patch_history(monkeypatch, [{"id": 100}])
+    _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
 
-    monkeypatch.setattr(
-        "handlers.fetch_history",
-        fake_fetch_history,
-    )
+    await check_and_notify(DummyBot(), {100}, _empty_cur())
 
-    called = False
-
-    async def fake_send(bot, text):
-        nonlocal called
-        called = True
-
-    monkeypatch.setattr(
-        "handlers.send_to_all_chats",
-        fake_send,
-    )
-
-    monkeypatch.setattr(
-        "handlers.save_stats_current",
-        lambda cur: None,
-    )
-
-    class DummyBot:
-        pass
-
-    await check_and_notify(
-        DummyBot(),
-        {100},
-        _empty_cur(),
-    )
-
-    assert called is False
+    assert sent == []
 
 
 @pytest.mark.asyncio
-async def test_new_relevant_entry(monkeypatch):
-    async def fake_fetch_history(session):
-        return [
-            {"id": 123},
-        ]
+async def test_new_relevant_entry_sends_and_saves(monkeypatch):
+    _patch_history(monkeypatch, [{"id": 123}])
+    monkeypatch.setattr("handlers.get_media_info", lambda entry: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda entry: "MESSAGE")
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
 
-    monkeypatch.setattr(
-        "handlers.fetch_history",
-        fake_fetch_history,
-    )
-
-    monkeypatch.setattr(
-        "handlers.get_media_info",
-        lambda entry: ("anime", "tv"),
-    )
-
-    monkeypatch.setattr(
-        "handlers.is_relevant",
-        lambda media_type, kind: True,
-    )
-
-    monkeypatch.setattr(
-        "handlers.build_message",
-        lambda entry: "MESSAGE",
-    )
-
-    sent = []
-
-    async def fake_send(bot, text):
-        sent.append(text)
-
-    monkeypatch.setattr(
-        "handlers.send_to_all_chats",
-        fake_send,
-    )
-
-    async def fake_sleep(*_):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
-
-    saved = []
-
-    monkeypatch.setattr(
-        "handlers.save_seen_ids",
-        lambda ids: saved.append(ids.copy()),
-    )
-
-    monkeypatch.setattr(
-        "handlers.save_stats_current",
-        lambda cur: None,
-    )
-
-    class DummyBot:
-        pass
-
-    result, cur = await check_and_notify(
-        DummyBot(),
-        {999},
-        _empty_cur(),
-    )
+    result, cur = await check_and_notify(DummyBot(), {999}, _empty_cur())
 
     assert 123 in result
     assert sent == ["MESSAGE"]
-    assert len(saved) == 1
+    assert saved == [{999, 123}]
 
 
 @pytest.mark.asyncio
-async def test_new_irrelevant_entry(monkeypatch):
-    async def fake_fetch_history(session):
-        return [
-            {"id": 999},
-        ]
+async def test_new_irrelevant_entry_records_but_no_send(monkeypatch):
+    # ВАЖНО: непустой seen_ids — иначе код уходит в baseline-ветку ДО фильтра,
+    # и тест на нерелевантность становится холостым (проходит при сломанном фильтре).
+    _patch_history(monkeypatch, [{"id": 999}])
+    monkeypatch.setattr("handlers.get_media_info", lambda entry: ("anime", "special"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: False)
+    monkeypatch.setattr("handlers.build_message", lambda entry: "SHOULD_NOT_SEND")
+    _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
 
-    monkeypatch.setattr(
-        "handlers.fetch_history",
-        fake_fetch_history,
-    )
+    result, cur = await check_and_notify(DummyBot(), {111}, _empty_cur())
 
-    monkeypatch.setattr(
-        "handlers.get_media_info",
-        lambda entry: ("anime", "special"),
-    )
-
-    monkeypatch.setattr(
-        "handlers.is_relevant",
-        lambda media_type, kind: False,
-    )
-
-    called = False
-
-    async def fake_send(bot, text):
-        nonlocal called
-        called = True
-
-    monkeypatch.setattr(
-        "handlers.send_to_all_chats",
-        fake_send,
-    )
-
-    monkeypatch.setattr(
-        "handlers.save_stats_current",
-        lambda cur: None,
-    )
-
-    class DummyBot:
-        pass
-
-    result, cur = await check_and_notify(
-        DummyBot(),
-        set(),
-        _empty_cur(),
-    )
-
-    assert 999 in result
-    assert called is False
+    assert 999 in result     # ID запомнен даже для нерелевантного
+    assert sent == []        # но сообщение не отправлено (фильтр)
