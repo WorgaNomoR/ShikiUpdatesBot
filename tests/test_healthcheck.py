@@ -124,6 +124,13 @@ async def test_threshold_default_misses(fake_web):
 
 
 @pytest.mark.asyncio
+async def test_threshold_guards_against_zero(fake_web):
+    """check_interval/misses=0 не должны обнулить порог (max(1, ...))."""
+    await healthcheck.start_health_server(check_interval=0, misses=0, port=12348)
+    assert healthcheck._health_threshold == 1   # max(1,0) * max(1,0)
+
+
+@pytest.mark.asyncio
 async def test_port_read_from_env_when_none(fake_web, monkeypatch):
     """port=None → берётся из переменной окружения PORT."""
     monkeypatch.setenv("PORT", "9999")
