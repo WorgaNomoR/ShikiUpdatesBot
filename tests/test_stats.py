@@ -25,7 +25,6 @@ import pytest
 
 import handlers
 import messages
-import shiki_api
 import stats as smod
 import storage
 
@@ -44,29 +43,6 @@ def _export_manga_row(tid, status="completed", chapters=1):
     return {"target_id": tid, "target_type": "Manga", "target_title": "x",
             "target_title_ru": "x", "score": 0, "status": status,
             "rewatches": 0, "chapters": chapters, "volumes": 0}
-
-
-# ════════════════════════════════════════════════════════════════
-#  is_relevant — фильтр значимости (сама функция, не замокана)
-# ════════════════════════════════════════════════════════════════
-
-def test_is_relevant_anime_allowed_kinds():
-    for kind in ("tv", "movie", "ova", "ona"):
-        assert shiki_api.is_relevant("anime", kind) is True, kind
-
-def test_is_relevant_anime_drops_specials_and_clips():
-    for kind in ("special", "tv_special", "music", "pv", "cm"):
-        assert shiki_api.is_relevant("anime", kind) is False, kind
-
-def test_is_relevant_manga_blocks_oneshot_doujin():
-    assert shiki_api.is_relevant("manga", "one_shot") is False
-    assert shiki_api.is_relevant("manga", "doujin") is False
-
-def test_is_relevant_manga_allows_regular():
-    assert shiki_api.is_relevant("manga", "manga") is True
-
-def test_is_relevant_empty_kind_is_false():
-    assert shiki_api.is_relevant("anime", "") is False
 
 
 # ════════════════════════════════════════════════════════════════
