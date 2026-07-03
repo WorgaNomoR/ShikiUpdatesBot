@@ -21,6 +21,7 @@ import handlers
 import messages
 import stats as smod
 import storage
+import utils
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
@@ -403,3 +404,57 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
     # но это no-op: запись цела, kind остался пустым (не выдумали вид)
     assert "999" in result["manga"]["titles"]
     assert result["manga"]["titles"]["999"]["kind"] == ""
+
+
+# ════════════════════════════════════════════════════════════════
+#  record_current_event + sync_stats_all (перенесено из test_polling)
+# ════════════════════════════════════════════════════════════════
+
+def _completed_event(tid, score, media="anime"):
+    return {"id": str(tid), "media": media, "event": "completed",
+            "score": score, "recorded_at": "2026-04-01T00:00:00+00:00"}
+
+
+# ── коррекция оценки в том же квартале ──
+
+def test_score_change_updates_existing_completed_event():
+    """score_changed по тайтлу с completed-событием квартала ⇒ обновляет его score.
+    Кейс «Атака титанов: случайно 3 → исправил»."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"].append(_completed_event(123, 3))
+
+    out = smod.record_current_event(cur, {"target": {"id": 123}}, "score_changed", "anime", 9)
+
+    completed = [e for e in out["events"] if e["id"] == "123" and e["event"] == "completed"]
+    assert len(completed) == 1
+    assert completed[0]["score"] == 9
+    assert all(e["event"] != "score_changed" for e in out["events"])
+
+
+def test_score_change_without_completed_is_noop():
+    """score_changed по тайтлу вне событий квартала ⇒ ничего не добавляем/не меняем."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    out = smod.record_current_event(cur, {"target": {"id": 999}}, "score_changed", "anime", 9)
+    assert out["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatch):
+    """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,
+    save не вызывается. Гарантия «429 не ломает stats_all»."""
+    import stats
+    preserved = {"_sentinel": "keep-me"}
+    saved = []
+
+    async def fake_export(session, media):
+        return None
+
+    monkeypatch.setattr(stats, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.load_stats_all", lambda use_cache=True: preserved)
+    monkeypatch.setattr("stats.save_stats_all", lambda d: saved.append(d))
+
+    stats, ok = await smod.sync_stats_all()
+
+    assert ok is False
+    assert stats is preserved
+    assert saved == []

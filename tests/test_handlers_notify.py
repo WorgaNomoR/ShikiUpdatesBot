@@ -11,6 +11,13 @@ def _empty_cur():
     return {"period": "2026-Q2", "events": []}
 
 
+def _relevant_entry(eid):
+    # запись, которая прошла бы is_relevant (anime/tv) и без baseline-ветки
+    # ушла бы в чат — тем и докажем, что baseline возвращает ДО отправки
+    return {"id": eid, "target": {"type": "Anime", "kind": "tv"},
+            "description": "просмотрено"}
+
+
 class DummyBot:
     pass
 
@@ -60,16 +67,21 @@ async def test_failed_fetch_skips_cycle(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
-    # пустой seen_ids -> baseline из текущей истории, НИЧЕГО не шлём
-    _patch_history(monkeypatch, [{"id": 1}, {"id": 2}])
+    # пустой seen_ids -> baseline, НИЧЕГО не шлём — ДАЖЕ релевантные записи
+    # (иначе первый запуск спамит всю историю). Релевантность критична: на
+    # нерелевантных тест прошёл бы и с удалённой baseline-веткой (их отсеет
+    # is_relevant) — т.е. не охранял бы её.
+    _patch_history(monkeypatch, [_relevant_entry(1), _relevant_entry(2)])
+    monkeypatch.setattr("handlers.record_current_event", lambda cur, *a, **k: cur)
+    monkeypatch.setattr("handlers.build_message", lambda e: "SHOULD_NOT_SEND")
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
     result, cur = await check_and_notify(DummyBot(), set(), _empty_cur())
 
     assert result == {1, 2}
-    assert saved == [{1, 2}]     # baseline сохранён
-    assert sent == []            # без отправки
+    assert saved == [{1, 2}]
+    assert sent == []
 
 
 @pytest.mark.asyncio

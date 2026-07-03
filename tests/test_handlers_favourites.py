@@ -612,3 +612,52 @@ async def test_check_and_notify_favourites_dedups_industry_people(monkeypatch, s
     assert len(sent) == 1                      # одно сообщение, не два
     assert "seyu_34785" in new_seen            # обе роли отмечены виденными,
     assert "producers_34785" in new_seen       # иначе зацикливание на «новом»
+
+
+# ── check_and_notify_favourites: цикловые проверки (baseline / упавший фетч) ──
+
+@pytest.mark.asyncio
+async def test_check_favourites_empty_baseline_does_not_spam(monkeypatch):
+    """check_and_notify_favourites с пустым seen: 0 отправок, baseline сохранён.
+    (Слой ЦИКЛА — в отличие от loop-теста выше, что проверяет init-блок.)"""
+    sent, saved = [], {}
+
+    async def fake_fetch_favourites(session):
+        return {"animes": [{"id": 100}, {"id": 101}], "mangas": [{"id": 200}]}
+
+    async def fake_send(bot, text):
+        sent.append(text)
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch_favourites)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda s: saved.update(keys=set(s)))
+
+    seen, _ = await handlers.check_and_notify_favourites(bot=None, seen=set())
+
+    expected = {"animes_100", "animes_101", "mangas_200"}
+    assert sent == []
+    assert seen == expected
+    assert saved.get("keys") == expected
+
+
+@pytest.mark.asyncio
+async def test_check_favourites_failed_fetch_keeps_state(monkeypatch):
+    """fetch_favourites → None: 0 отправок, seen не тронут, save не звался."""
+    sent, save_calls = [], []
+
+    async def fake_fetch_favourites(session):
+        return None
+
+    async def fake_send(bot, text):
+        sent.append(text)
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch_favourites)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda s: save_calls.append(s))
+
+    baseline = {"animes_1"}
+    seen, _ = await handlers.check_and_notify_favourites(bot=None, seen=set(baseline))
+
+    assert sent == []
+    assert seen == baseline
+    assert save_calls == []
