@@ -3,6 +3,8 @@
 import random
 import time
 
+import pytest
+
 import config
 import messages
 from messages import (
@@ -57,68 +59,50 @@ def test_h_plain_text():
 # build_message()
 # ==========================================================
 
-def test_completed_without_score(monkeypatch):
+@pytest.mark.parametrize("desc, score, key", [
+    ("просмотрено", None, "completed_no_score"),
+    ("оценено на 3", 3, "completed_score_low"),
+    ("оценено на 6", 6, "completed_score_mid"),
+    ("оценено на 9", 9, "completed_score_high"),
+    ("оценено на 10", 10, "completed_score_perfect"),
+])
+def test_build_message_completed_selects_bank_by_score(monkeypatch, desc, score, key):
+    # с fixed_choice шаблон детерминирован -> точная сверка ВЫБРАННОГО банка,
+    # а не «цифра где-то в тексте» (та проходит на любом банке -> мутационно дырява)
     monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("просмотрено")
+    msg = build_message(make_entry(desc))
+    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
+    expected = messages.MESSAGES["anime"][key][0].format(
+        n=messages._DISPLAY_NAME_HTML, title=title,
+        score=score if score is not None else "?",
     )
+    assert msg == expected
 
-    assert "Ergo Proxy" in msg
 
-
-def test_completed_low_score(monkeypatch):
+def test_build_message_manga_uses_manga_bank(monkeypatch):
+    # media_type определяется по target.type (не по url) -> проверяем банк manga
     monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 3")
+    entry = {
+        "description": "оценено на 3",
+        "target": {"name": "Berserk", "url": "/mangas/25-berserk", "type": "Manga"},
+        "created_at": "2025-01-01T12:00:00.000Z",
+    }
+    msg = build_message(entry)
+    title = f'<a href="{messages.SHIKI_BASE_URL}/mangas/25-berserk">Berserk</a>'
+    expected = messages.MESSAGES["manga"]["completed_score_low"][0].format(
+        n=messages._DISPLAY_NAME_HTML, title=title, score=3,
     )
-
-    assert "Ergo Proxy" in msg
-    assert "3" in msg
+    assert msg == expected
 
 
-def test_completed_mid_score(monkeypatch):
+def test_score_changed_uses_change_bank(monkeypatch):
     monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 5")
+    msg = build_message(make_entry("изменена оценка с 5 на 8"))
+    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
+    expected = messages.MESSAGES["score_changed"][0].format(
+        n=messages._DISPLAY_NAME_HTML, title=title, old=5, new=8,
     )
-
-    assert "Ergo Proxy" in msg
-    assert "5" in msg
-
-
-def test_completed_high_score(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 8")
-    )
-
-    assert "Ergo Proxy" in msg
-    assert "8" in msg
-
-
-def test_completed_perfect_score(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 10")
-    )
-
-    assert "Ergo Proxy" in msg
-
-
-def test_score_changed(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("изменена оценка с 5 на 8")
-    )
-
-    assert "5" in msg
-    assert "8" in msg
+    assert msg == expected
 
 
 def test_html_title_escape(monkeypatch):
