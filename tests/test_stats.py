@@ -1,20 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 """
-Тесты модуля статистики и избранного (ветка stats).
+Тесты модуля stats: агрегация (recompute_aggregates), сбор избранного
+(_collect_favourites), фильтр мусора по kind, metadata-retry в sync_stats_all,
+и smoke-тесты билдеров отчётов.
 
-Покрывают то, что появилось в ветке и НЕ покрыто другими файлами:
-форматтеры отчётов, агрегацию, фильтр мусора по kind, сбор избранного,
-нормализацию URL, утилиты, и smoke-тесты на билдеры сообщений.
-
-Намеренно НЕ дублирует:
-  test_messages.py  — build_message, h()
-  test_parsers.py   — extract_score, classify_event, _strip_html
-  test_favourites.py— build_favourite_message
-  test_media.py     — get_media_info
-
-Тесты ветки favourites-fix (unit 2, metadata-retry) — в конце файла,
-под своим секционным заголовком.
+Форматтеры отчётов (messages._fmt_mono_rows / _top_block / _score_dist_block
+и т.п.) тестируются здесь же — низкоуровневые хелперы рендера отчётов stats,
+живут рядом со своими потребителями.
 
 Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
