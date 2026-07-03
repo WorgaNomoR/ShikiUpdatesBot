@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Тесты shiki_api.py — сетевые фетчи (успех/ошибки/таймауты) и is_relevant.
+"""Тесты shiki_api.py — сетевые фетчи (успех/ошибки/таймауты), get_media_info и is_relevant.
 
 Сетевую границу мокаем одной парой _FakeSession/_FakeResponse (без копипасты
 в каждом тесте); is_relevant — чистая функция, не замокана.
@@ -16,6 +16,7 @@ import shiki_api
 from shiki_api import (
     fetch_favourites,
     fetch_history,
+    get_media_info,
 )
 
 
@@ -118,13 +119,44 @@ def test_is_relevant_manga_blocks_oneshot_doujin():
     assert shiki_api.is_relevant("manga", "doujin") is False
 
 
-def test_is_relevant_manga_allows_regular():
-    assert shiki_api.is_relevant("manga", "manga") is True
+def test_is_relevant_manga_allows_regular_kinds():
+    for kind in ("manga", "manhwa", "ranobe", "novel"):
+        assert shiki_api.is_relevant("manga", kind) is True, kind
 
 
 def test_is_relevant_empty_kind_is_false():
     assert shiki_api.is_relevant("anime", "") is False
+    assert shiki_api.is_relevant("manga", "") is False
 
 
 def test_is_relevant_unknown_media_type_is_false():
     assert shiki_api.is_relevant("person", "tv") is False
+# ════════════════════════════════════════════════════════════════
+#  get_media_info — media_type/kind из записи истории
+# ════════════════════════════════════════════════════════════════
+
+def test_get_media_info_anime_by_type():
+    assert get_media_info({"target": {"type": "Anime", "kind": "tv"}}) == ("anime", "tv")
+
+
+def test_get_media_info_novel_kind_is_manga():
+    assert get_media_info({"target": {"kind": "novel"}}) == ("manga", "novel")
+
+
+def test_get_media_info_fallback_to_anime():
+    assert get_media_info({"target": {}}) == ("anime", "")
+
+
+# ── Регрессии реальных прод-багов (были в test_media, сохранены как регрессии) ──
+
+def test_regression_manga_detected_by_kind():
+    """Исторический баг: манга определяется через kind, даже если type
+    отсутствует (напр. ранобэ приходит без target.type)."""
+    assert get_media_info({"target": {"kind": "ranobe"}}) == ("manga", "ranobe")
+
+
+def test_regression_manga_status_uses_watching():
+    """Исторический баг /status: Shikimori шлёт watching/rewatching и для аниме,
+    и для манги — поэтому манга ДОЛЖНА определяться как manga по target.type,
+    а не по статусу."""
+    assert get_media_info({"target": {"type": "Manga", "kind": "manga"}}) == ("manga", "manga")
