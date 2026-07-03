@@ -9,6 +9,7 @@ from messages import (
     classify_event,
     extract_score,
     extract_score_change,
+    format_rate_entry,
 )
 from utils import _utcnow, h
 
@@ -382,3 +383,116 @@ def test_classify_completed_fallback():
 
 def test_classify_completed_with_score():
     assert classify_event("оценено на 8") == "completed"
+
+
+# ============================================================
+# format_rate_entry()
+# ============================================================
+
+def test_format_rate_entry_russian_title_priority():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Ergo Proxy",
+            "russian": "Эрго Прокси",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "Эрго Прокси" in result
+    assert "Ergo Proxy" not in result
+
+
+def test_format_rate_entry_fallback_to_english():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Ergo Proxy",
+            "russian": "",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "Ergo Proxy" in result
+
+
+def test_format_rate_entry_html_escape():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "<Ergo & Proxy>",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "&lt;Ergo &amp; Proxy&gt;" in result
+
+
+def test_format_rate_entry_watching_icon():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert result.startswith("▶️")
+
+
+def test_format_rate_entry_rewatching_icon():
+    item = {
+        "_status": "rewatching",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert result.startswith("🔁")
+
+
+def test_format_rate_entry_unknown_icon():
+    item = {
+        "_status": "something",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert result.startswith("•")
+
+
+def test_format_rate_entry_with_link():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Anime",
+            "url": "/animes/1-anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert 'href="' in result
+    assert "/animes/1-anime" in result
+
+
+def test_format_rate_entry_without_link():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "href=" not in result
