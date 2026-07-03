@@ -1,9 +1,11 @@
 import random
 import time
 
+import config
 import messages
 from messages import (
     _strip_html,
+    build_favourite_message,
     build_message,
     build_startup_snapshot,
     classify_event,
@@ -496,3 +498,66 @@ def test_format_rate_entry_without_link():
     result = format_rate_entry(item, "anime")
 
     assert "href=" not in result
+
+
+# ============================================================
+# Message building
+# ============================================================
+
+def test_build_favourite_message_prefers_russian():
+    item = {
+        "russian": "Эрго Прокси",
+        "name": "Ergo Proxy",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "Эрго Прокси" in msg
+
+
+def test_build_favourite_message_english_fallback():
+    item = {
+        "name": "Ergo Proxy",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "Ergo Proxy" in msg
+
+
+def test_build_favourite_message_html_escape():
+    item = {
+        "name": "<Ergo & Proxy>",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "&lt;Ergo &amp; Proxy&gt;" in msg
+
+
+def test_build_favourite_message_link():
+    item = {
+        "name": "Ergo Proxy",
+        "url": "/animes/790-ergo-proxy",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "shikimori.io/animes/790-ergo-proxy" in msg
+
+
+def test_build_favourite_message_ranobe_uses_manga_bank():
+    item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
+    text = messages.build_favourite_message("ranobe", item)
+    manga_bank = [t.format(n=config.DISPLAY_NAME, title="Re:Zero")
+                  for t in messages.MESSAGES["favourites"]["manga"]]
+    assert text in manga_bank
+
+
+def test_build_favourite_message_industry_uses_person_bank():
+    item = {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None}
+    for cat in ("seyu", "mangakas", "producers", "people"):
+        text = messages.build_favourite_message(cat, item)
+        person_bank = [t.format(n=config.DISPLAY_NAME, title="Риэ Такахаси")
+                       for t in messages.MESSAGES["favourites"]["person"]]
+        assert text in person_bank, f"категория {cat} ушла не в банк person"

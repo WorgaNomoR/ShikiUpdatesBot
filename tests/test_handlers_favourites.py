@@ -1,17 +1,18 @@
+"""Тесты фичи «избранное»: флоу check_and_notify_favourites + сбор
+(_collect_favourites/build_favourites_messages) + seen-хранилище.
+build_favourite_message (leaf messages) вынесен в test_messages.py."""
+
 import asyncio
 import json
 from unittest.mock import AsyncMock
 
 import pytest
 
-import config
 import handlers
-import messages
 import shiki_api
 import stats as smod
 import storage
 from handlers import check_and_notify_favourites
-from messages import build_favourite_message
 from storage import (
     load_seen_favourites,
     save_seen_favourites,
@@ -135,52 +136,6 @@ def test_seen_favourites_roundtrip(monkeypatch, tmp_path):
     save_seen_favourites(original)
 
     assert load_seen_favourites() == original
-
-
-# ============================================================
-# Message building
-# ============================================================
-
-def test_build_favourite_message_prefers_russian():
-    item = {
-        "russian": "Эрго Прокси",
-        "name": "Ergo Proxy",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "Эрго Прокси" in msg
-
-
-def test_build_favourite_message_english_fallback():
-    item = {
-        "name": "Ergo Proxy",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "Ergo Proxy" in msg
-
-
-def test_build_favourite_message_html_escape():
-    item = {
-        "name": "<Ergo & Proxy>",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "&lt;Ergo &amp; Proxy&gt;" in msg
-
-
-def test_build_favourite_message_link():
-    item = {
-        "name": "Ergo Proxy",
-        "url": "/animes/790-ergo-proxy",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "shikimori.io/animes/790-ergo-proxy" in msg
 
 
 # ============================================================
@@ -553,23 +508,6 @@ def test_build_favourites_messages_has_ranobe_and_industry_blocks():
     msg = smod.build_favourites_messages(stats)[0]
     assert "Ранобэ" in msg
     assert "Люди индустрии" in msg
-
-
-def test_build_favourite_message_ranobe_uses_manga_bank():
-    item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
-    text = messages.build_favourite_message("ranobe", item)
-    manga_bank = [t.format(n=config.DISPLAY_NAME, title="Re:Zero")
-                  for t in messages.MESSAGES["favourites"]["manga"]]
-    assert text in manga_bank
-
-
-def test_build_favourite_message_industry_uses_person_bank():
-    item = {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None}
-    for cat in ("seyu", "mangakas", "producers", "people"):
-        text = messages.build_favourite_message(cat, item)
-        person_bank = [t.format(n=config.DISPLAY_NAME, title="Риэ Такахаси")
-                       for t in messages.MESSAGES["favourites"]["person"]]
-        assert text in person_bank, f"категория {cat} ушла не в банк person"
 
 
 @pytest.mark.asyncio
