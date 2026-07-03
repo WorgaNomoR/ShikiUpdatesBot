@@ -104,6 +104,16 @@ def test_load_subscribers_corrupted_json(monkeypatch, tmp_path):
     assert load_subscribers() == {}
 
 
+def test_load_subscribers_non_int_key_falls_back_to_empty(monkeypatch, tmp_path):
+    # ключ подписчика не приводится к int -> ValueError -> пустой список,
+    # а не падение (ветка except ValueError)
+    file = tmp_path / "subs.json"
+    file.write_text(json.dumps({"subscribers": {"abc": "X"}}), encoding="utf-8")
+    monkeypatch.setattr("storage.SUBS_FILE", str(file))
+
+    assert load_subscribers() == {}
+
+
 def test_save_subscribers(monkeypatch, tmp_path):
     file = tmp_path / "subs.json"
 
