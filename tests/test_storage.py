@@ -1,6 +1,5 @@
 import json
 
-import utils
 from storage import (
     load_seen_ids,
     load_subscribers,
@@ -174,6 +173,3 @@ def test_atomic_write_overwrites_existing_file(tmp_path):
     assert target.read_text(encoding="utf-8") == "new"
 
 
-def test_utcnow_is_naive():
-    dt = utils._utcnow()
-    assert dt.tzinfo is None

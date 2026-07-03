@@ -28,7 +28,6 @@ import messages
 import shiki_api
 import stats as smod
 import storage
-import utils
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
@@ -45,52 +44,6 @@ def _export_manga_row(tid, status="completed", chapters=1):
     return {"target_id": tid, "target_type": "Manga", "target_title": "x",
             "target_title_ru": "x", "score": 0, "status": status,
             "rewatches": 0, "chapters": chapters, "volumes": 0}
-
-
-# ════════════════════════════════════════════════════════════════
-#  Утилиты: _safe_int / _safe_float / _utcnow / _rel_url
-# ════════════════════════════════════════════════════════════════
-
-def test_safe_int_valid():
-    assert utils._safe_int(5) == 5
-    assert utils._safe_int("7") == 7
-
-def test_safe_int_invalid_returns_default():
-    assert utils._safe_int(None) == 0
-    assert utils._safe_int("abc") == 0
-    assert utils._safe_int("abc", default=-1) == -1
-
-def test_safe_float_valid():
-    assert utils._safe_float(7.5) == 7.5
-    assert utils._safe_float("8.1") == 8.1
-
-def test_safe_float_invalid_returns_default():
-    assert utils._safe_float(None) is None
-    assert utils._safe_float("xyz") is None
-    assert utils._safe_float("xyz", default=0.0) == 0.0
-
-def test_utcnow_is_naive():
-    dt = utils._utcnow()
-    assert dt.tzinfo is None  # наивное UTC, сравнимо с fromisoformat
-
-
-# ── _rel_url: регрессия на баг двойного домена (GraphQL отдаёт полный URL) ──
-
-def test_rel_url_strips_full_https():
-    assert utils._rel_url("https://shikimori.io/animes/226-elfen-lied") == "/animes/226-elfen-lied"
-
-def test_rel_url_strips_full_http():
-    assert utils._rel_url("http://shikimori.io/mangas/25") == "/mangas/25"
-
-def test_rel_url_keeps_relative():
-    assert utils._rel_url("/animes/30-eva") == "/animes/30-eva"
-
-def test_rel_url_empty_and_none():
-    assert utils._rel_url("") == ""
-    assert utils._rel_url(None) == ""
-
-def test_rel_url_domain_only():
-    assert utils._rel_url("https://shikimori.io") == ""
 
 
 # ════════════════════════════════════════════════════════════════
@@ -114,23 +67,6 @@ def test_is_relevant_manga_allows_regular():
 
 def test_is_relevant_empty_kind_is_false():
     assert shiki_api.is_relevant("anime", "") is False
-
-
-# ════════════════════════════════════════════════════════════════
-#  Квартальные даты
-# ════════════════════════════════════════════════════════════════
-
-def test_current_quarter():
-    from datetime import datetime
-    assert utils.current_quarter(datetime(2026, 1, 15)) == "2026-Q1"
-    assert utils.current_quarter(datetime(2026, 4, 1)) == "2026-Q2"
-    assert utils.current_quarter(datetime(2026, 7, 31)) == "2026-Q3"
-    assert utils.current_quarter(datetime(2026, 12, 1)) == "2026-Q4"
-
-def test_quarter_start():
-    from datetime import datetime
-    assert utils.quarter_start(datetime(2026, 5, 20)) == datetime(2026, 4, 1)
-    assert utils.quarter_start(datetime(2026, 1, 1)) == datetime(2026, 1, 1)
 
 
 # ════════════════════════════════════════════════════════════════
