@@ -80,6 +80,14 @@ def test_extract_score_change_html():
     ) == (5, 9)
 
 
+def test_extract_score_change_latin_c_homoglyph():
+    # Shikimori шлёт латинскую "c" (U+0063), не кириллическую "с" (U+0441);
+    # реальная строка ещё и оборачивает оценки в <b>. Регресс на "?/10 вместо ?".
+    assert extract_score_change(
+        "Изменена оценка c <b>6</b> на <b>7</b>"
+    ) == (6, 7)
+
+
 def test_extract_score_change_invalid():
     assert extract_score_change(
         "изменена оценка"
