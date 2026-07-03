@@ -362,7 +362,7 @@ def extract_score_change(description: str) -> tuple[int, int] | None:
     """
     desc = _strip_html(description)
     match = re.search(
-        r"изменена\s+оценка\s+с\s+(\d+)\s+на\s+(\d+)",
+        r"изменена\s+оценка\s+[сc]\s+(\d+)\s+на\s+(\d+)",
         desc, re.IGNORECASE
     )
     if match:
