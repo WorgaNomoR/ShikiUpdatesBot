@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 import json
 
-import utils
 from storage import (
     load_seen_ids,
     load_subscribers,
@@ -103,6 +104,16 @@ def test_load_subscribers_corrupted_json(monkeypatch, tmp_path):
     assert load_subscribers() == {}
 
 
+def test_load_subscribers_non_int_key_falls_back_to_empty(monkeypatch, tmp_path):
+    # ключ подписчика не приводится к int -> ValueError -> пустой список,
+    # а не падение (ветка except ValueError)
+    file = tmp_path / "subs.json"
+    file.write_text(json.dumps({"subscribers": {"abc": "X"}}), encoding="utf-8")
+    monkeypatch.setattr("storage.SUBS_FILE", str(file))
+
+    assert load_subscribers() == {}
+
+
 def test_save_subscribers(monkeypatch, tmp_path):
     file = tmp_path / "subs.json"
 
@@ -174,6 +185,3 @@ def test_atomic_write_overwrites_existing_file(tmp_path):
     assert target.read_text(encoding="utf-8") == "new"
 
 
-def test_utcnow_is_naive():
-    dt = utils._utcnow()
-    assert dt.tzinfo is None

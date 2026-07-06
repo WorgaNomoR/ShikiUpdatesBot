@@ -1,8 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 import random
 import time
 
+import pytest
+
+import config
 import messages
-from messages import build_message, build_startup_snapshot
+from messages import (
+    _strip_html,
+    build_favourite_message,
+    build_message,
+    build_startup_snapshot,
+    classify_event,
+    extract_score,
+    extract_score_change,
+    format_rate_entry,
+)
 from utils import _utcnow, h
 
 
@@ -45,68 +59,50 @@ def test_h_plain_text():
 # build_message()
 # ==========================================================
 
-def test_completed_without_score(monkeypatch):
+@pytest.mark.parametrize("desc, score, key", [
+    ("просмотрено", None, "completed_no_score"),
+    ("оценено на 3", 3, "completed_score_low"),
+    ("оценено на 6", 6, "completed_score_mid"),
+    ("оценено на 9", 9, "completed_score_high"),
+    ("оценено на 10", 10, "completed_score_perfect"),
+])
+def test_build_message_completed_selects_bank_by_score(monkeypatch, desc, score, key):
+    # с fixed_choice шаблон детерминирован -> точная сверка ВЫБРАННОГО банка,
+    # а не «цифра где-то в тексте» (та проходит на любом банке -> мутационно дырява)
     monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("просмотрено")
+    msg = build_message(make_entry(desc))
+    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
+    expected = messages.MESSAGES["anime"][key][0].format(
+        n=messages._DISPLAY_NAME_HTML, title=title,
+        score=score if score is not None else "?",
     )
+    assert msg == expected
 
-    assert "Ergo Proxy" in msg
 
-
-def test_completed_low_score(monkeypatch):
+def test_build_message_manga_uses_manga_bank(monkeypatch):
+    # media_type определяется по target.type (не по url) -> проверяем банк manga
     monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 3")
+    entry = {
+        "description": "оценено на 3",
+        "target": {"name": "Berserk", "url": "/mangas/25-berserk", "type": "Manga"},
+        "created_at": "2025-01-01T12:00:00.000Z",
+    }
+    msg = build_message(entry)
+    title = f'<a href="{messages.SHIKI_BASE_URL}/mangas/25-berserk">Berserk</a>'
+    expected = messages.MESSAGES["manga"]["completed_score_low"][0].format(
+        n=messages._DISPLAY_NAME_HTML, title=title, score=3,
     )
-
-    assert "Ergo Proxy" in msg
-    assert "3" in msg
+    assert msg == expected
 
 
-def test_completed_mid_score(monkeypatch):
+def test_score_changed_uses_change_bank(monkeypatch):
     monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 5")
+    msg = build_message(make_entry("изменена оценка с 5 на 8"))
+    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
+    expected = messages.MESSAGES["score_changed"][0].format(
+        n=messages._DISPLAY_NAME_HTML, title=title, old=5, new=8,
     )
-
-    assert "Ergo Proxy" in msg
-    assert "5" in msg
-
-
-def test_completed_high_score(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 8")
-    )
-
-    assert "Ergo Proxy" in msg
-    assert "8" in msg
-
-
-def test_completed_perfect_score(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("оценено на 10")
-    )
-
-    assert "Ergo Proxy" in msg
-
-
-def test_score_changed(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
-    msg = build_message(
-        make_entry("изменена оценка с 5 на 8")
-    )
-
-    assert "5" in msg
-    assert "8" in msg
+    assert msg == expected
 
 
 def test_html_title_escape(monkeypatch):
@@ -228,3 +224,326 @@ def test_startup_snapshot_survives_bad_timestamps():
     # кривые метки не роняют билдер, деградируют в 'нет данных'
     assert "🟢 Бот запущен" in txt
     assert "нет данных" in txt
+
+
+# ==========================================================
+# _strip_html
+# ==========================================================
+
+def test_strip_html_bold():
+    assert _strip_html("оценено на <b>7</b>") == "оценено на 7"
+
+
+def test_strip_html_strong():
+    assert _strip_html("оценено на <strong>8</strong>") == "оценено на 8"
+
+
+def test_strip_html_multiple_tags():
+    assert (
+        _strip_html("изменена оценка с <b>5</b> на <i>9</i>")
+        == "изменена оценка с 5 на 9"
+    )
+
+
+# ==========================================================
+# extract_score
+# ==========================================================
+
+def test_extract_score_ru():
+    assert extract_score("оценено на 9") == 9
+
+
+def test_extract_score_alt_ru_male():
+    assert extract_score("выставил оценку 8") == 8
+
+
+def test_extract_score_alt_ru_female():
+    assert extract_score("выставила оценку 6") == 6
+
+
+def test_extract_score_rated():
+    assert extract_score("rated 7") == 7
+
+
+def test_extract_score_scored():
+    assert extract_score("scored 10") == 10
+
+
+def test_extract_score_html_bold():
+    assert extract_score("оценено на <b>7</b>") == 7
+
+
+def test_extract_score_html_strong():
+    assert extract_score("оценено на <strong>8</strong>") == 8
+
+
+def test_extract_score_invalid():
+    assert extract_score("какой-то текст") is None
+
+
+def test_extract_score_empty():
+    assert extract_score("") is None
+
+
+# ==========================================================
+# extract_score_change
+# ==========================================================
+
+def test_extract_score_change_ru():
+    assert extract_score_change(
+        "изменена оценка с 5 на 9"
+    ) == (5, 9)
+
+
+def test_extract_score_change_html():
+    assert extract_score_change(
+        "изменена оценка с <b>5</b> на <b>9</b>"
+    ) == (5, 9)
+
+
+def test_extract_score_change_latin_c_homoglyph():
+    # Shikimori шлёт латинскую "c" (U+0063), не кириллическую "с" (U+0441);
+    # реальная строка ещё и оборачивает оценки в <b>. Регресс на "?/10 вместо ?".
+    assert extract_score_change(
+        "Изменена оценка c <b>6</b> на <b>7</b>"
+    ) == (6, 7)
+
+
+def test_extract_score_change_invalid():
+    assert extract_score_change(
+        "изменена оценка"
+    ) is None
+
+
+# ==========================================================
+# classify_event
+# ==========================================================
+
+def test_classify_score_changed():
+    assert classify_event(
+        "изменена оценка с 5 на 8"
+    ) == "score_changed"
+
+
+def test_classify_watching_smotryu():
+    assert classify_event("смотрю") == "watching"
+
+
+def test_classify_watching_smotrit():
+    assert classify_event("смотрит") == "watching"
+
+
+def test_classify_watching_chitayu():
+    assert classify_event("читаю") == "watching"
+
+
+def test_classify_watching_reading():
+    assert classify_event("reading") == "watching"
+
+
+def test_classify_rewatching_ru():
+    assert classify_event("пересматриваю") == "rewatching"
+
+
+def test_classify_rereading_ru():
+    assert classify_event("перечитываю") == "rewatching"
+
+
+def test_classify_rewatching_en():
+    assert classify_event("rewatching") == "rewatching"
+
+
+def test_classify_planned():
+    assert classify_event("добавлено в список") == "planned"
+
+
+def test_classify_planned_english():
+    assert classify_event("planned") == "planned"
+
+
+def test_classify_dropped():
+    assert classify_event("брошено") == "dropped"
+
+
+def test_classify_completed_fallback():
+    assert classify_event("просмотрено") == "completed"
+
+
+def test_classify_completed_with_score():
+    assert classify_event("оценено на 8") == "completed"
+
+
+# ============================================================
+# format_rate_entry()
+# ============================================================
+
+def test_format_rate_entry_russian_title_priority():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Ergo Proxy",
+            "russian": "Эрго Прокси",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "Эрго Прокси" in result
+    assert "Ergo Proxy" not in result
+
+
+def test_format_rate_entry_fallback_to_english():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Ergo Proxy",
+            "russian": "",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "Ergo Proxy" in result
+
+
+def test_format_rate_entry_html_escape():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "<Ergo & Proxy>",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "&lt;Ergo &amp; Proxy&gt;" in result
+
+
+def test_format_rate_entry_watching_icon():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert result.startswith("▶️")
+
+
+def test_format_rate_entry_rewatching_icon():
+    item = {
+        "_status": "rewatching",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert result.startswith("🔁")
+
+
+def test_format_rate_entry_unknown_icon():
+    item = {
+        "_status": "something",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert result.startswith("•")
+
+
+def test_format_rate_entry_with_link():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Anime",
+            "url": "/animes/1-anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert 'href="' in result
+    assert "/animes/1-anime" in result
+
+
+def test_format_rate_entry_without_link():
+    item = {
+        "_status": "watching",
+        "anime": {
+            "name": "Anime",
+        },
+    }
+
+    result = format_rate_entry(item, "anime")
+
+    assert "href=" not in result
+
+
+# ============================================================
+# Message building
+# ============================================================
+
+def test_build_favourite_message_prefers_russian():
+    item = {
+        "russian": "Эрго Прокси",
+        "name": "Ergo Proxy",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "Эрго Прокси" in msg
+
+
+def test_build_favourite_message_english_fallback():
+    item = {
+        "name": "Ergo Proxy",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "Ergo Proxy" in msg
+
+
+def test_build_favourite_message_html_escape():
+    item = {
+        "name": "<Ergo & Proxy>",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "&lt;Ergo &amp; Proxy&gt;" in msg
+
+
+def test_build_favourite_message_link():
+    item = {
+        "name": "Ergo Proxy",
+        "url": "/animes/790-ergo-proxy",
+    }
+
+    msg = build_favourite_message("animes", item)
+
+    assert "shikimori.io/animes/790-ergo-proxy" in msg
+
+
+def test_build_favourite_message_ranobe_uses_manga_bank():
+    item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
+    text = messages.build_favourite_message("ranobe", item)
+    manga_bank = [t.format(n=config.DISPLAY_NAME, title="Re:Zero")
+                  for t in messages.MESSAGES["favourites"]["manga"]]
+    assert text in manga_bank
+
+
+def test_build_favourite_message_industry_uses_person_bank():
+    item = {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None}
+    for cat in ("seyu", "mangakas", "producers", "people"):
+        text = messages.build_favourite_message(cat, item)
+        person_bank = [t.format(n=config.DISPLAY_NAME, title="Риэ Такахаси")
+                       for t in messages.MESSAGES["favourites"]["person"]]
+        assert text in person_bank, f"категория {cat} ушла не в банк person"

@@ -1,17 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
+"""Тесты фичи «избранное»: флоу check_and_notify_favourites + сбор
+(_collect_favourites/build_favourites_messages) + seen-хранилище.
+build_favourite_message (leaf messages) вынесен в test_messages.py."""
+
 import asyncio
 import json
 from unittest.mock import AsyncMock
 
 import pytest
 
-import config
 import handlers
-import messages
 import shiki_api
 import stats as smod
 import storage
 from handlers import check_and_notify_favourites
-from messages import build_favourite_message
 from storage import (
     load_seen_favourites,
     save_seen_favourites,
@@ -43,6 +46,14 @@ FAV_SAMPLE = {
         {"id": 38963, "name": "Masahiro Shinohara", "russian": "Масахиро Синохара", "url": None},
     ],
 }
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Флоу-тесты троттлят рассылку asyncio.sleep — глушим глобально."""
+    async def _fast(*args, **kwargs):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _fast)
 
 
 @pytest.fixture
@@ -138,52 +149,6 @@ def test_seen_favourites_roundtrip(monkeypatch, tmp_path):
 
 
 # ============================================================
-# Message building
-# ============================================================
-
-def test_build_favourite_message_prefers_russian():
-    item = {
-        "russian": "Эрго Прокси",
-        "name": "Ergo Proxy",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "Эрго Прокси" in msg
-
-
-def test_build_favourite_message_english_fallback():
-    item = {
-        "name": "Ergo Proxy",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "Ergo Proxy" in msg
-
-
-def test_build_favourite_message_html_escape():
-    item = {
-        "name": "<Ergo & Proxy>",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "&lt;Ergo &amp; Proxy&gt;" in msg
-
-
-def test_build_favourite_message_link():
-    item = {
-        "name": "Ergo Proxy",
-        "url": "/animes/790-ergo-proxy",
-    }
-
-    msg = build_favourite_message("animes", item)
-
-    assert "shikimori.io/animes/790-ergo-proxy" in msg
-
-
-# ============================================================
 # Notification logic
 # ============================================================
 
@@ -233,14 +198,6 @@ async def test_favourites_no_changes(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     class DummyBot:
         pass
@@ -285,14 +242,6 @@ async def test_new_favourite(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
     monkeypatch.setattr("handlers.load_stats_all",
@@ -341,14 +290,6 @@ async def test_multiple_new_favourites(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
     monkeypatch.setattr("handlers.load_stats_all",
@@ -397,14 +338,6 @@ async def test_favourite_without_id_is_ignored(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     class DummyBot:
         pass
@@ -446,14 +379,6 @@ async def test_untracked_category_is_ignored(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     class DummyBot:
         pass
@@ -465,46 +390,6 @@ async def test_untracked_category_is_ignored(monkeypatch):
 
     assert result == set()
     assert called is False
-
-
-@pytest.mark.asyncio
-async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
-
-    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
-    monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
-    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
-
-    async def fake_fetch(session):
-        return None
-    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch)
-
-    saved = False
-    def fake_save(data):
-        nonlocal saved
-        saved = True
-    monkeypatch.setattr("handlers.save_seen_favourites", fake_save)
-
-    # sync_stats_all и rotate_quarter_if_needed делают сетевые вызовы — мокаем
-    async def fake_sync():
-        return storage._empty_stats_all() if hasattr("handlers._empty_stats_all") else {}
-    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
-
-    async def fake_rotate(bot, cur, stats_all):
-        return cur
-    monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
-
-    # check_and_notify теперь принимает (bot, seen_ids, cur) и возвращает (seen_ids, cur)
-    async def fake_check(bot, seen, cur):
-        raise asyncio.CancelledError
-    monkeypatch.setattr("handlers.check_and_notify", fake_check)
-
-    class DummyBot:
-        pass
-
-    with pytest.raises(asyncio.CancelledError):
-        await handlers.polling_loop(DummyBot())
-
-    assert saved is False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -553,23 +438,6 @@ def test_build_favourites_messages_has_ranobe_and_industry_blocks():
     msg = smod.build_favourites_messages(stats)[0]
     assert "Ранобэ" in msg
     assert "Люди индустрии" in msg
-
-
-def test_build_favourite_message_ranobe_uses_manga_bank():
-    item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
-    text = messages.build_favourite_message("ranobe", item)
-    manga_bank = [t.format(n=config.DISPLAY_NAME, title="Re:Zero")
-                  for t in messages.MESSAGES["favourites"]["manga"]]
-    assert text in manga_bank
-
-
-def test_build_favourite_message_industry_uses_person_bank():
-    item = {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None}
-    for cat in ("seyu", "mangakas", "producers", "people"):
-        text = messages.build_favourite_message(cat, item)
-        person_bank = [t.format(n=config.DISPLAY_NAME, title="Риэ Такахаси")
-                       for t in messages.MESSAGES["favourites"]["person"]]
-        assert text in person_bank, f"категория {cat} ушла не в банк person"
 
 
 @pytest.mark.asyncio
@@ -672,3 +540,52 @@ async def test_check_and_notify_favourites_dedups_industry_people(monkeypatch, s
     assert len(sent) == 1                      # одно сообщение, не два
     assert "seyu_34785" in new_seen            # обе роли отмечены виденными,
     assert "producers_34785" in new_seen       # иначе зацикливание на «новом»
+
+
+# ── check_and_notify_favourites: цикловые проверки (baseline / упавший фетч) ──
+
+@pytest.mark.asyncio
+async def test_check_favourites_empty_baseline_does_not_spam(monkeypatch):
+    """check_and_notify_favourites с пустым seen: 0 отправок, baseline сохранён.
+    (Слой ЦИКЛА — в отличие от loop-теста выше, что проверяет init-блок.)"""
+    sent, saved = [], {}
+
+    async def fake_fetch_favourites(session):
+        return {"animes": [{"id": 100}, {"id": 101}], "mangas": [{"id": 200}]}
+
+    async def fake_send(bot, text):
+        sent.append(text)
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch_favourites)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda s: saved.update(keys=set(s)))
+
+    seen, _ = await handlers.check_and_notify_favourites(bot=None, seen=set())
+
+    expected = {"animes_100", "animes_101", "mangas_200"}
+    assert sent == []
+    assert seen == expected
+    assert saved.get("keys") == expected
+
+
+@pytest.mark.asyncio
+async def test_check_favourites_failed_fetch_keeps_state(monkeypatch):
+    """fetch_favourites → None: 0 отправок, seen не тронут, save не звался."""
+    sent, save_calls = [], []
+
+    async def fake_fetch_favourites(session):
+        return None
+
+    async def fake_send(bot, text):
+        sent.append(text)
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch_favourites)
+    monkeypatch.setattr("handlers.send_to_all_chats", fake_send)
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda s: save_calls.append(s))
+
+    baseline = {"animes_1"}
+    seen, _ = await handlers.check_and_notify_favourites(bot=None, seen=set(baseline))
+
+    assert sent == []
+    assert seen == baseline
+    assert save_calls == []

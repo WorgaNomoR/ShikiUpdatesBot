@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """Тесты для utils.py — чистых хелперов (даты/кварталы, HTML, приведение типов).
 
 Покрывают модуль в изоляции: каждый ассерт обязан падать на сломанной
@@ -141,6 +143,7 @@ def test_is_partial_false_when_missing():
 # ── _safe_int ──────────────────────────────────────────────────────
 def test_safe_int_parses_string():
     assert _safe_int("5") == 5
+    assert _safe_int(5) == 5  # int проходит насквозь
 
 
 def test_safe_int_default_on_garbage():
@@ -152,6 +155,7 @@ def test_safe_int_default_on_garbage():
 # ── _safe_float ────────────────────────────────────────────────────
 def test_safe_float_parses_string():
     assert _safe_float("8.73") == 8.73
+    assert _safe_float(7.5) == 7.5  # float проходит насквозь
 
 
 def test_safe_float_zero_and_negative_use_default():

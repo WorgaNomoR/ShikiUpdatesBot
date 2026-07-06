@@ -79,3 +79,10 @@ def test_config_intervals_have_int_defaults():
     import config
     assert isinstance(config.CHECK_INTERVAL, int)
     assert config.CHECK_INTERVAL == 15 * 60
+
+
+def test_config_owner_id_is_int():
+    import config
+    # OWNER_ID приходит из env строкой — config приводит к int
+    assert isinstance(config.OWNER_ID, int)
+    assert config.OWNER_ID == 123456  # задан в conftest

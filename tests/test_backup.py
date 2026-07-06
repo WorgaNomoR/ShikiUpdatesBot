@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """
 Тесты ветки backup: /backup (экспорт/импорт zip) + авто-бэкап состояния.
 
@@ -534,6 +536,7 @@ def test_restore_creates_missing_quarters_dir(backup_env):
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
 
 
+@pytest.mark.asyncio
 async def test_rotation_skips_resync_at_boot(backup_env, monkeypatch):
     """resync=False (стартовый вызов): НЕ дёргаем sync_stats_all — polling_loop
     уже дал свежий stats_all; второй синк своей сессией ловил 429 в день ротации."""
@@ -551,6 +554,7 @@ async def test_rotation_skips_resync_at_boot(backup_env, monkeypatch):
     sync.assert_not_awaited()
 
 
+@pytest.mark.asyncio
 async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
     """resync=True (дефолт, цикловой вызов): дёргаем sync_stats_all для свежих метаданных."""
     sync = AsyncMock(return_value=({}, True))

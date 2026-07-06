@@ -1,31 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """
-Тесты модуля статистики и избранного (ветка stats).
+Тесты модуля stats: агрегация (recompute_aggregates), сбор избранного
+(_collect_favourites), фильтр мусора по kind, metadata-retry в sync_stats_all,
+и smoke-тесты билдеров отчётов.
 
-Покрывают то, что появилось в ветке и НЕ покрыто другими файлами:
-форматтеры отчётов, агрегацию, фильтр мусора по kind, сбор избранного,
-нормализацию URL, утилиты, и smoke-тесты на билдеры сообщений.
-
-Намеренно НЕ дублирует:
-  test_messages.py  — build_message, h()
-  test_parsers.py   — extract_score, classify_event, _strip_html
-  test_favourites.py— build_favourite_message
-  test_media.py     — get_media_info
-
-Тесты ветки favourites-fix (unit 2, metadata-retry) — в конце файла,
-под своим секционным заголовком.
+Форматтеры отчётов (messages._fmt_mono_rows / _top_block / _score_dist_block
+и т.п.) тестируются здесь же — низкоуровневые хелперы рендера отчётов stats,
+живут рядом со своими потребителями.
 
 Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
 
 import copy
 import re
-from unittest.mock import AsyncMock
 
 import pytest
 
 import handlers
 import messages
-import shiki_api
 import stats as smod
 import storage
 import utils
@@ -45,92 +38,6 @@ def _export_manga_row(tid, status="completed", chapters=1):
     return {"target_id": tid, "target_type": "Manga", "target_title": "x",
             "target_title_ru": "x", "score": 0, "status": status,
             "rewatches": 0, "chapters": chapters, "volumes": 0}
-
-
-# ════════════════════════════════════════════════════════════════
-#  Утилиты: _safe_int / _safe_float / _utcnow / _rel_url
-# ════════════════════════════════════════════════════════════════
-
-def test_safe_int_valid():
-    assert utils._safe_int(5) == 5
-    assert utils._safe_int("7") == 7
-
-def test_safe_int_invalid_returns_default():
-    assert utils._safe_int(None) == 0
-    assert utils._safe_int("abc") == 0
-    assert utils._safe_int("abc", default=-1) == -1
-
-def test_safe_float_valid():
-    assert utils._safe_float(7.5) == 7.5
-    assert utils._safe_float("8.1") == 8.1
-
-def test_safe_float_invalid_returns_default():
-    assert utils._safe_float(None) is None
-    assert utils._safe_float("xyz") is None
-    assert utils._safe_float("xyz", default=0.0) == 0.0
-
-def test_utcnow_is_naive():
-    dt = utils._utcnow()
-    assert dt.tzinfo is None  # наивное UTC, сравнимо с fromisoformat
-
-
-# ── _rel_url: регрессия на баг двойного домена (GraphQL отдаёт полный URL) ──
-
-def test_rel_url_strips_full_https():
-    assert utils._rel_url("https://shikimori.io/animes/226-elfen-lied") == "/animes/226-elfen-lied"
-
-def test_rel_url_strips_full_http():
-    assert utils._rel_url("http://shikimori.io/mangas/25") == "/mangas/25"
-
-def test_rel_url_keeps_relative():
-    assert utils._rel_url("/animes/30-eva") == "/animes/30-eva"
-
-def test_rel_url_empty_and_none():
-    assert utils._rel_url("") == ""
-    assert utils._rel_url(None) == ""
-
-def test_rel_url_domain_only():
-    assert utils._rel_url("https://shikimori.io") == ""
-
-
-# ════════════════════════════════════════════════════════════════
-#  is_relevant — фильтр значимости (сама функция, не замокана)
-# ════════════════════════════════════════════════════════════════
-
-def test_is_relevant_anime_allowed_kinds():
-    for kind in ("tv", "movie", "ova", "ona"):
-        assert shiki_api.is_relevant("anime", kind) is True, kind
-
-def test_is_relevant_anime_drops_specials_and_clips():
-    for kind in ("special", "tv_special", "music", "pv", "cm"):
-        assert shiki_api.is_relevant("anime", kind) is False, kind
-
-def test_is_relevant_manga_blocks_oneshot_doujin():
-    assert shiki_api.is_relevant("manga", "one_shot") is False
-    assert shiki_api.is_relevant("manga", "doujin") is False
-
-def test_is_relevant_manga_allows_regular():
-    assert shiki_api.is_relevant("manga", "manga") is True
-
-def test_is_relevant_empty_kind_is_false():
-    assert shiki_api.is_relevant("anime", "") is False
-
-
-# ════════════════════════════════════════════════════════════════
-#  Квартальные даты
-# ════════════════════════════════════════════════════════════════
-
-def test_current_quarter():
-    from datetime import datetime
-    assert utils.current_quarter(datetime(2026, 1, 15)) == "2026-Q1"
-    assert utils.current_quarter(datetime(2026, 4, 1)) == "2026-Q2"
-    assert utils.current_quarter(datetime(2026, 7, 31)) == "2026-Q3"
-    assert utils.current_quarter(datetime(2026, 12, 1)) == "2026-Q4"
-
-def test_quarter_start():
-    from datetime import datetime
-    assert utils.quarter_start(datetime(2026, 5, 20)) == datetime(2026, 4, 1)
-    assert utils.quarter_start(datetime(2026, 1, 1)) == datetime(2026, 1, 1)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -500,72 +407,54 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
 
 
 # ════════════════════════════════════════════════════════════════
-#  polish
+#  record_current_event + sync_stats_all (перенесено из test_polling)
 # ════════════════════════════════════════════════════════════════
 
-def test_stats_menu_kb_has_close_button():
-    """Меню /stats содержит кнопку ❌ Закрыть с callback_data 'stats:close'."""
-
-    kb = handlers._stats_menu_kb()
-    buttons = [b for row in kb.inline_keyboard for b in row]
-    close = [b for b in buttons if b.callback_data == "stats:close"]
-    assert len(close) == 1, "ожидал ровно одну кнопку закрытия"
-    assert "Закры" in close[0].text
+def _completed_event(tid, score, media="anime"):
+    return {"id": str(tid), "media": media, "event": "completed",
+            "score": score, "recorded_at": "2026-04-01T00:00:00+00:00"}
 
 
-@pytest.mark.asyncio
-async def test_cmd_stats_menu_is_reply():
-    """Меню /stats шлётся ответом (reply) на команду — иначе ❌ Закрыть
-    не сможет удалить саму команду (рвётся reply_to_message)."""
+# ── коррекция оценки в том же квартале ──
 
-    message = AsyncMock()
-    message.text = "/stats"
+def test_score_change_updates_existing_completed_event():
+    """score_changed по тайтлу с completed-событием квартала ⇒ обновляет его score.
+    Кейс «Атака титанов: случайно 3 → исправил»."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"].append(_completed_event(123, 3))
 
-    await handlers.cmd_stats(message)
+    out = smod.record_current_event(cur, {"target": {"id": 123}}, "score_changed", "anime", 9)
 
-    message.reply.assert_awaited_once()
-    message.answer.assert_not_called()
+    completed = [e for e in out["events"] if e["id"] == "123" and e["event"] == "completed"]
+    assert len(completed) == 1
+    assert completed[0]["score"] == 9
+    assert all(e["event"] != "score_changed" for e in out["events"])
 
 
-@pytest.mark.asyncio
-async def test_stats_menu_close_deletes_menu_and_command():
-    """stats:close удаляет и меню, и команду /stats (reply_to_message)."""
-
-    callback = AsyncMock()
-    callback.data = "stats:close"
-    callback.message = AsyncMock()
-    callback.message.reply_to_message = AsyncMock()
-
-    await handlers.stats_menu_cb(callback)
-
-    callback.answer.assert_awaited_once_with()
-    callback.message.delete.assert_awaited_once()
-    callback.message.reply_to_message.delete.assert_awaited_once()
-    callback.message.answer.assert_not_called()
+def test_score_change_without_completed_is_noop():
+    """score_changed по тайтлу вне событий квартала ⇒ ничего не добавляем/не меняем."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    out = smod.record_current_event(cur, {"target": {"id": 999}}, "score_changed", "anime", 9)
+    assert out["events"] == []
 
 
 @pytest.mark.asyncio
-async def test_stats_menu_close_without_reply_does_not_crash():
-    """reply_to_message=None → закрытие удаляет только меню, без падения."""
+async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatch):
+    """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,
+    save не вызывается. Гарантия «429 не ломает stats_all»."""
+    import stats as stats_mod
+    preserved = {"_sentinel": "keep-me"}
+    saved = []
 
-    callback = AsyncMock()
-    callback.data = "stats:close"
-    callback.message = AsyncMock()
-    callback.message.reply_to_message = None
+    async def fake_export(session, media):
+        return None
 
-    await handlers.stats_menu_cb(callback)
+    monkeypatch.setattr(stats_mod, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.load_stats_all", lambda use_cache=True: preserved)
+    monkeypatch.setattr("stats.save_stats_all", lambda d: saved.append(d))
 
-    callback.message.delete.assert_awaited_once()
-    callback.answer.assert_awaited_once_with()
+    result_stats, ok = await smod.sync_stats_all()
 
-
-@pytest.mark.asyncio
-async def test_stats_menu_close_handles_none_message():
-    """callback.message=None (сообщение старше 48 ч) → close не падает."""
- 
-    callback = AsyncMock()
-    callback.data = "stats:close"
-    callback.message = None
-
-    await handlers.stats_menu_cb(callback)
-    callback.answer.assert_awaited_once_with()
+    assert ok is False
+    assert result_stats is preserved
+    assert saved == []
