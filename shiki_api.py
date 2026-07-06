@@ -11,6 +11,7 @@ utils; messages/stats/handlers зависят от него, не наоборо
 
 import asyncio
 import json
+import time
 
 import aiohttp
 
@@ -195,37 +196,140 @@ def _parse_genres(genres_raw: list, kind_filter: str) -> list[str]:
     return out
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  ЦЕНТРАЛЬНЫЙ ТРОТТЛ + РЕТРАЙ НА 429  (единый choke-point на все запросы)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Firewall-стиль: между любыми двумя исходящими запросами держим фиксированный
+# min-gap, БЕЗ джиттера. Один цикл шлёт ~7 запросов за <1 с и без троттла
+# пробивает лимит Шики 5 req/сек → поздние падают в 429 (мета манги теряется,
+# избранное протухает). Троттл сериализует всплеск в ≤ 1/_MIN_GAP req/сек.
+# Плюс мягкий ретрай на 429 (Retry-After) как страховка, если лимит всё же
+# задет (напр. чужой трафик с того же IP). 429 перехватываем ДО проверки
+# статуса. Один choke-point на все call-sites (вкл. /status и будущий
+# много-профильный режим «запросы × N профилей»).
+
+_MIN_GAP: float = 0.25              # сек между выстрелами → ≤4 req/сек (< лимита 5)
+_MAX_429_RETRIES: int = 2           # доп. попыток после первого 429
+_RETRY_AFTER_DEFAULT: float = 1.0   # если сервер не прислал корректный Retry-After
+_RETRY_AFTER_CAP: float = 10.0      # потолок ожидания, чтобы не подвесить цикл
+
+_last_request_at: float = 0.0       # монотонная метка последнего выстрела
+_throttle_lock: "asyncio.Lock | None" = None
+
+
+def _get_throttle_lock() -> asyncio.Lock:
+    """Ленивое создание лока — привязка к работающему event loop на первом
+    запросе, а не к импортному (которого может не быть / он может смениться)."""
+    global _throttle_lock
+    if _throttle_lock is None:
+        _throttle_lock = asyncio.Lock()
+    return _throttle_lock
+
+
+async def _throttle() -> None:
+    """Держит фиксированный min-gap перед выстрелом. Сериализован локом: все
+    call-sites проходят через одну точку, всплеск размазывается в ровный ритм."""
+    global _last_request_at
+    async with _get_throttle_lock():
+        gap = _MIN_GAP - (time.monotonic() - _last_request_at)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        _last_request_at = time.monotonic()
+
+
+def _retry_after(headers) -> float:
+    """Секунды ожидания из заголовка Retry-After (форма «число секунд»).
+    HTTP-date-форму не поддерживаем — фолбэк на дефолт. Клампим в
+    [0, _RETRY_AFTER_CAP]."""
+    raw = headers.get("Retry-After") if headers is not None else None
+    if raw is None:
+        return _RETRY_AFTER_DEFAULT
+    try:
+        secs = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return _RETRY_AFTER_DEFAULT
+    if secs < 0:
+        return _RETRY_AFTER_DEFAULT
+    return min(secs, _RETRY_AFTER_CAP)
+
+
+async def _fetch(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    parse,
+    label: str,
+    timeout: float,
+    headers: dict = HEADERS,
+    json_body: dict | None = None,
+):
+    """
+    Единый выстрел HTTP через центральный троттл + ретрай на 429.
+
+    Перед КАЖДОЙ попыткой await-им _throttle() (min-gap). При 429 читаем
+    Retry-After, спим, ретраим (до _MAX_429_RETRIES). На не-200 → None. На
+    успехе отдаём await parse(resp). parse разбирает тело под конкретный вызов
+    (list / dict / GraphQL); его исключения парсинга ловим здесь → None.
+    """
+    for attempt in range(_MAX_429_RETRIES + 1):
+        await _throttle()
+        try:
+            if method == "POST":
+                cm = session.post(
+                    url, headers=headers, json=json_body,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                )
+            else:
+                cm = session.get(
+                    url, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                )
+            async with cm as resp:
+                if resp.status == 429:
+                    delay = _retry_after(getattr(resp, "headers", None))
+                    if attempt < _MAX_429_RETRIES:
+                        log.warning(
+                            "%s: 429 rate limit, ретрай через %.2f с (попытка %d/%d)",
+                            label, delay, attempt + 1, _MAX_429_RETRIES,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    log.warning("%s: 429 rate limit, ретраи исчерпаны", label)
+                    return None
+                if resp.status != 200:
+                    log.warning("%s: HTTP %d", label, resp.status)
+                    return None
+                return await parse(resp)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.error("%s: ошибка запроса: %s", label, e)
+            return None
+        except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+            log.error("%s: не удалось разобрать ответ: %s", label, e)
+            return None
+    return None
+
+
 async def _gql_request(
     session: aiohttp.ClientSession, query: str, variables: dict,
 ) -> dict | None:
     """
-    Один GraphQL-запрос. Возвращает поле data или None при ошибке.
-    Частичные данные (data + errors) возвращаются — пусть caller решает.
+    Один GraphQL-запрос через центральный троттл/ретрай. Возвращает поле data
+    или None при ошибке. Частичные данные (data + errors) возвращаются — пусть
+    caller решает.
     """
-    try:
-        async with session.post(
-            GRAPHQL_URL,
-            headers={**HEADERS, "Content-Type": "application/json"},
-            json={"query": query, "variables": variables},
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            if resp.status != 200:
-                log.warning("_gql_request: HTTP %d", resp.status)
-                return None
-            try:
-                payload = await resp.json(content_type=None)
-            except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
-                log.warning("_gql_request: не удалось распарсить ответ: %s", e)
-                return None
-            if "errors" in payload:
-                log.warning("_gql_request: GraphQL errors: %s", payload["errors"])
-            return payload.get("data")
-    except asyncio.TimeoutError:
-        log.warning("_gql_request: таймаут (20 с)")
-        return None
-    except aiohttp.ClientError as e:
-        log.error("_gql_request: ошибка клиента: %s", e)
-        return None
+    async def _parse(resp):
+        payload = await resp.json(content_type=None)
+        if "errors" in payload:
+            log.warning("_gql_request: GraphQL errors: %s", payload["errors"])
+        return payload.get("data")
+
+    return await _fetch(
+        session, "POST", GRAPHQL_URL, parse=_parse, label="_gql_request",
+        headers={**HEADERS, "Content-Type": "application/json"}, timeout=20,
+        json_body={"query": query, "variables": variables},
+    )
 
 
 async def fetch_list_export(session: aiohttp.ClientSession, media: str) -> list[dict] | None:
@@ -239,24 +343,18 @@ async def fetch_list_export(session: aiohttp.ClientSession, media: str) -> list[
        score, status, rewatches, episodes|volumes|chapters, text}
     """
     url = LIST_EXPORT_ANIME if media == "anime" else LIST_EXPORT_MANGA
-    try:
-        async with session.get(
-            url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status != 200:
-                log.warning("fetch_list_export(%s): HTTP %d", media, resp.status)
-                return None
-            data = await resp.json(content_type=None)
-            if not isinstance(data, list):
-                log.warning("fetch_list_export(%s): ответ не список.", media)
-                return None
-            return data
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        log.error("fetch_list_export(%s): ошибка запроса: %s", media, e)
-        return None
-    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
-        log.error("fetch_list_export(%s): не удалось разобрать ответ: %s", media, e)
-        return None
+
+    async def _parse(resp):
+        data = await resp.json(content_type=None)
+        if not isinstance(data, list):
+            log.warning("fetch_list_export(%s): ответ не список.", media)
+            return None
+        return data
+
+    return await _fetch(
+        session, "GET", url, parse=_parse,
+        label=f"fetch_list_export({media})", timeout=30,
+    )
 
 
 async def fetch_meta_batch(media: str, ids: list[str],
@@ -319,9 +417,8 @@ async def fetch_meta_batch(media: str, ids: list[str],
                 log.warning("fetch_meta_batch(%s): ошибка парсинга id=%s: %s",
                             media, item.get("id"), e)
 
-        # Пауза между батчами — не триггерим rate limit (5 req/sec)
-        if i + 50 < len(clean):
-            await asyncio.sleep(0.5)
+        # Троттл между батчами обеспечивает центральный _throttle в _gql_request
+        # (фиксированный min-gap) — отдельная пауза здесь больше не нужна.
 
     log.info("fetch_meta_batch(%s): получено %d/%d тайтлов.", media, len(result), len(clean))
     return result
@@ -331,22 +428,10 @@ async def fetch_history(session: aiohttp.ClientSession) -> list[dict] | None:
     """Запрашиваем историю с API Shikimori.
     Возвращает список записей при успехе или None при любой ошибке.
     """
-    try:
-        async with session.get(
-            HISTORY_URL,
-            headers=HEADERS,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                log.warning("fetch_history: API вернул статус %d", resp.status)
-                return None
-            return await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        log.error("fetch_history: ошибка запроса: %s", e)
-        return None
-    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
-        log.error("fetch_history: не удалось разобрать ответ: %s", e)
-        return None
+    return await _fetch(
+        session, "GET", HISTORY_URL,
+        parse=lambda resp: resp.json(), label="fetch_history", timeout=15,
+    )
 
 
 async def fetch_favourites(session: aiohttp.ClientSession) -> dict | None:
@@ -357,22 +442,10 @@ async def fetch_favourites(session: aiohttp.ClientSession) -> dict | None:
     Каждый элемент содержит хотя бы "id", "name", "russian", "url".
     Возвращает None при любой ошибке.
     """
-    try:
-        async with session.get(
-            FAVOURITES_URL,
-            headers=HEADERS,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                log.warning("fetch_favourites: API вернул статус %d", resp.status)
-                return None
-            return await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        log.error("fetch_favourites: ошибка запроса: %s", e)
-        return None
-    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
-        log.error("fetch_favourites: не удалось разобрать ответ: %s", e)
-        return None
+    return await _fetch(
+        session, "GET", FAVOURITES_URL,
+        parse=lambda resp: resp.json(), label="fetch_favourites", timeout=15,
+    )
 
 
 async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | None:
@@ -386,27 +459,21 @@ async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | N
     async with aiohttp.ClientSession() as session:
         for status in statuses:
             url = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/{media}_rates?status={status}&limit=50"
-            try:
-                async with session.get(
-                    url,
-                    headers=HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Добавляем поле status в каждую запись, чтобы знать откуда она
-                        for item in data:
-                            item["_status"] = status
-                        results.extend(data)
-                    else:
-                        log.warning("fetch_current_rates: статус %d для %s/%s", resp.status, media, status)
-                        return None
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.error("fetch_current_rates ошибка (%s/%s): %s", media, status, e)
+
+            async def _parse(resp, _status=status):
+                data = await resp.json()
+                # Помечаем каждую запись статусом, чтобы знать её происхождение.
+                for item in data:
+                    item["_status"] = _status
+                return data
+
+            data = await _fetch(
+                session, "GET", url, parse=_parse,
+                label=f"fetch_current_rates({media}/{status})", timeout=15,
+            )
+            if data is None:
                 return None
-            except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
-                log.error("fetch_current_rates: не удалось разобрать ответ (%s/%s): %s", media, status, e)
-                return None
+            results.extend(data)
     return results
 
 
