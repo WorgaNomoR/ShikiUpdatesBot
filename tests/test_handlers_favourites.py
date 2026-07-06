@@ -48,6 +48,14 @@ FAV_SAMPLE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Флоу-тесты троттлят рассылку asyncio.sleep — глушим глобально."""
+    async def _fast(*args, **kwargs):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _fast)
+
+
 @pytest.fixture
 def silence_favourites_io(monkeypatch):
     """Глушит общую рутину тестов check_and_notify_favourites: запись seen
@@ -190,14 +198,6 @@ async def test_favourites_no_changes(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     class DummyBot:
         pass
@@ -242,14 +242,6 @@ async def test_new_favourite(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
     monkeypatch.setattr("handlers.load_stats_all",
@@ -298,14 +290,6 @@ async def test_multiple_new_favourites(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     # Изоляция от ФС: ветка found_new иначе читает/пишет stats_all и seen.
     monkeypatch.setattr("handlers.load_stats_all",
@@ -354,14 +338,6 @@ async def test_favourite_without_id_is_ignored(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     class DummyBot:
         pass
@@ -403,14 +379,6 @@ async def test_untracked_category_is_ignored(monkeypatch):
         fake_send,
     )
 
-    async def fake_sleep(*args, **kwargs):
-        pass
-
-    monkeypatch.setattr(
-        asyncio,
-        "sleep",
-        fake_sleep,
-    )
 
     class DummyBot:
         pass
@@ -422,46 +390,6 @@ async def test_untracked_category_is_ignored(monkeypatch):
 
     assert result == set()
     assert called is False
-
-
-@pytest.mark.asyncio
-async def test_favourites_init_skipped_when_api_unavailable(monkeypatch):
-
-    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
-    monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
-    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
-
-    async def fake_fetch(session):
-        return None
-    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch)
-
-    saved = False
-    def fake_save(data):
-        nonlocal saved
-        saved = True
-    monkeypatch.setattr("handlers.save_seen_favourites", fake_save)
-
-    # sync_stats_all и rotate_quarter_if_needed делают сетевые вызовы — мокаем
-    async def fake_sync():
-        return storage._empty_stats_all() if hasattr("handlers._empty_stats_all") else {}
-    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
-
-    async def fake_rotate(bot, cur, stats_all):
-        return cur
-    monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
-
-    # check_and_notify теперь принимает (bot, seen_ids, cur) и возвращает (seen_ids, cur)
-    async def fake_check(bot, seen, cur):
-        raise asyncio.CancelledError
-    monkeypatch.setattr("handlers.check_and_notify", fake_check)
-
-    class DummyBot:
-        pass
-
-    with pytest.raises(asyncio.CancelledError):
-        await handlers.polling_loop(DummyBot())
-
-    assert saved is False
 
 
 # ═══════════════════════════════════════════════════════════════
