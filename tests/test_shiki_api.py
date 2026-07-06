@@ -306,3 +306,63 @@ def test_retry_after_defaults_on_http_date_form():
 
 def test_retry_after_caps_absurd_values():
     assert shiki_api._retry_after({"Retry-After": "9999"}) == shiki_api._RETRY_AFTER_CAP
+
+
+# ── Битое тело при 200: parse спотыкается (None/не-список) → None, не исключение ──
+
+class _FakeSessionCM:
+    """async-context-manager вокруг готовой сессии — под fetch_current_rates,
+    которая открывает собственный aiohttp.ClientSession()."""
+    def __init__(self, session):
+        self._session = session
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, *args):
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [None, [1, 2]],
+    ids=["none", "list"],
+)
+async def test_gql_request_survives_malformed_payload(payload):
+    """200, но тело не той формы: `"errors" in payload` / `payload.get` роняют
+    TypeError/AttributeError — _fetch обязан вернуть None, а не пробросить."""
+    session = _SeqSession([_SeqResponse(200, json_value=payload)])
+    assert await shiki_api._gql_request(session, "q", {}) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [None, {"foo": "bar"}],
+    ids=["none", "dict"],
+)
+async def test_fetch_current_rates_survives_malformed_payload(monkeypatch, payload):
+    """200, но тело не итерируется как список записей (None) или даёт не те
+    элементы (dict → ключи-строки) — обход `item["_status"]=...` роняет
+    TypeError; ждём мягкий None."""
+    session = _SeqSession([_SeqResponse(200, json_value=payload)])
+    monkeypatch.setattr(
+        shiki_api.aiohttp, "ClientSession",
+        lambda *a, **k: _FakeSessionCM(session),
+    )
+    assert await shiki_api.fetch_current_rates("anime", ["watching"]) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_swallows_parse_structure_errors():
+    """Прямой контракт _fetch: структурные ошибки parse (AttributeError и пр.)
+    на 200 гасятся в None, не всплывают в вызывающий флоу."""
+    async def bad_parse(resp):
+        raise AttributeError("boom")
+
+    session = _SeqSession([_SeqResponse(200, json_value={})])
+    result = await shiki_api._fetch(
+        session, "GET", "http://x", parse=bad_parse, label="t", timeout=5,
+    )
+    assert result is None

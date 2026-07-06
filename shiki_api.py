@@ -301,12 +301,18 @@ async def _fetch(
                 if resp.status != 200:
                     log.warning("%s: HTTP %d", label, resp.status)
                     return None
-                return await parse(resp)
+                try:
+                    return await parse(resp)
+                except (json.JSONDecodeError, aiohttp.ContentTypeError,
+                        AttributeError, TypeError, KeyError) as e:
+                    # Статус 200, но тело битое / неожиданной структуры (None,
+                    # не список, нет ожидаемых полей) — parse спотыкается на
+                    # .get()/итерации/`in`. Деградируем в None+warning, а не
+                    # рвём итерацию наверх в общий except polling_loop.
+                    log.warning("%s: не удалось разобрать ответ: %s", label, e)
+                    return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.error("%s: ошибка запроса: %s", label, e)
-            return None
-        except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
-            log.error("%s: не удалось разобрать ответ: %s", label, e)
             return None
     return None
 
