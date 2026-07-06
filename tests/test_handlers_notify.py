@@ -100,12 +100,13 @@ async def test_empty_history_keeps_seen(monkeypatch):
 @pytest.mark.asyncio
 async def test_no_new_entries_no_send(monkeypatch):
     _patch_history(monkeypatch, [{"id": 100}])
-    _capture_saves(monkeypatch)
+    saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
     await check_and_notify(DummyBot(), {100}, _empty_cur())
 
     assert sent == []
+    assert saved == []
 
 
 @pytest.mark.asyncio

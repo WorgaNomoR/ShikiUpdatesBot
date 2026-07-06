@@ -79,6 +79,7 @@ async def test_multiple_subscribers(monkeypatch):
 
     await send_to_all_chats(bot, "hello")
 
+    assert len(bot.sent) == 3
     assert {c for c, _ in bot.sent} == {111, 222, 333}
 
 

@@ -75,3 +75,18 @@ async def test_stats_menu_close_handles_none_message():
 
     await handlers.stats_menu_cb(callback)
     callback.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_close_falls_back_to_edit_markup_when_delete_fails():
+    """Если msg.delete() падает — убираем кнопки через edit_reply_markup(None)."""
+    callback = AsyncMock()
+    callback.data = "stats:close"
+    callback.message = AsyncMock()
+    callback.message.reply_to_message = None
+    callback.message.delete = AsyncMock(side_effect=Exception("too old"))
+
+    await handlers.stats_menu_cb(callback)
+
+    callback.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+    callback.answer.assert_awaited_once_with()

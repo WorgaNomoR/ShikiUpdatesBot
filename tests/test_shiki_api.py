@@ -8,6 +8,7 @@
 
 import asyncio
 import json
+import types
 
 import aiohttp
 import pytest
@@ -74,8 +75,16 @@ async def test_fetch_returns_none_on_client_error(fetch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fetch", _FETCHERS)
-async def test_fetch_returns_none_on_invalid_json(fetch):
-    resp = _FakeResponse(200, json_exc=json.JSONDecodeError("bad", "", 0))
+@pytest.mark.parametrize(
+    "exc",
+    [
+        json.JSONDecodeError("bad", "", 0),
+        aiohttp.ContentTypeError(types.SimpleNamespace(real_url="http://shikimori.io"), ()),
+    ],
+    ids=["json_decode_error", "content_type_error"],
+)
+async def test_fetch_returns_none_on_invalid_json(fetch, exc):
+    resp = _FakeResponse(200, json_exc=exc)
     assert await fetch(_FakeSession(response=resp)) is None
 
 

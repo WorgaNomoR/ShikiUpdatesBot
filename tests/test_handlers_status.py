@@ -91,6 +91,7 @@ async def test_status_anime_failed_manga_ok(monkeypatch):
     _patch_rates(monkeypatch, anime=None, manga=[_manga_item("Berserk")])
     text = await _run()
     assert "не удалось получить данные" in text.lower()
+    assert "Berserk" not in text
 
 
 @pytest.mark.asyncio
@@ -98,3 +99,4 @@ async def test_status_manga_failed_anime_ok(monkeypatch):
     _patch_rates(monkeypatch, anime=[_anime_item("Ergo Proxy")], manga=None)
     text = await _run()
     assert "не удалось получить данные" in text.lower()
+    assert "Ergo Proxy" not in text

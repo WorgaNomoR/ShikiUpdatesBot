@@ -442,19 +442,19 @@ def test_score_change_without_completed_is_noop():
 async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatch):
     """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,
     save не вызывается. Гарантия «429 не ломает stats_all»."""
-    import stats
+    import stats as stats_mod
     preserved = {"_sentinel": "keep-me"}
     saved = []
 
     async def fake_export(session, media):
         return None
 
-    monkeypatch.setattr(stats, "fetch_list_export", fake_export)
+    monkeypatch.setattr(stats_mod, "fetch_list_export", fake_export)
     monkeypatch.setattr("stats.load_stats_all", lambda use_cache=True: preserved)
     monkeypatch.setattr("stats.save_stats_all", lambda d: saved.append(d))
 
-    stats, ok = await smod.sync_stats_all()
+    result_stats, ok = await smod.sync_stats_all()
 
     assert ok is False
-    assert stats is preserved
+    assert result_stats is preserved
     assert saved == []
