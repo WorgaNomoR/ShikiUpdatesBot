@@ -366,3 +366,38 @@ async def test_fetch_swallows_parse_structure_errors():
         session, "GET", "http://x", parse=bad_parse, label="t", timeout=5,
     )
     assert result is None
+
+
+# ── fetch_current_rates: мягкая деградация по статусам (watching/rewatching) ──
+
+@pytest.mark.asyncio
+async def test_fetch_current_rates_partial_on_single_status_failure(monkeypatch):
+    """Один статус упал, другой ок → отдаём частичное (не None): один сбой не
+    обнуляет весь /status."""
+    watching = [{"id": 1, "anime": {"kind": "tv"}}]
+    session = _SeqSession([
+        _SeqResponse(200, json_value=watching),   # watching — ок
+        _SeqResponse(500, json_value=None),       # rewatching — сбой (не-200, без ретрая)
+    ])
+    monkeypatch.setattr(
+        shiki_api.aiohttp, "ClientSession",
+        lambda *a, **k: _FakeSessionCM(session),
+    )
+    result = await shiki_api.fetch_current_rates("anime", ["watching", "rewatching"])
+    assert result is not None
+    assert [r["id"] for r in result] == [1]
+    assert result[0]["_status"] == "watching"
+
+
+@pytest.mark.asyncio
+async def test_fetch_current_rates_none_only_when_all_statuses_fail(monkeypatch):
+    """None — только при полном отказе (ни один статус не пришёл)."""
+    session = _SeqSession([
+        _SeqResponse(500, json_value=None),
+        _SeqResponse(500, json_value=None),
+    ])
+    monkeypatch.setattr(
+        shiki_api.aiohttp, "ClientSession",
+        lambda *a, **k: _FakeSessionCM(session),
+    )
+    assert await shiki_api.fetch_current_rates("anime", ["watching", "rewatching"]) is None

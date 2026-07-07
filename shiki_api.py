@@ -461,9 +461,13 @@ async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | N
     Запрашивает тайтлы в указанных статусах.
     media:    "anime" или "manga"
     statuses: ["watching", "rewatching"] — одинаково для аниме и манги
-    Возвращает объединённый список записей при успехе или None при любой ошибке.
+    Возвращает объединённый список записей. Деградирует мягко: сбой одного
+    статуса (429/таймаут/ошибка) пропускаем и продолжаем по остальным — один
+    неудачный запрос не обнуляет весь /status. None только если НИ один статус
+    не удался получить (полный отказ API); пустой список statuses → [].
     """
     results = []
+    ok_count = 0
     async with aiohttp.ClientSession() as session:
         for status in statuses:
             url = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/{media}_rates?status={status}&limit=50"
@@ -480,8 +484,14 @@ async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | N
                 label=f"fetch_current_rates({media}/{status})", timeout=15,
             )
             if data is None:
-                return None
+                log.warning("fetch_current_rates(%s/%s): статус не получен — пропускаем, "
+                            "продолжаем по остальным.", media, status)
+                continue
+            ok_count += 1
             results.extend(data)
+    # Полный отказ (были статусы, но ни один не пришёл) → None; иначе частичное/полное.
+    if statuses and ok_count == 0:
+        return None
     return results
 
 
