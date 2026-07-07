@@ -262,7 +262,7 @@ async def _fetch(
     parse,
     label: str,
     timeout: float,
-    headers: dict = HEADERS,
+    headers: dict | None = None,
     json_body: dict | None = None,
 ):
     """
@@ -273,6 +273,8 @@ async def _fetch(
     успехе отдаём await parse(resp). parse разбирает тело под конкретный вызов
     (list / dict / GraphQL); его исключения парсинга ловим здесь → None.
     """
+    if headers is None:
+        headers = dict(HEADERS)   # копия дефолта: даже будущая in-place мутация не тронет модульный HEADERS
     for attempt in range(_MAX_429_RETRIES + 1):
         await _throttle()
         try:
