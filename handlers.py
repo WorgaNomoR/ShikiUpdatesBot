@@ -471,11 +471,21 @@ async def cmd_favs(message: Message) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 
+# Sentinel «favourites не передан» (прямой/тестовый вызов → фетчим сами) vs
+# явный None из цикла («уже пытались, недоступно» → НЕ рефетчим, деградируем).
+_FAV_UNSET = object()
+
+
 async def check_and_notify_favourites(
-    bot: Bot, seen: set[str],
+    bot: Bot, seen: set[str], favourites=_FAV_UNSET,
 ) -> tuple[set[str], bool]:
     """
     Проверяем избранное:
+    0. favourites: если передан уже скачанный ответ /favourites (цикл тянет его
+       ОДИН раз и делит между уведомлениями и ресинком) — используем его и НЕ
+       ходим в сеть. favourites=_FAV_UNSET (не передан, прямой вызов) — фетчим
+       сами. Явный None («в этом цикле избранное недоступно») — пропускаем цикл,
+       БЕЗ повторного фетча.
     1. Загружаем текущий список с Shikimori
     2. Находим новые элементы (которых нет в seen)
     3. Отправляем уведомления и обновляем seen
@@ -486,11 +496,12 @@ async def check_and_notify_favourites(
     Ключ в seen: "{category}_{id}", например "animes_5114".
     Возвращает (seen, found_new).
     """
-    async with aiohttp.ClientSession() as session:
-        favourites = await fetch_favourites(session)
+    if favourites is _FAV_UNSET:
+        async with aiohttp.ClientSession() as session:
+            favourites = await fetch_favourites(session)
 
     if favourites is None:
-        log.info("Запрос избранного не удался — пропускаем цикл.")
+        log.info("Избранное недоступно — пропускаем цикл (без повторного фетча).")
         return seen, False
 
     # baseline пуст (первый запуск либо стартовая инициализация не прошла
@@ -786,7 +797,14 @@ async def polling_loop(bot: Bot) -> None:
         try:
             log.info("Проверяем историю и избранное...")
             seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
-            seen_favs, _  = await check_and_notify_favourites(bot, seen_favs)
+            # Избранное фетчим ОДИН раз за цикл и переиспользуем — в уведомлениях
+            # и в ресинке stats_all (fav=), как на старте. Дедуп убирает второй
+            # фетч избранного внутри sync_stats_all → на цикл 1 запрос вместо 2.
+            async with aiohttp.ClientSession() as fav_session:
+                cycle_favourites = await fetch_favourites(fav_session)
+            seen_favs, _  = await check_and_notify_favourites(
+                bot, seen_favs, favourites=cycle_favourites,
+            )
 
             # Периодический (и ретрай-после-неудачного-старта) ресинк stats_all,
             # чтобы сбой одного запроса не оставлял статистику протухшей/пустой
@@ -794,7 +812,7 @@ async def polling_loop(bot: Bot) -> None:
             # по новым id. save_stats_all обновляет кэш, ротация ниже видит свежее.
             if _should_full_sync(last_full_sync, time.monotonic(), FULL_SYNC_INTERVAL):
                 try:
-                    _, synced_ok = await sync_stats_all()
+                    _, synced_ok = await sync_stats_all(fav=cycle_favourites)
                     if synced_ok:
                         last_full_sync = time.monotonic()
                     else:

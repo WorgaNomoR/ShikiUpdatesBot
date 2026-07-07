@@ -36,3 +36,15 @@ def _fast_boot(monkeypatch):
     """boot-throttle: обнуляем стартовые паузы, чтобы тесты не ждали реальные секунды."""
     import handlers
     monkeypatch.setattr(handlers, "BOOT_PHASE_DELAY", 0)
+
+
+@pytest.fixture(autouse=True)
+def _no_throttle(monkeypatch):
+    """shiki_api throttle: min-gap→0 + сброс лока/метки на каждый тест, чтобы
+    (1) тесты не спали реальные 0.25 с между запросами и (2) asyncio.Lock не
+    утекал между функциональными event-loop'ами pytest-asyncio. Выделенные
+    тесты троттла сами возвращают _MIN_GAP и гоняют фейковые часы."""
+    import shiki_api
+    monkeypatch.setattr(shiki_api, "_MIN_GAP", 0)
+    shiki_api._throttle_lock = None
+    shiki_api._last_request_at = 0.0

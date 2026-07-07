@@ -352,3 +352,85 @@ async def test_boot_fetches_favourites_once_and_threads_session(monkeypatch):
     assert captured["session"] is not None
     assert captured["session"] is fav_calls[0]
     assert captured["fav"] is not None and "animes" in captured["fav"]
+
+
+@pytest.mark.asyncio
+async def test_cycle_fetches_favourites_once_and_threads_to_sync(monkeypatch):
+    """Дедуп в цикловом пути: за один проход избранное тянется ОДИН раз и
+    делится между уведомлениями (favourites=) и ресинком stats_all (fav=),
+    вместо двух фетчей (check + внутри sync)."""
+    import main  # noqa: F401
+
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.load_stats_all", lambda: storage._empty_stats_all())
+    monkeypatch.setattr("handlers.save_seen_favourites", lambda favs: None)
+    monkeypatch.setattr("handlers.heartbeat", lambda: None)
+    # Форсим ресинк stats_all в цикле, чтобы проверить проброс fav=.
+    monkeypatch.setattr("handlers._should_full_sync", lambda *a, **k: True)
+
+    fav_payload = {"animes": [{"id": 10}], "mangas": [], "characters": [], "people": []}
+    fav_calls = []
+
+    async def fake_favourites(session):
+        fav_calls.append(session)
+        return fav_payload
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_favourites)
+
+    cnf_favs = []
+
+    async def fake_cnf(bot, seen, favourites=None):
+        cnf_favs.append(favourites)
+        return seen, False
+
+    monkeypatch.setattr("handlers.check_and_notify_favourites", fake_cnf)
+
+    sync_favs = []
+
+    async def fake_sync(session=None, fav=None):
+        sync_favs.append(fav)
+        return storage._empty_stats_all(), True
+
+    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
+
+    async def fake_rotate(bot, cur, stats_all, resync=False):
+        return cur
+
+    monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
+
+    async def fake_weekly(bot, cur):
+        return cur
+
+    monkeypatch.setattr("handlers._weekly_backup_if_due", fake_weekly)
+
+    calls = 0
+
+    async def fake_check(bot, seen, cur):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise asyncio.CancelledError
+        return seen, cur
+
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
+
+    async def fake_sleep(_):
+        pass
+
+    monkeypatch.setattr(handlers.asyncio, "sleep", fake_sleep)
+
+    class DummyBot:
+        pass
+
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(DummyBot())
+
+    # boot(1) + один проход цикла(1) = 2; второй проход падает в check до фетча.
+    assert len(fav_calls) == 2
+    # Уведомлениям цикл отдал уже скачанное избранное (тот же объект).
+    assert cnf_favs == [fav_payload]
+    # Ресинку в цикле проброшен fav= (иначе sync_stats_all фетчил бы 2-й раз).
+    assert sync_favs[-1] is fav_payload

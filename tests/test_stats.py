@@ -247,6 +247,30 @@ async def test_collect_favourites_api_fail_keeps_previous(monkeypatch):
     assert stats["favourites"]["anime"] == [{"id": "1", "title": "Старое", "url": "/animes/1"}]
 
 
+@pytest.mark.asyncio
+async def test_collect_favourites_explicit_none_keeps_previous_without_fetch(monkeypatch):
+    """Дедуп: fav=None передан ЯВНО (= «недоступно в этом цикле») → оставляем
+    прежнее БЕЗ повторного фетча. Контраст с fav не переданным (тот фетчит)."""
+    stats = storage._empty_stats_all()
+    stats["favourites"]["anime"] = [{"id": "1", "title": "Старое", "url": "/animes/1"}]
+
+    fetched = False
+
+    async def fake_fetch(session):
+        nonlocal fetched
+        fetched = True
+        return {"animes": []}
+
+    monkeypatch.setattr("stats.fetch_favourites", fake_fetch)
+
+    class S:
+        pass
+    result = await smod._collect_favourites(S(), stats, fav=None)
+
+    assert fetched is False       # повторного фетча не было
+    assert result["favourites"]["anime"] == [{"id": "1", "title": "Старое", "url": "/animes/1"}]
+
+
 # ════════════════════════════════════════════════════════════════
 #  SMOKE-тесты билдеров (поймали бы оба прод-бага)
 #    1. build_stats_all_messages undefined после ручного мержа

@@ -169,3 +169,235 @@ def test_regression_manga_status_uses_watching():
     и для манги — поэтому манга ДОЛЖНА определяться как manga по target.type,
     а не по статусу."""
     assert get_media_info({"target": {"type": "Manga", "kind": "manga"}}) == ("manga", "manga")
+
+
+# ════════════════════════════════════════════════════════════════
+#  Центральный троттл + ретрай на 429  (единый choke-point _fetch)
+# ════════════════════════════════════════════════════════════════
+
+class _SeqResponse:
+    """Ответ с явными headers (для Retry-After) и json(), принимающим
+    content_type= (годится и для gql/list_export)."""
+    def __init__(self, status, *, json_value=None, headers=None):
+        self.status = status
+        self._json_value = json_value
+        self.headers = headers or {}
+
+    async def json(self, *args, **kwargs):
+        return self._json_value
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _SeqSession:
+    """Отдаёт заранее заготовленную очередь ответов — по одному на выстрел."""
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def get(self, *args, **kwargs):
+        self.calls += 1
+        return self._responses.pop(0)
+
+    def post(self, *args, **kwargs):
+        self.calls += 1
+        return self._responses.pop(0)
+
+
+# ── _throttle: держит min-gap (мутация: без sleep всплеск не тормозится) ──
+
+@pytest.mark.asyncio
+async def test_throttle_enforces_min_gap_on_burst(monkeypatch):
+    monkeypatch.setattr(shiki_api, "_MIN_GAP", 0.25)
+    shiki_api._throttle_lock = None
+    shiki_api._last_request_at = 0.0
+
+    clock = {"t": 1000.0}
+    slept = []
+    monkeypatch.setattr(shiki_api.time, "monotonic", lambda: clock["t"])
+
+    async def fake_sleep(d):
+        slept.append(d)
+        clock["t"] += d
+
+    monkeypatch.setattr(shiki_api.asyncio, "sleep", fake_sleep)
+
+    # Первый выстрел: last=0, «сейчас» далеко → gap<0, не спим.
+    await shiki_api._throttle()
+    assert slept == []
+    # Второй сразу за ним: часы не двигались → держим полный min-gap.
+    await shiki_api._throttle()
+    assert slept == [pytest.approx(0.25)]
+
+
+# ── _fetch реально проходит через троттл (мутация: обход choke-point) ──
+
+@pytest.mark.asyncio
+async def test_fetch_goes_through_throttle(monkeypatch):
+    calls = []
+
+    async def fake_throttle():
+        calls.append(1)
+
+    monkeypatch.setattr(shiki_api, "_throttle", fake_throttle)
+    session = _SeqSession([_SeqResponse(200, json_value=[])])
+    await fetch_history(session)
+    assert calls == [1]
+
+
+# ── 429 → Retry-After → ретрай восстанавливается И возвращает данные ──
+
+@pytest.mark.asyncio
+async def test_fetch_retries_on_429_and_returns_data(monkeypatch):
+    slept = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr(shiki_api.asyncio, "sleep", fake_sleep)
+
+    payload = [{"id": 1, "description": "оценено на 9"}]
+    session = _SeqSession([
+        _SeqResponse(429, headers={"Retry-After": "2"}),
+        _SeqResponse(200, json_value=payload),
+    ])
+    result = await fetch_history(session)
+    assert result == payload          # данные пришли на успешном ретрае
+    assert session.calls == 2         # ровно одна доп. попытка
+    assert slept == [pytest.approx(2.0)]  # уважили Retry-After (троттл спит 0)
+
+
+@pytest.mark.asyncio
+async def test_fetch_returns_none_when_429_exhausted(monkeypatch):
+    async def fake_sleep(d):
+        pass
+
+    monkeypatch.setattr(shiki_api.asyncio, "sleep", fake_sleep)
+
+    attempts = shiki_api._MAX_429_RETRIES + 1
+    session = _SeqSession(
+        [_SeqResponse(429, headers={"Retry-After": "0"}) for _ in range(attempts)]
+    )
+    assert await fetch_history(session) is None
+    assert session.calls == attempts   # 1 исходный + _MAX_429_RETRIES ретраев
+
+
+# ── _retry_after: парсинг Retry-After с фолбэками и клампом ──
+
+def test_retry_after_parses_seconds():
+    assert shiki_api._retry_after({"Retry-After": "3"}) == 3.0
+
+
+def test_retry_after_defaults_when_missing_or_none():
+    assert shiki_api._retry_after({}) == shiki_api._RETRY_AFTER_DEFAULT
+    assert shiki_api._retry_after(None) == shiki_api._RETRY_AFTER_DEFAULT
+
+
+def test_retry_after_defaults_on_http_date_form():
+    # HTTP-date-форму не поддерживаем — фолбэк, а не падение.
+    assert shiki_api._retry_after(
+        {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+    ) == shiki_api._RETRY_AFTER_DEFAULT
+
+
+def test_retry_after_caps_absurd_values():
+    assert shiki_api._retry_after({"Retry-After": "9999"}) == shiki_api._RETRY_AFTER_CAP
+
+
+# ── Битое тело при 200: parse спотыкается (None/не-список) → None, не исключение ──
+
+class _FakeSessionCM:
+    """async-context-manager вокруг готовой сессии — под fetch_current_rates,
+    которая открывает собственный aiohttp.ClientSession()."""
+    def __init__(self, session):
+        self._session = session
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, *args):
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [None, [1, 2]],
+    ids=["none", "list"],
+)
+async def test_gql_request_survives_malformed_payload(payload):
+    """200, но тело не той формы: `"errors" in payload` / `payload.get` роняют
+    TypeError/AttributeError — _fetch обязан вернуть None, а не пробросить."""
+    session = _SeqSession([_SeqResponse(200, json_value=payload)])
+    assert await shiki_api._gql_request(session, "q", {}) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [None, {"foo": "bar"}],
+    ids=["none", "dict"],
+)
+async def test_fetch_current_rates_survives_malformed_payload(monkeypatch, payload):
+    """200, но тело не итерируется как список записей (None) или даёт не те
+    элементы (dict → ключи-строки) — обход `item["_status"]=...` роняет
+    TypeError; ждём мягкий None."""
+    session = _SeqSession([_SeqResponse(200, json_value=payload)])
+    monkeypatch.setattr(
+        shiki_api.aiohttp, "ClientSession",
+        lambda *a, **k: _FakeSessionCM(session),
+    )
+    assert await shiki_api.fetch_current_rates("anime", ["watching"]) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_swallows_parse_structure_errors():
+    """Прямой контракт _fetch: структурные ошибки parse (AttributeError и пр.)
+    на 200 гасятся в None, не всплывают в вызывающий флоу."""
+    async def bad_parse(resp):
+        raise AttributeError("boom")
+
+    session = _SeqSession([_SeqResponse(200, json_value={})])
+    result = await shiki_api._fetch(
+        session, "GET", "http://x", parse=bad_parse, label="t", timeout=5,
+    )
+    assert result is None
+
+
+# ── fetch_current_rates: мягкая деградация по статусам (watching/rewatching) ──
+
+@pytest.mark.asyncio
+async def test_fetch_current_rates_partial_on_single_status_failure(monkeypatch):
+    """Один статус упал, другой ок → отдаём частичное (не None): один сбой не
+    обнуляет весь /status."""
+    watching = [{"id": 1, "anime": {"kind": "tv"}}]
+    session = _SeqSession([
+        _SeqResponse(200, json_value=watching),   # watching — ок
+        _SeqResponse(500, json_value=None),       # rewatching — сбой (не-200, без ретрая)
+    ])
+    monkeypatch.setattr(
+        shiki_api.aiohttp, "ClientSession",
+        lambda *a, **k: _FakeSessionCM(session),
+    )
+    result = await shiki_api.fetch_current_rates("anime", ["watching", "rewatching"])
+    assert result is not None
+    assert [r["id"] for r in result] == [1]
+    assert result[0]["_status"] == "watching"
+
+
+@pytest.mark.asyncio
+async def test_fetch_current_rates_none_only_when_all_statuses_fail(monkeypatch):
+    """None — только при полном отказе (ни один статус не пришёл)."""
+    session = _SeqSession([
+        _SeqResponse(500, json_value=None),
+        _SeqResponse(500, json_value=None),
+    ])
+    monkeypatch.setattr(
+        shiki_api.aiohttp, "ClientSession",
+        lambda *a, **k: _FakeSessionCM(session),
+    )
+    assert await shiki_api.fetch_current_rates("anime", ["watching", "rewatching"]) is None

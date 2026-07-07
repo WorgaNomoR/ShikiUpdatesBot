@@ -220,17 +220,25 @@ def recompute_aggregates(media: str, titles: dict, existing_by_quarter: dict | N
     return agg
 
 
+# Sentinel «аргумент fav не передан» — отличаем от явного None. None означает
+# «избранное уже пытались получить в этом цикле и оно недоступно» → НЕ рефетчим
+# (иначе на упавшем цикле бьём эндпоинт повторно — анти-паттерн для rate-limit);
+# _UNSET означает «прямой/standalone-вызов, фетчим сами».
+_UNSET = object()
+
+
 async def _collect_favourites(
     session: "aiohttp.ClientSession | None",
     stats: dict,
-    fav: dict | None = None,
+    fav=_UNSET,
 ) -> dict:
     """
     Собирает избранное в структуру stats["favourites"].
 
-    fav: если передан готовый ответ API (например, уже скачанный в
-    check_and_notify_favourites) — используем его и НЕ ходим в сеть повторно.
-    Если None — фетчим сами через session.
+    fav: готовый ответ API (уже скачанный в цикле) — используем и НЕ ходим в
+    сеть повторно. fav=_UNSET (не передан, standalone-вызов) — фетчим сами через
+    session. fav=None (передан явно = «в этом цикле избранное недоступно») —
+    оставляем прежнее, БЕЗ повторного фетча.
 
     Для аниме/манги/ранобэ джойнит оценку и название из titles{} (если тайтл
     там есть); если нет — берёт название из ответа API. Персонажи/люди —
@@ -243,16 +251,18 @@ async def _collect_favourites(
     поэтому people+mangakas+seyu+producers сливаем в один блок "people"
     («Люди индустрии»). Ранобэ — отдельный блок, но джойнит по namespace манги.
     """
-    if fav is None:
+    if fav is _UNSET:
         if session is None:
-            # Защита от вызова с обоими None: fetch_favourites(None) упал бы
-            # внутри на session.get(...). В норме не случается (sync_stats_all
-            # передаёт session, check_and_notify_favourites — готовый fav).
-            log.error("_collect_favourites: переданы и fav=None, и session=None — оставляем прежнее.")
+            # Защита: fetch_favourites(None) упал бы внутри на session.get(...).
+            # В норме не случается (sync_stats_all передаёт session,
+            # check_and_notify_favourites — готовый fav).
+            log.error("_collect_favourites: fav не передан, а session=None — оставляем прежнее.")
             return stats
         fav = await fetch_favourites(session)
     if fav is None:
-        log.info("_collect_favourites: запрос избранного не удался — оставляем прежнее.")
+        # Либо фетч вернул None, либо явно передали None (недоступно в цикле) —
+        # в обоих случаях оставляем прежнее, повторно НЕ фетчим.
+        log.info("_collect_favourites: избранное недоступно — оставляем прежнее.")
         return stats
 
     # API-категория → (выходной ключ stats, ключ titles для джойна или None).
@@ -317,7 +327,7 @@ async def _collect_favourites(
 
 async def sync_stats_all(
     session: "aiohttp.ClientSession | None" = None,
-    fav: dict | None = None,
+    fav=_UNSET,
 ) -> tuple[dict, bool]:
     """
     Главная функция актуализации stats_all.
