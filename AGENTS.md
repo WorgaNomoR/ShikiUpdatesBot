@@ -98,6 +98,7 @@ When adding or moving code, keep dependencies one-directional (import from lower
 - Set at least the required env vars (`BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`) — via the environment or a local `.env` (see `.env.example`).
 - Run the bot: `python main.py`
 - Run tests: `pytest tests/`
+- Lint before pushing/opening a PR: `ruff check .` (config in `ruff.toml`: E4/E7/E9/F/I — E402 import-placement and I import-sort are enforced; also runs in CI with autofix).
 
 ## Notes for AI agents
 - The module split is done (see Architecture). Keep the dependency graph acyclic and one-directional; `healthcheck.py` is the reference (one-way deps, parameters instead of back-imports).
