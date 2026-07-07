@@ -628,3 +628,21 @@ async def test_backup_export_reports_failure(backup_env, monkeypatch):
 
     cb.message.bot.send_message.assert_awaited_once()  # пользователю ушла ошибка
     assert "❌" in cb.message.bot.send_message.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_backup_export_propagates_send_backup_exception(backup_env, monkeypatch):
+    """Контракт send_backup включает исключение (сеть/Telegram API). Обёртка
+    backup_export_cb его НЕ глотает — фиксируем текущее поведение (пробрасывает)."""
+    monkeypatch.setattr(handlers, "send_backup", AsyncMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+
+    cb = MagicMock()
+    cb.from_user.id = handlers.OWNER_ID
+    cb.answer = AsyncMock()
+    cb.message.bot = AsyncMock()
+    cb.message.chat.id = 999
+    cb.message.message_id = 42
+
+    with pytest.raises(RuntimeError):
+        await handlers.backup_export_cb(cb)

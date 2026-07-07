@@ -7,9 +7,9 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram.enums import ParseMode
 
 import handlers
-
 
 # ── /subs — только для владельца, ветвление по наличию подписчиков ──
 
@@ -57,7 +57,24 @@ async def test_cmd_subs_lists_all_subscribers(monkeypatch):
     assert "<b>2</b>" in text                     # счётчик подписчиков
     assert "Alice" in text and "Bob" in text      # оба в списке
     assert "111" in text and "222" in text        # с chat_id
-    assert msg.answer.call_args.kwargs.get("parse_mode") is not None   # HTML-разметка
+    assert msg.answer.call_args.kwargs.get("parse_mode") == ParseMode.HTML
+
+
+@pytest.mark.asyncio
+async def test_cmd_subs_escapes_html_in_subscriber_names(monkeypatch):
+    """Имена подписчиков из Telegram идут в HTML-сообщение -> обязаны
+    экранироваться h(), иначе < > & ломают разметку."""
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {111: "<b>A&B</b>"})
+
+    msg = MagicMock()
+    msg.from_user = MagicMock(id=handlers.OWNER_ID)
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_subs(msg)
+
+    text = msg.answer.call_args.args[0]
+    assert "&lt;b&gt;A&amp;B&lt;/b&gt;" in text     # экранировано
+    assert "<b>A&B</b>" not in text                 # сырой вид не просочился
 
 
 # ── /stop — отписка: ветвление «не подписан» / реальная отписка ──

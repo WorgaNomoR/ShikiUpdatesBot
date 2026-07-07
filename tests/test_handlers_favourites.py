@@ -6,7 +6,7 @@ build_favourite_message (leaf messages) вынесен в test_messages.py."""
 
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -665,8 +665,6 @@ async def test_check_and_notify_favourites_explicit_none_skips_without_refetch(
 #  cmd_favs — оркестрация /favs (что зовёт, как обрабатывает сбой)
 # ════════════════════════════════════════════════════════════════
 
-from unittest.mock import MagicMock
-
 
 @pytest.mark.asyncio
 async def test_cmd_favs_sends_report_with_preview_disabled(monkeypatch):
@@ -706,4 +704,5 @@ async def test_cmd_favs_reports_error_and_skips_send(monkeypatch):
     await handlers.cmd_favs(msg)
 
     msg.answer.assert_awaited_once()              # сообщили об ошибке
+    assert "не удалось" in msg.answer.call_args.args[0].lower()
     send.assert_not_awaited()                     # отчёт НЕ ушёл

@@ -194,10 +194,12 @@ class _SeqResponse:
 
 
 class _SeqSession:
-    """Отдаёт заранее заготовленную очередь ответов — по одному на выстрел."""
+    """Отдаёт заранее заготовленную очередь ответов — по одному на выстрел.
+    Пишет json-тела POST (requests) — чтобы проверять границы батчинга."""
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = 0
+        self.requests = []
 
     def get(self, *args, **kwargs):
         self.calls += 1
@@ -205,6 +207,7 @@ class _SeqSession:
 
     def post(self, *args, **kwargs):
         self.calls += 1
+        self.requests.append(kwargs.get("json"))
         return self._responses.pop(0)
 
 
@@ -584,6 +587,10 @@ async def test_fetch_meta_batch_splits_into_batches_of_50():
     ])
     result = await shiki_api.fetch_meta_batch("anime", ids, session=session)
     assert session.calls == 2                       # ровно два батча (50 + 10)
+    # реальные размеры чанков, а не только их число: ловит сдвиг границы
+    # (напр. step=30 тоже дал бы 2 вызова, но батчи [30, 30], а не [50, 10])
+    sizes = [len(r["variables"]["ids"].split(",")) for r in session.requests]
+    assert sizes == [50, 10]
     assert set(result) == {"1000", "2000"}          # данные обоих батчей сохранены
 
 

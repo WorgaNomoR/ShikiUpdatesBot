@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import json
-import storage
 
+import pytest
+
+import storage
 from storage import (
     load_seen_ids,
     load_subscribers,
@@ -190,8 +192,6 @@ def test_atomic_write_overwrites_existing_file(tmp_path):
 #  stats_all.json — загрузка/сохранение + in-memory кэш
 # ═══════════════════════════════════════════════════════════════════
 
-import pytest
-
 
 @pytest.fixture(autouse=True)
 def _reset_stats_all_cache():
@@ -289,10 +289,11 @@ def test_save_stats_all_writes_file_and_updates_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "STATS_ALL_FILE", f)
 
     data = _valid_stats_all()
+    original_updated_at = data["updated_at"]
     storage.save_stats_all(data)
 
     on_disk = json.loads(f.read_text(encoding="utf-8"))
-    assert on_disk["updated_at"] is not None      # штамп времени проставлен
+    assert on_disk["updated_at"] != original_updated_at   # штамп времени реально обновлён
     assert on_disk["anime"] == data["anime"]
     # кэш обновлён тем же объектом -> следующий load отдаёт его без чтения файла
     assert storage.load_stats_all() is data
