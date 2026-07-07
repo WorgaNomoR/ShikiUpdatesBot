@@ -194,10 +194,12 @@ class _SeqResponse:
 
 
 class _SeqSession:
-    """Отдаёт заранее заготовленную очередь ответов — по одному на выстрел."""
+    """Отдаёт заранее заготовленную очередь ответов — по одному на выстрел.
+    Пишет json-тела POST (requests) — чтобы проверять границы батчинга."""
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = 0
+        self.requests = []
 
     def get(self, *args, **kwargs):
         self.calls += 1
@@ -205,6 +207,7 @@ class _SeqSession:
 
     def post(self, *args, **kwargs):
         self.calls += 1
+        self.requests.append(kwargs.get("json"))
         return self._responses.pop(0)
 
 
@@ -401,3 +404,233 @@ async def test_fetch_current_rates_none_only_when_all_statuses_fail(monkeypatch)
         lambda *a, **k: _FakeSessionCM(session),
     )
     assert await shiki_api.fetch_current_rates("anime", ["watching", "rewatching"]) is None
+
+
+# ════════════════════════════════════════════════════════════════
+#  _parse_genres — фильтр по kind, предпочтение русского (чистая функция)
+# ════════════════════════════════════════════════════════════════
+
+def test_parse_genres_filters_by_kind_and_prefers_russian():
+    raw = [
+        {"russian": "Драма", "name": "Drama", "kind": "genre"},
+        {"russian": "Психология", "name": "Psychological", "kind": "theme"},
+        {"russian": "", "name": "Seinen", "kind": "demographic"},
+    ]
+    assert shiki_api._parse_genres(raw, "genre") == ["Драма"]
+    assert shiki_api._parse_genres(raw, "theme") == ["Психология"]
+    # russian пустой → фолбэк на name
+    assert shiki_api._parse_genres(raw, "demographic") == ["Seinen"]
+
+
+def test_parse_genres_skips_empty_names_and_non_dicts():
+    raw = [
+        {"russian": "", "name": "", "kind": "genre"},   # оба пустые → пропуск
+        "не словарь",                                    # не dict → пропуск
+        {"russian": "Экшен", "name": "Action", "kind": "genre"},
+    ]
+    assert shiki_api._parse_genres(raw, "genre") == ["Экшен"]
+
+
+def test_parse_genres_empty_input_is_empty_list():
+    assert shiki_api._parse_genres(None, "genre") == []
+    assert shiki_api._parse_genres([], "genre") == []
+
+
+# ════════════════════════════════════════════════════════════════
+#  _gql_request — успех и частичные данные (data + errors) через HTTP-границу
+# ════════════════════════════════════════════════════════════════
+
+def _gql_response(data, *, errors=None):
+    payload = {"data": data}
+    if errors is not None:
+        payload["errors"] = errors
+    return _SeqResponse(200, json_value=payload)
+
+
+@pytest.mark.asyncio
+async def test_gql_request_returns_data_field():
+    session = _SeqSession([_gql_response({"animes": [{"id": "1"}]})])
+    data = await shiki_api._gql_request(session, "q", {"ids": "1"})
+    assert data == {"animes": [{"id": "1"}]}
+
+
+@pytest.mark.asyncio
+async def test_gql_request_returns_partial_data_despite_errors():
+    """Частичные данные (data + errors) отдаём как есть — решает caller.
+    Ветка логирования errors при этом отрабатывает (не роняет)."""
+    session = _SeqSession([
+        _gql_response({"animes": []}, errors=[{"message": "boom"}]),
+    ])
+    data = await shiki_api._gql_request(session, "q", {"ids": "1"})
+    assert data == {"animes": []}
+
+
+# ════════════════════════════════════════════════════════════════
+#  fetch_list_export — публичный экспорт списка (успех / не-список / URL)
+# ════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_fetch_list_export_returns_list_on_success():
+    payload = [{"target_id": 1, "score": 9, "status": "completed"}]
+    session = _SeqSession([_SeqResponse(200, json_value=payload)])
+    assert await shiki_api.fetch_list_export(session, "anime") == payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_list_export_none_when_not_a_list():
+    """200, но тело не список (dict) → мягкий None, не исключение."""
+    session = _SeqSession([_SeqResponse(200, json_value={"oops": True})])
+    assert await shiki_api.fetch_list_export(session, "anime") is None
+
+
+class _UrlRecordingSession:
+    """Пишет URL каждого GET — проверяем выбор anime/manga эндпоинта."""
+    def __init__(self, response):
+        self._response = response
+        self.urls = []
+
+    def get(self, url, *args, **kwargs):
+        self.urls.append(url)
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_fetch_list_export_picks_media_specific_url():
+    anime_sess = _UrlRecordingSession(_SeqResponse(200, json_value=[]))
+    await shiki_api.fetch_list_export(anime_sess, "anime")
+    assert anime_sess.urls == [shiki_api.LIST_EXPORT_ANIME]
+
+    manga_sess = _UrlRecordingSession(_SeqResponse(200, json_value=[]))
+    await shiki_api.fetch_list_export(manga_sess, "manga")
+    assert manga_sess.urls == [shiki_api.LIST_EXPORT_MANGA]
+
+
+# ════════════════════════════════════════════════════════════════
+#  fetch_meta_batch — батчинг + парсинг meta через HTTP-границу
+# ════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_fetch_meta_batch_empty_ids_returns_empty_without_network():
+    # session=None + пустые ids → возврат до открытия сессии (сети не касаемся)
+    assert await shiki_api.fetch_meta_batch("anime", []) == {}
+    assert await shiki_api.fetch_meta_batch("anime", ["", "  "]) == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_meta_batch_parses_full_anime_meta():
+    item = {
+        "id": 226,
+        "url": "https://shikimori.one/animes/226-elfen-lied",
+        "kind": "TV",
+        "score": "8.5",
+        "rating": "r",
+        "origin": "manga",
+        "duration": 25,
+        "episodes": 13,
+        "airedOn": {"year": 2004},
+        "studios": [{"name": "Arms"}, {"noname": 1}],
+        "genres": [
+            {"russian": "Драма", "name": "Drama", "kind": "genre"},
+            {"russian": "Психология", "name": "Psychological", "kind": "theme"},
+            {"russian": "", "name": "Seinen", "kind": "demographic"},
+        ],
+    }
+    session = _SeqSession([_gql_response({"animes": [item]})])
+    result = await shiki_api.fetch_meta_batch("anime", ["226"], session=session)
+
+    assert set(result) == {"226"}
+    meta = result["226"]
+    assert meta["url"] == shiki_api._rel_url(item["url"])   # нормализован к относительному
+    assert meta["kind"] == "tv"                              # приведён к нижнему регистру
+    assert meta["year"] == 2004
+    assert meta["shiki_score"] == 8.5
+    assert meta["genres"] == ["Драма"]
+    assert meta["themes"] == ["Психология"]
+    assert meta["demographic"] == ["Seinen"]
+    assert meta["duration"] == 25
+    assert meta["episodes_total"] == 13
+    assert meta["rating"] == "R-17"                          # RU-маппинг рейтинга
+    assert meta["origin"] == "Манга"                         # RU-маппинг origin
+    assert meta["studios"] == ["Arms"]                       # студия без name отброшена
+
+
+@pytest.mark.asyncio
+async def test_fetch_meta_batch_parses_manga_meta():
+    item = {
+        "id": 1,
+        "url": "/mangas/1-berserk",
+        "kind": "Manga",
+        "score": "9.1",
+        "chapters": 100,
+        "volumes": 12,
+        "airedOn": {"year": 1989},
+        "publishers": [{"name": "Hakusensha"}, {"nope": 1}],
+        "genres": [],
+    }
+    session = _SeqSession([_gql_response({"mangas": [item]})])
+    meta = (await shiki_api.fetch_meta_batch("manga", ["1"], session=session))["1"]
+
+    assert meta["chapters_total"] == 100
+    assert meta["volumes_total"] == 12
+    assert meta["publishers"] == ["Hakusensha"]
+    # манга-ветка НЕ добавляет аниме-специфичные поля
+    assert "rating" not in meta and "origin" not in meta and "studios" not in meta
+
+
+@pytest.mark.asyncio
+async def test_fetch_meta_batch_splits_into_batches_of_50():
+    """>50 id → несколько GraphQL-запросов; данные всех батчей склеиваются."""
+    ids = [str(i) for i in range(60)]
+    session = _SeqSession([
+        _gql_response({"animes": [{"id": "1000", "genres": []}]}),
+        _gql_response({"animes": [{"id": "2000", "genres": []}]}),
+    ])
+    result = await shiki_api.fetch_meta_batch("anime", ids, session=session)
+    assert session.calls == 2                       # ровно два батча (50 + 10)
+    # реальные размеры чанков, а не только их число: ловит сдвиг границы
+    # (напр. step=30 тоже дал бы 2 вызова, но батчи [30, 30], а не [50, 10])
+    sizes = [len(r["variables"]["ids"].split(",")) for r in session.requests]
+    assert sizes == [50, 10]
+    assert set(result) == {"1000", "2000"}          # данные обоих батчей сохранены
+
+
+@pytest.mark.asyncio
+async def test_fetch_meta_batch_keeps_partial_on_batch_failure():
+    """Сбой одного батча (не-200 → _gql_request=None) не обнуляет остальные."""
+    ids = [str(i) for i in range(60)]
+    session = _SeqSession([
+        _SeqResponse(500, json_value=None),                        # первый батч — сбой
+        _gql_response({"animes": [{"id": "2000", "genres": []}]}),  # второй — ок
+    ])
+    result = await shiki_api.fetch_meta_batch("anime", ids, session=session)
+    assert session.calls == 2
+    assert set(result) == {"2000"}                  # уцелевший батч на месте
+
+
+@pytest.mark.asyncio
+async def test_fetch_meta_batch_skips_items_without_id_and_broken_items():
+    """Элемент без id пропускается; элемент, роняющий парсинг, гасится
+    per-item (warning) — остальные из того же батча выживают."""
+    good = {"id": 226, "genres": [], "studios": [{"name": "OK"}]}
+    no_id = {"kind": "tv", "genres": []}                            # нет id → skip
+    broken = {"id": 999, "genres": [], "studios": ["не словарь"]}   # .get на строке → AttributeError
+    session = _SeqSession([_gql_response({"animes": [good, no_id, broken]})])
+    result = await shiki_api.fetch_meta_batch("anime", ["226", "999"], session=session)
+    assert set(result) == {"226"}                   # только исправный элемент
+
+
+@pytest.mark.asyncio
+async def test_fetch_meta_batch_opens_own_session_when_none(monkeypatch):
+    """session=None → открывает собственную ClientSession (boot-throttle-путь)."""
+    session = _SeqSession([_gql_response({"animes": [{"id": "7", "genres": []}]})])
+    monkeypatch.setattr(
+        shiki_api.aiohttp, "ClientSession",
+        lambda *a, **k: _FakeSessionCM(session),
+    )
+    result = await shiki_api.fetch_meta_batch("anime", ["7"])   # без session
+    assert set(result) == {"7"}
+
+
+def test_retry_after_defaults_on_negative_value():
+    # Отрицательный Retry-After бессмыслен -> фолбэк на дефолт, не отрицательный сон
+    assert shiki_api._retry_after({"Retry-After": "-5"}) == shiki_api._RETRY_AFTER_DEFAULT

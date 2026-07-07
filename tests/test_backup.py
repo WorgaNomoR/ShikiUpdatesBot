@@ -569,3 +569,80 @@ async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
     old_cur = {"period": "2025-Q1", "events": []}
     await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
     sync.assert_awaited_once()
+
+
+# ─────────────────────────────────────────────────────────────
+#  backup_export_cb — кнопка «📤 Экспорт» (оркестрация)
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_backup_export_rejects_non_owner(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr(handlers, "send_backup", sent)
+
+    cb = MagicMock()
+    cb.from_user.id = 1                       # не владелец (OWNER_ID=999 в backup_env)
+    cb.answer = AsyncMock()
+
+    await handlers.backup_export_cb(cb)
+
+    cb.answer.assert_awaited_once()
+    assert cb.answer.call_args.kwargs.get("show_alert") is True
+    sent.assert_not_awaited()                 # архив НЕ собирали
+
+
+@pytest.mark.asyncio
+async def test_backup_export_owner_sends_archive(backup_env, monkeypatch):
+    sent = AsyncMock(return_value=True)       # send_backup успешен
+    monkeypatch.setattr(handlers, "send_backup", sent)
+    deleted = AsyncMock()
+    monkeypatch.setattr(handlers, "_safe_delete", deleted)
+
+    cb = MagicMock()
+    cb.from_user.id = handlers.OWNER_ID
+    cb.answer = AsyncMock()
+    cb.message.bot = AsyncMock()
+    cb.message.chat.id = 999
+    cb.message.message_id = 42
+
+    await handlers.backup_export_cb(cb)
+
+    sent.assert_awaited_once()                 # архив собран и отправлен
+    deleted.assert_awaited_once_with(cb.message.bot, 999, 42)   # меню убрано: (bot, chat_id, message_id)
+    cb.message.bot.send_message.assert_not_awaited()   # ошибки нет
+
+
+@pytest.mark.asyncio
+async def test_backup_export_reports_failure(backup_env, monkeypatch):
+    monkeypatch.setattr(handlers, "send_backup", AsyncMock(return_value=False))  # сбой сборки
+    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+
+    cb = MagicMock()
+    cb.from_user.id = handlers.OWNER_ID
+    cb.answer = AsyncMock()
+    cb.message.bot = AsyncMock()
+    cb.message.chat.id = 999
+    cb.message.message_id = 42
+
+    await handlers.backup_export_cb(cb)
+
+    cb.message.bot.send_message.assert_awaited_once()  # пользователю ушла ошибка
+    assert "❌" in cb.message.bot.send_message.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_backup_export_propagates_send_backup_exception(backup_env, monkeypatch):
+    """Контракт send_backup включает исключение (сеть/Telegram API). Обёртка
+    backup_export_cb его НЕ глотает — фиксируем текущее поведение (пробрасывает)."""
+    monkeypatch.setattr(handlers, "send_backup", AsyncMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+
+    cb = MagicMock()
+    cb.from_user.id = handlers.OWNER_ID
+    cb.answer = AsyncMock()
+    cb.message.bot = AsyncMock()
+    cb.message.chat.id = 999
+    cb.message.message_id = 42
+
+    with pytest.raises(RuntimeError):
+        await handlers.backup_export_cb(cb)
