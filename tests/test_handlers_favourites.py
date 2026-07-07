@@ -659,3 +659,51 @@ async def test_check_and_notify_favourites_explicit_none_skips_without_refetch(
     assert fetched is False       # НИ одного повторного сетевого запроса
     assert found_new is False
     assert result == {"animes_1"}
+
+
+# ════════════════════════════════════════════════════════════════
+#  cmd_favs — оркестрация /favs (что зовёт, как обрабатывает сбой)
+# ════════════════════════════════════════════════════════════════
+
+from unittest.mock import MagicMock
+
+
+@pytest.mark.asyncio
+async def test_cmd_favs_sends_report_with_preview_disabled(monkeypatch):
+    """Успех: строит отчёт по избранному и шлёт его с disable_preview=True
+    (у избранного длинные списки — превью-ссылки только мусорят)."""
+    monkeypatch.setattr(handlers, "_stats_report_favourites",
+                        AsyncMock(return_value=["fav-1", "fav-2"]))
+    send = AsyncMock()
+    monkeypatch.setattr(handlers, "_send_stats_reports", send)
+
+    msg = MagicMock()
+    msg.bot = MagicMock()
+    msg.chat.id = 777
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_favs(msg)
+
+    send.assert_awaited_once()
+    args, kwargs = send.call_args
+    assert args[0] is msg.bot and args[1] == 777
+    assert args[2] == ["fav-1", "fav-2"]          # именно построенный отчёт
+    assert kwargs.get("disable_preview") is True
+    msg.answer.assert_not_awaited()               # ошибок не было
+
+
+@pytest.mark.asyncio
+async def test_cmd_favs_reports_error_and_skips_send(monkeypatch):
+    """Сбой построения -> пользователю уходит мягкая ошибка, отчёт не шлётся."""
+    monkeypatch.setattr(handlers, "_stats_report_favourites",
+                        AsyncMock(side_effect=RuntimeError("boom")))
+    send = AsyncMock()
+    monkeypatch.setattr(handlers, "_send_stats_reports", send)
+
+    msg = MagicMock()
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_favs(msg)
+
+    msg.answer.assert_awaited_once()              # сообщили об ошибке
+    send.assert_not_awaited()                     # отчёт НЕ ушёл
