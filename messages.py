@@ -355,12 +355,20 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
+def _clean_description(description: str) -> str:
+    """Строка истории, готовая к русскому матчингу: снимаем HTML-теги,
+    затем чиним латинские омоглифы (issue #28). Один порядок на все
+    парсеры — чтобы strip→normalize не разошёлся при будущих правках.
+    """
+    return _normalize_homoglyphs(_strip_html(description))
+
+
 def extract_score_change(description: str) -> tuple[int, int] | None:
     """
     Парсим «изменена оценка с X на Y» → возвращаем (old, new).
     Если не распознали — None.
     """
-    desc = _normalize_homoglyphs(_strip_html(description))
+    desc = _clean_description(description)
     match = re.search(
         r"изменена\s+оценка\s+с\s+(\d+)\s+на\s+(\d+)",
         desc, re.IGNORECASE
@@ -378,7 +386,7 @@ def extract_score(description: str) -> int | None:
       "выставил оценку 8"     <- альтернативный
       "rated 7" / "scored 7"  <- английский
     """
-    desc = _normalize_homoglyphs(_strip_html(description))
+    desc = _clean_description(description)
     # Основной русский формат: «оценено на 9» (число может быть в <b>9</b>)
     match = re.search(r"оценено\s+на\s+(\d+)", desc, re.IGNORECASE)
     if match:
@@ -412,7 +420,7 @@ def classify_event(description: str) -> str:
       "прочитано"                -> completed  (без оценки)
       "оценено на 9"             -> completed  (с оценкой, парсим отдельно)
     """
-    desc = _normalize_homoglyphs(_strip_html(description)).lower()
+    desc = _clean_description(description).lower()
 
     # Порядок важен: специфичные — выше, чтобы не поглотил более общий паттерн
 
