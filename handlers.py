@@ -471,14 +471,21 @@ async def cmd_favs(message: Message) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 
+# Sentinel «favourites не передан» (прямой/тестовый вызов → фетчим сами) vs
+# явный None из цикла («уже пытались, недоступно» → НЕ рефетчим, деградируем).
+_FAV_UNSET = object()
+
+
 async def check_and_notify_favourites(
-    bot: Bot, seen: set[str], favourites: dict | None = None,
+    bot: Bot, seen: set[str], favourites=_FAV_UNSET,
 ) -> tuple[set[str], bool]:
     """
     Проверяем избранное:
     0. favourites: если передан уже скачанный ответ /favourites (цикл тянет его
        ОДИН раз и делит между уведомлениями и ресинком) — используем его и НЕ
-       ходим в сеть. Если None (прямой вызов / фолбэк) — фетчим сами.
+       ходим в сеть. favourites=_FAV_UNSET (не передан, прямой вызов) — фетчим
+       сами. Явный None («в этом цикле избранное недоступно») — пропускаем цикл,
+       БЕЗ повторного фетча.
     1. Загружаем текущий список с Shikimori
     2. Находим новые элементы (которых нет в seen)
     3. Отправляем уведомления и обновляем seen
@@ -489,12 +496,12 @@ async def check_and_notify_favourites(
     Ключ в seen: "{category}_{id}", например "animes_5114".
     Возвращает (seen, found_new).
     """
-    if favourites is None:
+    if favourites is _FAV_UNSET:
         async with aiohttp.ClientSession() as session:
             favourites = await fetch_favourites(session)
 
     if favourites is None:
-        log.info("Запрос избранного не удался — пропускаем цикл.")
+        log.info("Избранное недоступно — пропускаем цикл (без повторного фетча).")
         return seen, False
 
     # baseline пуст (первый запуск либо стартовая инициализация не прошла

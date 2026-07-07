@@ -635,3 +635,27 @@ async def test_check_and_notify_favourites_fetches_when_not_injected(
     assert fetched is True
     assert found_new is False
     assert result == {"animes_1"}
+
+
+@pytest.mark.asyncio
+async def test_check_and_notify_favourites_explicit_none_skips_without_refetch(
+    monkeypatch, silence_favourites_io
+):
+    """Дедуп на упавшем цикле: явный favourites=None = «уже пытались, недоступно»
+    → НЕ рефетчим (иначе бьём эндпоинт повторно), мягко пропускаем цикл."""
+    fetched = False
+
+    async def fake_fetch(session):
+        nonlocal fetched
+        fetched = True
+        return {"animes": [{"id": 1}]}
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_fetch)
+
+    result, found_new = await handlers.check_and_notify_favourites(
+        None, {"animes_1"}, favourites=None,
+    )
+
+    assert fetched is False       # НИ одного повторного сетевого запроса
+    assert found_new is False
+    assert result == {"animes_1"}
