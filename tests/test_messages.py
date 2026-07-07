@@ -315,6 +315,22 @@ def test_extract_score_change_invalid():
     ) is None
 
 
+def test_extract_score_change_english_still_parsed():
+    # Нормализация не должна ломать чисто латинские форматы.
+    assert extract_score("rated 7") == 7
+    assert extract_score("scored 10") == 10
+
+
+def test_extract_score_homoglyph_in_russian_word():
+    # Латинская "о" (U+006f) внутри «оценено» — mixed-script, чинится.
+    assert extract_score("\u006fценено на 9") == 9
+
+
+def test_classify_event_homoglyph_in_russian_word():
+    # Латинская "o" в «брошено» — без нормализации классификатор промахнётся.
+    assert classify_event("бр\u006fшено") == "dropped"
+
+
 # ==========================================================
 # classify_event
 # ==========================================================

@@ -12,6 +12,7 @@ from utils import (
     _fmt_dt_short,
     _human_ago,
     _is_partial_quarter,
+    _normalize_homoglyphs,
     _quarter_end,
     _rel_url,
     _safe_float,
@@ -187,3 +188,54 @@ def test_human_ago_buckets():
 def test_human_ago_future_clamps_to_just_now():
     now = datetime(2026, 7, 2, 15, 0, 0)
     assert _human_ago(now + timedelta(hours=1), now) == "только что"
+
+
+# ==========================================================
+# _normalize_homoglyphs — латинские двойники → кириллица
+# ==========================================================
+
+def test_normalize_standalone_latin_c_connective():
+    # Одиночная латинская "c" (U+0063) — русский предлог «с».
+    out = _normalize_homoglyphs("оценка c 8")
+    assert out == "оценка с 8"
+    assert out[7] == "\u0441"  # кириллическая с, не латинская c
+
+
+def test_normalize_standalone_latin_o_connective():
+    out = _normalize_homoglyphs("вопрос o жизни")
+    assert out == "вопрос о жизни"
+    assert out[7] == "\u043e"  # кириллическая о
+
+
+def test_normalize_mixed_script_token_repaired():
+    # "брoшено" с латинской o внутри русского слова — чиним поголовно.
+    src = "бр\u006fшено"  # o латинская
+    assert any(ord(c) < 128 for c in src)  # предпосылка: латиница есть
+    out = _normalize_homoglyphs(src)
+    assert out == "брошено"
+    assert all(ord(c) > 0x400 for c in out)  # чистая кириллица
+
+
+def test_normalize_uppercase_mixed_script():
+    src = "\u041daруто"  # Н кириллица, a латинская
+    out = _normalize_homoglyphs(src)
+    assert out == "Наруто"
+
+
+def test_normalize_pure_latin_word_untouched():
+    # english-форматы и совпадающие с омоглифами латинские слова не трогаем.
+    for word in ("rated", "scored", "co", "cop"):
+        assert _normalize_homoglyphs(word) == word
+
+
+def test_normalize_latin_title_and_url_intact():
+    src = "Cowboy Bebop https://shikimori.io/animes/1-cowboy-bebop"
+    assert _normalize_homoglyphs(src) == src
+
+
+def test_normalize_pure_cyrillic_unchanged():
+    assert _normalize_homoglyphs("изменена оценка с 5 на 9") == "изменена оценка с 5 на 9"
+
+
+def test_normalize_empty_string():
+    assert _normalize_homoglyphs("") == ""

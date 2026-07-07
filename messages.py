@@ -17,7 +17,7 @@ from config import (
     SHIKI_BASE_URL,
 )
 from shiki_api import get_media_info
-from utils import _fmt_dt_short, _human_ago, _rel_url, _safe_int, h
+from utils import _fmt_dt_short, _human_ago, _normalize_homoglyphs, _rel_url, _safe_int, h
 
 # ═══════════════════════════════════════════════════════════════════
 #  БАНК СООБЩЕНИЙ
@@ -360,9 +360,9 @@ def extract_score_change(description: str) -> tuple[int, int] | None:
     Парсим «изменена оценка с X на Y» → возвращаем (old, new).
     Если не распознали — None.
     """
-    desc = _strip_html(description)
+    desc = _normalize_homoglyphs(_strip_html(description))
     match = re.search(
-        r"изменена\s+оценка\s+[сc]\s+(\d+)\s+на\s+(\d+)",
+        r"изменена\s+оценка\s+с\s+(\d+)\s+на\s+(\d+)",
         desc, re.IGNORECASE
     )
     if match:
@@ -378,7 +378,7 @@ def extract_score(description: str) -> int | None:
       "выставил оценку 8"     <- альтернативный
       "rated 7" / "scored 7"  <- английский
     """
-    desc = _strip_html(description)
+    desc = _normalize_homoglyphs(_strip_html(description))
     # Основной русский формат: «оценено на 9» (число может быть в <b>9</b>)
     match = re.search(r"оценено\s+на\s+(\d+)", desc, re.IGNORECASE)
     if match:
@@ -412,7 +412,7 @@ def classify_event(description: str) -> str:
       "прочитано"                -> completed  (без оценки)
       "оценено на 9"             -> completed  (с оценкой, парсим отдельно)
     """
-    desc = _strip_html(description).lower()
+    desc = _normalize_homoglyphs(_strip_html(description)).lower()
 
     # Порядок важен: специфичные — выше, чтобы не поглотил более общий паттерн
 
