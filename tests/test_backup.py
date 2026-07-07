@@ -608,7 +608,7 @@ async def test_backup_export_owner_sends_archive(backup_env, monkeypatch):
     await handlers.backup_export_cb(cb)
 
     sent.assert_awaited_once()                 # архив собран и отправлен
-    deleted.assert_awaited_once()              # меню убрано
+    deleted.assert_awaited_once_with(cb.message.bot, 999, 42)   # меню убрано: (bot, chat_id, message_id)
     cb.message.bot.send_message.assert_not_awaited()   # ошибки нет
 
 

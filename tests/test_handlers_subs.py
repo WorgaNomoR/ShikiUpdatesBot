@@ -116,6 +116,6 @@ async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
     await handlers.cmd_stop(msg)
 
     assert saved == [{777: "Trinity"}]            # 555 удалён, остальные целы
-    backup.assert_awaited_once()                  # авто-бэкап после отписки
-    assert backup.call_args.kwargs.get("subscribed") is False
+    # полная сигнатура: (bot, chat_id, name, subscribed=False) — ловит перестановку
+    backup.assert_awaited_once_with(msg.bot, 555, "Neo", subscribed=False)
     msg.answer.assert_awaited_once()
