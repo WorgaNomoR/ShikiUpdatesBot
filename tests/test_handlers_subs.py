@@ -10,6 +10,7 @@ import pytest
 from aiogram.enums import ParseMode
 
 import handlers
+import storage
 
 # ── /subs — только для владельца, ветвление по наличию подписчиков ──
 
@@ -119,3 +120,24 @@ async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
     # полная сигнатура: (bot, chat_id, name, subscribed=False) — ловит перестановку
     backup.assert_awaited_once_with(msg.bot, 555, "Neo", subscribed=False)
     msg.answer.assert_awaited_once()
+
+
+# ── /start — подписка зрителя + авто-бэкап состояния ──
+
+@pytest.mark.asyncio
+async def test_cmd_start_triggers_auto_backup(backup_env, monkeypatch):
+    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backup.send_backup", sent)
+
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user.full_name = "Morpheus"
+    msg.from_user.id = 555
+    msg.answer = AsyncMock()
+    msg.bot = AsyncMock()
+
+    await handlers.cmd_start(msg)
+
+    assert storage.load_subscribers() == {555: "Morpheus"}   # подписка сохранена
+    sent.assert_awaited_once()                            # бэкап ушёл

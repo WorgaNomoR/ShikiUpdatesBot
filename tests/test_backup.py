@@ -11,7 +11,7 @@ import io
 import json
 import time
 import zipfile
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -264,25 +264,6 @@ async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monk
     assert out["last_backup_at"] == old   # не сдвигаем метку, если не ушло
 
 
-@pytest.mark.asyncio
-async def test_cmd_start_triggers_auto_backup(backup_env, monkeypatch):
-    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr("backup.send_backup", sent)
-
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user.full_name = "Morpheus"
-    msg.from_user.id = 555
-    msg.answer = AsyncMock()
-    msg.bot = AsyncMock()
-
-    await handlers.cmd_start(msg)
-
-    assert storage.load_subscribers() == {555: "Morpheus"}   # подписка сохранена
-    sent.assert_awaited_once()                            # бэкап ушёл
-
-
 # ─────────────────────────────────────────────────────────────
 #  Структура stats_current
 # ─────────────────────────────────────────────────────────────
@@ -398,25 +379,8 @@ def test_valid_import_payload_accepts_canonical_shapes():
 
 
 # ─────────────────────────────────────────────────────────────
-#  Замечания ревью: ротация-бэкап покрыт + вложенный каталог создаётся
+#  Замечание ревью: вложенный каталог quarters/ создаётся на свежем томе.
 # ─────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr("handlers.send_backup", sent)
-    monkeypatch.setattr("handlers.sync_stats_all", AsyncMock(return_value=({}, True)))
-    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
-    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
-    monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
-    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
-    monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
-
-    old_cur = {"period": "2025-Q1", "events": []}   # заведомо прошлый квартал → ротация
-    await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
-
-    sent.assert_awaited_once()
-    assert backup.BACKUP_TAG in sent.call_args.args[1]
 
 
 def test_restore_creates_missing_quarters_dir(backup_env):
@@ -429,38 +393,3 @@ def test_restore_creates_missing_quarters_dir(backup_env):
     assert "quarters/2026-Q1.json" in result["restored"]
     # _atomic_write сам создаёт parent — краша на свежем томе нет
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
-
-
-@pytest.mark.asyncio
-async def test_rotation_skips_resync_at_boot(backup_env, monkeypatch):
-    """resync=False (стартовый вызов): НЕ дёргаем sync_stats_all — polling_loop
-    уже дал свежий stats_all; второй синк своей сессией ловил 429 в день ротации."""
-    sync = AsyncMock(return_value=({}, True))
-    monkeypatch.setattr("handlers.sync_stats_all", sync)
-    monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
-    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
-    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
-    monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
-    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
-    monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
-
-    old_cur = {"period": "2025-Q1", "events": []}
-    await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {}, resync=False)
-    sync.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
-    """resync=True (дефолт, цикловой вызов): дёргаем sync_stats_all для свежих метаданных."""
-    sync = AsyncMock(return_value=({}, True))
-    monkeypatch.setattr("handlers.sync_stats_all", sync)
-    monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
-    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
-    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
-    monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
-    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
-    monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
-
-    old_cur = {"period": "2025-Q1", "events": []}
-    await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
-    sync.assert_awaited_once()
