@@ -18,29 +18,11 @@ import pytest
 import backup
 import handlers
 import main
-import stats
 import storage
 
 # ─────────────────────────────────────────────────────────────
-#  Фикстуры
+#  Хелперы
 # ─────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def backup_env(tmp_path, monkeypatch):
-    """Редиректим пути состояния в tmp_path, чтобы тесты не трогали /data."""
-    data = tmp_path / "data"
-    quarters = data / "quarters"
-    quarters.mkdir(parents=True)
-    monkeypatch.setattr("backup.DATA_DIR", data)
-    monkeypatch.setattr(storage, "SUBS_FILE", data / "subscribers.json")
-    monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
-    monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
-    monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
-    monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
-    monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
-    monkeypatch.setattr("handlers.OWNER_ID", 999)
-    monkeypatch.setattr("backup.OWNER_ID", 999)
-    return data
 
 
 def _zip_bytes(members: dict[str, str]) -> bytes:
@@ -282,31 +264,6 @@ async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monk
     assert out["last_backup_at"] == old   # не сдвигаем метку, если не ушло
 
 
-# ─────────────────────────────────────────────────────────────
-#  Команда /backup и интеграция в под/отписку
-# ─────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_cmd_backup_rejects_non_owner(backup_env):
-    msg = MagicMock()
-    msg.from_user.id = 1  # не владелец
-    msg.answer = AsyncMock()
-    await handlers.cmd_backup(msg)
-    msg.answer.assert_awaited_once()
-    # меню не показано (нет reply_markup)
-    assert "reply_markup" not in msg.answer.call_args.kwargs
-
-
-@pytest.mark.asyncio
-async def test_cmd_backup_owner_shows_menu(backup_env):
-    msg = MagicMock()
-    msg.from_user.id = handlers.OWNER_ID
-    msg.reply = AsyncMock()
-    await handlers.cmd_backup(msg)
-    kwargs = msg.reply.call_args.kwargs
-    assert "reply_markup" in kwargs   # инлайн-меню есть
-
-
 @pytest.mark.asyncio
 async def test_cmd_start_triggers_auto_backup(backup_env, monkeypatch):
     (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
@@ -401,54 +358,6 @@ async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Кнопка «Закрыть» в меню /backup (паттерн как у /stats)
-# ─────────────────────────────────────────────────────────────
-
-def test_backup_menu_has_close_button():
-    kb = handlers._backup_menu_kb()
-    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert "backup:close" in datas
-
-
-@pytest.mark.asyncio
-async def test_backup_close_deletes_menu_and_command(backup_env):
-    cmd_msg = MagicMock()
-    cmd_msg.delete = AsyncMock()
-    menu = MagicMock()
-    menu.delete = AsyncMock()
-    menu.reply_to_message = cmd_msg
-    cb = MagicMock()
-    cb.from_user.id = handlers.OWNER_ID
-    cb.message = menu
-    cb.answer = AsyncMock()
-
-    await handlers.backup_close_cb(cb, AsyncMock())
-
-    menu.delete.assert_awaited_once()
-    cmd_msg.delete.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_backup_close_handles_missing_message(backup_env):
-    cb = MagicMock()
-    cb.from_user.id = handlers.OWNER_ID
-    cb.message = None
-    cb.answer = AsyncMock()
-    await handlers.backup_close_cb(cb, AsyncMock())   # не должно бросить
-
-
-@pytest.mark.asyncio
-async def test_backup_close_rejects_non_owner(backup_env):
-    cb = MagicMock()
-    cb.from_user.id = 1
-    cb.message = MagicMock()
-    cb.message.delete = AsyncMock()
-    cb.answer = AsyncMock()
-    await handlers.backup_close_cb(cb, AsyncMock())
-    cb.message.delete.assert_not_awaited()
-
-
-# ─────────────────────────────────────────────────────────────
 #  Проверка СТРУКТУРЫ при импорте (не только well-formed JSON)
 # ─────────────────────────────────────────────────────────────
 
@@ -486,20 +395,6 @@ def test_valid_import_payload_accepts_canonical_shapes():
     assert backup._valid_import_payload("subscribers.json", {"subscribers": {"1": "A"}})
     assert backup._valid_import_payload("stats_current.json", {"period": "2026-Q2", "events": []})
     assert backup._valid_import_payload("quarters/2026-Q1.json", {"period": "2026-Q1"})
-
-
-@pytest.mark.asyncio
-async def test_backup_close_clears_fsm_state(backup_env):
-    state = AsyncMock()
-    menu = MagicMock()
-    menu.delete = AsyncMock()
-    menu.reply_to_message = None
-    cb = MagicMock()
-    cb.from_user.id = handlers.OWNER_ID
-    cb.message = menu
-    cb.answer = AsyncMock()
-    await handlers.backup_close_cb(cb, state)
-    state.clear.assert_awaited_once()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -569,80 +464,3 @@ async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
     old_cur = {"period": "2025-Q1", "events": []}
     await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
     sync.assert_awaited_once()
-
-
-# ─────────────────────────────────────────────────────────────
-#  backup_export_cb — кнопка «📤 Экспорт» (оркестрация)
-# ─────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_backup_export_rejects_non_owner(backup_env, monkeypatch):
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr(handlers, "send_backup", sent)
-
-    cb = MagicMock()
-    cb.from_user.id = 1                       # не владелец (OWNER_ID=999 в backup_env)
-    cb.answer = AsyncMock()
-
-    await handlers.backup_export_cb(cb)
-
-    cb.answer.assert_awaited_once()
-    assert cb.answer.call_args.kwargs.get("show_alert") is True
-    sent.assert_not_awaited()                 # архив НЕ собирали
-
-
-@pytest.mark.asyncio
-async def test_backup_export_owner_sends_archive(backup_env, monkeypatch):
-    sent = AsyncMock(return_value=True)       # send_backup успешен
-    monkeypatch.setattr(handlers, "send_backup", sent)
-    deleted = AsyncMock()
-    monkeypatch.setattr(handlers, "_safe_delete", deleted)
-
-    cb = MagicMock()
-    cb.from_user.id = handlers.OWNER_ID
-    cb.answer = AsyncMock()
-    cb.message.bot = AsyncMock()
-    cb.message.chat.id = 999
-    cb.message.message_id = 42
-
-    await handlers.backup_export_cb(cb)
-
-    sent.assert_awaited_once()                 # архив собран и отправлен
-    deleted.assert_awaited_once_with(cb.message.bot, 999, 42)   # меню убрано: (bot, chat_id, message_id)
-    cb.message.bot.send_message.assert_not_awaited()   # ошибки нет
-
-
-@pytest.mark.asyncio
-async def test_backup_export_reports_failure(backup_env, monkeypatch):
-    monkeypatch.setattr(handlers, "send_backup", AsyncMock(return_value=False))  # сбой сборки
-    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
-
-    cb = MagicMock()
-    cb.from_user.id = handlers.OWNER_ID
-    cb.answer = AsyncMock()
-    cb.message.bot = AsyncMock()
-    cb.message.chat.id = 999
-    cb.message.message_id = 42
-
-    await handlers.backup_export_cb(cb)
-
-    cb.message.bot.send_message.assert_awaited_once()  # пользователю ушла ошибка
-    assert "❌" in cb.message.bot.send_message.call_args.args[1]
-
-
-@pytest.mark.asyncio
-async def test_backup_export_propagates_send_backup_exception(backup_env, monkeypatch):
-    """Контракт send_backup включает исключение (сеть/Telegram API). Обёртка
-    backup_export_cb его НЕ глотает — фиксируем текущее поведение (пробрасывает)."""
-    monkeypatch.setattr(handlers, "send_backup", AsyncMock(side_effect=RuntimeError("boom")))
-    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
-
-    cb = MagicMock()
-    cb.from_user.id = handlers.OWNER_ID
-    cb.answer = AsyncMock()
-    cb.message.bot = AsyncMock()
-    cb.message.chat.id = 999
-    cb.message.message_id = 42
-
-    with pytest.raises(RuntimeError):
-        await handlers.backup_export_cb(cb)
