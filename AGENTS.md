@@ -11,7 +11,7 @@
 The former `main.py` monolith was split into single-responsibility modules with a strictly one-way (acyclic) dependency graph. `main.py` is now a thin entrypoint that wires the handlers into the Dispatcher.
 
 - `config.py` — env / local `.env` loading (`load_dotenv`), data-dir paths, logging, the shared `log`. Foundation: imports nothing project-local.
-- `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_utcnow`, `quarter_*`, `_safe_int`, `_safe_float`.
+- `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_utcnow`, `quarter_*`, `_safe_int`, `_safe_float`, `_normalize_homoglyphs`.
 - `storage.py` — file persistence: `_atomic_write`, load/save of every JSON state file, the `stats_all` in-memory cache.
 - `shiki_api.py` — Shikimori client + media domain: `fetch_*`, GraphQL, kind filters, `get_media_info`, `is_relevant`, translation dicts, and the central request throttle + 429 retry (`_throttle`/`_fetch`).
 - `messages.py` — message bank, history parsers, `build_message` / `build_favourite_message`, presentation formatters.
@@ -76,6 +76,7 @@ When adding or moving code, keep dependencies one-directional (import from lower
 - **Translations are baked into stored records.** `origin` and `rating` are translated via `_ORIGIN_RU`/`_RATING_RU` (`shiki_api.py`) at fetch time and saved into `titles`. Existing records keep their old value when a dict is edited — fixes apply only to new records (or after wiping the test bot's data). This was deliberately not refactored to "store-raw-translate-on-display" (deemed over-engineering for a rarely-changing dict).
 - **`/stats` and the quarterly report share `_build_quarter_section`** (`stats.py`). Editing it changes both at once — convenient, but verify both.
 - **`/stats all` and the quarterly report are built by DIFFERENT code** (`build_stats_all_messages` works from pre-computed aggregates; the quarterly section aggregates a title list on the fly). Shared look comes from common formatters (`_top_block`, `_fmt_mono_rows`, `_section_header`, `_score_dist_block` in `messages.py`), not shared builders.
+- **Shikimori mixes Latin homoglyphs into Russian history strings.** It sends Latin lookalikes (e.g. `c` U+0063 for Cyrillic `с`, `o` for `о`) inside Russian descriptions, so Cyrillic regexes miss and the score renders as `?`. The three history parsers (`extract_score_change`, `extract_score`, `classify_event` in `messages.py`) run input through `_normalize_homoglyphs()` (utils) right after `_strip_html`. It is a single scoped normalization pass — **not** per-site `[xy]` char classes (whack-a-mole): Latin twins are folded to Cyrillic only inside mixed-script tokens (token already has Cyrillic) plus the whitelisted standalone connectives `c→с`/`o→о`; pure-Latin tokens (English `rated`/`scored`, English titles, URLs) are left untouched. When adding a new Russian-matching parser, feed it normalized text; do not resurrect per-connective `[сc]` classes.
 - **Link previews are disabled selectively.** `/favs` passes `disable_preview=True` (its first link is always the same favourite); `/stats`, `/status`, and notifications keep previews (a card for the relevant title is desirable).
 
 ## Testing notes (two real prod bugs slipped through — smoke tests now guard against them)
