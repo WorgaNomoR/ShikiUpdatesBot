@@ -646,3 +646,177 @@ async def test_backup_export_propagates_send_backup_exception(backup_env, monkey
 
     with pytest.raises(RuntimeError):
         await handlers.backup_export_cb(cb)
+
+
+# ─────────────────────────────────────────────────────────────
+#  backup_import_cb — кнопка «📥 Импорт»: вход в FSM ожидания .zip
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_backup_import_rejects_non_owner(backup_env):
+    state = AsyncMock()
+    cb = MagicMock()
+    cb.from_user.id = 1                        # не владелец (OWNER_ID=999 в backup_env)
+    cb.answer = AsyncMock()
+
+    await handlers.backup_import_cb(cb, state)
+
+    cb.answer.assert_awaited_once()
+    assert cb.answer.call_args.kwargs.get("show_alert") is True
+    state.set_state.assert_not_awaited()       # в FSM не вошли
+    cb.message.edit_text.assert_not_called()   # промпт не трогали
+
+
+@pytest.mark.asyncio
+async def test_backup_import_enters_fsm_and_stores_prompt(backup_env):
+    state = AsyncMock()
+    cb = MagicMock()
+    cb.from_user.id = handlers.OWNER_ID
+    cb.answer = AsyncMock()
+    cb.message.edit_text = AsyncMock(return_value=MagicMock(message_id=555))
+
+    await handlers.backup_import_cb(cb, state)
+
+    cb.answer.assert_awaited_once()            # тихий ack (без show_alert)
+    state.set_state.assert_awaited_once_with(handlers.BackupStates.waiting_import_file)
+    cb.message.edit_text.assert_awaited_once()  # промпт-сообщение переписано
+    state.update_data.assert_awaited_once_with(prompt_msg_id=555)  # id промпта сохранён для чистки
+
+
+# ─────────────────────────────────────────────────────────────
+#  backup_receive — приём .zip и восстановление (оркестрация)
+# ─────────────────────────────────────────────────────────────
+
+def _import_message(*, owner=True, with_doc=True, file_name="backup.zip"):
+    """Мок Message для backup_receive. bot — AsyncMock (download awaitable),
+    answer — AsyncMock. Реальное состояние не трогаем: I/O-границы мокаются в тесте."""
+    msg = MagicMock()
+    msg.from_user.id = handlers.OWNER_ID if owner else 1
+    if with_doc:
+        msg.document.file_name = file_name
+    else:
+        msg.document = None
+    msg.chat.id = 999
+    msg.message_id = 77
+    msg.answer = AsyncMock()
+    msg.bot = AsyncMock()
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_backup_receive_rejects_non_owner(backup_env, monkeypatch):
+    restore = MagicMock()
+    monkeypatch.setattr(handlers, "restore_backup_zip", restore)
+    state = AsyncMock()
+    msg = _import_message(owner=False)
+
+    await handlers.backup_receive(msg, state)
+
+    msg.answer.assert_not_awaited()      # чужому — молчим (owner-only команда)
+    restore.assert_not_called()          # архив не трогали
+    state.clear.assert_not_awaited()     # чужой FSM не сбрасываем
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_doc, file_name", [
+    (False, None),          # вложения нет вовсе
+    (True, "state.txt"),    # не .zip
+    (True, "backup.zip.exe"),  # .zip лишь в середине имени — не суффикс
+])
+async def test_backup_receive_rejects_non_zip(backup_env, monkeypatch, with_doc, file_name):
+    restore = MagicMock()
+    monkeypatch.setattr(handlers, "restore_backup_zip", restore)
+    state = AsyncMock()
+    msg = _import_message(with_doc=with_doc, file_name=file_name)
+
+    await handlers.backup_receive(msg, state)
+
+    msg.answer.assert_awaited_once()     # подсказали, что ждём .zip
+    assert "📎" in msg.answer.call_args.args[0]
+    restore.assert_not_called()          # до восстановления не дошли
+
+
+@pytest.mark.asyncio
+async def test_backup_receive_download_failure(backup_env, monkeypatch):
+    restore = MagicMock()
+    monkeypatch.setattr(handlers, "restore_backup_zip", restore)
+    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+    state = AsyncMock()
+    state.get_data = AsyncMock(return_value={"prompt_msg_id": 55})
+    msg = _import_message()
+    msg.bot.download = AsyncMock(side_effect=RuntimeError("network down"))
+
+    await handlers.backup_receive(msg, state)
+
+    msg.answer.assert_awaited_once()
+    assert "❌" in msg.answer.call_args.args[0]
+    assert "скачать" in msg.answer.call_args.args[0]
+    restore.assert_not_called()          # битую загрузку в restore не потащили
+
+
+@pytest.mark.asyncio
+async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
+    monkeypatch.setattr(handlers, "restore_backup_zip",
+                        MagicMock(side_effect=ValueError("битый zip-архив")))
+    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+    state = AsyncMock()
+    state.get_data = AsyncMock(return_value={"prompt_msg_id": 55})
+    msg = _import_message()
+    msg.bot.download = AsyncMock()
+
+    await handlers.backup_receive(msg, state)
+
+    msg.answer.assert_awaited_once()
+    text = msg.answer.call_args.args[0]
+    assert "❌" in text and "не восстановлен" in text
+    assert "битый zip-архив" in text     # причина проброшена пользователю
+
+
+@pytest.mark.asyncio
+async def test_backup_receive_success_reports_and_refreshes(backup_env, monkeypatch):
+    monkeypatch.setattr(handlers, "restore_backup_zip", MagicMock(return_value={
+        "restored": ["subscribers.json", "stats_current.json"],
+        "skipped": ["junk.txt"],
+    }))
+    deleted = AsyncMock()
+    monkeypatch.setattr(handlers, "_safe_delete", deleted)
+    subs = MagicMock(return_value={1: "a", 2: "b"})
+    monkeypatch.setattr(handlers, "load_subscribers", subs)
+    state = AsyncMock()
+    state.get_data = AsyncMock(return_value={"prompt_msg_id": 55})
+    msg = _import_message()
+    msg.bot.download = AsyncMock()
+
+    await handlers.backup_receive(msg, state)
+
+    state.clear.assert_awaited_once()                    # FSM закрыт до восстановления
+    subs.assert_called_once()                            # refresh подписчиков (subscribers.json в restored)
+    deleted.assert_any_await(msg.bot, msg.chat.id, 55)   # промпт убран
+    deleted.assert_any_await(msg.bot, msg.chat.id, 77)   # само сообщение с архивом убрано
+    msg.answer.assert_awaited_once()
+    text = msg.answer.call_args.args[0]
+    assert "✅" in text and "👥" in text                 # отчёт + строка про подписчиков
+    assert "Пропущено" in text                           # skipped отражён
+
+
+@pytest.mark.asyncio
+async def test_backup_receive_success_without_subscribers_skips_refresh(backup_env, monkeypatch):
+    monkeypatch.setattr(handlers, "restore_backup_zip", MagicMock(return_value={
+        "restored": ["stats_current.json"],
+        "skipped": [],
+    }))
+    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+    subs = MagicMock(return_value={})
+    monkeypatch.setattr(handlers, "load_subscribers", subs)
+    state = AsyncMock()
+    state.get_data = AsyncMock(return_value={})          # промпта нет — ветка без чистки промпта
+    msg = _import_message()
+    msg.bot.download = AsyncMock()
+
+    await handlers.backup_receive(msg, state)
+
+    subs.assert_not_called()                             # subscribers.json не восстановлен → refresh не нужен
+    msg.answer.assert_awaited_once()
+    text = msg.answer.call_args.args[0]
+    assert "✅" in text and "👥" not in text             # отчёт без строки про подписчиков
+    assert "Пропущено" not in text                       # skipped пуст
