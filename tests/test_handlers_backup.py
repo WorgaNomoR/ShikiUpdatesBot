@@ -75,6 +75,7 @@ async def test_backup_close_handles_missing_message(backup_env):
     cb.message = None
     cb.answer = AsyncMock()
     await handlers.backup_close_cb(cb, AsyncMock())   # не должно бросить
+    cb.answer.assert_awaited_once()   # ack колбэка отправлен даже без message
 
 
 @pytest.mark.asyncio
