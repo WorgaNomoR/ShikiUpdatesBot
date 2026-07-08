@@ -10,7 +10,6 @@ import pytest
 from aiogram.enums import ParseMode
 
 import handlers
-import storage
 
 # ── /subs — только для владельца, ветвление по наличию подписчиков ──
 
@@ -122,22 +121,25 @@ async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
     msg.answer.assert_awaited_once()
 
 
-# ── /start — подписка зрителя + авто-бэкап состояния ──
+# ── /start — подписка зрителя + авто-бэкап (зеркало /stop) ──
 
 @pytest.mark.asyncio
-async def test_cmd_start_triggers_auto_backup(backup_env, monkeypatch):
-    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr("backup.send_backup", sent)
+async def test_cmd_start_subscribes_and_triggers_backup(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    saved = []
+    monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(dict(s)))
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
 
     msg = MagicMock()
     msg.chat.id = 555
-    msg.from_user.full_name = "Morpheus"
-    msg.from_user.id = 555
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+    msg.bot = MagicMock()
     msg.answer = AsyncMock()
-    msg.bot = AsyncMock()
 
     await handlers.cmd_start(msg)
 
-    assert storage.load_subscribers() == {555: "Morpheus"}   # подписка сохранена
-    sent.assert_awaited_once()                            # бэкап ушёл
+    assert saved == [{555: "Morpheus"}]            # новый подписчик сохранён
+    # полная сигнатура: (bot, chat_id, name, subscribed=True) — ловит subscribed-флип
+    backup.assert_awaited_once_with(msg.bot, 555, "Morpheus", subscribed=True)
+    msg.answer.assert_awaited_once()
