@@ -347,7 +347,8 @@ async def test_backup_receive_success_without_subscribers_skips_refresh(backup_e
         "restored": ["stats_current.json"],
         "skipped": [],
     }))
-    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+    deleted = AsyncMock()
+    monkeypatch.setattr(handlers, "_safe_delete", deleted)
     subs = MagicMock(return_value={})
     monkeypatch.setattr(handlers, "load_subscribers", subs)
     state = AsyncMock()
@@ -358,6 +359,7 @@ async def test_backup_receive_success_without_subscribers_skips_refresh(backup_e
     await handlers.backup_receive(msg, state)
 
     subs.assert_not_called()                             # subscribers.json не восстановлен → refresh не нужен
+    deleted.assert_awaited_once_with(msg.bot, msg.chat.id, 77)  # архив убран; промпта не было — второго _safe_delete нет
     msg.answer.assert_awaited_once()
     text = msg.answer.call_args.args[0]
     assert "✅" in text and "👥" not in text             # отчёт без строки про подписчиков
