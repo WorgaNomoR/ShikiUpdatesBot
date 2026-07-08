@@ -48,3 +48,25 @@ def _no_throttle(monkeypatch):
     monkeypatch.setattr(shiki_api, "_MIN_GAP", 0)
     shiki_api._throttle_lock = None
     shiki_api._last_request_at = 0.0
+
+
+# Общая фикстура редиректа состояния в tmp_path: используют и
+# test_backup.py (ядро), и test_handlers_backup.py (хендлеры /backup).
+@pytest.fixture
+def backup_env(tmp_path, monkeypatch):
+    """Редиректим пути состояния в tmp_path, чтобы тесты не трогали /data."""
+    import stats
+    import storage
+    data = tmp_path / "data"
+    quarters = data / "quarters"
+    quarters.mkdir(parents=True)
+    monkeypatch.setattr("backup.DATA_DIR", data)
+    monkeypatch.setattr(storage, "SUBS_FILE", data / "subscribers.json")
+    monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
+    monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
+    monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
+    monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
+    monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
+    monkeypatch.setattr("handlers.OWNER_ID", 999)
+    monkeypatch.setattr("backup.OWNER_ID", 999)
+    return data
