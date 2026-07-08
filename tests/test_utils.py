@@ -222,6 +222,14 @@ def test_normalize_uppercase_mixed_script():
     assert out == "Наруто"
 
 
+def test_normalize_uppercase_latin_y_to_cyrillic():
+    # Latin Y (U+0059) ↔ кириллическая У (U+0423) — пара конфузаблов.
+    src = "\u0059лыбка"  # Y латинская + русское «лыбка»
+    out = _normalize_homoglyphs(src)
+    assert out == "Улыбка"
+    assert out[0] == "\u0423"  # кириллическая У
+
+
 def test_normalize_pure_latin_word_untouched():
     # english-форматы и совпадающие с омоглифами латинские слова не трогаем.
     for word in ("rated", "scored", "co", "cop"):
