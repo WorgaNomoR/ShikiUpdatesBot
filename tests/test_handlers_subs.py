@@ -119,3 +119,27 @@ async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
     # полная сигнатура: (bot, chat_id, name, subscribed=False) — ловит перестановку
     backup.assert_awaited_once_with(msg.bot, 555, "Neo", subscribed=False)
     msg.answer.assert_awaited_once()
+
+
+# ── /start — подписка зрителя + авто-бэкап (зеркало /stop) ──
+
+@pytest.mark.asyncio
+async def test_cmd_start_subscribes_and_triggers_backup(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    saved = []
+    monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(dict(s)))
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+    msg.bot = MagicMock()
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_start(msg)
+
+    assert saved == [{555: "Morpheus"}]            # новый подписчик сохранён
+    # полная сигнатура: (bot, chat_id, name, subscribed=True) — ловит subscribed-флип
+    backup.assert_awaited_once_with(msg.bot, 555, "Morpheus", subscribed=True)
+    msg.answer.assert_awaited_once()

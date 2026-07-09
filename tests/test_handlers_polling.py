@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
+import backup
 import config
 import handlers
 import storage
@@ -434,3 +436,115 @@ async def test_cycle_fetches_favourites_once_and_threads_to_sync(monkeypatch):
     assert cnf_favs == [fav_payload]
     # Ресинку в цикле проброшен fav= (иначе sync_stats_all фетчил бы 2-й раз).
     assert sync_favs[-1] is fav_payload
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Ротация квартала (rotate_quarter_if_needed) — polling-флоу.
+#  Перенесено из test_backup.py (#35): цель — handlers.rotate_quarter_if_needed,
+#  а не backup.py. Матрица вход→выход ротации живёт здесь; test_backup.py
+#  мокал rotate на уровне цикла.
+# ═══════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
+    """Расхоловленный (#35): чистые хелперы _update_by_quarter и
+    build_quarterly_report_messages гоняем ВЖИВУЮ на реальном quarter-state;
+    мокаем только I/O-границы (send_backup, sync_stats_all сеть,
+    _save_quarter_snapshot / _load_prev_quarter_summary / save_stats_all файлы).
+    Так тест ловит реальную агрегацию by_quarter и содержимое отчёта, а не
+    только факт «rotate дёрнул send_backup»."""
+    # Реальный стейт прошлого квартала: 2 завершённых аниме, 1 манга, 1 дроп.
+    old_cur = {
+        "period": "2025-Q1",
+        "events": [
+            {"id": "1", "media": "anime", "event": "completed", "score": 10},
+            {"id": "2", "media": "anime", "event": "completed", "score": 8},
+            {"id": "3", "media": "manga", "event": "completed", "score": 9},
+            {"id": "4", "media": "anime", "event": "dropped"},
+        ],
+    }
+    stats_all = storage._empty_stats_all()
+    stats_all["anime"]["titles"] = {
+        "1": {"title": "Аниме-Один", "url": "/animes/1", "score": 10,
+              "year": 2020, "episodes_watched": 12},
+        "2": {"title": "Аниме-Два", "url": "/animes/2", "score": 8,
+              "year": 2021, "episodes_watched": 24},
+        "4": {"title": "Аниме-Дроп", "url": "/animes/4", "score": 0},
+    }
+    stats_all["manga"]["titles"] = {
+        "3": {"title": "Манга-Три", "url": "/mangas/3", "score": 9,
+              "year": 2019, "chapters_read": 100},
+    }
+
+    # I/O-границы — мок. sync_stats_all отдаёт наш реальный stats_all
+    # (сеть замокана, но данные настоящие → чистые хелперы работают на них).
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("handlers.send_backup", sent)
+    monkeypatch.setattr("handlers.sync_stats_all", AsyncMock(return_value=(stats_all, True)))
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary",
+                        lambda *a, **k: {"period": "2024-Q4",
+                                         "anime_completed": 1, "manga_completed": 0})
+    saved = {}
+    monkeypatch.setattr("handlers.save_stats_all", lambda sa: saved.update(sa=sa))
+    # Время — не I/O ротации: гасим паузу между сообщениями отчёта.
+
+    async def _no_sleep(*a, **k):
+        return None
+    monkeypatch.setattr(handlers.asyncio, "sleep", _no_sleep)
+
+    bot = AsyncMock()
+    await handlers.rotate_quarter_if_needed(bot, old_cur, {})   # resync=True (дефолт)
+
+    # 1. Бэкап-снапшот ротации ушёл владельцу с тегом.
+    sent.assert_awaited_once()
+    assert backup.BACKUP_TAG in sent.call_args.args[1]
+
+    # 2. _update_by_quarter реально агрегировал квартал в stats_all.
+    a_bq = saved["sa"]["anime"]["aggregates"]["by_quarter"]["2025-Q1"]
+    assert a_bq == {"completed": 2, "avg_score": 9.0, "episodes_watched": 36}
+    m_bq = saved["sa"]["manga"]["aggregates"]["by_quarter"]["2025-Q1"]
+    assert m_bq == {"completed": 1, "avg_score": 9.0, "chapters_read": 100}
+
+    # 3. build_quarterly_report_messages реально собрал отчёт (3 темы),
+    #    с заголовком, реальными тайтлами и блоком сравнения (prev-summary дан).
+    report = [c.args[1] for c in bot.send_message.await_args_list]
+    assert len(report) == 3
+    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in report[0]
+    assert "Аниме-Один" in report[0]
+    assert "Сравнение" in report[2]
+
+
+@pytest.mark.asyncio
+async def test_rotation_skips_resync_at_boot(backup_env, monkeypatch):
+    """resync=False (стартовый вызов): НЕ дёргаем sync_stats_all — polling_loop
+    уже дал свежий stats_all; второй синк своей сессией ловил 429 в день ротации."""
+    sync = AsyncMock(return_value=({}, True))
+    monkeypatch.setattr("handlers.sync_stats_all", sync)
+    monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
+
+    old_cur = {"period": "2025-Q1", "events": []}
+    await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {}, resync=False)
+    sync.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
+    """resync=True (дефолт, цикловой вызов): дёргаем sync_stats_all для свежих метаданных."""
+    sync = AsyncMock(return_value=({}, True))
+    monkeypatch.setattr("handlers.sync_stats_all", sync)
+    monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
+
+    old_cur = {"period": "2025-Q1", "events": []}
+    await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
+    sync.assert_awaited_once()
