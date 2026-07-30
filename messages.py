@@ -287,22 +287,6 @@ MESSAGES = {
         "✏️ {n} исправил оценку <b>{title}</b> с {old} на {new}. Бывает, мнения меняются.",
         "📊 Обновление рейтинга: <b>{title}</b> {old} → {new}. {n} не стоит на месте.",
     ],  # конец "score_changed"
-    "score_changed_up": [
-        "📈 <b>{title}</b>: {old} → {new}. {n} пересмотрел и проникся.",
-        "✨ Оценка <b>{title}</b> выросла с {old} до {new}. Раскрылось со временем — и {n} это оценил.",
-        "🤝 Второй шанс сработал: <b>{title}</b> получает от {n} уже {new}/10 вместо {old}.",
-        "🧠 Послевкусие оказалось приятнее: {n} поднял <b>{title}</b> с {old} до {new}.",
-        "🚀 <b>{title}</b> идёт на повышение: {old} → {new}. Уважение заслужено.",
-        "💡 Что-то щёлкнуло — и {n} повысил оценку <b>{title}</b> с {old} до {new}.",
-    ],
-    "score_changed_down": [
-        "📉 <b>{title}</b>: {old} → {new}. Похоже, {n} немного остыл.",
-        "🌧️ Оценка <b>{title}</b> снизилась с {old} до {new}. Без обид — просто настроение сменилось.",
-        "🫠 Магия чуть выветрилась: {n} опустил <b>{title}</b> с {old} до {new}.",
-        "🤷 Было {old}, стало {new}: {n} ещё подумал о <b>{title}</b> и решил быть честнее.",
-        "🧊 <b>{title}</b> теперь получает {new}/10 вместо {old}. Послевкусие немного остыло.",
-        "🔍 Чем дольше {n} думал о <b>{title}</b>, тем скромнее становилась оценка: {old} → {new}.",
-    ],
 
     # ────────────────────────────────
     #  ИЗБРАННОЕ — добавление в favourites
@@ -515,15 +499,10 @@ def build_message(entry: dict) -> str:
     score = None
 
     if event_type == "score_changed":
+        # Изменение оценки — берём шаблон из общего банка, не из anime/manga
         change = extract_score_change(description)
         old_score, new_score = change if change else (None, None)
-        if change is None or old_score == new_score:
-            key = "score_changed"
-        elif new_score > old_score:
-            key = "score_changed_up"
-        else:
-            key = "score_changed_down"
-        template = random.choice(MESSAGES[key])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
+        template = random.choice(MESSAGES["score_changed"])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = template.format(
             n=_DISPLAY_NAME_HTML,
             title=title,

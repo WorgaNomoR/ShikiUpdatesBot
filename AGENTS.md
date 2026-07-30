@@ -1,36 +1,5 @@
 # Agent guidance for ShikiUpdatesBot
 
-## Working agreements
-
-### Roles and technical authority
-- The maintainer defines product goals, desired behaviour, and priorities. Codex is the primary author and architect of the Python codebase and owns implementation and architectural decisions.
-- Do not assume the maintainer must resolve Python implementation details. Inspect the code and existing decisions directly. Ask only when a product choice, ambiguous intent, missing authority, or external coordination genuinely requires input.
-- If a request or suggestion would harm correctness, stability, maintainability, or the bot as a whole, say so explicitly before implementation, explain the concrete risk, and recommend a safer alternative. The final technical decision rests with Codex, within the maintainer's product intent and authorized scope.
-- Reject complexity that has no comparable practical benefit. Prefer the smallest robust design that preserves existing behaviour.
-
-### Canon and durable knowledge
-- Written canon beats conversational memory. Record important discoveries and decisions when they are made:
-  - agreed implementation work → a GitHub issue;
-  - process and architectural decisions → this `AGENTS.md`;
-  - raw, deferred, or rejected ideas (with the reason) → `ideas.md`.
-- Do not keep duplicate sources of truth. Current behaviour is established by code and tests; `AGENTS.md` records how the project is intended to work and why; GitHub issues are the canonical home of accepted active work; `ideas.md` is the pre-issue inbox and decision parking lot.
-- Codex may update `AGENTS.md` whenever needed without asking for permission, but must report material documentation changes in its handoff.
-- `AGENTS.md` is committed and synchronized through public GitHub. Never put secrets, tokens, private identifiers, machine-specific paths, or temporary session details in it.
-
-### Tests and verification
-- A behaviour change or bug fix ships with its tests. A regression test must fail against the broken/unpatched behaviour and pass with the fix.
-- Test placement mirrors production ownership: `test_<module>.py` for focused modules and `test_handlers_<flow>.py` for handler orchestration. Each symbol's input→output matrix has one authoritative test home.
-- Tests of module X verify X's logic and its handling of dependency contracts, including `None`, empty, and exceptional outcomes. They do not duplicate the dependency's own input→output matrix.
-- Run cheap pure helpers for real. Mock I/O boundaries such as Telegram, HTTP, storage/filesystem access, and clocks. Full aiogram surfaces may use `unittest.mock`; narrow contracts may use small hand-written stubs.
-- Before a PR, run `pytest tests/` and `ruff check .` when the environment provides the required interpreter and tools. If verification cannot run, report that limitation explicitly.
-
-### Work tracking and delivery
-- Once a design is agreed, create or update a GitHub issue immediately. Issues are written in English and should include appropriate labels, dependency notes such as `Blocked by: #N`, and an acceptance/test outline.
-- An issue tied to a branch starts with the branch name (`branch-name: summary`). PR titles do not carry the branch prefix: use an imperative squash-commit subject and put `Fixes #N` in the PR body.
-- Review feedback that arrives after merge approval and belongs to already planned work is added to the existing issue instead of being fixed opportunistically or duplicated in a new issue.
-- Codex should offer a consistent commit subject/body and, when useful, an English PR title/body. Git-mutating operations remain with the maintainer unless the maintainer explicitly requests otherwise; read-only inspection (`status`, `diff`, `log`, `show`) is allowed.
-- Start every distinct development stage in a fresh Codex task; a new branch always means a new task. Durable context must come from `AGENTS.md`, GitHub issues, `ideas.md`, and the code rather than an old chat.
-
 ## What this repository is
 - A Telegram bot that tracks a Shikimori user's history and favourites, then sends notifications to Telegram subscribers.
 - Collects statistics (genres, studios, scores, demographics, etc.) and sends the owner an automatic report at the start of each quarter.

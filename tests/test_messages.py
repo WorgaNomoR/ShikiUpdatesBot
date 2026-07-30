@@ -95,38 +95,14 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     assert msg == expected
 
 
-@pytest.mark.parametrize(("description", "bank_key", "old", "new"), [
-    ("изменена оценка с 5 на 8", "score_changed_up", 5, 8),
-    ("изменена оценка с 8 на 5", "score_changed_down", 8, 5),
-])
-def test_score_changed_selects_direction_bank(
-        monkeypatch, description, bank_key, old, new,
-):
+def test_score_changed_uses_change_bank(monkeypatch):
     monkeypatch.setattr(random, "choice", fixed_choice)
-    msg = build_message(make_entry(description))
-    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
-    expected = messages.MESSAGES[bank_key][0].format(
-        n=messages._DISPLAY_NAME_HTML, title=title, old=old, new=new,
-    )
-    assert msg == expected
-
-
-def test_score_changed_unparseable_uses_neutral_bank(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-    msg = build_message(make_entry("изменена оценка"))
+    msg = build_message(make_entry("изменена оценка с 5 на 8"))
     title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
     expected = messages.MESSAGES["score_changed"][0].format(
-        n=messages._DISPLAY_NAME_HTML, title=title, old="?", new="?",
+        n=messages._DISPLAY_NAME_HTML, title=title, old=5, new=8,
     )
     assert msg == expected
-
-
-@pytest.mark.parametrize("bank_key", ["score_changed_up", "score_changed_down"])
-def test_score_changed_direction_banks_are_nonempty_and_format_safe(bank_key):
-    templates = messages.MESSAGES[bank_key]
-    assert templates
-    for template in templates:
-        assert template.format(n="N", title="Title", old=5, new=8)
 
 
 def test_html_title_escape(monkeypatch):
