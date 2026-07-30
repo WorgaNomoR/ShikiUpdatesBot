@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 import random
 import time
+from string import Formatter
 
 import pytest
 
@@ -33,6 +34,38 @@ def make_entry(description, title="Ergo Proxy", url="/animes/790-ergo-proxy"):
         },
         "created_at": "2025-01-01T12:00:00.000Z",
     }
+
+
+def expected_score_changed_messages(bank_key, old, new):
+    n = messages._DISPLAY_NAME_HTML
+    title = "<b>Ergo Proxy</b>"
+    banks = {
+        "score_changed": {
+            f"🔄 {n} пересмотрел оценку {title}: было {old}, стало {new}. Что-то изменилось.",
+            f"🤔 {title} переоценено: {old} → {new}. {n} явно что-то переосмыслил.",
+            f"🏹 {old} → {new} за {title}. {n} дал второй шанс (или отобрал).",
+            f"⚖️ Весы справедливости скорректированы: {title} теперь {new}/10 вместо {old}.",
+            f"✏️ {n} исправил оценку {title} с {old} на {new}. Бывает, мнения меняются.",
+            f"📊 Обновление рейтинга: {title} {old} → {new}. {n} не стоит на месте.",
+        },
+        "score_changed_up": {
+            f"📈 {title}: {old} → {new}. {n} пересмотрел и проникся.",
+            f"✨ Оценка {title} выросла с {old} до {new}. Раскрылось со временем — и {n} это оценил.",
+            f"🤝 Второй шанс сработал: {title} получает от {n} уже {new}/10 вместо {old}.",
+            f"🧠 Послевкусие оказалось приятнее: {n} поднял {title} с {old} до {new}.",
+            f"🚀 {title} идёт на повышение: {old} → {new}. Уважение заслужено.",
+            f"💡 Что-то щёлкнуло — и {n} повысил оценку {title} с {old} до {new}.",
+        },
+        "score_changed_down": {
+            f"📉 {title}: {old} → {new}. Похоже, {n} немного остыл.",
+            f"🌧️ Оценка {title} снизилась с {old} до {new}. Без обид — просто настроение сменилось.",
+            f"🫠 Магия чуть выветрилась: {n} опустил {title} с {old} до {new}.",
+            f"🤷 Было {old}, стало {new}: {n} ещё подумал о {title} и решил быть честнее.",
+            f"🧊 {title} теперь получает {new}/10 вместо {old}. Послевкусие немного остыло.",
+            f"🔍 Чем дольше {n} думал о {title}, тем скромнее становилась оценка: {old} → {new}.",
+        },
+    }
+    return banks[bank_key]
 
 
 # ==========================================================
@@ -101,35 +134,42 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     ("изменена оценка с 5 на 5", "score_changed", 5, 5),
 ])
 def test_score_changed_selects_direction_bank(description, bank_key, old, new):
-    msg = build_message(make_entry(description))
-    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
-    expected = {
-        template.format(
-            n=messages._DISPLAY_NAME_HTML, title=title, old=old, new=new,
-        )
-        for template in messages.MESSAGES[bank_key]
-    }
-    assert msg in expected
+    msg = build_message(make_entry(description, url=""))
+    assert msg in expected_score_changed_messages(bank_key, old, new)
 
 
 def test_score_changed_unparseable_uses_neutral_bank():
-    msg = build_message(make_entry("изменена оценка"))
-    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
-    expected = {
+    msg = build_message(make_entry("изменена оценка", url=""))
+    assert msg in expected_score_changed_messages("score_changed", "?", "?")
+
+
+@pytest.mark.parametrize(
+    "bank_key", ["score_changed", "score_changed_up", "score_changed_down"],
+)
+def test_score_changed_banks_match_independent_expected_messages(bank_key):
+    templates = messages.MESSAGES[bank_key]
+    rendered = {
         template.format(
-            n=messages._DISPLAY_NAME_HTML, title=title, old="?", new="?",
+            n=messages._DISPLAY_NAME_HTML,
+            title="Ergo Proxy",
+            old=4,
+            new=9,
         )
-        for template in messages.MESSAGES["score_changed"]
+        for template in templates
     }
-    assert msg in expected
+    assert rendered == expected_score_changed_messages(bank_key, 4, 9)
 
 
 @pytest.mark.parametrize("bank_key", ["score_changed_up", "score_changed_down"])
-def test_score_changed_direction_banks_are_nonempty_and_format_safe(bank_key):
-    templates = messages.MESSAGES[bank_key]
-    assert templates
-    for template in templates:
-        assert template.format(n="N", title="Title", old=5, new=8)
+def test_score_changed_direction_templates_keep_required_fields(bank_key):
+    required_fields = {"title", "old", "new"}
+    for template in messages.MESSAGES[bank_key]:
+        fields = {
+            field_name
+            for _, field_name, _, _ in Formatter().parse(template)
+            if field_name
+        }
+        assert required_fields <= fields
 
 
 def test_html_title_escape(monkeypatch):
