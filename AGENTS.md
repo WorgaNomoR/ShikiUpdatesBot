@@ -3,9 +3,9 @@
 ## Working agreements
 
 ### Roles and technical authority
-- The maintainer defines product goals, desired behaviour, and priorities. Codex is the primary author and architect of the Python codebase and owns implementation and architectural decisions.
+- The maintainer defines product goals, desired behaviour, and priorities, and retains final authority over repository changes and merges. Codex is the primary author and technical lead for the Python codebase: within the approved scope, it makes implementation and architectural decisions by default without offloading Python details to the maintainer.
 - Do not assume the maintainer must resolve Python implementation details. Inspect the code and existing decisions directly. Ask only when a product choice, ambiguous intent, missing authority, or external coordination genuinely requires input.
-- If a request or suggestion would harm correctness, stability, maintainability, or the bot as a whole, say so explicitly before implementation, explain the concrete risk, and recommend a safer alternative. The final technical decision rests with Codex, within the maintainer's product intent and authorized scope.
+- If a request or proposed solution would harm correctness, stability, maintainability, security, or the bot as a whole, say so explicitly before implementation, explain the concrete risk, and recommend a safer alternative. The maintainer may accept or override a technical choice after reviewing the tradeoffs, while Codex remains responsible for the quality of what it authors and must not silently ship a knowingly harmful solution.
 - Reject complexity that has no comparable practical benefit. Prefer the smallest robust design that preserves existing behaviour.
 
 ### Canon and durable knowledge

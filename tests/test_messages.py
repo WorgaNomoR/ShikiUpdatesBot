@@ -98,27 +98,30 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
 @pytest.mark.parametrize(("description", "bank_key", "old", "new"), [
     ("изменена оценка с 5 на 8", "score_changed_up", 5, 8),
     ("изменена оценка с 8 на 5", "score_changed_down", 8, 5),
+    ("изменена оценка с 5 на 5", "score_changed", 5, 5),
 ])
-def test_score_changed_selects_direction_bank(
-        monkeypatch, description, bank_key, old, new,
-):
-    monkeypatch.setattr(random, "choice", fixed_choice)
+def test_score_changed_selects_direction_bank(description, bank_key, old, new):
     msg = build_message(make_entry(description))
     title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
-    expected = messages.MESSAGES[bank_key][0].format(
-        n=messages._DISPLAY_NAME_HTML, title=title, old=old, new=new,
-    )
-    assert msg == expected
+    expected = {
+        template.format(
+            n=messages._DISPLAY_NAME_HTML, title=title, old=old, new=new,
+        )
+        for template in messages.MESSAGES[bank_key]
+    }
+    assert msg in expected
 
 
-def test_score_changed_unparseable_uses_neutral_bank(monkeypatch):
-    monkeypatch.setattr(random, "choice", fixed_choice)
+def test_score_changed_unparseable_uses_neutral_bank():
     msg = build_message(make_entry("изменена оценка"))
     title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
-    expected = messages.MESSAGES["score_changed"][0].format(
-        n=messages._DISPLAY_NAME_HTML, title=title, old="?", new="?",
-    )
-    assert msg == expected
+    expected = {
+        template.format(
+            n=messages._DISPLAY_NAME_HTML, title=title, old="?", new="?",
+        )
+        for template in messages.MESSAGES["score_changed"]
+    }
+    assert msg in expected
 
 
 @pytest.mark.parametrize("bank_key", ["score_changed_up", "score_changed_down"])
