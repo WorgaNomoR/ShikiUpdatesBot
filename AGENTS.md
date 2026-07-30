@@ -3,12 +3,14 @@
 ## Working agreements
 
 ### Roles and technical authority
+
 - The maintainer defines product goals, desired behaviour, and priorities, and retains final authority over repository changes and merges. Codex is the primary author and technical lead for the Python codebase: within the approved scope, it makes implementation and architectural decisions by default without offloading Python details to the maintainer.
 - Do not assume the maintainer must resolve Python implementation details. Inspect the code and existing decisions directly. Ask only when a product choice, ambiguous intent, missing authority, or external coordination genuinely requires input.
 - If a request or proposed solution would harm correctness, stability, maintainability, security, or the bot as a whole, say so explicitly before implementation, explain the concrete risk, and recommend a safer alternative. The maintainer may accept or override a technical choice after reviewing the tradeoffs, while Codex remains responsible for the quality of what it authors and must not silently ship a knowingly harmful solution.
 - Reject complexity that has no comparable practical benefit. Prefer the smallest robust design that preserves existing behaviour.
 
 ### Canon and durable knowledge
+
 - Written canon beats conversational memory. Record important discoveries and decisions when they are made:
   - agreed implementation work → a GitHub issue;
   - process and architectural decisions → this `AGENTS.md`;
@@ -18,6 +20,7 @@
 - `AGENTS.md` is committed and synchronized through public GitHub. Never put secrets, tokens, private identifiers, machine-specific paths, or temporary session details in it.
 
 ### Tests and verification
+
 - A behaviour change or bug fix ships with its tests. A regression test must fail against the broken/unpatched behaviour and pass with the fix.
 - Test placement mirrors production ownership: `test_<module>.py` for focused modules and `test_handlers_<flow>.py` for handler orchestration. Each symbol's input→output matrix has one authoritative test home.
 - Tests of module X verify X's logic and its handling of dependency contracts, including `None`, empty, and exceptional outcomes. They do not duplicate the dependency's own input→output matrix.
@@ -25,6 +28,7 @@
 - Before a PR, run `pytest tests/` and `ruff check .` when the environment provides the required interpreter and tools. If verification cannot run, report that limitation explicitly.
 
 ### Work tracking and delivery
+
 - Once a design is agreed, create or update a GitHub issue immediately. Issues are written in English and should include appropriate labels, dependency notes such as `Blocked by: #N`, and an acceptance/test outline.
 - An issue tied to a branch starts with the branch name (`branch-name: summary`). PR titles do not carry the branch prefix: use an imperative squash-commit subject and put `Fixes #N` in the PR body.
 - Review feedback that arrives after merge approval and belongs to already planned work is added to the existing issue instead of being fixed opportunistically or duplicated in a new issue.

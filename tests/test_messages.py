@@ -129,9 +129,13 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
 
 
 @pytest.mark.parametrize(("description", "bank_key", "old", "new"), [
-    ("изменена оценка с 5 на 8", "score_changed_up", 5, 8),
-    ("изменена оценка с 8 на 5", "score_changed_down", 8, 5),
+    ("изменена оценка с 1 на 10", "score_changed_up", 1, 10),
+    ("изменена оценка с 10 на 1", "score_changed_down", 10, 1),
     ("изменена оценка с 5 на 5", "score_changed", 5, 5),
+    ("изменена оценка с 0 на 5", "score_changed", 0, 5),
+    ("изменена оценка с 5 на 0", "score_changed", 5, 0),
+    ("изменена оценка с 11 на 5", "score_changed", 11, 5),
+    ("изменена оценка с 5 на 11", "score_changed", 5, 11),
 ])
 def test_score_changed_selects_direction_bank(description, bank_key, old, new):
     msg = build_message(make_entry(description, url=""))

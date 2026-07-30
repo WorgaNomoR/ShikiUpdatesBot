@@ -517,7 +517,11 @@ def build_message(entry: dict) -> str:
     if event_type == "score_changed":
         change = extract_score_change(description)
         old_score, new_score = change if change else (None, None)
-        if change is None or old_score == new_score:
+        if (
+            change is None
+            or old_score == new_score
+            or not (1 <= old_score <= 10 and 1 <= new_score <= 10)
+        ):
             key = "score_changed"
         elif new_score > old_score:
             key = "score_changed_up"
