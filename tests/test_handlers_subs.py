@@ -10,6 +10,7 @@ import pytest
 from aiogram.enums import ParseMode
 
 import handlers
+from name_grammar import build_display_name_context
 
 # ── /subs — только для владельца, ветвление по наличию подписчиков ──
 
@@ -124,8 +125,34 @@ async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
 # ── /start — подписка зрителя + авто-бэкап (зеркало /stop) ──
 
 @pytest.mark.asyncio
+async def test_cmd_start_already_subscribed_uses_genitive_display_name(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {555: "Morpheus"})
+    monkeypatch.setattr(
+        handlers,
+        "DISPLAY_NAME_CONTEXT",
+        build_display_name_context("Костя"),
+    )
+
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_start(msg)
+
+    reply = msg.answer.call_args.args[0]
+    assert "об активности Кости" in reply
+    assert "активности Костя" not in reply
+
+
+@pytest.mark.asyncio
 async def test_cmd_start_subscribes_and_triggers_backup(monkeypatch):
     monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    monkeypatch.setattr(
+        handlers,
+        "DISPLAY_NAME_CONTEXT",
+        build_display_name_context("Костя"),
+    )
     saved = []
     monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(dict(s)))
     backup = AsyncMock()
@@ -143,3 +170,51 @@ async def test_cmd_start_subscribes_and_triggers_backup(monkeypatch):
     # полная сигнатура: (bot, chat_id, name, subscribed=True) — ловит subscribed-флип
     backup.assert_awaited_once_with(msg.bot, 555, "Morpheus", subscribed=True)
     msg.answer.assert_awaited_once()
+    reply = msg.answer.call_args.args[0]
+    assert "об активности Кости" in reply
+    assert "активности Костя" not in reply
+
+
+@pytest.mark.parametrize("already_subscribed", [True, False])
+@pytest.mark.asyncio
+async def test_cmd_start_escapes_html_names_in_both_branches(
+    monkeypatch,
+    already_subscribed,
+):
+    """Оба ответа /start включают HTML: экранируем имя подписчика и
+    склонённое DISPLAY_NAME, а в хранилище оставляем исходное имя."""
+    subscriber_name = "<Neo & Trinity>"
+    initial_subs = {555: subscriber_name} if already_subscribed else {}
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: initial_subs.copy())
+    monkeypatch.setattr(
+        handlers,
+        "DISPLAY_NAME_CONTEXT",
+        build_display_name_context("<Костя & Co>", "none"),
+    )
+    saved = []
+    monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(dict(s)))
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name=subscriber_name, id=555)
+    msg.bot = MagicMock()
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_start(msg)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.call_args.args[0]
+    assert "&lt;Neo &amp; Trinity&gt;" in reply
+    assert "&lt;Костя &amp; Co&gt;" in reply
+    assert subscriber_name not in reply
+    assert "<Костя & Co>" not in reply
+    assert msg.answer.call_args.kwargs == {"parse_mode": ParseMode.HTML}
+
+    if already_subscribed:
+        assert saved == []
+        backup.assert_not_awaited()
+    else:
+        assert saved == [{555: subscriber_name}]
+        backup.assert_awaited_once_with(msg.bot, 555, subscriber_name, subscribed=True)

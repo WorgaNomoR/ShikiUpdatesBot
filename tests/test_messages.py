@@ -6,7 +6,6 @@ from string import Formatter
 
 import pytest
 
-import config
 import messages
 from messages import (
     _strip_html,
@@ -18,6 +17,7 @@ from messages import (
     extract_score_change,
     format_rate_entry,
 )
+from name_grammar import DisplayNameContext, build_display_name_context
 from utils import _utcnow, h
 
 
@@ -36,8 +36,11 @@ def make_entry(description, title="Ergo Proxy", url="/animes/790-ergo-proxy"):
     }
 
 
+FALLBACK_NAME_CONTEXT = build_display_name_context("WorgaNomoR", "none")
+
+
 def expected_score_changed_messages(bank_key, old, new):
-    n = messages._DISPLAY_NAME_HTML
+    n = h(FALLBACK_NAME_CONTEXT.nominative)
     title = "<b>Ergo Proxy</b>"
     banks = {
         "score_changed": {
@@ -62,7 +65,7 @@ def expected_score_changed_messages(bank_key, old, new):
             f"🫠 Магия чуть выветрилась: {n} опустил {title} с {old} до {new}.",
             f"🤷 Было {old}, стало {new}: {n} ещё подумал о {title} и решил быть честнее.",
             f"🧊 {title} теперь получает {new}/10 вместо {old}. Послевкусие немного остыло.",
-            f"🔍 Чем дольше {n} думал о {title}, тем скромнее становилась оценка: {old} → {new}.",
+            f"🔍 Чем дольше {n} размышляет о {title}, тем скромнее становится оценка: {old} → {new}.",
         },
     }
     return banks[bank_key]
@@ -105,8 +108,10 @@ def test_build_message_completed_selects_bank_by_score(monkeypatch, desc, score,
     monkeypatch.setattr(random, "choice", fixed_choice)
     msg = build_message(make_entry(desc))
     title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
-    expected = messages.MESSAGES["anime"][key][0].format(
-        n=messages._DISPLAY_NAME_HTML, title=title,
+    expected = messages.format_name_template(
+        messages.MESSAGES["anime"][key][0],
+        messages.DISPLAY_NAME_CONTEXT,
+        title=title,
         score=score if score is not None else "?",
     )
     assert msg == expected
@@ -122,8 +127,11 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     }
     msg = build_message(entry)
     title = f'<a href="{messages.SHIKI_BASE_URL}/mangas/25-berserk">Berserk</a>'
-    expected = messages.MESSAGES["manga"]["completed_score_low"][0].format(
-        n=messages._DISPLAY_NAME_HTML, title=title, score=3,
+    expected = messages.format_name_template(
+        messages.MESSAGES["manga"]["completed_score_low"][0],
+        messages.DISPLAY_NAME_CONTEXT,
+        title=title,
+        score=3,
     )
     assert msg == expected
 
@@ -137,12 +145,20 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     ("изменена оценка с 11 на 5", "score_changed", 11, 5),
     ("изменена оценка с 5 на 11", "score_changed", 5, 11),
 ])
-def test_score_changed_selects_direction_bank(description, bank_key, old, new):
+def test_score_changed_selects_direction_bank(
+    monkeypatch,
+    description,
+    bank_key,
+    old,
+    new,
+):
+    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     msg = build_message(make_entry(description, url=""))
     assert msg in expected_score_changed_messages(bank_key, old, new)
 
 
-def test_score_changed_unparseable_uses_neutral_bank():
+def test_score_changed_unparseable_uses_neutral_bank(monkeypatch):
+    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     msg = build_message(make_entry("изменена оценка", url=""))
     assert msg in expected_score_changed_messages("score_changed", "?", "?")
 
@@ -150,11 +166,13 @@ def test_score_changed_unparseable_uses_neutral_bank():
 @pytest.mark.parametrize(
     "bank_key", ["score_changed", "score_changed_up", "score_changed_down"],
 )
-def test_score_changed_banks_match_independent_expected_messages(bank_key):
+def test_score_changed_banks_match_independent_expected_messages(monkeypatch, bank_key):
+    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     templates = messages.MESSAGES[bank_key]
     rendered = {
-        template.format(
-            n=messages._DISPLAY_NAME_HTML,
+        messages.format_name_template(
+            template,
+            FALLBACK_NAME_CONTEXT,
             title="Ergo Proxy",
             old=4,
             new=9,
@@ -226,10 +244,15 @@ def test_display_name_html_constant_is_escaped():
 
 
 def test_favourite_message_uses_escaped_name(monkeypatch):
-    monkeypatch.setattr(messages, "_DISPLAY_NAME_HTML", "Ампер&амп;Санд")
+    monkeypatch.setattr(
+        messages,
+        "DISPLAY_NAME_CONTEXT",
+        build_display_name_context("Ампер&Санд", "none"),
+    )
+    monkeypatch.setattr(random, "choice", fixed_choice)
     item = {"id": 1, "name": "X", "russian": "Икс", "url": None}
     text = messages.build_favourite_message("animes", item)
-    assert "Ампер&амп;Санд" in text
+    assert "Ампер&amp;Санд" in text
 
 
 def test_broadcast_header_escapes_special_chars(monkeypatch):
@@ -616,8 +639,14 @@ def test_build_favourite_message_link():
 def test_build_favourite_message_ranobe_uses_manga_bank():
     item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
     text = messages.build_favourite_message("ranobe", item)
-    manga_bank = [t.format(n=config.DISPLAY_NAME, title="Re:Zero")
-                  for t in messages.MESSAGES["favourites"]["manga"]]
+    manga_bank = [
+        messages.format_name_template(
+            template,
+            messages.DISPLAY_NAME_CONTEXT,
+            title="Re:Zero",
+        )
+        for template in messages.MESSAGES["favourites"]["manga"]
+    ]
     assert text in manga_bank
 
 
@@ -625,6 +654,118 @@ def test_build_favourite_message_industry_uses_person_bank():
     item = {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None}
     for cat in ("seyu", "mangakas", "producers", "people"):
         text = messages.build_favourite_message(cat, item)
-        person_bank = [t.format(n=config.DISPLAY_NAME, title="Риэ Такахаси")
-                       for t in messages.MESSAGES["favourites"]["person"]]
+        person_bank = [
+            messages.format_name_template(
+                template,
+                messages.DISPLAY_NAME_CONTEXT,
+                title="Риэ Такахаси",
+            )
+            for template in messages.MESSAGES["favourites"]["person"]
+        ]
         assert text in person_bank, f"категория {cat} ушла не в банк person"
+
+
+def _all_message_templates():
+    for value in messages.MESSAGES.values():
+        if isinstance(value, list):
+            yield from value
+            continue
+        for nested in value.values():
+            if isinstance(nested, list):
+                yield from nested
+                continue
+            for templates in nested.values():
+                yield from templates
+
+
+@pytest.mark.parametrize("gender", ["male", "female", None])
+def test_every_message_template_renders_with_independent_name_forms(gender):
+    context = DisplayNameContext(
+        nominative="ИМ",
+        genitive="РОД",
+        dative="ДАТ",
+        accusative="ВИН",
+        instrumental="ТВОР",
+        gender=gender,
+        inflection_applied=True,
+    )
+    allowed_fields = {
+        "n",
+        "n_gen",
+        "n_dat",
+        "n_acc",
+        "n_ins",
+        "g",
+        "title",
+        "score",
+        "old",
+        "new",
+    }
+
+    for template in _all_message_templates():
+        fields = {
+            field_name
+            for _, field_name, _, _ in Formatter().parse(template)
+            if field_name
+        }
+        assert fields <= allowed_fields, template
+        rendered = messages.format_name_template(
+            template,
+            context,
+            title="ТАЙТЛ",
+            score=8,
+            old=4,
+            new=8,
+        )
+        assert "{" not in rendered and "}" not in rendered, template
+        for field, sentinel in {
+            "n": "ИМ",
+            "n_gen": "РОД",
+            "n_dat": "ДАТ",
+            "n_acc": "ВИН",
+            "n_ins": "ТВОР",
+        }.items():
+            if field in fields:
+                assert sentinel in rendered, template
+
+
+def test_kostya_regressions_cover_every_required_case():
+    context = build_display_name_context("Костя")
+    rendered_bank = "\n".join(
+        messages.format_name_template(
+            template,
+            context,
+            title="ТАЙТЛ",
+            score=8,
+            old=4,
+            new=8,
+        )
+        for template in _all_message_templates()
+    )
+
+    assert "в руках у Кости" in rendered_bank
+    assert "не потрясло мир Кости" in rendered_bank
+    assert "Мнение Кости — тайна" in rendered_bank
+    assert "зацепило Костю" in rendered_bank
+    assert "легла Косте на душу" in rendered_bank
+    assert "не пережило встречи с Костей" in rendered_bank
+
+
+def test_female_context_selects_female_surrounding_grammar():
+    context = build_display_name_context("Анна")
+    samples = [
+        "{n} {g:посмотрел|посмотрела} <b>{title}</b>.",
+        "{n} {g:доволен|довольна}.",
+        "И это {g:его|её} право.",
+        "{n} {g:дочитал|дочитала} и {g:уставился|уставилась} в стену.",
+    ]
+
+    assert [
+        messages.format_name_template(template, context, title="ТАЙТЛ")
+        for template in samples
+    ] == [
+        "Анна посмотрела <b>ТАЙТЛ</b>.",
+        "Анна довольна.",
+        "И это её право.",
+        "Анна дочитала и уставилась в стену.",
+    ]
