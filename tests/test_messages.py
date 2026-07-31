@@ -25,8 +25,15 @@ def fixed_choice(seq):
     return seq[0]
 
 
-def make_entry(description, title="Ergo Proxy", url="/animes/790-ergo-proxy"):
-    return {
+def make_entry(
+    description,
+    title="Ergo Proxy",
+    url="/animes/790-ergo-proxy",
+    *,
+    target_type=None,
+    kind=None,
+):
+    entry = {
         "description": description,
         "target": {
             "name": title,
@@ -34,14 +41,22 @@ def make_entry(description, title="Ergo Proxy", url="/animes/790-ergo-proxy"):
         },
         "created_at": "2025-01-01T12:00:00.000Z",
     }
+    if target_type is not None:
+        entry["target"]["type"] = target_type
+    if kind is not None:
+        entry["target"]["kind"] = kind
+    return entry
 
 
 FALLBACK_NAME_CONTEXT = build_display_name_context("WorgaNomoR", "none")
 
 
-def expected_score_changed_messages(bank_key, old, new):
+def expected_score_changed_messages(bank_key, old, new, media_label=None):
     n = h(FALLBACK_NAME_CONTEXT.nominative)
-    title = "<b>Ergo Proxy</b>"
+    title_text = "Ergo Proxy"
+    if media_label is not None:
+        title_text += f" ({media_label})"
+    title = f"<b>{title_text}</b>"
     banks = {
         "score_changed": {
             f"🔄 {n} пересмотрел оценку {title}: было {old}, стало {new}. Что-то изменилось.",
@@ -136,6 +151,51 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     assert msg == expected
 
 
+@pytest.mark.parametrize("kind", ["novel", "ranobe"])
+@pytest.mark.parametrize(("description", "bank_key"), [
+    ("добавлено в список", "planned"),
+    ("читаю", "watching"),
+    ("перечитываю", "rewatching"),
+    ("брошено", "dropped"),
+    ("прочитано", "completed_no_score"),
+    ("оценено на 3", "completed_score_low"),
+    ("оценено на 6", "completed_score_mid"),
+    ("оценено на 9", "completed_score_high"),
+    ("оценено на 10", "completed_score_perfect"),
+])
+def test_build_message_ranobe_kinds_use_every_ranobe_bank(
+    monkeypatch,
+    kind,
+    description,
+    bank_key,
+):
+    sentinel_bank = {
+        key: [f"RANOBE:{key}"]
+        for key in (
+            "planned",
+            "watching",
+            "rewatching",
+            "dropped",
+            "completed_no_score",
+            "completed_score_low",
+            "completed_score_mid",
+            "completed_score_high",
+            "completed_score_perfect",
+        )
+    }
+    monkeypatch.setitem(messages.MESSAGES, "ranobe", sentinel_bank)
+    monkeypatch.setattr(random, "choice", fixed_choice)
+
+    msg = build_message(make_entry(
+        description,
+        url="/mangas/1-book",
+        target_type="Manga",
+        kind=kind,
+    ))
+
+    assert msg == f"RANOBE:{bank_key}"
+
+
 @pytest.mark.parametrize(("description", "bank_key", "old", "new"), [
     ("изменена оценка с 1 на 10", "score_changed_up", 1, 10),
     ("изменена оценка с 10 на 1", "score_changed_down", 10, 1),
@@ -154,13 +214,39 @@ def test_score_changed_selects_direction_bank(
 ):
     monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     msg = build_message(make_entry(description, url=""))
-    assert msg in expected_score_changed_messages(bank_key, old, new)
+    assert msg in expected_score_changed_messages(bank_key, old, new, "аниме")
 
 
 def test_score_changed_unparseable_uses_neutral_bank(monkeypatch):
     monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     msg = build_message(make_entry("изменена оценка", url=""))
-    assert msg in expected_score_changed_messages("score_changed", "?", "?")
+    assert msg in expected_score_changed_messages(
+        "score_changed", "?", "?", "аниме",
+    )
+
+
+@pytest.mark.parametrize(("target_type", "kind", "label"), [
+    ("Anime", "tv", "аниме"),
+    ("Manga", "manga", "манга"),
+    ("Manga", "novel", "ранобэ"),
+    ("Manga", "ranobe", "ранобэ"),
+])
+def test_score_changed_includes_human_media_label(
+    monkeypatch,
+    target_type,
+    kind,
+    label,
+):
+    monkeypatch.setattr(random, "choice", fixed_choice)
+
+    msg = build_message(make_entry(
+        "изменена оценка с 5 на 1",
+        url="",
+        target_type=target_type,
+        kind=kind,
+    ))
+
+    assert f"<b>Ergo Proxy ({label})</b>" in msg
 
 
 @pytest.mark.parametrize(
@@ -636,18 +722,39 @@ def test_build_favourite_message_link():
     assert "shikimori.io/animes/790-ergo-proxy" in msg
 
 
-def test_build_favourite_message_ranobe_uses_manga_bank():
+def test_build_favourite_message_ranobe_uses_dedicated_bank(monkeypatch):
     item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
-    text = messages.build_favourite_message("ranobe", item)
-    manga_bank = [
-        messages.format_name_template(
-            template,
-            messages.DISPLAY_NAME_CONTEXT,
-            title="Re:Zero",
-        )
-        for template in messages.MESSAGES["favourites"]["manga"]
+    monkeypatch.setitem(
+        messages.MESSAGES["favourites"],
+        "ranobe",
+        ["RANOBE FAVOURITE: <b>{title}</b>"],
+    )
+    monkeypatch.setitem(
+        messages.MESSAGES["favourites"],
+        "manga",
+        ["MANGA FAVOURITE: <b>{title}</b>"],
+    )
+
+    ranobe_text = messages.build_favourite_message("ranobe", item)
+    manga_text = messages.build_favourite_message("mangas", item)
+
+    assert ranobe_text == "RANOBE FAVOURITE: <b>Re:Zero</b>"
+    assert manga_text == "MANGA FAVOURITE: <b>Re:Zero</b>"
+
+
+def test_every_ranobe_template_is_explicit_and_avoids_manga_wording():
+    history_templates = [
+        template
+        for templates in messages.MESSAGES["ranobe"].values()
+        for template in templates
     ]
-    assert text in manga_bank
+    favourite_templates = messages.MESSAGES["favourites"]["ranobe"]
+
+    for template in [*history_templates, *favourite_templates]:
+        lowered = template.lower()
+        assert "ранобэ" in lowered, template
+        assert "манг" not in lowered, template
+        assert "художник" not in lowered, template
 
 
 def test_build_favourite_message_industry_uses_person_bank():

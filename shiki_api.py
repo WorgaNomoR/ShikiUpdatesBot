@@ -38,9 +38,11 @@ MANGA_BLOCKED_KINDS: frozenset[str] = frozenset({
     "doujin",   # Додзинси (любительское)
 })
 
+RANOBE_KINDS: frozenset[str] = frozenset({"novel", "ranobe"})
+
 MANGA_KINDS: frozenset[str] = frozenset({
-    "manga", "manhwa", "manhua", "novel", "ranobe", "one_shot", "doujin",
-})
+    "manga", "manhwa", "manhua", "one_shot", "doujin",
+}) | RANOBE_KINDS
 
 _FAV_CATEGORIES: tuple[str, ...] = (
     "animes", "mangas", "ranobe",
