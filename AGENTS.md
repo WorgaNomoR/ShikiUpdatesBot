@@ -38,7 +38,7 @@
 ## What this repository is
 - A Telegram bot that tracks a Shikimori user's history and favourites, then sends notifications to Telegram subscribers.
 - Collects statistics (genres, studios, scores, demographics, etc.) and sends the owner an automatic report at the start of each quarter.
-- Exposes `/stats` (button menu: current quarter / all-time) and `/favs` (favourite anime & manga) to all subscribers.
+- Exposes `/stats` (button menu: current quarter / all-time) and `/favs` (favourite anime, manga, ranobe, characters, and industry people) to all subscribers.
 - Uses `aiogram` for Telegram and `aiohttp` for HTTP (both client, for Shikimori, and server, for healthcheck).
 - Split into focused modules (see Architecture); tests live in `tests/`.
 
@@ -49,8 +49,8 @@ The former `main.py` monolith was split into single-responsibility modules with 
 - `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_utcnow`, `quarter_*`, `_safe_int`, `_safe_float`, `_normalize_homoglyphs`.
 - `name_grammar.py` — startup-time validation, gender detection, first-name inflection, immutable display-name context, and `{g:male|female}` formatting. Pure domain layer over `pytrovich`; imports nothing project-local.
 - `storage.py` — file persistence: `_atomic_write`, load/save of every JSON state file, the `stats_all` in-memory cache.
-- `shiki_api.py` — Shikimori client + media domain: `fetch_*`, GraphQL, kind filters, `get_media_info`, `is_relevant`, translation dicts, and the central request throttle + 429 retry (`_throttle`/`_fetch`).
-- `messages.py` — message bank, history parsers, `build_message` / `build_favourite_message`, presentation formatters.
+- `shiki_api.py` — Shikimori client + media domain: `fetch_*`, GraphQL, kind filters (including the shared `RANOBE_KINDS`), `get_media_info`, `is_relevant`, translation dicts, and the central request throttle + 429 retry (`_throttle`/`_fetch`).
+- `messages.py` — anime/manga/ranobe message banks, history parsers, `build_message` / `build_favourite_message`, presentation formatters.
 - `stats.py` — aggregation, `sync_stats_all`, current-quarter events, quarter snapshots, the `build_*_messages` report builders.
 - `backup.py` — `/backup` logic: zip build/restore, delivery to the owner, auto-backup triggers, the shutdown hook.
 - `handlers.py` — all aiogram commands & FSM, inline menus, broadcast, the notification cycle (`check_and_notify*`, `polling_loop`), quarter rotation, the owner-reachability gate.
@@ -97,6 +97,7 @@ When adding or moving code, keep dependencies one-directional (import from lower
 - **Stability is the top priority.** Every function must be exception-safe: unexpected or missing data must never crash the bot. Network fetches return `None` on any error (not empty collections) to distinguish API failures from genuinely empty results. Statistics degrade gracefully — a failed export or GraphQL call yields a report without enriched metadata rather than a crash.
 - Statistics data sources: user lists come from the public `list_export` JSON endpoints (no auth); title metadata comes from the GraphQL `animes`/`mangas` batch queries with `censored: false`. Do NOT reintroduce per-title REST calls or OAuth — these were evaluated and rejected.
 - A single relevance filter `is_relevant(media, kind)` governs BOTH notifications and statistics. OVA/ONA are kept; specials/clips/PV are dropped. Do not duplicate or diverge this logic.
+- **Ranobe is a presentation-only split from manga.** Shikimori history keeps ranobe in the manga domain; `get_media_info` therefore continues to return `media_type="manga"` for `kind in RANOBE_KINDS` (`novel`/`ranobe`), and statistics plus `is_relevant` must keep treating it as manga. `messages.build_message` uses the preserved `kind` only to select the dedicated `MESSAGES["ranobe"]` presentation bank; favourites route the API `ranobe` category to `MESSAGES["favourites"]["ranobe"]`. Score-change direction banks remain shared across all media and append a human label (`аниме`/`манга`/`ранобэ`) to the rendered title. Do not change the domain `media_type` to `ranobe` merely to choose wording.
 - **Anti-429 defense is layered (Shikimori limits: 5 req/sec burst + 90 req/min).** 429s have been a recurring source of breakage, so outgoing requests are guarded at several levels:
   - **Central request throttle (primary).** `shiki_api._throttle()` — one choke-point every request `await`s before firing: fixed min-gap (`_MIN_GAP`, 0.25s → ≤4 req/sec; monotonic mark + lazy `asyncio.Lock`; firewall-style, **no jitter**). All network fns route through a single `_fetch()` helper, so every call-site (incl. `/status` and a future multi-profile mode) is serialized.
   - **429 retry.** `_fetch` intercepts `429` *before* the status check, reads `Retry-After` (`_retry_after`: seconds form only; fallback `_RETRY_AFTER_DEFAULT`, capped `_RETRY_AFTER_CAP`), sleeps and retries up to `_MAX_429_RETRIES`. Data on a successful retry; exhaustion → `None`.
