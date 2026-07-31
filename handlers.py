@@ -1101,8 +1101,9 @@ async def cmd_start(message: Message) -> None:
 
     if chat_id in subs:
         await message.answer(
-            f"☕ Ты уже подписан, {name}! Буду слать новости об активности "
-            f"{DISPLAY_NAME_CONTEXT.genitive}."
+            f"☕ Ты уже подписан, {h(name)}! Буду слать новости об активности "
+            f"{h(DISPLAY_NAME_CONTEXT.genitive)}.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -1111,12 +1112,12 @@ async def cmd_start(message: Message) -> None:
     log.info("Новый подписчик: %s (chat_id=%d). Всего: %d.", name, chat_id, len(subs))
     await _backup_after_subscription(message.bot, chat_id, name, subscribed=True)
     reply = (
-        f"✅ Подписка оформлена, {name}!\n"
+        f"✅ Подписка оформлена, {h(name)}!\n"
         "Теперь ты будешь получать уведомления об активности "
-        f"{DISPLAY_NAME_CONTEXT.genitive} на Shikimori. \U0001f3cc\n\n"
+        f"{h(DISPLAY_NAME_CONTEXT.genitive)} на Shikimori. \U0001f3cc\n\n"
         "Чтобы отписаться — /stop"
     )
-    await message.answer(reply)
+    await message.answer(reply, parse_mode=ParseMode.HTML)
 
 
 async def cmd_stop(message: Message) -> None:
