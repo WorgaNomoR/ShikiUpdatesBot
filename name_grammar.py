@@ -103,10 +103,7 @@ def build_display_name_context(
     fallback = _fallback_context(name)
 
     if mode not in _GENDER_MODES:
-        logger.warning(
-            "Неподдерживаемый DISPLAY_NAME_GENDER=%r; грамматика имени отключена",
-            gender_mode,
-        )
+        logger.warning("Неподдерживаемый DISPLAY_NAME_GENDER; грамматика имени отключена")
         return fallback
     if mode == "none":
         return fallback

@@ -180,13 +180,15 @@ def test_ineligible_name_skips_dependency():
 
 
 def test_invalid_gender_mode_falls_back_and_logs_once(caplog):
+    invalid_mode = "private-marker<&>"
     with caplog.at_level(logging.WARNING):
-        context = build_display_name_context("Костя", "robot")
+        context = build_display_name_context("Костя", invalid_mode)
 
     assert context.genitive == "Костя"
     assert context.gender is None
     records = [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert len(records) == 1
+    assert invalid_mode not in caplog.text
 
 
 def test_detector_failure_falls_back_and_logs_once(caplog):
