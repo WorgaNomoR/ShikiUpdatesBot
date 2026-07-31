@@ -1,3 +1,4 @@
 aiogram
 aiohttp
 python-dotenv
+pytrovich>=0.2,<0.3

@@ -23,6 +23,8 @@ dotenv.load_dotenv = _no_dotenv
 os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("OWNER_ID", "123456")
 os.environ.setdefault("SHIKI_USER", "WNR")
+os.environ.pop("DISPLAY_NAME", None)
+os.environ.pop("DISPLAY_NAME_GENDER", None)
 
 # Изолированная папка данных — чтобы тесты не лезли в реальный /data
 _test_data_dir = Path(tempfile.gettempdir()) / "shikibot_test_data"

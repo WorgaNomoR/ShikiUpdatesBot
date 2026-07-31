@@ -53,7 +53,12 @@ SHIKI_BASE_URL = (os.environ.get("SHIKI_BASE_URL") or "https://shikimori.io").st
 
 # Отображаемое имя в сообщениях. Опционально через env DISPLAY_NAME;
 # по умолчанию — ник профиля (SHIKI_USER). Пустая строка/пробелы → фолбэк.
-DISPLAY_NAME   = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
+DISPLAY_NAME = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
+# Автоопределение пола и склонение поддерживаемых русских имён.
+# male/female — явный пол для неоднозначных имён; none — старое поведение.
+DISPLAY_NAME_GENDER = (
+    os.environ.get("DISPLAY_NAME_GENDER", "auto").strip().lower() or "auto"
+)
 
 CHECK_INTERVAL        = _int_env("CHECK_INTERVAL", 15 * 60)          # проверка истории, сек (15 мин)
 ERROR_NOTIFY_INTERVAL = _int_env("ERROR_NOTIFY_INTERVAL", 30 * 60)   # антиспам уведомлений об ошибке

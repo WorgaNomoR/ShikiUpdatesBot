@@ -32,7 +32,7 @@
 - Once a design is agreed, create or update a GitHub issue immediately. Issues are written in English and should include appropriate labels, dependency notes such as `Blocked by: #N`, and an acceptance/test outline.
 - An issue tied to a branch starts with the branch name (`branch-name: summary`). PR titles do not carry the branch prefix: use an imperative squash-commit subject and put `Fixes #N` in the PR body.
 - Review feedback that arrives after merge approval and belongs to already planned work is added to the existing issue instead of being fixed opportunistically or duplicated in a new issue.
-- Codex should offer a consistent commit subject/body and, when useful, an English PR title/body. Git-mutating operations remain with the maintainer unless the maintainer explicitly requests otherwise; read-only inspection (`status`, `diff`, `log`, `show`) is allowed.
+- Codex should offer a consistent commit subject/body and, when useful, an English PR title and body. Git-mutating operations remain with the maintainer unless the maintainer explicitly requests otherwise; read-only inspection (`status`, `diff`, `log`, `show`) is allowed.
 - Start every distinct development stage in a fresh Codex task; a new branch always means a new task. Durable context must come from `AGENTS.md`, GitHub issues, `ideas.md`, and the code rather than an old chat.
 
 ## What this repository is
@@ -47,6 +47,7 @@ The former `main.py` monolith was split into single-responsibility modules with 
 
 - `config.py` — env / local `.env` loading (`load_dotenv`), data-dir paths, logging, the shared `log`. Foundation: imports nothing project-local.
 - `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_utcnow`, `quarter_*`, `_safe_int`, `_safe_float`, `_normalize_homoglyphs`.
+- `name_grammar.py` — startup-time validation, gender detection, first-name inflection, immutable display-name context, and `{g:male|female}` formatting. Pure domain layer over `pytrovich`; imports nothing project-local.
 - `storage.py` — file persistence: `_atomic_write`, load/save of every JSON state file, the `stats_all` in-memory cache.
 - `shiki_api.py` — Shikimori client + media domain: `fetch_*`, GraphQL, kind filters, `get_media_info`, `is_relevant`, translation dicts, and the central request throttle + 429 retry (`_throttle`/`_fetch`).
 - `messages.py` — message bank, history parsers, `build_message` / `build_favourite_message`, presentation formatters.
@@ -71,6 +72,7 @@ graph TD
     stats --> messages
     stats --> shiki_api
     stats --> storage
+    messages --> name_grammar
     messages --> shiki_api
     backup --> storage
     storage --> base["config + utils (foundation)"]
@@ -87,7 +89,8 @@ When adding or moving code, keep dependencies one-directional (import from lower
 - `tests/` — pytest coverage for storage, notifications, parsers, statistics, backup, the polling loop, the owner-gate, and Telegram send behaviour.
 
 ## Key patterns and conventions
-- Environment variables (read in `config.py`, with local `.env` support via `load_dotenv`; a clear startup error names any missing required one): **required** — `BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`. **Optional with defaults** — `DISPLAY_NAME` (defaults to the `SHIKI_USER` nick), `SHIKI_BASE_URL`, `CHECK_INTERVAL`, `ERROR_NOTIFY_INTERVAL`, `FULL_SYNC_INTERVAL`, `DATA_DIR` (`/data`), `PORT` (`8080`).
+- Environment variables (read in `config.py`, with local `.env` support via `load_dotenv`; a clear startup error names any missing required one): **required** — `BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`. **Optional with defaults** — `DISPLAY_NAME` (defaults to the `SHIKI_USER` nick), `DISPLAY_NAME_GENDER` (`auto`; also `male`, `female`, `none`), `SHIKI_BASE_URL`, `CHECK_INTERVAL`, `ERROR_NOTIFY_INTERVAL`, `FULL_SYNC_INTERVAL`, `DATA_DIR` (`/data`), `PORT` (`8080`).
+- Display-name morphology runs once when `messages.py` initializes. Only Russian first names made of Cyrillic letters with optional hyphen-separated components are eligible. `auto` requires a confident `pytrovich` gender; ambiguous/ineligible names and every dependency failure fall back to the raw name in all cases plus masculine template alternatives. `male`/`female` force grammar; `none` skips morphology. Templates keep `{n}` nominative and use `{n_gen}`, `{n_dat}`, `{n_acc}`, `{n_ins}` plus `{g:male|female}`. Every selected form is HTML-escaped after inflection.
 - The bot stores state in JSON files under `DATA_DIR`: `seen_ids.json`, `subscribers.json`, `seen_favourites.json`, `stats_all.json`, `stats_current.json`, and snapshots in `quarters/`; `stats_current.json` additionally holds `last_backup_at`, the weekly auto-backup marker.
 - All file writes go through `_atomic_write()` (temp file + `os.replace()`) for crash safety.
 - All Telegram messages use `ParseMode.HTML`; user-facing strings from the API are escaped via `h()` (`html.escape`).
@@ -122,6 +125,7 @@ When adding or moving code, keep dependencies one-directional (import from lower
 
 ## Typical developer tasks
 - Update message templates or event classification: the message bank and parsers live in `messages.py`.
+- Update display-name cases or gender agreement: grammar rules and formatting live in `name_grammar.py`; template case/gender tags live in `messages.py`.
 - Fix parser edge cases for Shikimori descriptions and score extraction (`messages.py`).
 - Extend statistics aggregation or report formatting: `stats.py` (`build_*_messages`, `recompute_aggregates`, `_build_quarter_section`) and the `_top_block`/`_fmt_*` formatters in `messages.py`.
 - Add a new report type to the `/stats` menu: append one entry to `_STATS_MENU` in `handlers.py` (callback key, label, async builder, row) — keyboard and dispatch update automatically.

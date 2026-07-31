@@ -75,6 +75,11 @@ def test_config_display_name_falls_back_to_shiki_user():
     assert config.DISPLAY_NAME == config.SHIKI_USER
 
 
+def test_config_display_name_gender_defaults_to_auto():
+    import config
+    assert config.DISPLAY_NAME_GENDER == "auto"
+
+
 def test_config_intervals_have_int_defaults():
     import config
     assert isinstance(config.CHECK_INTERVAL, int)
