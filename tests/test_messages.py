@@ -107,7 +107,7 @@ def test_build_message_completed_selects_bank_by_score(monkeypatch, desc, score,
     title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
     expected = messages.format_name_template(
         messages.MESSAGES["anime"][key][0],
-        messages._DISPLAY_NAME_CONTEXT,
+        messages.DISPLAY_NAME_CONTEXT,
         title=title,
         score=score if score is not None else "?",
     )
@@ -126,7 +126,7 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     title = f'<a href="{messages.SHIKI_BASE_URL}/mangas/25-berserk">Berserk</a>'
     expected = messages.format_name_template(
         messages.MESSAGES["manga"]["completed_score_low"][0],
-        messages._DISPLAY_NAME_CONTEXT,
+        messages.DISPLAY_NAME_CONTEXT,
         title=title,
         score=3,
     )
@@ -160,7 +160,7 @@ def test_score_changed_banks_match_independent_expected_messages(bank_key):
     rendered = {
         messages.format_name_template(
             template,
-            messages._DISPLAY_NAME_CONTEXT,
+            messages.DISPLAY_NAME_CONTEXT,
             title="Ergo Proxy",
             old=4,
             new=9,
@@ -234,7 +234,7 @@ def test_display_name_html_constant_is_escaped():
 def test_favourite_message_uses_escaped_name(monkeypatch):
     monkeypatch.setattr(
         messages,
-        "_DISPLAY_NAME_CONTEXT",
+        "DISPLAY_NAME_CONTEXT",
         build_display_name_context("Ампер&Санд", "none"),
     )
     monkeypatch.setattr(random, "choice", fixed_choice)
@@ -630,7 +630,7 @@ def test_build_favourite_message_ranobe_uses_manga_bank():
     manga_bank = [
         messages.format_name_template(
             template,
-            messages._DISPLAY_NAME_CONTEXT,
+            messages.DISPLAY_NAME_CONTEXT,
             title="Re:Zero",
         )
         for template in messages.MESSAGES["favourites"]["manga"]
@@ -645,7 +645,7 @@ def test_build_favourite_message_industry_uses_person_bank():
         person_bank = [
             messages.format_name_template(
                 template,
-                messages._DISPLAY_NAME_CONTEXT,
+                messages.DISPLAY_NAME_CONTEXT,
                 title="Риэ Такахаси",
             )
             for template in messages.MESSAGES["favourites"]["person"]

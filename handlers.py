@@ -39,6 +39,7 @@ from config import (
 from healthcheck import heartbeat
 from messages import (
     BROADCAST_HEADER,
+    DISPLAY_NAME_CONTEXT,
     build_favourite_message,
     build_message,
     build_startup_snapshot,
@@ -1100,7 +1101,8 @@ async def cmd_start(message: Message) -> None:
 
     if chat_id in subs:
         await message.answer(
-            f"☕ Ты уже подписан, {name}! Буду слать новости о {DISPLAY_NAME}."
+            f"☕ Ты уже подписан, {name}! Буду слать новости об активности "
+            f"{DISPLAY_NAME_CONTEXT.genitive}."
         )
         return
 
@@ -1110,7 +1112,8 @@ async def cmd_start(message: Message) -> None:
     await _backup_after_subscription(message.bot, chat_id, name, subscribed=True)
     reply = (
         f"✅ Подписка оформлена, {name}!\n"
-        f"Теперь ты будешь получать уведомления об активности {DISPLAY_NAME} на Shikimori. \U0001f3cc\n\n"
+        "Теперь ты будешь получать уведомления об активности "
+        f"{DISPLAY_NAME_CONTEXT.genitive} на Shikimori. \U0001f3cc\n\n"
         "Чтобы отписаться — /stop"
     )
     await message.answer(reply)

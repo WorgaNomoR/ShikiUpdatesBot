@@ -359,11 +359,11 @@ MESSAGES = {
 
 # Валидация, определение пола и склонение выполняются ровно один раз на импорте.
 # В самих билдерах остаются только выбор шаблона и безопасное форматирование.
-_DISPLAY_NAME_CONTEXT = build_display_name_context(
+DISPLAY_NAME_CONTEXT = build_display_name_context(
     DISPLAY_NAME,
     DISPLAY_NAME_GENDER,
 )
-_DISPLAY_NAME_HTML = format_name_template("{n}", _DISPLAY_NAME_CONTEXT)
+_DISPLAY_NAME_HTML = format_name_template("{n}", DISPLAY_NAME_CONTEXT)
 BROADCAST_HEADER = f"📢 <b>{_DISPLAY_NAME_HTML} говорит:</b>"
 
 
@@ -538,7 +538,7 @@ def build_message(entry: dict) -> str:
         template = random.choice(MESSAGES[key])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = format_name_template(
             template,
-            _DISPLAY_NAME_CONTEXT,
+            DISPLAY_NAME_CONTEXT,
             title=title,
             old=old_score if old_score is not None else "?",
             new=new_score if new_score is not None else "?",
@@ -559,7 +559,7 @@ def build_message(entry: dict) -> str:
         template = random.choice(bank[key])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = format_name_template(
             template,
-            _DISPLAY_NAME_CONTEXT,
+            DISPLAY_NAME_CONTEXT,
             title=title,
             score=score if score is not None else "?",
         )
@@ -568,7 +568,7 @@ def build_message(entry: dict) -> str:
         template = random.choice(bank[key])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = format_name_template(
             template,
-            _DISPLAY_NAME_CONTEXT,
+            DISPLAY_NAME_CONTEXT,
             title=title,
             score="?",
         )
@@ -611,7 +611,7 @@ def build_favourite_message(category: str, item: dict) -> str:
 
     text = format_name_template(
         random.choice(templates),  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
-        _DISPLAY_NAME_CONTEXT,
+        DISPLAY_NAME_CONTEXT,
         title=title,
     )
 
