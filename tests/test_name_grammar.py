@@ -141,16 +141,20 @@ def test_explicit_gender_makes_ambiguous_name_deterministic(
 
 
 def test_none_skips_dependency_and_preserves_masculine_fallback():
-    def fail_factory():
-        raise AssertionError("морфология не должна запускаться")
+    calls = []
+
+    def counting_factory():
+        calls.append(1)
+        raise RuntimeError("морфология не должна запускаться")
 
     context = build_display_name_context(
         "Костя",
         "none",
-        detector_factory=fail_factory,
-        maker_factory=fail_factory,
+        detector_factory=counting_factory,
+        maker_factory=counting_factory,
     )
 
+    assert calls == []
     assert context.inflection_applied is False
     assert context.gender is None
     assert context.genitive == "Костя"
@@ -158,14 +162,19 @@ def test_none_skips_dependency_and_preserves_masculine_fallback():
 
 
 def test_ineligible_name_skips_dependency():
-    def fail_factory():
-        raise AssertionError("морфология не должна запускаться")
+    calls = []
+
+    def counting_factory():
+        calls.append(1)
+        raise RuntimeError("морфология не должна запускаться")
 
     context = build_display_name_context(
         "WorgaNomoR",
-        detector_factory=fail_factory,
-        maker_factory=fail_factory,
+        detector_factory=counting_factory,
+        maker_factory=counting_factory,
     )
+
+    assert calls == []
     assert context.genitive == "WorgaNomoR"
     assert context.inflection_applied is False
 
