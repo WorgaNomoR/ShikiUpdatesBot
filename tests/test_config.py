@@ -2,6 +2,8 @@
 # Copyright (C) 2026  WorgaNomoR
 """Тесты config.py — хелперы окружения и чтение env (env-config фолд)."""
 
+import importlib
+
 import pytest
 
 from config import _int_env, _required_env
@@ -78,6 +80,22 @@ def test_config_display_name_falls_back_to_shiki_user():
 def test_config_display_name_gender_defaults_to_auto():
     import config
     assert config.DISPLAY_NAME_GENDER == "auto"
+
+
+@pytest.mark.parametrize(("raw_value", "expected"), [
+    (" FEMALE ", "female"),
+    ("   ", "auto"),
+])
+def test_config_display_name_gender_normalizes_env(monkeypatch, raw_value, expected):
+    import config
+
+    monkeypatch.setenv("DISPLAY_NAME_GENDER", raw_value)
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.DISPLAY_NAME_GENDER == expected
+    finally:
+        monkeypatch.delenv("DISPLAY_NAME_GENDER", raising=False)
+        importlib.reload(config)
 
 
 def test_config_intervals_have_int_defaults():

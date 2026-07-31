@@ -36,8 +36,11 @@ def make_entry(description, title="Ergo Proxy", url="/animes/790-ergo-proxy"):
     }
 
 
+FALLBACK_NAME_CONTEXT = build_display_name_context("WorgaNomoR", "none")
+
+
 def expected_score_changed_messages(bank_key, old, new):
-    n = messages._DISPLAY_NAME_HTML
+    n = h(FALLBACK_NAME_CONTEXT.nominative)
     title = "<b>Ergo Proxy</b>"
     banks = {
         "score_changed": {
@@ -142,12 +145,20 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     ("изменена оценка с 11 на 5", "score_changed", 11, 5),
     ("изменена оценка с 5 на 11", "score_changed", 5, 11),
 ])
-def test_score_changed_selects_direction_bank(description, bank_key, old, new):
+def test_score_changed_selects_direction_bank(
+    monkeypatch,
+    description,
+    bank_key,
+    old,
+    new,
+):
+    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     msg = build_message(make_entry(description, url=""))
     assert msg in expected_score_changed_messages(bank_key, old, new)
 
 
-def test_score_changed_unparseable_uses_neutral_bank():
+def test_score_changed_unparseable_uses_neutral_bank(monkeypatch):
+    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     msg = build_message(make_entry("изменена оценка", url=""))
     assert msg in expected_score_changed_messages("score_changed", "?", "?")
 
@@ -155,12 +166,13 @@ def test_score_changed_unparseable_uses_neutral_bank():
 @pytest.mark.parametrize(
     "bank_key", ["score_changed", "score_changed_up", "score_changed_down"],
 )
-def test_score_changed_banks_match_independent_expected_messages(bank_key):
+def test_score_changed_banks_match_independent_expected_messages(monkeypatch, bank_key):
+    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
     templates = messages.MESSAGES[bank_key]
     rendered = {
         messages.format_name_template(
             template,
-            messages.DISPLAY_NAME_CONTEXT,
+            FALLBACK_NAME_CONTEXT,
             title="Ergo Proxy",
             old=4,
             new=9,
