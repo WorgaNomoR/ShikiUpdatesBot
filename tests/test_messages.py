@@ -152,48 +152,46 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["novel", "ranobe"])
-@pytest.mark.parametrize(("description", "bank_key"), [
-    ("добавлено в список", "planned"),
-    ("читаю", "watching"),
-    ("перечитываю", "rewatching"),
-    ("брошено", "dropped"),
-    ("прочитано", "completed_no_score"),
-    ("оценено на 3", "completed_score_low"),
-    ("оценено на 6", "completed_score_mid"),
-    ("оценено на 9", "completed_score_high"),
-    ("оценено на 10", "completed_score_perfect"),
+@pytest.mark.parametrize(("description", "bank_key", "score"), [
+    ("добавлено в список", "planned", "?"),
+    ("читаю", "watching", "?"),
+    ("перечитываю", "rewatching", "?"),
+    ("брошено", "dropped", "?"),
+    ("прочитано", "completed_no_score", "?"),
+    ("оценено на 3", "completed_score_low", 3),
+    ("оценено на 6", "completed_score_mid", 6),
+    ("оценено на 9", "completed_score_high", 9),
+    ("оценено на 10", "completed_score_perfect", 10),
 ])
 def test_build_message_ranobe_kinds_use_every_ranobe_bank(
-    monkeypatch,
     kind,
     description,
     bank_key,
+    score,
 ):
-    sentinel_bank = {
-        key: [f"RANOBE:{key}"]
-        for key in (
-            "planned",
-            "watching",
-            "rewatching",
-            "dropped",
-            "completed_no_score",
-            "completed_score_low",
-            "completed_score_mid",
-            "completed_score_high",
-            "completed_score_perfect",
+    relative_url = "/mangas/1-book"
+    title = (
+        f'<a href="{messages.SHIKI_BASE_URL}{relative_url}">Ergo Proxy</a>'
+    )
+    expected_messages = {
+        messages.format_name_template(
+            template,
+            messages.DISPLAY_NAME_CONTEXT,
+            title=title,
+            score=score,
         )
+        for template in messages.MESSAGES["ranobe"][bank_key]
     }
-    monkeypatch.setitem(messages.MESSAGES, "ranobe", sentinel_bank)
-    monkeypatch.setattr(random, "choice", fixed_choice)
 
     msg = build_message(make_entry(
         description,
-        url="/mangas/1-book",
+        url=relative_url,
         target_type="Manga",
         kind=kind,
     ))
 
-    assert msg == f"RANOBE:{bank_key}"
+    assert msg in expected_messages
+    assert msg.count(messages.SHIKI_BASE_URL) == 1
 
 
 @pytest.mark.parametrize(("description", "bank_key", "old", "new"), [
@@ -225,28 +223,27 @@ def test_score_changed_unparseable_uses_neutral_bank(monkeypatch):
     )
 
 
-@pytest.mark.parametrize(("target_type", "kind", "label"), [
-    ("Anime", "tv", "аниме"),
-    ("Manga", "manga", "манга"),
-    ("Manga", "novel", "ранобэ"),
-    ("Manga", "ranobe", "ранобэ"),
+@pytest.mark.parametrize(("target_type", "kind", "label", "url"), [
+    ("Anime", "tv", "аниме", "/animes/790-ergo-proxy"),
+    ("Manga", "manga", "манга", "/mangas/790-ergo-proxy"),
+    ("Manga", "novel", "ранобэ", "/mangas/790-ergo-proxy"),
+    ("Manga", "ranobe", "ранобэ", "/mangas/790-ergo-proxy"),
 ])
 def test_score_changed_includes_human_media_label(
-    monkeypatch,
     target_type,
     kind,
     label,
+    url,
 ):
-    monkeypatch.setattr(random, "choice", fixed_choice)
-
     msg = build_message(make_entry(
         "изменена оценка с 5 на 1",
-        url="",
+        url=url,
         target_type=target_type,
         kind=kind,
     ))
 
-    assert f"<b>Ergo Proxy ({label})</b>" in msg
+    assert f"Ergo Proxy</a> ({label})</b>" in msg
+    assert msg.count(messages.SHIKI_BASE_URL) == 1
 
 
 @pytest.mark.parametrize(
@@ -722,24 +719,39 @@ def test_build_favourite_message_link():
     assert "shikimori.io/animes/790-ergo-proxy" in msg
 
 
-def test_build_favourite_message_ranobe_uses_dedicated_bank(monkeypatch):
-    item = {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero", "url": None}
-    monkeypatch.setitem(
-        messages.MESSAGES["favourites"],
-        "ranobe",
-        ["RANOBE FAVOURITE: <b>{title}</b>"],
-    )
-    monkeypatch.setitem(
-        messages.MESSAGES["favourites"],
-        "manga",
-        ["MANGA FAVOURITE: <b>{title}</b>"],
-    )
+def test_build_favourite_message_ranobe_uses_dedicated_bank():
+    relative_url = "/mangas/74697-re-zero"
+    item = {
+        "id": 74697,
+        "name": "Re:Zero",
+        "russian": "Re:Zero",
+        "url": relative_url,
+    }
+    title = f'<a href="{messages.SHIKI_BASE_URL}{relative_url}">Re:Zero</a>'
+    ranobe_bank = {
+        messages.format_name_template(
+            template,
+            messages.DISPLAY_NAME_CONTEXT,
+            title=title,
+        )
+        for template in messages.MESSAGES["favourites"]["ranobe"]
+    }
+    manga_bank = {
+        messages.format_name_template(
+            template,
+            messages.DISPLAY_NAME_CONTEXT,
+            title=title,
+        )
+        for template in messages.MESSAGES["favourites"]["manga"]
+    }
 
     ranobe_text = messages.build_favourite_message("ranobe", item)
     manga_text = messages.build_favourite_message("mangas", item)
 
-    assert ranobe_text == "RANOBE FAVOURITE: <b>Re:Zero</b>"
-    assert manga_text == "MANGA FAVOURITE: <b>Re:Zero</b>"
+    assert ranobe_text in ranobe_bank
+    assert manga_text in manga_bank
+    assert ranobe_text.count(messages.SHIKI_BASE_URL) == 1
+    assert manga_text.count(messages.SHIKI_BASE_URL) == 1
 
 
 def test_every_ranobe_template_is_explicit_and_avoids_manga_wording():
@@ -752,6 +764,7 @@ def test_every_ranobe_template_is_explicit_and_avoids_manga_wording():
 
     for template in [*history_templates, *favourite_templates]:
         lowered = template.lower()
+        assert "{title}" in template, template
         assert "ранобэ" in lowered, template
         assert "манг" not in lowered, template
         assert "художник" not in lowered, template
