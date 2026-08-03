@@ -32,6 +32,7 @@
 - Once a design is agreed, create or update a GitHub issue immediately. Issues are written in English and should include appropriate labels, dependency notes such as `Blocked by: #N`, and an acceptance/test outline.
 - An issue tied to a branch starts with the branch name (`branch-name: summary`). PR titles do not carry the branch prefix: use an imperative squash-commit subject and put `Fixes #N` in the PR body.
 - Review feedback that arrives after merge approval and belongs to already planned work is added to the existing issue instead of being fixed opportunistically or duplicated in a new issue.
+- Before a PR, audit the final diff and issue against the durable documentation: `README.md` for user-facing behaviour, configuration, and deployment; `AGENTS.md` for process, architecture, and stability decisions; and `ideas.md` for deferred items that were implemented, rejected, superseded, or promoted to an issue. Update only the affected sources, avoid duplicating behaviour already established by code and tests, and report material documentation changes in the handoff.
 - Codex should offer a consistent commit subject/body and, when useful, an English PR title and body. Git-mutating operations remain with the maintainer unless the maintainer explicitly requests otherwise; read-only inspection (`status`, `diff`, `log`, `show`) is allowed.
 - Start every distinct development stage in a fresh Codex task; a new branch always means a new task. Durable context must come from `AGENTS.md`, GitHub issues, `ideas.md`, and the code rather than an old chat.
 
