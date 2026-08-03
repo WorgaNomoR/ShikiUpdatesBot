@@ -129,7 +129,7 @@ def test_is_relevant_manga_blocks_oneshot_doujin():
 
 
 def test_is_relevant_manga_allows_regular_kinds():
-    for kind in ("manga", "manhwa", "ranobe", "novel"):
+    for kind in ("manga", "manhwa", "light_novel", "novel", "ranobe"):
         assert shiki_api.is_relevant("manga", kind) is True, kind
 
 
@@ -148,8 +148,10 @@ def test_get_media_info_anime_by_type():
     assert get_media_info({"target": {"type": "Anime", "kind": "tv"}}) == ("anime", "tv")
 
 
-def test_get_media_info_novel_kind_is_manga():
-    assert get_media_info({"target": {"kind": "novel"}}) == ("manga", "novel")
+@pytest.mark.parametrize("kind", ["light_novel", "novel", "ranobe"])
+def test_get_media_info_ranobe_kind_is_manga(kind):
+    """Ranobe kind determines the manga domain even without target.type."""
+    assert get_media_info({"target": {"kind": kind}}) == ("manga", kind)
 
 
 def test_get_media_info_fallback_to_anime():
@@ -157,12 +159,6 @@ def test_get_media_info_fallback_to_anime():
 
 
 # ── Регрессии реальных прод-багов (были в test_media, сохранены как регрессии) ──
-
-def test_regression_manga_detected_by_kind():
-    """Исторический баг: манга определяется через kind, даже если type
-    отсутствует (напр. ранобэ приходит без target.type)."""
-    assert get_media_info({"target": {"kind": "ranobe"}}) == ("manga", "ranobe")
-
 
 def test_regression_manga_status_uses_watching():
     """Исторический баг /status: Shikimori шлёт watching/rewatching и для аниме,
