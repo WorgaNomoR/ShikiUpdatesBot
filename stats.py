@@ -64,11 +64,12 @@ _KIND_RU_ANIME: dict[str, str] = {
 }
 
 _KIND_RU_MANGA: dict[str, str] = {
-    "manga":  "Манга",
-    "manhwa": "Манхва",
-    "manhua": "Маньхуа",
-    "novel":  "Новеллы",
-    "ranobe": "Ранобэ",
+    "manga":       "Манга",
+    "manhwa":      "Манхва",
+    "manhua":      "Маньхуа",
+    "light_novel": "Ранобэ",
+    "novel":       "Новеллы",
+    "ranobe":      "Ранобэ",
 }
 
 

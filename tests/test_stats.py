@@ -294,6 +294,20 @@ def test_smoke_build_stats_all_returns_list():
     assert all(isinstance(m, str) for m in msgs)
     assert msgs  # непустой
 
+
+def test_stats_all_translates_light_novel_kind_as_ranobe():
+    stats = _populated_stats()
+    stats["manga"]["aggregates"].update({
+        "total_completed": 4,
+        "kinds": {"manga": 1, "light_novel": 3},
+    })
+
+    manga_message = smod.build_stats_all_messages(stats)[1]
+
+    assert "Манга" in manga_message
+    assert "Ранобэ" in manga_message
+    assert "light_novel" not in manga_message
+
 def test_smoke_build_favourites_returns_list():
     msgs = smod.build_favourites_messages(_populated_stats())
     assert isinstance(msgs, list) and all(isinstance(m, str) for m in msgs)
