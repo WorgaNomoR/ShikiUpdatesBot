@@ -26,8 +26,7 @@ from messages import (
     _pct_diff,
     _score_dist_block,
     _section_header,
-    _status_block_anime,
-    _status_block_manga,
+    _status_block,
     _top_block,
 )
 from shiki_api import (
@@ -838,7 +837,11 @@ def build_stats_all_messages(stats: dict) -> list[str]:
 
     # Детализация блоками
     for block in (
-        _status_block_anime(a_agg),
+        _status_block(
+            a_agg,
+            completed_label="Завершено",
+            watching_label="Смотрю",
+        ),
         _kinds_block(a_agg.get("kinds", {}), _KIND_RU_ANIME),
         _score_dist_block(a_agg.get("score_dist", {})),
         _top_block("🎭", "Жанры",      a_agg.get("genres", {}),      8, show_percent=True, total=a_total),
@@ -872,7 +875,11 @@ def build_stats_all_messages(stats: dict) -> list[str]:
         m.append(line)
 
     for block in (
-        _status_block_manga(m_agg),
+        _status_block(
+            m_agg,
+            completed_label="Прочитано",
+            watching_label="Читаю",
+        ),
         _kinds_block(m_agg.get("kinds", {}), _KIND_RU_MANGA),
         _score_dist_block(m_agg.get("score_dist", {})),
         _top_block("🎭", "Жанры",     m_agg.get("genres", {}),      8, show_percent=True, total=m_total),
@@ -887,6 +894,29 @@ def build_stats_all_messages(stats: dict) -> list[str]:
     return ["\n".join(a), "\n".join(m)]
 
 
+def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
+    """Общие входные данные текущего и итогового квартальных отчётов."""
+    events = cur.get("events", [])
+    return {
+        "anime": {
+            "completed": _quarter_titles(cur, stats_all, "anime", "completed"),
+            "dropped": _quarter_titles(cur, stats_all, "anime", "dropped"),
+            "planned": sum(
+                1 for event in events
+                if event["media"] == "anime" and event["event"] == "planned"
+            ),
+        },
+        "manga": {
+            "completed": _quarter_titles(cur, stats_all, "manga", "completed"),
+            "dropped": _quarter_titles(cur, stats_all, "manga", "dropped"),
+            "planned": sum(
+                1 for event in events
+                if event["media"] == "manga" and event["event"] == "planned"
+            ),
+        },
+    }
+
+
 def build_current_stats_messages(cur: dict, stats_all: dict) -> list[str]:
     """
     Список сообщений для /stats (текущий квартал), разбитый по темам:
@@ -895,21 +925,29 @@ def build_current_stats_messages(cur: dict, stats_all: dict) -> list[str]:
     """
     title_label = tracking_period_label(cur)
 
-    comp_a = _quarter_titles(cur, stats_all, "anime", "completed")
-    drop_a = _quarter_titles(cur, stats_all, "anime", "dropped")
-    comp_m = _quarter_titles(cur, stats_all, "manga", "completed")
-    drop_m = _quarter_titles(cur, stats_all, "manga", "dropped")
-
-    plan_a = sum(1 for e in cur.get("events", []) if e["media"] == "anime" and e["event"] == "planned")
-    plan_m = sum(1 for e in cur.get("events", []) if e["media"] == "manga" and e["event"] == "planned")
+    report = _prepare_quarter_report(cur, stats_all)
+    anime = report["anime"]
+    manga = report["manga"]
 
     header = f"📊 <b>Статистика {h(title_label)}</b>"
     if _is_partial_quarter(cur):
         header += "\n<i>⚠️ Квартал отслеживается не с самого начала — данные неполные.</i>"
 
     msgs: list[str] = []
-    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, _section_header("🎬", "АНИМЕ")))
-    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, _section_header("📚", "МАНГА")))
+    msgs.append(header + "\n\n" + _anime_block(
+        cur,
+        anime["completed"],
+        anime["dropped"],
+        anime["planned"],
+        _section_header("🎬", "АНИМЕ"),
+    ))
+    msgs.append(_manga_block(
+        cur,
+        manga["completed"],
+        manga["dropped"],
+        manga["planned"],
+        _section_header("📚", "МАНГА"),
+    ))
     return msgs
 
 
@@ -920,13 +958,9 @@ def build_quarterly_report_messages(cur: dict, stats_all: dict, prev_quarter: di
     """
     title_label = tracking_period_label(cur)
 
-    comp_a = _quarter_titles(cur, stats_all, "anime", "completed")
-    drop_a = _quarter_titles(cur, stats_all, "anime", "dropped")
-    comp_m = _quarter_titles(cur, stats_all, "manga", "completed")
-    drop_m = _quarter_titles(cur, stats_all, "manga", "dropped")
-
-    plan_a = sum(1 for e in cur.get("events", []) if e["media"] == "anime" and e["event"] == "planned")
-    plan_m = sum(1 for e in cur.get("events", []) if e["media"] == "manga" and e["event"] == "planned")
+    report = _prepare_quarter_report(cur, stats_all)
+    anime = report["anime"]
+    manga = report["manga"]
 
     header = f"📊 <b>КВАРТАЛЬНЫЙ ОТЧЁТ</b>\n<b>{h(title_label)}</b>"
     if _is_partial_quarter(cur):
@@ -935,10 +969,22 @@ def build_quarterly_report_messages(cur: dict, stats_all: dict, prev_quarter: di
     msgs: list[str] = []
 
     # Сообщение 1: заголовок + аниме
-    msgs.append(header + "\n\n" + _anime_block(cur, comp_a, drop_a, plan_a, _section_header("🎬", "АНИМЕ")))
+    msgs.append(header + "\n\n" + _anime_block(
+        cur,
+        anime["completed"],
+        anime["dropped"],
+        anime["planned"],
+        _section_header("🎬", "АНИМЕ"),
+    ))
 
     # Сообщение 2: манга
-    msgs.append(_manga_block(cur, comp_m, drop_m, plan_m, _section_header("📚", "МАНГА")))
+    msgs.append(_manga_block(
+        cur,
+        manga["completed"],
+        manga["dropped"],
+        manga["planned"],
+        _section_header("📚", "МАНГА"),
+    ))
 
     # Сообщение 3: сравнение + достижения
     extra: list[str] = []
@@ -947,17 +993,17 @@ def build_quarterly_report_messages(cur: dict, stats_all: dict, prev_quarter: di
         prev_m = prev_quarter.get("manga_completed", 0)
         prev_label = quarter_label(prev_quarter.get("period") or "прошлый квартал")
         extra.append(f"📈 <b>Сравнение с {h(prev_label)}:</b>")
-        extra.append(f"🎬 Аниме: {_pct_diff(len(comp_a), prev_a)}")
-        extra.append(f"📚 Манга: {_pct_diff(len(comp_m), prev_m)}")
+        extra.append(f"🎬 Аниме: {_pct_diff(len(anime['completed']), prev_a)}")
+        extra.append(f"📚 Манга: {_pct_diff(len(manga['completed']), prev_m)}")
 
-    all_comp = comp_a + comp_m
+    all_comp = anime["completed"] + manga["completed"]
     ach: list[str] = []
     tens = [r for r in all_comp if r.get("score") == 10]
     if len(tens) >= 3:
         ach.append(f"💎 Десятку поставил {len(tens)} раза — строгий критик!")
     elif len(tens) == 1:
         ach.append("💎 Один безоговорочный шедевр за квартал.")
-    total_drops = len(drop_a) + len(drop_m)
+    total_drops = len(anime["dropped"]) + len(manga["dropped"])
     if total_drops == 0 and all_comp:
         ach.append("🎯 Ни одного дропа — железная воля или идеальный вкус!")
     elif total_drops >= 5:

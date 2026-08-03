@@ -84,6 +84,7 @@ from storage import (
     save_subscribers,
 )
 from utils import (
+    _subscriber_link,
     current_quarter,
     h,
     quarter_label,
@@ -384,6 +385,27 @@ async def cmd_stats(message: Message) -> None:
     )
 
 
+async def _cleanup_inline_menu(message: Message | None) -> None:
+    """Удалить inline-меню и команду, на которую оно отвечает, если возможно."""
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except Exception as e:
+        log.debug("_cleanup_inline_menu: не удалось удалить меню: %s", e)
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception as e:
+            log.debug("_cleanup_inline_menu: не удалось убрать кнопки меню: %s", e)
+
+    command = getattr(message, "reply_to_message", None)
+    if command is not None:
+        try:
+            await command.delete()
+        except Exception as e:
+            log.debug("_cleanup_inline_menu: не удалось удалить команду: %s", e)
+
+
 async def stats_menu_cb(callback: CallbackQuery) -> None:
     """
     Обработчик нажатия кнопки в меню /stats.
@@ -397,29 +419,7 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
     # Обрабатываем до lookup'а, иначе ключ ушёл бы в ветку 'Неизвестный вариант'.
     if key == "close":
         await callback.answer()
-        # callback.message может быть None (сообщение старше 48 ч) или
-        # InaccessibleMessage — тогда удалять нечего, тихо выходим.
-        msg = callback.message
-        if msg is None:
-            return
-        # Убираем сообщение с кнопками...
-        try:
-            await msg.delete()
-        except Exception as e:
-            log.debug("stats_menu_cb: не удалось удалить меню при закрытии: %s", e)
-            try:
-                await msg.edit_reply_markup(reply_markup=None)
-            except Exception as e:
-                log.debug("stats_menu_cb: не удалось убрать кнопки меню: %s", e)
-        # ...и саму команду /stats, на которую меню отвечало (reply_to_message),
-        # чтобы чат остался чистым. getattr — на случай InaccessibleMessage без
-        # этого поля. В личке бот вправе удалять входящие; если нельзя — лог и дальше.
-        cmd_msg = getattr(msg, "reply_to_message", None)
-        if cmd_msg is not None:
-            try:
-                await cmd_msg.delete()
-            except Exception as e:
-                log.debug("stats_menu_cb: не удалось удалить команду /stats: %s", e)
+        await _cleanup_inline_menu(callback.message)
         return
 
     builder = _STATS_BUILDERS.get(key)
@@ -1023,23 +1023,7 @@ async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()   # защитно: Закрыть снимает любое повисшее FSM-состояние
     await callback.answer()
-    msg = callback.message
-    if msg is None:   # сообщение старше 48 ч / InaccessibleMessage — удалять нечего
-        return
-    try:
-        await msg.delete()
-    except Exception as e:
-        log.debug("backup_close_cb: не удалось удалить меню: %s", e)
-        try:
-            await msg.edit_reply_markup(reply_markup=None)
-        except Exception as e:
-            log.debug("backup_close_cb: не удалось убрать кнопки меню: %s", e)
-    cmd_msg = getattr(msg, "reply_to_message", None)
-    if cmd_msg is not None:
-        try:
-            await cmd_msg.delete()
-        except Exception as e:
-            log.debug("backup_close_cb: не удалось удалить команду /backup: %s", e)
+    await _cleanup_inline_menu(callback.message)
 
 
 async def backup_receive(message: Message, state: FSMContext) -> None:
@@ -1157,7 +1141,7 @@ async def cmd_subs(message: Message) -> None:
     count = len(subs)
     lines = [f"👥 Подписчиков: <b>{count}</b>", ""]
     for i, (cid, uname) in enumerate(subs.items(), 1):
-        lines.append(f"{i}. {h(uname)} (<code>{cid}</code>)")
+        lines.append(f"{i}. {_subscriber_link(cid, uname)}")
     sep = "\n"
     await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
 

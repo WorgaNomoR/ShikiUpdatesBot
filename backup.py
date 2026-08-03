@@ -30,8 +30,8 @@ from storage import (
     save_stats_current,
 )
 from utils import (
+    _subscriber_link,
     _utcnow,
-    h,
 )
 
 # ═══════════════════════════════════════════════════════════════════
@@ -51,13 +51,6 @@ _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
-
-
-def _subscriber_link(chat_id: int, name: str) -> str:
-    """Имя, обёрнутое в ссылку на профиль (tg://user?id=...).
-    Telegram открывает карточку пользователя по такой ссылке — владельцу
-    удобно сразу перейти к тому, кто подписался/отписался."""
-    return f'<a href="tg://user?id={chat_id}">{h(name)}</a>'
 
 
 def _backup_filename() -> str:

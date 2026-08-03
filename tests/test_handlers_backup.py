@@ -51,12 +51,10 @@ def test_backup_menu_has_close_button():
 
 
 @pytest.mark.asyncio
-async def test_backup_close_deletes_menu_and_command(backup_env):
-    cmd_msg = MagicMock()
-    cmd_msg.delete = AsyncMock()
+async def test_backup_close_delegates_cleanup(backup_env, monkeypatch):
+    cleanup = AsyncMock()
+    monkeypatch.setattr(handlers, "_cleanup_inline_menu", cleanup)
     menu = MagicMock()
-    menu.delete = AsyncMock()
-    menu.reply_to_message = cmd_msg
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
     cb.message = menu
@@ -64,18 +62,20 @@ async def test_backup_close_deletes_menu_and_command(backup_env):
 
     await handlers.backup_close_cb(cb, AsyncMock())
 
-    menu.delete.assert_awaited_once()
-    cmd_msg.delete.assert_awaited_once()
+    cleanup.assert_awaited_once_with(menu)
 
 
 @pytest.mark.asyncio
-async def test_backup_close_handles_missing_message(backup_env):
+async def test_backup_close_handles_missing_message(backup_env, monkeypatch):
+    cleanup = AsyncMock()
+    monkeypatch.setattr(handlers, "_cleanup_inline_menu", cleanup)
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
     cb.message = None
     cb.answer = AsyncMock()
-    await handlers.backup_close_cb(cb, AsyncMock())   # не должно бросить
+    await handlers.backup_close_cb(cb, AsyncMock())
     cb.answer.assert_awaited_once()   # ack колбэка отправлен даже без message
+    cleanup.assert_awaited_once_with(None)
 
 
 @pytest.mark.asyncio
@@ -90,7 +90,8 @@ async def test_backup_close_rejects_non_owner(backup_env):
 
 
 @pytest.mark.asyncio
-async def test_backup_close_clears_fsm_state(backup_env):
+async def test_backup_close_clears_fsm_state(backup_env, monkeypatch):
+    monkeypatch.setattr(handlers, "_cleanup_inline_menu", AsyncMock())
     state = AsyncMock()
     menu = MagicMock()
     menu.delete = AsyncMock()

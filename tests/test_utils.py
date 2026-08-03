@@ -17,6 +17,7 @@ from utils import (
     _rel_url,
     _safe_float,
     _safe_int,
+    _subscriber_link,
     _utcnow,
     current_quarter,
     h,
@@ -37,6 +38,19 @@ def test_h_coerces_non_str():
 
 def test_h_plain_text_unchanged():
     assert h("привет") == "привет"
+
+
+# ── _subscriber_link: безопасная ссылка на Telegram-профиль ───────
+def test_subscriber_link_wraps_name_in_tg_profile_link():
+    assert _subscriber_link(42, "Алиса") == (
+        '<a href="tg://user?id=42">Алиса</a>'
+    )
+
+
+def test_subscriber_link_escapes_html_in_name():
+    assert _subscriber_link(1, "<b>A&B</b>") == (
+        '<a href="tg://user?id=1">&lt;b&gt;A&amp;B&lt;/b&gt;</a>'
+    )
 
 
 # ── _rel_url: нормализация ссылок ──────────────────────────────────

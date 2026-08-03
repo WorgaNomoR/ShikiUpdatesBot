@@ -851,28 +851,19 @@ def _score_dist_block(dist: dict) -> list[str]:
     return ["📊 <b>Оценки</b>", body] if body else []
 
 
-def _status_block_anime(agg: dict) -> list[str]:
-    """Вертикальный блок статусов для аниме."""
+def _status_block(
+    agg: dict,
+    *,
+    completed_label: str,
+    watching_label: str,
+) -> list[str]:
+    """Вертикальный блок статусов с медиаспецифичными подписями."""
     rows = [
-        ("Завершено", agg.get("total_completed", 0)),
-        ("Брошено",   agg.get("total_dropped", 0)),
-        ("Смотрю",    agg.get("total_watching", 0)),
-        ("В планах",  agg.get("total_planned", 0)),
-        ("Отложено",  agg.get("total_on_hold", 0)),
-    ]
-    rows = [(n, c) for n, c in rows if c]  # скрываем нулевые
-    body = _fmt_mono_rows(rows)
-    return ["📦 <b>Статусы</b>", body] if body else []
-
-
-def _status_block_manga(agg: dict) -> list[str]:
-    """Вертикальный блок статусов для манги."""
-    rows = [
-        ("Прочитано", agg.get("total_completed", 0)),
-        ("Брошено",   agg.get("total_dropped", 0)),
-        ("Читаю",     agg.get("total_watching", 0)),
-        ("В планах",  agg.get("total_planned", 0)),
-        ("Отложено",  agg.get("total_on_hold", 0)),
+        (completed_label, agg.get("total_completed", 0)),
+        ("Брошено", agg.get("total_dropped", 0)),
+        (watching_label, agg.get("total_watching", 0)),
+        ("В планах", agg.get("total_planned", 0)),
+        ("Отложено", agg.get("total_on_hold", 0)),
     ]
     rows = [(n, c) for n, c in rows if c]
     body = _fmt_mono_rows(rows)

@@ -304,6 +304,24 @@ def test_smoke_build_current_returns_list():
     msgs = smod.build_current_stats_messages(cur, _populated_stats())
     assert isinstance(msgs, list) and all(isinstance(m, str) for m in msgs)
 
+
+def test_current_and_quarterly_reports_keep_distinct_structure():
+    cur = {"period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
+           "tracking_since": "2026-04-01T00:00:00", "events": []}
+
+    current = smod.build_current_stats_messages(cur, _populated_stats())
+    quarterly = smod.build_quarterly_report_messages(
+        cur,
+        _populated_stats(),
+        {"period": "2026-Q1", "anime_completed": 1, "manga_completed": 0},
+    )
+
+    assert len(current) == 2
+    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" not in current[0]
+    assert len(quarterly) == 3
+    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in quarterly[0]
+    assert "Сравнение" in quarterly[2]
+
 def test_smoke_empty_stats_no_crash():
     # Пустая структура не должна ронять билдеры
     empty = storage._empty_stats_all()
