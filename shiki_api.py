@@ -38,7 +38,10 @@ MANGA_BLOCKED_KINDS: frozenset[str] = frozenset({
     "doujin",   # Додзинси (любительское)
 })
 
-RANOBE_KINDS: frozenset[str] = frozenset({"novel", "ranobe"})
+RANOBE_KINDS: frozenset[str] = frozenset({
+    "light_novel", "novel",
+    "ranobe",  # defensive REST alias; отсутствует в текущем MangaKindEnum
+})
 
 MANGA_KINDS: frozenset[str] = frozenset({
     "manga", "manhwa", "manhua", "one_shot", "doujin",

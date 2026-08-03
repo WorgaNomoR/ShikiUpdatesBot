@@ -151,7 +151,7 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     assert msg == expected
 
 
-@pytest.mark.parametrize("kind", ["novel", "ranobe"])
+@pytest.mark.parametrize("kind", ["light_novel", "novel", "ranobe"])
 @pytest.mark.parametrize(("description", "bank_key", "score"), [
     ("добавлено в список", "planned", "?"),
     ("читаю", "watching", "?"),
@@ -226,6 +226,7 @@ def test_score_changed_unparseable_uses_neutral_bank(monkeypatch):
 @pytest.mark.parametrize(("target_type", "kind", "label", "url"), [
     ("Anime", "tv", "аниме", "/animes/790-ergo-proxy"),
     ("Manga", "manga", "манга", "/mangas/790-ergo-proxy"),
+    ("Manga", "light_novel", "ранобэ", "/mangas/790-ergo-proxy"),
     ("Manga", "novel", "ранобэ", "/mangas/790-ergo-proxy"),
     ("Manga", "ranobe", "ранобэ", "/mangas/790-ergo-proxy"),
 ])
