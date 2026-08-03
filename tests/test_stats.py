@@ -322,6 +322,68 @@ def test_current_and_quarterly_reports_keep_distinct_structure():
     assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in quarterly[0]
     assert "Сравнение" in quarterly[2]
 
+
+def test_prepare_quarter_report_collects_each_media_and_event_type():
+    anime_completed = {"title": "Anime completed", "score": 2}
+    anime_dropped = {"title": "Anime dropped", "score": 0}
+    manga_completed = {"title": "Manga completed", "score": 3}
+    manga_dropped = {"title": "Manga dropped", "score": 0}
+    stats = {
+        "anime": {"titles": {
+            "a-completed": anime_completed,
+            "a-dropped": anime_dropped,
+        }},
+        "manga": {"titles": {
+            "m-completed": manga_completed,
+            "m-dropped": manga_dropped,
+        }},
+    }
+    cur = {"events": [
+        {"id": "a-completed", "media": "anime", "event": "completed", "score": 9},
+        {"id": "a-dropped", "media": "anime", "event": "dropped"},
+        {"media": "anime", "event": "planned"},
+        {"id": "m-completed", "media": "manga", "event": "completed", "score": 8},
+        {"id": "m-dropped", "media": "manga", "event": "dropped"},
+        {"media": "manga", "event": "planned"},
+        None,
+        "broken",
+        {},
+    ]}
+
+    report = smod._prepare_quarter_report(cur, stats)
+
+    assert report == {
+        "anime": {
+            "completed": [{"title": "Anime completed", "score": 9}],
+            "dropped": [{"title": "Anime dropped", "score": 0}],
+            "planned": 1,
+        },
+        "manga": {
+            "completed": [{"title": "Manga completed", "score": 8}],
+            "dropped": [{"title": "Manga dropped", "score": 0}],
+            "planned": 1,
+        },
+    }
+
+
+def test_quarter_reports_treat_none_events_as_empty():
+    cur = {"period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
+           "tracking_since": "2026-04-01T00:00:00", "events": None}
+
+    prepared = smod._prepare_quarter_report(cur, _populated_stats())
+    current = smod.build_current_stats_messages(cur, _populated_stats())
+    quarterly = smod.build_quarterly_report_messages(
+        cur, _populated_stats(), prev_quarter=None,
+    )
+
+    assert prepared == {
+        "anime": {"completed": [], "dropped": [], "planned": 0},
+        "manga": {"completed": [], "dropped": [], "planned": 0},
+    }
+    assert len(current) == 2
+    assert len(quarterly) == 2
+    assert all(isinstance(message, str) for message in current + quarterly)
+
 def test_smoke_empty_stats_no_crash():
     # Пустая структура не должна ронять билдеры
     empty = storage._empty_stats_all()

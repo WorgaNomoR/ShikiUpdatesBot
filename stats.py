@@ -571,6 +571,14 @@ def record_current_event(
     return cur
 
 
+def _quarter_events(cur: dict) -> list[dict]:
+    """Валидные словари событий квартала; повреждённое состояние игнорируем."""
+    raw_events = cur.get("events")
+    if not isinstance(raw_events, list):
+        return []
+    return [event for event in raw_events if isinstance(event, dict)]
+
+
 def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[dict]:
     """
     Возвращает записи titles{} для тайтлов, у которых в текущем квартале
@@ -580,7 +588,7 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
     titles = (stats_all.get(media) or {}).get("titles") or {}
     out = []
     seen = set()
-    for ev in cur.get("events", []):
+    for ev in _quarter_events(cur):
         if ev.get("media") != media or ev.get("event") != event:
             continue
         tid = ev.get("id")
@@ -896,14 +904,15 @@ def build_stats_all_messages(stats: dict) -> list[str]:
 
 def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
     """Общие входные данные текущего и итогового квартальных отчётов."""
-    events = cur.get("events", [])
+    events = _quarter_events(cur)
     return {
         "anime": {
             "completed": _quarter_titles(cur, stats_all, "anime", "completed"),
             "dropped": _quarter_titles(cur, stats_all, "anime", "dropped"),
             "planned": sum(
                 1 for event in events
-                if event["media"] == "anime" and event["event"] == "planned"
+                if event.get("media") == "anime"
+                and event.get("event") == "planned"
             ),
         },
         "manga": {
@@ -911,7 +920,8 @@ def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
             "dropped": _quarter_titles(cur, stats_all, "manga", "dropped"),
             "planned": sum(
                 1 for event in events
-                if event["media"] == "manga" and event["event"] == "planned"
+                if event.get("media") == "manga"
+                and event.get("event") == "planned"
             ),
         },
     }
