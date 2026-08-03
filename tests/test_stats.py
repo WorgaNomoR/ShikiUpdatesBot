@@ -366,9 +366,16 @@ def test_prepare_quarter_report_collects_each_media_and_event_type():
     }
 
 
-def test_quarter_reports_treat_none_events_as_empty():
+@pytest.mark.parametrize("invalid_events", [
+    None,
+    "broken",
+    {"media": "anime", "event": "planned"},
+    42,
+    True,
+])
+def test_quarter_reports_treat_non_list_events_as_empty(invalid_events):
     cur = {"period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
-           "tracking_since": "2026-04-01T00:00:00", "events": None}
+           "tracking_since": "2026-04-01T00:00:00", "events": invalid_events}
 
     prepared = smod._prepare_quarter_report(cur, _populated_stats())
     current = smod.build_current_stats_messages(cur, _populated_stats())
