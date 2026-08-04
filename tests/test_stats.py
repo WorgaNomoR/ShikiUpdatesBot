@@ -442,6 +442,51 @@ def test_quarter_reports_treat_non_list_events_as_empty(invalid_events):
     assert len(quarterly) == 2
     assert all(isinstance(message, str) for message in current + quarterly)
 
+
+def test_quarter_reports_normalize_event_id_and_score_fields():
+    stats = _populated_stats()
+    stats["anime"]["titles"] = {
+        "1": {
+            **_anime_rec(score=2),
+            "title": "Valid completed",
+            "url": "/animes/1",
+        },
+    }
+    cur = {
+        "period": "2026-Q2",
+        "period_start": "2026-04-01T00:00:00",
+        "tracking_since": "2026-04-01T00:00:00",
+        "events": [
+            {
+                "id": ["1"],
+                "media": "anime",
+                "event": "completed",
+                "score": 10,
+            },
+            {
+                "id": 1,
+                "media": "anime",
+                "event": "completed",
+                "score": "9",
+            },
+        ],
+    }
+
+    prepared = smod._prepare_quarter_report(cur, stats)
+    reports = (
+        smod.build_current_stats_messages(cur, stats),
+        smod.build_quarterly_report_messages(cur, stats, prev_quarter=None),
+    )
+
+    assert prepared["anime"]["completed"] == [{
+        **stats["anime"]["titles"]["1"],
+        "score": 9,
+    }]
+    for messages_list in reports:
+        assert isinstance(messages_list, list)
+        assert all(isinstance(message, str) for message in messages_list)
+        assert "Средняя оценка: <b>9.0</b>" in messages_list[0]
+
 def test_smoke_empty_stats_no_crash():
     # Пустая структура не должна ронять билдеры
     empty = storage._empty_stats_all()

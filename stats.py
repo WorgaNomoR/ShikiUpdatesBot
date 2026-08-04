@@ -577,7 +577,20 @@ def _quarter_events(cur: dict) -> list[dict]:
     raw_events = cur.get("events")
     if not isinstance(raw_events, list):
         return []
-    return [event for event in raw_events if isinstance(event, dict)]
+    events = []
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+        normalized = dict(event)
+        if normalized.get("event") in ("completed", "dropped"):
+            tid = normalized.get("id")
+            if isinstance(tid, bool) or not isinstance(tid, (str, int)):
+                continue
+            normalized["id"] = str(tid)
+        if normalized.get("score") is not None:
+            normalized["score"] = _safe_int(normalized["score"])
+        events.append(normalized)
+    return events
 
 
 def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[dict]:
