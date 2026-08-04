@@ -307,7 +307,8 @@ def test_stats_all_translates_ranobe_kinds(kind):
 
     assert "Манга" in manga_message
     assert "Ранобэ" in manga_message
-    assert kind not in manga_message
+    assert "light_novel" not in manga_message
+    assert "ranobe" not in manga_message
 
 def test_smoke_build_favourites_returns_list():
     msgs = smod.build_favourites_messages(_populated_stats())
@@ -365,6 +366,8 @@ def test_quarter_report_links_contain_canonical_domain_once():
     )
 
     for messages_list in reports:
+        assert isinstance(messages_list, list)
+        assert all(isinstance(message, str) for message in messages_list)
         hrefs = re.findall(r'href="([^"]*)"', "\n".join(messages_list))
         assert hrefs == [
             "https://shikimori.io/animes/790-ergo-proxy",
