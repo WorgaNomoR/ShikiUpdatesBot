@@ -9,6 +9,7 @@
 
 Содержимое:
   • h / _rel_url            — экранирование HTML и нормализация ссылок;
+  • _subscriber_link        — безопасная Telegram-ссылка на подписчика;
   • _utcnow / quarter_*      — работа с датами и кварталами;
   • _safe_int / _safe_float  — аккуратное приведение типов из API.
 """
@@ -24,6 +25,11 @@ def h(text: str) -> str:
     Применять ко всем пользовательским данным из API перед вставкой в сообщение.
     """
     return html.escape(str(text))
+
+
+def _subscriber_link(chat_id: int, name: str) -> str:
+    """Имя как безопасная HTML-ссылка на Telegram-профиль пользователя."""
+    return f'<a href="tg://user?id={chat_id}">{h(name)}</a>'
 
 
 def _rel_url(url: str) -> str:

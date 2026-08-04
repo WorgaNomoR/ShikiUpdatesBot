@@ -294,6 +294,22 @@ def test_smoke_build_stats_all_returns_list():
     assert all(isinstance(m, str) for m in msgs)
     assert msgs  # непустой
 
+
+@pytest.mark.parametrize("kind", ["light_novel", "ranobe"])
+def test_stats_all_translates_ranobe_kinds(kind):
+    stats = _populated_stats()
+    stats["manga"]["aggregates"].update({
+        "total_completed": 4,
+        "kinds": {"manga": 1, kind: 3},
+    })
+
+    manga_message = smod.build_stats_all_messages(stats)[1]
+
+    assert "Манга" in manga_message
+    assert "Ранобэ" in manga_message
+    assert "light_novel" not in manga_message
+    assert "ranobe" not in manga_message
+
 def test_smoke_build_favourites_returns_list():
     msgs = smod.build_favourites_messages(_populated_stats())
     assert isinstance(msgs, list) and all(isinstance(m, str) for m in msgs)
@@ -303,6 +319,173 @@ def test_smoke_build_current_returns_list():
            "tracking_since": "2026-04-01T00:00:00", "events": []}
     msgs = smod.build_current_stats_messages(cur, _populated_stats())
     assert isinstance(msgs, list) and all(isinstance(m, str) for m in msgs)
+
+
+def test_current_and_quarterly_reports_keep_distinct_structure():
+    cur = {"period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
+           "tracking_since": "2026-04-01T00:00:00", "events": []}
+
+    current = smod.build_current_stats_messages(cur, _populated_stats())
+    quarterly = smod.build_quarterly_report_messages(
+        cur,
+        _populated_stats(),
+        {"period": "2026-Q1", "anime_completed": 1, "manga_completed": 0},
+    )
+
+    assert len(current) == 2
+    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" not in current[0]
+    assert len(quarterly) == 3
+    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in quarterly[0]
+    assert "Сравнение" in quarterly[2]
+
+
+def test_quarter_report_links_contain_canonical_domain_once():
+    stats = _populated_stats()
+    stats["anime"]["titles"] = {
+        "1": {
+            **_anime_rec(score=9),
+            "title": "Эрго Прокси",
+            "url": "https://shikimori.io/animes/790-ergo-proxy",
+        },
+    }
+    cur = {
+        "period": "2026-Q2",
+        "period_start": "2026-04-01T00:00:00",
+        "tracking_since": "2026-04-01T00:00:00",
+        "events": [{
+            "id": "1",
+            "media": "anime",
+            "event": "completed",
+            "score": 9,
+        }],
+    }
+
+    reports = (
+        smod.build_current_stats_messages(cur, stats),
+        smod.build_quarterly_report_messages(cur, stats, prev_quarter=None),
+    )
+
+    for messages_list in reports:
+        assert isinstance(messages_list, list)
+        assert all(isinstance(message, str) for message in messages_list)
+        hrefs = re.findall(r'href="([^"]*)"', "\n".join(messages_list))
+        assert hrefs == [
+            "https://shikimori.io/animes/790-ergo-proxy",
+        ]
+
+
+def test_prepare_quarter_report_collects_each_media_and_event_type():
+    anime_completed = {"title": "Anime completed", "score": 2}
+    anime_dropped = {"title": "Anime dropped", "score": 0}
+    manga_completed = {"title": "Manga completed", "score": 3}
+    manga_dropped = {"title": "Manga dropped", "score": 0}
+    stats = {
+        "anime": {"titles": {
+            "a-completed": anime_completed,
+            "a-dropped": anime_dropped,
+        }},
+        "manga": {"titles": {
+            "m-completed": manga_completed,
+            "m-dropped": manga_dropped,
+        }},
+    }
+    cur = {"events": [
+        {"id": "a-completed", "media": "anime", "event": "completed", "score": 9},
+        {"id": "a-dropped", "media": "anime", "event": "dropped"},
+        {"media": "anime", "event": "planned"},
+        {"id": "m-completed", "media": "manga", "event": "completed", "score": 8},
+        {"id": "m-dropped", "media": "manga", "event": "dropped"},
+        {"media": "manga", "event": "planned"},
+        None,
+        "broken",
+        {},
+    ]}
+
+    report = smod._prepare_quarter_report(cur, stats)
+
+    assert report == {
+        "anime": {
+            "completed": [{"title": "Anime completed", "score": 9}],
+            "dropped": [{"title": "Anime dropped", "score": 0}],
+            "planned": 1,
+        },
+        "manga": {
+            "completed": [{"title": "Manga completed", "score": 8}],
+            "dropped": [{"title": "Manga dropped", "score": 0}],
+            "planned": 1,
+        },
+    }
+
+
+@pytest.mark.parametrize("invalid_events", [
+    None,
+    "broken",
+    {"media": "anime", "event": "planned"},
+    42,
+    True,
+])
+def test_quarter_reports_treat_non_list_events_as_empty(invalid_events):
+    cur = {"period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
+           "tracking_since": "2026-04-01T00:00:00", "events": invalid_events}
+
+    prepared = smod._prepare_quarter_report(cur, _populated_stats())
+    current = smod.build_current_stats_messages(cur, _populated_stats())
+    quarterly = smod.build_quarterly_report_messages(
+        cur, _populated_stats(), prev_quarter=None,
+    )
+
+    assert prepared == {
+        "anime": {"completed": [], "dropped": [], "planned": 0},
+        "manga": {"completed": [], "dropped": [], "planned": 0},
+    }
+    assert len(current) == 2
+    assert len(quarterly) == 2
+    assert all(isinstance(message, str) for message in current + quarterly)
+
+
+def test_quarter_reports_normalize_event_id_and_score_fields():
+    stats = _populated_stats()
+    stats["anime"]["titles"] = {
+        "1": {
+            **_anime_rec(score=2),
+            "title": "Valid completed",
+            "url": "/animes/1",
+        },
+    }
+    cur = {
+        "period": "2026-Q2",
+        "period_start": "2026-04-01T00:00:00",
+        "tracking_since": "2026-04-01T00:00:00",
+        "events": [
+            {
+                "id": ["1"],
+                "media": "anime",
+                "event": "completed",
+                "score": 10,
+            },
+            {
+                "id": 1,
+                "media": "anime",
+                "event": "completed",
+                "score": "9",
+            },
+        ],
+    }
+
+    prepared = smod._prepare_quarter_report(cur, stats)
+    reports = (
+        smod.build_current_stats_messages(cur, stats),
+        smod.build_quarterly_report_messages(cur, stats, prev_quarter=None),
+    )
+
+    assert prepared["anime"]["completed"] == [{
+        **stats["anime"]["titles"]["1"],
+        "score": 9,
+    }]
+    for messages_list in reports:
+        assert isinstance(messages_list, list)
+        assert all(isinstance(message, str) for message in messages_list)
+        assert "Средняя оценка: <b>9.0</b>" in messages_list[0]
 
 def test_smoke_empty_stats_no_crash():
     # Пустая структура не должна ронять билдеры

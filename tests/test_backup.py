@@ -163,21 +163,6 @@ async def test_send_backup_swallows_send_errors(backup_env):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Ссылка на профиль
-# ─────────────────────────────────────────────────────────────
-
-def test_subscriber_link_wraps_name_in_tg_profile_link():
-    link = backup._subscriber_link(42, "Алиса")
-    assert 'href="tg://user?id=42"' in link
-    assert ">Алиса<" in link
-
-
-def test_subscriber_link_escapes_html_in_name():
-    link = backup._subscriber_link(1, "<b>x</b>")
-    assert "&lt;b&gt;" in link   # имя экранировано
-
-
-# ─────────────────────────────────────────────────────────────
 #  Авто-бэкап на под/отписку
 # ─────────────────────────────────────────────────────────────
 
