@@ -295,18 +295,19 @@ def test_smoke_build_stats_all_returns_list():
     assert msgs  # непустой
 
 
-def test_stats_all_translates_light_novel_kind_as_ranobe():
+@pytest.mark.parametrize("kind", ["light_novel", "ranobe"])
+def test_stats_all_translates_ranobe_kinds(kind):
     stats = _populated_stats()
     stats["manga"]["aggregates"].update({
         "total_completed": 4,
-        "kinds": {"manga": 1, "light_novel": 3},
+        "kinds": {"manga": 1, kind: 3},
     })
 
     manga_message = smod.build_stats_all_messages(stats)[1]
 
     assert "Манга" in manga_message
     assert "Ранобэ" in manga_message
-    assert "light_novel" not in manga_message
+    assert kind not in manga_message
 
 def test_smoke_build_favourites_returns_list():
     msgs = smod.build_favourites_messages(_populated_stats())
@@ -335,6 +336,39 @@ def test_current_and_quarterly_reports_keep_distinct_structure():
     assert len(quarterly) == 3
     assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in quarterly[0]
     assert "Сравнение" in quarterly[2]
+
+
+def test_quarter_report_links_contain_canonical_domain_once():
+    stats = _populated_stats()
+    stats["anime"]["titles"] = {
+        "1": {
+            **_anime_rec(score=9),
+            "title": "Эрго Прокси",
+            "url": "https://shikimori.io/animes/790-ergo-proxy",
+        },
+    }
+    cur = {
+        "period": "2026-Q2",
+        "period_start": "2026-04-01T00:00:00",
+        "tracking_since": "2026-04-01T00:00:00",
+        "events": [{
+            "id": "1",
+            "media": "anime",
+            "event": "completed",
+            "score": 9,
+        }],
+    }
+
+    reports = (
+        smod.build_current_stats_messages(cur, stats),
+        smod.build_quarterly_report_messages(cur, stats, prev_quarter=None),
+    )
+
+    for messages_list in reports:
+        hrefs = re.findall(r'href="([^"]*)"', "\n".join(messages_list))
+        assert hrefs == [
+            "https://shikimori.io/animes/790-ergo-proxy",
+        ]
 
 
 def test_prepare_quarter_report_collects_each_media_and_event_type():
