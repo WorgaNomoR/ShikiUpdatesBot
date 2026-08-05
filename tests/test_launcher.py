@@ -71,3 +71,23 @@ def test_launcher_releases_instance_after_main(monkeypatch):
 
     assert launcher.run([]) == 0
     instance.release.assert_called_once_with()
+
+
+def test_launcher_releases_instance_when_main_fails(monkeypatch):
+    async def fake_main():
+        raise RuntimeError("main failed")
+
+    instance = MagicMock()
+    instance.acquire.return_value = True
+    monkeypatch.setitem(sys.modules, "main", SimpleNamespace(main=fake_main))
+    monkeypatch.setattr(launcher, "ensure_frozen_env", lambda: False)
+    monkeypatch.setattr(
+        launcher,
+        "_load_config",
+        lambda: SimpleNamespace(DATA_DIR="data", log=MagicMock()),
+    )
+    monkeypatch.setattr(launcher, "SingleInstance", lambda: instance)
+    monkeypatch.setattr(launcher, "_pause_after_error", lambda: None)
+
+    assert launcher.run([]) == 1
+    instance.release.assert_called_once_with()

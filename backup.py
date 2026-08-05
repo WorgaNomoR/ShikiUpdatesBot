@@ -11,8 +11,10 @@
 import asyncio
 import io
 import json
+import tempfile
 import time
 import zipfile
+from pathlib import Path
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
@@ -68,7 +70,13 @@ def _build_backup_zip() -> bytes:
         for path in sorted(DATA_DIR.rglob("*")):
             if not path.is_file() or path.name.endswith(".tmp"):
                 continue
-            zf.write(path, path.relative_to(DATA_DIR).as_posix())
+            relative = path.relative_to(DATA_DIR)
+            if any(
+                part.startswith(".restore-") and part.endswith(".tmp")
+                for part in relative.parts
+            ):
+                continue
+            zf.write(path, relative.as_posix())
     return buf.getvalue()
 
 
@@ -162,19 +170,92 @@ def _valid_import_payload(name: str, obj) -> bool:
             "release_url",
             "last_notified_version",
         }
-        return isinstance(obj, dict) and all(
-            obj.get(key) is None or isinstance(obj.get(key), str)
-            for key in keys
+        return (
+            isinstance(obj, dict)
+            and set(obj) == keys
+            and all(
+                value is None or isinstance(value, str)
+                for value in obj.values()
+            )
         )
     if name.startswith(_IMPORT_ALLOWED_DIR + "/"):
         return isinstance(obj, dict) and "period" in obj
     return False
 
 
+def _publish_staged_file(source: Path, target: Path) -> None:
+    """Атомарно опубликовать заранее записанный файл восстановления."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(target)
+
+
+def _publish_restore_files(pending: dict[str, str]) -> list[str]:
+    """Применить набор файлов с откатом при ошибке текущего процесса.
+
+    Новые данные и снимки заменяемых файлов сначала записываются рядом с
+    DATA_DIR. Поэтому публикация идёт атомарными rename, а уже опубликованные
+    файлы можно вернуть без новой записи и дополнительного места на диске.
+    """
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".restore-",
+            suffix=".tmp",
+            dir=DATA_DIR,
+            ignore_cleanup_errors=True,
+        ) as raw_stage:
+            stage = Path(raw_stage)
+            new_root = stage / "new"
+            old_root = stage / "old"
+            existed: dict[str, bool] = {}
+
+            for name, payload in pending.items():
+                target = DATA_DIR / name
+                _atomic_write(new_root / name, payload)
+                existed[name] = target.is_file()
+                if existed[name]:
+                    _atomic_write(old_root / name, target.read_text(encoding="utf-8"))
+
+            published: list[str] = []
+            try:
+                for name in pending:
+                    _publish_staged_file(new_root / name, DATA_DIR / name)
+                    published.append(name)
+            except Exception as publish_error:
+                rollback_errors: list[Exception] = []
+                for name in reversed(published):
+                    target = DATA_DIR / name
+                    try:
+                        if existed[name]:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            (old_root / name).replace(target)
+                        else:
+                            target.unlink(missing_ok=True)
+                    except Exception as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    log.critical(
+                        "restore_backup_zip: публикация и откат завершились ошибкой: %s; %s",
+                        publish_error,
+                        rollback_errors,
+                    )
+                    raise ValueError(
+                        "не удалось применить архив и полностью вернуть исходное состояние"
+                    ) from publish_error
+                raise ValueError(
+                    "не удалось применить архив; исходное состояние восстановлено"
+                ) from publish_error
+            return published
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"не удалось подготовить восстановление: {e}") from e
+
+
 def restore_backup_zip(raw: bytes) -> dict:
     """Восстанавливаем состояние из архива по белому списку.
-    Каждый разрешённый член сперва валидируем как JSON и только потом пишем
-    атомарно (_atomic_write) в DATA_DIR — частичное/битое состояние не льём.
+    Все разрешённые члены сперва валидируем как JSON, затем публикуем из
+    staging-каталога; ошибка публикации запускает откат уже заменённых файлов.
     Возвращаем {'restored': [...], 'skipped': [...]}.
     Бросаем ValueError, если архив битый или в нём нет ни одного валидного
     файла из белого списка."""
@@ -197,7 +278,7 @@ def restore_backup_zip(raw: bytes) -> dict:
             try:
                 payload = zf.read(name).decode("utf-8")
                 obj = json.loads(payload)   # синтаксически валидный JSON?
-            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            except (UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as e:
                 log.warning("restore_backup_zip: пропускаю битый %s: %s", name, e)
                 skipped.append(name)
                 continue
@@ -210,9 +291,7 @@ def restore_backup_zip(raw: bytes) -> dict:
     if not pending:
         raise ValueError("в архиве нет валидных файлов из белого списка")
 
-    for name, payload in pending.items():
-        _atomic_write(DATA_DIR / name, payload)
-        restored.append(name)
+    restored = _publish_restore_files(pending)
     log.info("restore_backup_zip: восстановлено %d, пропущено %d.",
              len(restored), len(skipped))
     return {"restored": restored, "skipped": skipped}

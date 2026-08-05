@@ -34,6 +34,19 @@ def _zip_bytes(members: dict[str, str]) -> bytes:
     return buf.getvalue()
 
 
+def _corrupt_stored_member(raw: bytes, name: str) -> bytes:
+    """Повредить данные ZIP-члена, сохранив центральный каталог и старый CRC."""
+    damaged = bytearray(raw)
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        info = zf.getinfo(name)
+        offset = info.header_offset
+        name_length = int.from_bytes(damaged[offset + 26:offset + 28], "little")
+        extra_length = int.from_bytes(damaged[offset + 28:offset + 30], "little")
+        data_offset = offset + 30 + name_length + extra_length
+        damaged[data_offset] ^= 0xFF
+    return bytes(damaged)
+
+
 # ─────────────────────────────────────────────────────────────
 #  Сборка архива
 # ─────────────────────────────────────────────────────────────
@@ -42,6 +55,8 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
     (backup_env / "stats_current.json").write_text('{"period": "2026-Q2"}', encoding="utf-8")
     (backup_env / "subscribers.json.tmp").write_text("garbage", encoding="utf-8")
+    restore_stage = backup_env / ".restore-interrupted.tmp" / "new"
+    storage._atomic_write(restore_stage / "subscribers.json", "staged")
     (backup_env / "quarters" / "2026-Q1.json").write_text('{"period": "2026-Q1"}', encoding="utf-8")
 
     raw = backup._build_backup_zip()
@@ -51,6 +66,7 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     assert "stats_current.json" in names
     assert "quarters/2026-Q1.json" in names          # вложенность сохранена
     assert "subscribers.json.tmp" not in names       # *.tmp исключён
+    assert not any(name.startswith(".restore-") for name in names)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -130,6 +146,78 @@ def test_restore_skips_corrupt_json(backup_env):
 def test_restore_bad_zip_raises(backup_env):
     with pytest.raises(ValueError):
         backup.restore_backup_zip(b"this is not a zip")
+
+
+def test_restore_skips_corrupt_crc_member(backup_env):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("subscribers.json", '{"subscribers": {"1": "Bob"}}')
+        zf.writestr("stats_current.json", '{"period": "2026-Q2", "events": []}')
+    raw = _corrupt_stored_member(buf.getvalue(), "subscribers.json")
+
+    result = backup.restore_backup_zip(raw)
+
+    assert "subscribers.json" in result["skipped"]
+    assert result["restored"] == ["stats_current.json"]
+    assert not (backup_env / "subscribers.json").exists()
+
+
+@pytest.mark.parametrize("change", ["missing", "extra"])
+def test_restore_rejects_inexact_update_state_schema(backup_env, change):
+    state = {
+        "last_checked_at": None,
+        "latest_version": "v1.2.0",
+        "release_url": "https://release",
+        "last_notified_version": "v1.2.0",
+    }
+    if change == "missing":
+        state.pop("release_url")
+    else:
+        state["unexpected"] = "value"
+
+    raw = _zip_bytes({"update_state.json": json.dumps(state)})
+
+    with pytest.raises(ValueError, match="нет валидных файлов"):
+        backup.restore_backup_zip(raw)
+    assert not (backup_env / "update_state.json").exists()
+
+
+def test_restore_rolls_back_first_file_when_second_publish_fails(
+    backup_env,
+    monkeypatch,
+):
+    storage._atomic_write(
+        backup_env / "subscribers.json",
+        '{"subscribers": {"1": "Old"}}',
+    )
+    storage._atomic_write(
+        backup_env / "stats_current.json",
+        '{"period": "old", "events": []}',
+    )
+    raw = _zip_bytes({
+        "subscribers.json": '{"subscribers": {"2": "New"}}',
+        "stats_current.json": '{"period": "new", "events": []}',
+    })
+    real_publish = backup._publish_staged_file
+    calls = 0
+
+    def fail_second_publish(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("disk failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(backup, "_publish_staged_file", fail_second_publish)
+
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        backup.restore_backup_zip(raw)
+
+    assert storage.load_subscribers() == {1: "Old"}
+    assert json.loads((backup_env / "stats_current.json").read_text(encoding="utf-8")) == {
+        "period": "old",
+        "events": [],
+    }
 
 
 def test_restore_no_valid_members_raises(backup_env):

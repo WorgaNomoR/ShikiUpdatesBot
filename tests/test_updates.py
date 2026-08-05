@@ -164,11 +164,14 @@ def test_version_keyboard_contains_repository_and_release(monkeypatch):
 
 
 def test_start_update_loop_is_disabled_outside_release_exe(monkeypatch):
+    create_task = MagicMock()
     monkeypatch.setattr(updates, "update_checks_enabled", lambda: False)
     monkeypatch.setattr(updates, "_update_task", None)
+    monkeypatch.setattr(updates.asyncio, "create_task", create_task)
 
     assert updates.start_update_loop(AsyncMock()) is False
     assert updates._update_task is None
+    create_task.assert_not_called()
 
 
 @pytest.mark.asyncio
