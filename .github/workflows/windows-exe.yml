@@ -15,11 +15,13 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: windows-2022
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     env:
       APP_REPOSITORY: ${{ vars.UPDATE_REPOSITORY || github.repository }}
       APP_SERVER_URL: ${{ github.server_url }}
@@ -77,6 +79,7 @@ jobs:
           }
 
       - name: Smoke version and configuration
+        shell: pwsh
         env:
           BOT_TOKEN: test-token
           OWNER_ID: "123456"
@@ -88,9 +91,18 @@ jobs:
           OWNER_ID=123456
           SHIKI_USER=test-user
           "@ | Set-Content .\dist\.env -Encoding utf8
-          .\dist\ShikiUpdatesBot.exe --version
-          .\dist\ShikiUpdatesBot.exe --check-config
-          Remove-Item .\dist\.env
+          try {
+            .\dist\ShikiUpdatesBot.exe --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "--version failed (exit=$LASTEXITCODE)"
+            }
+            .\dist\ShikiUpdatesBot.exe --check-config
+            if ($LASTEXITCODE -ne 0) {
+              throw "--check-config failed (exit=$LASTEXITCODE)"
+            }
+          } finally {
+            Remove-Item .\dist\.env -ErrorAction SilentlyContinue
+          }
 
       - name: Assemble portable ZIP and checksum
         shell: pwsh
@@ -122,9 +134,24 @@ jobs:
             release/*.sha256
           if-no-files-found: error
 
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download verified release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ShikiUpdatesBot-${{ needs.build.outputs.version }}-windows-x64
+          path: release
+
       - name: Create draft GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
+          APP_VERSION: ${{ needs.build.outputs.version }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |

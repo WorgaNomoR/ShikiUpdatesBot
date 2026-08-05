@@ -405,6 +405,6 @@ def test_update_state_roundtrip(monkeypatch, tmp_path):
 
 def test_load_update_state_bad_json_returns_defaults(monkeypatch, tmp_path):
     path = tmp_path / "update_state.json"
-    path.write_text("{broken", encoding="utf-8")
+    storage._atomic_write(path, "{broken")
     monkeypatch.setattr(storage, "UPDATE_STATE_FILE", path)
     assert storage.load_update_state() == storage._empty_update_state()

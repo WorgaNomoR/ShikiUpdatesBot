@@ -68,6 +68,7 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
     monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
     monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
+    monkeypatch.setattr(storage, "UPDATE_STATE_FILE", data / "update_state.json")
     monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
     monkeypatch.setattr("handlers.OWNER_ID", 999)
     monkeypatch.setattr("backup.OWNER_ID", 999)

@@ -1,31 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Контракты portable runtime и замороженной точки входа."""
+"""Контракты portable runtime и Windows-интеграции."""
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-import build_info
-import launcher
-import project_meta
 import runtime
-
-
-def test_semver_tuple_is_strict():
-    assert build_info.semver_tuple("v1.2.3") == (1, 2, 3)
-    assert build_info.semver_tuple("1.2.3") == (1, 2, 3)
-    assert build_info.semver_tuple("v1.2") is None
-    assert build_info.semver_tuple("v01.2.3") is None
-    assert build_info.semver_tuple("dev") is None
-
-
-def test_source_mode_has_canonical_project_version_and_repository():
-    assert build_info.APP_VERSION == project_meta.PROJECT_VERSION
-    assert build_info.APP_REPOSITORY == project_meta.PROJECT_REPOSITORY
 
 
 def test_frozen_relative_data_dir_stays_beside_exe(monkeypatch, tmp_path):
@@ -98,33 +81,27 @@ def test_console_close_guard_requests_async_shutdown(monkeypatch):
     guard = runtime.WindowsConsoleCloseGuard(loop, request_stop, timeout=0)
     assert guard.install() is True
     try:
-        assert guard._handler(2) is True
+        assert guard._handler(2) == 1
         loop.call_soon_threadsafe.assert_called_once_with(request_stop)
     finally:
         guard.complete()
         guard.uninstall()
 
 
-def test_launcher_version_does_not_load_config(monkeypatch, capsys):
-    monkeypatch.setattr(launcher, "APP_VERSION", "v1.2.3")
-    monkeypatch.setattr(launcher, "_load_config", lambda: (_ for _ in ()).throw(AssertionError))
-    assert launcher.run(["--version"]) == 0
-    assert "v1.2.3" in capsys.readouterr().out
+@pytest.mark.skipif(os.name != "nt", reason="Windows console control handler")
+def test_console_close_guard_handles_closed_event_loop(monkeypatch):
+    monkeypatch.setattr(runtime, "IS_FROZEN", True)
+    loop = MagicMock()
+    loop.call_soon_threadsafe.side_effect = RuntimeError("loop closed")
+    guard = runtime.WindowsConsoleCloseGuard(loop, MagicMock(), timeout=0)
+    assert guard.install() is True
+    try:
+        assert guard._handler(2) == 1
+    finally:
+        guard.complete()
+        guard.uninstall()
 
 
-def test_launcher_check_config_is_offline(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(launcher, "ensure_frozen_env", lambda: False)
-    monkeypatch.setattr(
-        launcher,
-        "_load_config",
-        lambda: SimpleNamespace(DATA_DIR=tmp_path),
-    )
-    assert launcher.run(["--check-config"]) == 0
-    assert str(tmp_path) in capsys.readouterr().out
-
-
-def test_launcher_first_run_stops_after_creating_env(monkeypatch, capsys):
-    monkeypatch.setattr(launcher, "ensure_frozen_env", lambda: True)
-    monkeypatch.setattr(launcher, "_pause_after_error", lambda: None)
-    assert launcher.run([]) == 2
-    assert "Создан файл настроек" in capsys.readouterr().out
+def test_console_close_guard_default_timeout_fits_windows_limit():
+    guard = runtime.WindowsConsoleCloseGuard(MagicMock(), MagicMock())
+    assert guard._timeout == 4.0

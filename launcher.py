@@ -52,11 +52,18 @@ def run(argv: Sequence[str] | None = None) -> int:
             print(f"Конфигурация корректна. DATA_DIR: {config.DATA_DIR}")
             return 0
 
-        with SingleInstance():
+        instance = SingleInstance()
+        if not instance.acquire():
+            print("ShikiUpdatesBot уже запущен из этой папки.")
+            _pause_after_error()
+            return 3
+        try:
             config.log.info("ShikiUpdatesBot %s запускается из %s", APP_VERSION, APP_ROOT)
             from main import main
 
             asyncio.run(main())
+        finally:
+            instance.release()
         return 0
     except KeyboardInterrupt:
         return 130

@@ -5,6 +5,7 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram.enums import ParseMode
 
 import handlers
 
@@ -22,8 +23,6 @@ async def test_version_refreshes_and_renders(monkeypatch):
     state = {"latest_version": "v1.2.0", "release_url": "https://release"}
     refresh = AsyncMock(return_value=state)
     monkeypatch.setattr(handlers, "refresh_update_state", refresh)
-    monkeypatch.setattr(handlers, "build_version_text", lambda value: "VERSION STATUS")
-    monkeypatch.setattr(handlers, "build_version_keyboard", lambda url: f"BUTTON:{url}")
     message = AsyncMock()
     message.from_user = MagicMock(id=handlers.OWNER_ID)
 
@@ -31,5 +30,9 @@ async def test_version_refreshes_and_renders(monkeypatch):
 
     refresh.assert_awaited_once_with(force=True)
     message.answer.assert_awaited_once()
-    assert message.answer.await_args.args[0] == "VERSION STATUS"
-    assert message.answer.await_args.kwargs["reply_markup"] == "BUTTON:https://release"
+    text = message.answer.await_args.args[0]
+    keyboard = message.answer.await_args.kwargs["reply_markup"]
+    assert "<b>ShikiUpdatesBot</b>" in text
+    assert "v1.2.0" in text
+    assert message.answer.await_args.kwargs["parse_mode"] == ParseMode.HTML
+    assert keyboard.inline_keyboard[0][-1].url == "https://release"

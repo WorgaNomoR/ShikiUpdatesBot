@@ -2,7 +2,8 @@
 # Copyright (C) 2026  WorgaNomoR
 """Проверка GitHub Release: парсинг, кэш и однократная доставка."""
 
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -131,14 +132,14 @@ async def test_notification_delivery_failure_is_retried_later(release_build, mon
         "last_notified_version": None,
     }
     monkeypatch.setattr(updates, "refresh_update_state", AsyncMock(return_value=state))
-    save = AsyncMock()
+    save = MagicMock()
     monkeypatch.setattr(updates, "save_update_state", save)
     bot = AsyncMock()
     bot.send_message.side_effect = RuntimeError("owner unavailable")
 
     await updates.check_and_notify_update(bot)
 
-    save.assert_not_awaited()
+    save.assert_not_called()
     assert state["last_notified_version"] is None
 
 
@@ -160,3 +161,36 @@ def test_version_keyboard_contains_repository_and_release(monkeypatch):
         "https://github.test/project",
         "https://github.test/releases/latest",
     ]
+
+
+def test_start_update_loop_is_disabled_outside_release_exe(monkeypatch):
+    monkeypatch.setattr(updates, "update_checks_enabled", lambda: False)
+    monkeypatch.setattr(updates, "_update_task", None)
+
+    assert updates.start_update_loop(AsyncMock()) is False
+    assert updates._update_task is None
+
+
+@pytest.mark.asyncio
+async def test_start_update_loop_is_idempotent(monkeypatch):
+    started = asyncio.Event()
+
+    async def fake_update_loop(bot):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(updates, "update_checks_enabled", lambda: True)
+    monkeypatch.setattr(updates, "update_loop", fake_update_loop)
+    monkeypatch.setattr(updates, "_update_task", None)
+    bot = AsyncMock()
+
+    assert updates.start_update_loop(bot) is True
+    task = updates._update_task
+    assert task is not None
+    await started.wait()
+    assert updates.start_update_loop(bot) is False
+    assert updates._update_task is task
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

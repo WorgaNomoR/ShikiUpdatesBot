@@ -1,14 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  WorgaNomoR
 """Воспроизводимая Windows one-file сборка с идентификаторами релиза из CI."""
 
 import os
 import re
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, copy_metadata
-from project_meta import PROJECT_REPOSITORY, PROJECT_VERSION
 
 root = Path(SPECPATH)
+sys.path.insert(0, str(root))
+
+from project_meta import PROJECT_REPOSITORY, PROJECT_VERSION  # noqa: E402
+
 meta_dir = root / "build" / "pyinstaller-meta"
 meta_dir.mkdir(parents=True, exist_ok=True)
 

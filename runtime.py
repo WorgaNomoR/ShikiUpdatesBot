@@ -19,6 +19,9 @@ import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+if os.name == "nt":
+    from ctypes import wintypes
+
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_ROOT = (
     Path(sys.executable).resolve().parent
@@ -99,9 +102,13 @@ class SingleInstance:
         if not IS_FROZEN or os.name != "nt":
             return True
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
-        kernel32.CreateMutexW.restype = ctypes.c_void_p
-        handle = kernel32.CreateMutexW(None, False, self.name)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        )
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel32.CreateMutexW(None, 0, self.name)
         if not handle:
             raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
         self._handle = int(handle)
@@ -115,8 +122,8 @@ class SingleInstance:
             self._handle = None
             return
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-        kernel32.CloseHandle.restype = ctypes.c_bool
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
         kernel32.CloseHandle(self._handle)
         self._handle = None
 
@@ -134,7 +141,7 @@ class WindowsConsoleCloseGuard:
 
     _CLOSE_EVENTS = {2, 5, 6}  # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
 
-    def __init__(self, loop, request_stop, timeout: float = 10.0) -> None:
+    def __init__(self, loop, request_stop, timeout: float = 4.0) -> None:
         self._loop = loop
         self._request_stop = request_stop
         self._timeout = timeout
@@ -145,20 +152,23 @@ class WindowsConsoleCloseGuard:
     def install(self) -> bool:
         if not IS_FROZEN or os.name != "nt" or self._installed:
             return False
-        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
 
         @callback_type
-        def handler(event: int) -> bool:
+        def handler(event: int) -> int:
             if event not in self._CLOSE_EVENTS:
-                return False
-            self._loop.call_soon_threadsafe(self._request_stop)
+                return 0
+            try:
+                self._loop.call_soon_threadsafe(self._request_stop)
+            except RuntimeError:
+                return 1
             self._completed.wait(self._timeout)
-            return True
+            return 1
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.SetConsoleCtrlHandler.argtypes = (callback_type, ctypes.c_bool)
-        kernel32.SetConsoleCtrlHandler.restype = ctypes.c_bool
-        if not kernel32.SetConsoleCtrlHandler(handler, True):
+        kernel32.SetConsoleCtrlHandler.argtypes = (callback_type, wintypes.BOOL)
+        kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+        if not kernel32.SetConsoleCtrlHandler(handler, 1):
             raise OSError(ctypes.get_last_error(), "SetConsoleCtrlHandler failed")
         self._handler = handler
         self._installed = True
@@ -171,6 +181,8 @@ class WindowsConsoleCloseGuard:
         if not self._installed or self._handler is None or os.name != "nt":
             return
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.SetConsoleCtrlHandler(self._handler, False)
+        kernel32.SetConsoleCtrlHandler.argtypes = (type(self._handler), wintypes.BOOL)
+        kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+        kernel32.SetConsoleCtrlHandler(self._handler, 0)
         self._handler = None
         self._installed = False

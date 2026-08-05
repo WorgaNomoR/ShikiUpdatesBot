@@ -47,7 +47,7 @@ SHUTDOWN_BACKUP_TIMEOUT  = 8    # с: жёсткий потолок отправ
 _last_backup_sent_at: float | None = None   # monotonic-метка последнего успешного бэкапа
 
 _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
-    "subscribers.json", "stats_current.json",
+    "subscribers.json", "stats_current.json", "update_state.json",
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -121,7 +121,7 @@ async def _shutdown_backup(bot: Bot) -> None:
 
 def _is_allowed_import_member(name: str) -> bool:
     """Разрешено ли имя из архива к восстановлению?
-    Бел.список: subscribers.json, stats_current.json, quarters/<имя>.json.
+    Бел.список: subscribers.json, stats_current.json, update_state.json и кварталы.
     Глушим zip-slip: '..'-сегменты, абсолютные пути и бэкслеши отвергаем."""
     if not name or name.endswith("/"):
         return False
@@ -155,6 +155,17 @@ def _valid_import_payload(name: str, obj) -> bool:
     if name == "stats_current.json":
         return (isinstance(obj, dict) and "period" in obj
                 and isinstance(obj.get("events"), list))
+    if name == "update_state.json":
+        keys = {
+            "last_checked_at",
+            "latest_version",
+            "release_url",
+            "last_notified_version",
+        }
+        return isinstance(obj, dict) and all(
+            obj.get(key) is None or isinstance(obj.get(key), str)
+            for key in keys
+        )
     if name.startswith(_IMPORT_ALLOWED_DIR + "/"):
         return isinstance(obj, dict) and "period" in obj
     return False

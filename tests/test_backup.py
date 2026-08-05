@@ -60,6 +60,7 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
 @pytest.mark.parametrize("name", [
     "subscribers.json",
     "stats_current.json",
+    "update_state.json",
     "quarters/2026-Q1.json",
     "quarters/2025-Q4.json",
 ])
@@ -92,17 +93,25 @@ def test_restore_round_trip(backup_env):
     raw = _zip_bytes({
         "subscribers.json": '{"subscribers": {"123": "Alice"}}',
         "stats_current.json": '{"period": "2026-Q2", "events": []}',
+        "update_state.json": (
+            '{"last_checked_at": null, "latest_version": "v1.2.0", '
+            '"release_url": "https://release", "last_notified_version": "v1.2.0"}'
+        ),
         "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
         "seen_ids.json": '{"seen_ids": [1, 2, 3]}',   # должен быть отброшен
     })
     result = backup.restore_backup_zip(raw)
 
     assert set(result["restored"]) == {
-        "subscribers.json", "stats_current.json", "quarters/2026-Q1.json",
+        "subscribers.json",
+        "stats_current.json",
+        "update_state.json",
+        "quarters/2026-Q1.json",
     }
     assert "seen_ids.json" in result["skipped"]
     # файлы реально записаны
     assert storage.load_subscribers() == {123: "Alice"}
+    assert storage.load_update_state()["last_notified_version"] == "v1.2.0"
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
     assert not (backup_env / "seen_ids.json").exists()
 
