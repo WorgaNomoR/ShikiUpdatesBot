@@ -10,8 +10,7 @@ import pytest
 import main
 
 
-@pytest.mark.asyncio
-async def test_frozen_main_wires_updates_and_cleans_console_guard(monkeypatch):
+def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     bot = SimpleNamespace(set_my_commands=AsyncMock())
     dispatcher = SimpleNamespace(
         message=SimpleNamespace(register=MagicMock()),
@@ -33,20 +32,47 @@ async def test_frozen_main_wires_updates_and_cleans_console_guard(monkeypatch):
     monkeypatch.setattr(main, "start_health_server", health)
     monkeypatch.setattr(main, "start_update_loop", start_updates)
     monkeypatch.setattr(main, "WindowsConsoleCloseGuard", guard_factory)
-    monkeypatch.setattr(main, "IS_FROZEN", True)
+    monkeypatch.setattr(main, "IS_FROZEN", frozen)
+    return SimpleNamespace(
+        bot=bot,
+        dispatcher=dispatcher,
+        probe=probe,
+        health=health,
+        start_updates=start_updates,
+        guard=guard,
+        guard_factory=guard_factory,
+    )
+
+
+@pytest.mark.asyncio
+async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
+    app = _patch_app_dependencies(monkeypatch, frozen=True)
 
     with pytest.raises(RuntimeError, match="polling stopped"):
         await main.main()
 
-    bot.set_my_commands.assert_awaited_once()
-    dispatcher.shutdown.register.assert_called_once_with(main._shutdown_backup)
-    probe.assert_awaited_once_with(bot)
-    start_updates.assert_called_once_with(bot)
-    health.assert_not_awaited()
-    guard.install.assert_called_once_with()
-    dispatcher.start_polling.assert_awaited_once_with(
-        bot,
+    app.bot.set_my_commands.assert_awaited_once()
+    app.dispatcher.shutdown.register.assert_not_called()
+    app.probe.assert_awaited_once_with(app.bot)
+    app.start_updates.assert_called_once_with(app.bot)
+    app.health.assert_not_awaited()
+    app.guard.install.assert_called_once_with()
+    app.dispatcher.start_polling.assert_awaited_once_with(
+        app.bot,
         allowed_updates=["message", "callback_query"],
     )
-    guard.complete.assert_called_once_with()
-    guard.uninstall.assert_called_once_with()
+    app.guard.complete.assert_called_once_with()
+    app.guard.uninstall.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_source_main_keeps_healthcheck_and_shutdown_backup(monkeypatch):
+    app = _patch_app_dependencies(monkeypatch, frozen=False)
+
+    with pytest.raises(RuntimeError, match="polling stopped"):
+        await main.main()
+
+    app.health.assert_awaited_once_with(check_interval=main.CHECK_INTERVAL)
+    app.dispatcher.shutdown.register.assert_called_once_with(main._shutdown_backup)
+    app.start_updates.assert_called_once_with(app.bot)
+    app.guard_factory.assert_not_called()

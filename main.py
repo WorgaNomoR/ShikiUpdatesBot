@@ -87,12 +87,11 @@ async def main() -> None:
         BotCommand(command="stop",   description="Отписаться 😢"),
     ])
 
-    # Healthcheck-сервер (для хостингов с обязательным портом + watchdog)
+    # Healthcheck и финальный бэкап нужны source/Docker-хостингу. Portable exe
+    # хранит данные постоянно и не должен слать архив при каждом выключении ПК.
     if not IS_FROZEN:
         await start_health_server(check_interval=CHECK_INTERVAL)
-
-    # Финальный бэкап при остановке (aiogram ловит SIGTERM/SIGINT → emit_shutdown)
-    dp.shutdown.register(_shutdown_backup)
+        dp.shutdown.register(_shutdown_backup)
 
     # owner-reachability gate: пробуем достучаться до владельца. Доставилось →
     # запускаем фоновый цикл; нет → апдейт-поллинг всё равно жив, /start добудит.
