@@ -87,7 +87,9 @@ def test_launcher_releases_instance_when_main_fails(monkeypatch):
         lambda: SimpleNamespace(DATA_DIR="data", log=MagicMock()),
     )
     monkeypatch.setattr(launcher, "SingleInstance", lambda: instance)
-    monkeypatch.setattr(launcher, "_pause_after_error", lambda: None)
+    pause_after_error = MagicMock()
+    monkeypatch.setattr(launcher, "_pause_after_error", pause_after_error)
 
     assert launcher.run([]) == 1
+    pause_after_error.assert_called_once_with()
     instance.release.assert_called_once_with()

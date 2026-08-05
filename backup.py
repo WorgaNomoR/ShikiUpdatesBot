@@ -278,7 +278,15 @@ def restore_backup_zip(raw: bytes) -> dict:
             try:
                 payload = zf.read(name).decode("utf-8")
                 obj = json.loads(payload)   # синтаксически валидный JSON?
-            except (UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as e:
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                zipfile.BadZipFile,
+                RuntimeError,
+                NotImplementedError,
+                OSError,
+                EOFError,
+            ) as e:
                 log.warning("restore_backup_zip: пропускаю битый %s: %s", name, e)
                 skipped.append(name)
                 continue

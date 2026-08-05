@@ -162,6 +162,36 @@ def test_restore_skips_corrupt_crc_member(backup_env):
     assert not (backup_env / "subscribers.json").exists()
 
 
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        RuntimeError("encrypted member"),
+        NotImplementedError("unsupported compression"),
+        OSError("read failed"),
+        EOFError("truncated member"),
+    ],
+    ids=["encrypted", "unsupported-compression", "os-error", "unexpected-eof"],
+)
+def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read_error):
+    raw = _zip_bytes({
+        "subscribers.json": '{"subscribers": {"1": "Bob"}}',
+        "stats_current.json": '{"period": "2026-Q2", "events": []}',
+    })
+    real_read = zipfile.ZipFile.read
+
+    def fail_selected_member(zf, name, *args, **kwargs):
+        if name == "subscribers.json":
+            raise read_error
+        return real_read(zf, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", fail_selected_member)
+
+    result = backup.restore_backup_zip(raw)
+
+    assert "subscribers.json" in result["skipped"]
+    assert result["restored"] == ["stats_current.json"]
+
+
 @pytest.mark.parametrize("change", ["missing", "extra"])
 def test_restore_rejects_inexact_update_state_schema(backup_env, change):
     state = {
