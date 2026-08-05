@@ -386,3 +386,25 @@ def test_save_stats_current_swallows_write_error(monkeypatch, tmp_path):
         raise OSError("disk full")
     monkeypatch.setattr(storage, "_atomic_write", boom)
     storage.save_stats_current({"period": "2026-Q2", "events": []})
+
+
+# ── update_state.json ──
+
+def test_update_state_roundtrip(monkeypatch, tmp_path):
+    path = tmp_path / "update_state.json"
+    monkeypatch.setattr(storage, "UPDATE_STATE_FILE", path)
+    expected = {
+        "last_checked_at": "2026-08-05T12:00:00+00:00",
+        "latest_version": "v1.2.0",
+        "release_url": "https://example.test/release",
+        "last_notified_version": None,
+    }
+    storage.save_update_state(expected)
+    assert storage.load_update_state() == expected
+
+
+def test_load_update_state_bad_json_returns_defaults(monkeypatch, tmp_path):
+    path = tmp_path / "update_state.json"
+    path.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(storage, "UPDATE_STATE_FILE", path)
+    assert storage.load_update_state() == storage._empty_update_state()

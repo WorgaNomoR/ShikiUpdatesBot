@@ -9,6 +9,10 @@
 - If a request or proposed solution would harm correctness, stability, maintainability, security, or the bot as a whole, say so explicitly before implementation, explain the concrete risk, and recommend a safer alternative. The maintainer may accept or override a technical choice after reviewing the tradeoffs, while Codex remains responsible for the quality of what it authors and must not silently ship a knowingly harmful solution.
 - Reject complexity that has no comparable practical benefit. Prefer the smallest robust design that preserves existing behaviour.
 
+### Language and code comments
+
+- Write Python and build-script comments, module docstrings, and function/class docstrings in Russian. Keep identifiers, protocol names, library/API names, command-line flags, and standard license headers in their canonical form. GitHub issues, commit/PR metadata, and unavoidable third-party configuration fields remain in English where the workflow requires it.
+
 ### Canon and durable knowledge
 
 - Written canon beats conversational memory. Record important discoveries and decisions when they are made:
@@ -39,37 +43,53 @@
 ## What this repository is
 - A Telegram bot that tracks a Shikimori user's history and favourites, then sends notifications to Telegram subscribers.
 - Collects statistics (genres, studios, scores, demographics, etc.) and sends the owner an automatic report at the start of each quarter.
-- Exposes `/stats` (button menu: current quarter / all-time) and `/favs` (favourite anime, manga, ranobe, characters, and industry people) to all subscribers.
+- Exposes `/stats` (button menu: current quarter / all-time) and `/favs` (favourite anime, manga, ranobe, characters, and industry people) to all subscribers; `/version` is owner-only.
 - Uses `aiogram` for Telegram and `aiohttp` for HTTP (both client, for Shikimori, and server, for healthcheck).
 - Split into focused modules (see Architecture); tests live in `tests/`.
 
 ## Architecture (modules)
-The former `main.py` monolith was split into single-responsibility modules with a strictly one-way (acyclic) dependency graph. `main.py` is now a thin entrypoint that wires the handlers into the Dispatcher.
+The former `main.py` monolith was split into single-responsibility modules with a strictly one-way (acyclic) dependency graph. `main.py` is now a thin application entrypoint; `launcher.py` is the PyInstaller console entrypoint.
 
-- `config.py` — env / local `.env` loading (`load_dotenv`), data-dir paths, logging, the shared `log`. Foundation: imports nothing project-local.
+- `runtime.py` — stdlib-only frozen/source detection, physical app-root paths, first-run `.env` copy, rotating portable logs, and the Windows single-instance mutex. Lowest foundation; imports nothing project-local.
+- `project_meta.py` / `build_info.py` — canonical project version/description and runtime build identity (`APP_VERSION`, repository/server/API URLs), strict SemVer parsing, and PyInstaller overrides injected through `_build_info`.
+- `config.py` — explicit app-root `.env` loading (`load_dotenv`), data-dir paths, and shared logging. Depends only on `runtime`.
 - `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_subscriber_link`, `_utcnow`, `quarter_*`, `_safe_int`, `_safe_float`, `_normalize_homoglyphs`.
 - `name_grammar.py` — startup-time validation, gender detection, first-name inflection, immutable display-name context, and `{g:male|female}` formatting. Pure domain layer over `pytrovich`; imports nothing project-local.
-- `storage.py` — file persistence: `_atomic_write`, load/save of every JSON state file, the `stats_all` in-memory cache.
+- `storage.py` — file persistence: `_atomic_write`, load/save of every JSON state file (including standalone `update_state.json`), the `stats_all` in-memory cache.
+- `updates.py` — notification-only GitHub Release check, daily cache/state, owner notification, and update-loop lifecycle. It never downloads or replaces files and does not use the Shikimori throttle.
 - `shiki_api.py` — Shikimori client + media domain: `fetch_*`, GraphQL, kind filters (including the shared `RANOBE_KINDS`), `get_media_info`, `is_relevant`, translation dicts, and the central request throttle + 429 retry (`_throttle`/`_fetch`).
 - `messages.py` — anime/manga/ranobe message banks, history parsers, `build_message` / `build_favourite_message`, presentation formatters.
 - `stats.py` — aggregation, `sync_stats_all`, current-quarter events, quarter snapshots, the `build_*_messages` report builders.
 - `backup.py` — `/backup` logic: zip build/restore, delivery to the owner, auto-backup triggers, the shutdown hook.
 - `handlers.py` — all aiogram commands & FSM, inline menus and their shared exception-safe cleanup, broadcast, the notification cycle (`check_and_notify*`, `polling_loop`), quarter rotation, the owner-reachability gate.
 - `healthcheck.py` — isolated HTTP healthcheck server + heartbeat watchdog. Imports nothing from the app; the dependency is one-way.
-- `main.py` — entrypoint: builds the Bot/Dispatcher, registers handlers, runs the owner-reachability gate + healthcheck + polling.
+- `main.py` — application entrypoint: builds the Bot/Dispatcher, registers handlers, runs the owner gate, source/Docker healthcheck, update loop, and polling.
+- `launcher.py` — frozen console entrypoint: `--version`, `--check-config`, first-run diagnostics, single-instance ownership, and delegation to `main.main()`.
 
 Dependency graph (each module depends only on those below it; `healthcheck` is fully isolated):
 
 ```mermaid
 graph TD
+    launcher --> main
+    launcher --> runtime
+    launcher --> build_info
+    launcher --> config
     main --> handlers
     main --> backup
     main --> healthcheck
+    main --> updates
+    main --> runtime
     handlers --> backup
     handlers --> stats
     handlers --> messages
     handlers --> shiki_api
     handlers --> storage
+    handlers --> updates
+    updates --> storage
+    updates --> build_info
+    build_info --> project_meta
+    updates --> base
+    updates --> runtime
     stats --> messages
     stats --> shiki_api
     stats --> storage
@@ -78,21 +98,27 @@ graph TD
     backup --> storage
     storage --> base["config + utils (foundation)"]
     shiki_api --> base
+    config --> runtime
     healthcheck["healthcheck (isolated)"]
 ```
 
 When adding or moving code, keep dependencies one-directional (import from lower modules only) and pass runtime values (like `CHECK_INTERVAL`) as parameters where that avoids a cycle. `healthcheck.py` is the reference pattern.
 
 ## Important files
-- `README.md` — setup (three deploy tiers), commands, statistics, healthcheck, and test instructions.
+- `README.md` — setup (hosting, portable Windows exe, local Python, Docker), commands, statistics, healthcheck, and test instructions.
+- `project_meta.py` — the single committed project version, canonical repository, and short `/version` description shared by source and packaged modes.
+- `ShikiUpdatesBot.spec` / `requirements-build.txt` / `README-Windows.txt` — pinned one-file build, build-only dependency, and packaged Windows instructions; `assets/ShikiUpdatesBot.ico` is the embedded multi-size Windows icon and its sibling PNG is the editable preview source.
 - `requirements.txt` / `requirements-dev.txt` — runtime and development dependencies (`python-dotenv` is a runtime dep for `.env` loading).
 - `.env.example` — template for the environment variables.
 - `tests/` — pytest coverage for configuration, pure helpers, storage, the Shikimori API, messages and name grammar, statistics, backup, handler flows, the polling loop, the owner-gate, and Telegram send behaviour.
 
 ## Key patterns and conventions
-- Environment variables (read in `config.py`, except `PORT`, which `healthcheck.py` reads directly; local `.env` files are loaded by `config.py` via `load_dotenv`, and a clear startup error names any missing required variable): **required** — `BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`. **Optional with defaults** — `DISPLAY_NAME` (defaults to the `SHIKI_USER` nick), `DISPLAY_NAME_GENDER` (`auto`; also `male`, `female`, `none`), `SHIKI_BASE_URL`, `CHECK_INTERVAL`, `ERROR_NOTIFY_INTERVAL`, `FULL_SYNC_INTERVAL`, `DATA_DIR` (`/data`), `PORT` (`8080`).
+- Environment variables (read in `config.py`, except `PORT`, which `healthcheck.py` reads directly; `.env` is loaded explicitly from the source/exe root and never overrides the process environment): **required** — `BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`. **Optional with defaults** — `DISPLAY_NAME` (defaults to the `SHIKI_USER` nick), `DISPLAY_NAME_GENDER` (`auto`; also `male`, `female`, `none`), `SHIKI_BASE_URL`, `CHECK_INTERVAL`, `ERROR_NOTIFY_INTERVAL`, `FULL_SYNC_INTERVAL`, `DATA_DIR` (`/data` for source/Docker, `<exe>/data` frozen), `PORT` (`8080`, source/Docker only). Frozen relative `DATA_DIR` overrides resolve from the portable root.
 - Display-name morphology runs once when `messages.py` initializes. Only Russian first names made of Cyrillic letters with optional hyphen-separated components are eligible. `auto` requires a confident `pytrovich` gender; ambiguous/ineligible names and every dependency failure fall back to the raw name in all cases plus masculine template alternatives. `male`/`female` force grammar; `none` skips morphology. Templates keep `{n}` nominative and use `{n_gen}`, `{n_dat}`, `{n_acc}`, `{n_ins}` plus `{g:male|female}`. Every selected form is HTML-escaped after inflection.
-- The bot stores state in JSON files under `DATA_DIR`: `seen_ids.json`, `subscribers.json`, `seen_favourites.json`, `stats_all.json`, `stats_current.json`, and snapshots in `quarters/`; `stats_current.json` additionally holds `last_backup_at`, the weekly auto-backup marker.
+- The bot stores state in JSON files under `DATA_DIR`: `seen_ids.json`, `subscribers.json`, `seen_favourites.json`, `stats_all.json`, `stats_current.json`, `update_state.json`, and snapshots in `quarters/`; `stats_current.json` additionally holds `last_backup_at`, the weekly auto-backup marker. Frozen rotating logs live in sibling `logs/`, deliberately outside `/backup`.
+- **Project version has one source of truth.** `project_meta.PROJECT_VERSION` is used by Python/source mode and must exactly match a release tag before CI will publish it. Non-tag exe artifacts append `-dev`; release builds embed the exact tag. `/version` works in every mode: source performs an explicit check only when the owner asks, while a release exe also checks automatically once per day.
+- **Standalone release identity is build-time, not user config.** `ShikiUpdatesBot.spec` embeds the tag plus `github.repository`, server, and API URLs. Fork exe builds follow their own releases automatically; maintainers may set the build-time `UPDATE_REPOSITORY` repository variable to follow another upstream. Only full SemVer releases with a Windows x64 ZIP participate; GitHub errors are non-fatal and notifications are once per successfully delivered newer version.
+- **Portable Windows contract.** Persistent files stay beside the physical exe (`sys.executable`), never under `%APPDATA%` or PyInstaller `_MEI`. A missing `.env` is copied once from the adjacent example and never overwritten; healthcheck is skipped frozen; the named mutex prevents a second process in the same folder. Updating means replacing only the stopped exe.
 - All file writes go through `_atomic_write()` (temp file + `os.replace()`) for crash safety.
 - All Telegram messages use `ParseMode.HTML`; user-facing strings from the API are escaped via `h()` (`html.escape`).
 - **Stability is the top priority.** Every function must be exception-safe: unexpected or missing data must never crash the bot. Network fetches return `None` on any error (not empty collections) to distinguish API failures from genuinely empty results. Statistics degrade gracefully — a failed export or GraphQL call yields a report without enriched metadata rather than a crash.
@@ -139,6 +165,8 @@ When adding or moving code, keep dependencies one-directional (import from lower
 - Install test dependencies before running tests: `pip install -r requirements-dev.txt`
 - Set at least the required env vars (`BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`) — via the environment or a local `.env` (see `.env.example`).
 - Run the bot: `python main.py`
+- Build the Windows exe: `pip install -r requirements-build.txt`, then `pyinstaller --clean --noconfirm ShikiUpdatesBot.spec`
+- Smoke the exe: `dist\ShikiUpdatesBot.exe --version` and `dist\ShikiUpdatesBot.exe --check-config`
 - Run tests: `pytest tests/`
 - Lint before pushing/opening a PR: `ruff check .` (config in `ruff.toml`: E4/E7/E9/F/I — E402 import-placement and I import-sort are enforced; also runs in CI with autofix).
 

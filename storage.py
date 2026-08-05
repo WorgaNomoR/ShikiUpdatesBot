@@ -18,6 +18,7 @@ from config import (
     STATS_ALL_FILE,
     STATS_CURRENT_FILE,
     SUBS_FILE,
+    UPDATE_STATE_FILE,
     log,
 )
 from utils import _utcnow, current_quarter, quarter_start
@@ -239,3 +240,47 @@ def save_stats_current(data: dict) -> None:
         _atomic_write(STATS_CURRENT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception as e:
         log.error("save_stats_current: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  update_state.json — ПРОВЕРКА ВЕРСИИ STANDALONE-СБОРКИ
+# ═══════════════════════════════════════════════════════════════════
+
+def _empty_update_state() -> dict:
+    return {
+        "last_checked_at": None,
+        "latest_version": None,
+        "release_url": None,
+        "last_notified_version": None,
+    }
+
+
+def load_update_state() -> dict:
+    """Загрузить состояние обновлений; повреждённые данные безопасно сбросить."""
+    state = _empty_update_state()
+    try:
+        if UPDATE_STATE_FILE.exists():
+            raw = json.loads(UPDATE_STATE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("expected an object")
+            for key in state:
+                value = raw.get(key)
+                if value is None or isinstance(value, str):
+                    state[key] = value
+            return state
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning("load_update_state: %s", e)
+    return state
+
+
+def save_update_state(data: dict) -> None:
+    """Атомарно сохранить только стабильную схему проверки обновлений."""
+    state = _empty_update_state()
+    for key in state:
+        value = data.get(key)
+        if value is None or isinstance(value, str):
+            state[key] = value
+    try:
+        _atomic_write(UPDATE_STATE_FILE, json.dumps(state, ensure_ascii=False, indent=2))
+    except Exception as e:
+        log.error("save_update_state: %s", e)

@@ -3,10 +3,14 @@
 """Тесты config.py — хелперы окружения и чтение env (env-config фолд)."""
 
 import importlib
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from config import _int_env, _required_env
+from config import _int_env, _required_env, _required_int_env
 
 
 # ── _required_env ──────────────────────────────────────────────────
@@ -58,6 +62,46 @@ def test_int_env_bad_value_raises(monkeypatch):
     monkeypatch.setenv("X_INT", "notanumber")
     with pytest.raises(RuntimeError, match="X_INT"):
         _int_env("X_INT", 42)
+
+
+def test_required_int_env_names_invalid_variable_without_value(monkeypatch):
+    monkeypatch.setenv("X_SECRET_INT", "not-a-number")
+    with pytest.raises(RuntimeError, match="X_SECRET_INT") as error:
+        _required_int_env("X_SECRET_INT")
+    assert "not-a-number" not in str(error.value)
+
+
+def test_load_local_env_accepts_utf8_bom(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(
+        b"\xef\xbb\xbfBOT_TOKEN=bom-token\n"
+        b"OWNER_ID=123456\n"
+        b"SHIKI_USER=bom-user\n"
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    executable = tmp_path / "ShikiUpdatesBot.exe"
+    script = (
+        "import sys; "
+        f"sys.path.insert(0, {str(repo_root)!r}); "
+        "sys.frozen = True; "
+        f"sys.executable = {str(executable)!r}; "
+        "import config; "
+        "print(config.BOT_TOKEN)"
+    )
+    child_env = os.environ.copy()
+    for name in ("BOT_TOKEN", "OWNER_ID", "SHIKI_USER", "DATA_DIR"):
+        child_env.pop(name, None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        env=child_env,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "bom-token"
 
 
 # ── чтение конфигурации из окружения (conftest задаёт значения) ─────

@@ -18,6 +18,7 @@ from config import (
     BOT_TOKEN,
     CHECK_INTERVAL,
     DISPLAY_NAME,
+    log,
 )
 from handlers import (
     BackupStates,
@@ -38,10 +39,13 @@ from handlers import (
     cmd_status,
     cmd_stop,
     cmd_subs,
+    cmd_version,
     probe_owner_and_start,
     stats_menu_cb,
 )
 from healthcheck import start_health_server
+from runtime import IS_FROZEN, WindowsConsoleCloseGuard
+from updates import start_update_loop
 
 
 async def main() -> None:
@@ -58,6 +62,7 @@ async def main() -> None:
     dp.message.register(cmd_cancel,    Command("cancel"))
     dp.message.register(cmd_stats,     Command("stats"))
     dp.message.register(cmd_favs,      Command("favs"))
+    dp.message.register(cmd_version,   Command("version"))
 
     # FSM-обработчики для /broadcast
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
@@ -83,7 +88,8 @@ async def main() -> None:
     ])
 
     # Healthcheck-сервер (для хостингов с обязательным портом + watchdog)
-    await start_health_server(check_interval=CHECK_INTERVAL)
+    if not IS_FROZEN:
+        await start_health_server(check_interval=CHECK_INTERVAL)
 
     # Финальный бэкап при остановке (aiogram ловит SIGTERM/SIGINT → emit_shutdown)
     dp.shutdown.register(_shutdown_backup)
@@ -91,8 +97,27 @@ async def main() -> None:
     # owner-reachability gate: пробуем достучаться до владельца. Доставилось →
     # запускаем фоновый цикл; нет → апдейт-поллинг всё равно жив, /start добудит.
     await probe_owner_and_start(bot)
+    start_update_loop(bot)
 
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    close_guard = None
+    if IS_FROZEN:
+        loop = asyncio.get_running_loop()
+
+        def request_stop() -> None:
+            asyncio.create_task(dp.stop_polling())
+
+        close_guard = WindowsConsoleCloseGuard(loop, request_stop)
+        try:
+            close_guard.install()
+        except OSError as e:
+            log.warning("Не удалось установить обработчик закрытия консоли: %s", e)
+
+    try:
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    finally:
+        if close_guard is not None:
+            close_guard.complete()
+            close_guard.uninstall()
 
 
 if __name__ == "__main__":

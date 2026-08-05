@@ -83,6 +83,11 @@ from storage import (
     save_stats_current,
     save_subscribers,
 )
+from updates import (
+    build_version_keyboard,
+    build_version_text,
+    refresh_update_state,
+)
 from utils import (
     _subscriber_link,
     current_quarter,
@@ -109,7 +114,7 @@ def _confirm_kb() -> InlineKeyboardMarkup:
 
 
 async def _safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
-    """Best-effort удаление сообщения.
+    """Удалить сообщение по возможности, не распространяя ошибку.
 
     Глушит штатные «message to delete not found» / уже удалённое / истёкшее
     окно: чистка чата не должна ронять основной флоу. Переиспользуемый примитив
@@ -585,7 +590,7 @@ async def check_and_notify_favourites(
 
 
 def _is_blocked_error(exc: Exception) -> bool:
-    """True, если ошибка отправки означает, что получатель недоступен
+    """Вернуть True, если ошибка отправки означает, что получатель недоступен
     (заблокировал бота / удалён / чат не найден) — повод его отписать."""
     err = str(exc).lower()
     return ("bot was blocked" in err
@@ -912,7 +917,7 @@ def _build_startup_text() -> str:
 
 
 async def probe_owner_and_start(bot: Bot) -> None:
-    """owner-reachability gate. Шлёт владельцу '🟢 Бот запущен' — проба аварийного
+    """Проверка доступности владельца. Шлёт '🟢 Бот запущен' — пробу аварийного
     канала + легитимный сигнал рестарта (без дебаунса). Доставилось → стартуем
     фоновый цикл; не доставилось (владелец заблокировал бота / TelegramForbiddenError
     и т.п.) → WARNING, цикл НЕ стартуем. Апдейт-поллинг (dp.start_polling) жив всегда:
@@ -1319,3 +1324,16 @@ async def cmd_status(message: Message) -> None:
 
     sep = "\n"
     await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_version(message: Message) -> None:
+    """Показать владельцу версию и состояние проверки обновлений."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+    state = await refresh_update_state(force=True)
+    await message.answer(
+        build_version_text(state),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_version_keyboard(state.get("release_url")),
+    )
