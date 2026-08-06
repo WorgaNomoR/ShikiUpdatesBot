@@ -11,9 +11,11 @@
 import asyncio
 import io
 import json
+import lzma
 import tempfile
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 from aiogram import Bot
@@ -286,6 +288,8 @@ def restore_backup_zip(raw: bytes) -> dict:
                 NotImplementedError,
                 OSError,
                 EOFError,
+                zlib.error,
+                lzma.LZMAError,
             ) as e:
                 log.warning("restore_backup_zip: пропускаю битый %s: %s", name, e)
                 skipped.append(name)

@@ -9,8 +9,10 @@
 """
 import io
 import json
+import lzma
 import time
 import zipfile
+import zlib
 from unittest.mock import AsyncMock
 
 import pytest
@@ -160,6 +162,9 @@ def test_restore_skips_corrupt_crc_member(backup_env):
     assert "subscribers.json" in result["skipped"]
     assert result["restored"] == ["stats_current.json"]
     assert not (backup_env / "subscribers.json").exists()
+    assert json.loads(
+        (backup_env / "stats_current.json").read_text(encoding="utf-8")
+    ) == {"period": "2026-Q2", "events": []}
 
 
 @pytest.mark.parametrize(
@@ -169,8 +174,17 @@ def test_restore_skips_corrupt_crc_member(backup_env):
         NotImplementedError("unsupported compression"),
         OSError("read failed"),
         EOFError("truncated member"),
+        zlib.error("invalid deflate stream"),
+        lzma.LZMAError("invalid lzma stream"),
     ],
-    ids=["encrypted", "unsupported-compression", "os-error", "unexpected-eof"],
+    ids=[
+        "encrypted",
+        "unsupported-compression",
+        "os-error",
+        "unexpected-eof",
+        "deflate-error",
+        "lzma-error",
+    ],
 )
 def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read_error):
     raw = _zip_bytes({
@@ -190,6 +204,10 @@ def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read_error
 
     assert "subscribers.json" in result["skipped"]
     assert result["restored"] == ["stats_current.json"]
+    assert not (backup_env / "subscribers.json").exists()
+    assert json.loads(
+        (backup_env / "stats_current.json").read_text(encoding="utf-8")
+    ) == {"period": "2026-Q2", "events": []}
 
 
 @pytest.mark.parametrize("change", ["missing", "extra"])
