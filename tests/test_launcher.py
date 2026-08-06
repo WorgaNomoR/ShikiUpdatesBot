@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 """Консольный запуск portable exe и его диагностические режимы."""
 
+import io
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -28,11 +29,16 @@ def test_launcher_check_config_is_offline(monkeypatch, capsys, tmp_path):
     assert str(tmp_path) in capsys.readouterr().out
 
 
-def test_launcher_first_run_stops_after_creating_env(monkeypatch, capsys):
+def test_launcher_first_run_stops_after_creating_env(monkeypatch):
+    output = io.BytesIO()
+    cp1252_stdout = io.TextIOWrapper(output, encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", cp1252_stdout)
     monkeypatch.setattr(launcher, "ensure_frozen_env", lambda: True)
     monkeypatch.setattr(launcher, "_pause_after_error", lambda: None)
+
     assert launcher.run([]) == 2
-    assert "Создан файл настроек" in capsys.readouterr().out
+    cp1252_stdout.flush()
+    assert "Создан файл настроек" in output.getvalue().decode("utf-8")
 
 
 def test_launcher_reports_second_instance_without_traceback(monkeypatch, capsys):

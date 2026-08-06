@@ -93,10 +93,12 @@ def test_console_close_guard_handles_closed_event_loop(monkeypatch):
     monkeypatch.setattr(runtime, "IS_FROZEN", True)
     loop = MagicMock()
     loop.call_soon_threadsafe.side_effect = RuntimeError("loop closed")
-    guard = runtime.WindowsConsoleCloseGuard(loop, MagicMock(), timeout=0)
+    request_stop = MagicMock()
+    guard = runtime.WindowsConsoleCloseGuard(loop, request_stop, timeout=0)
     assert guard.install() is True
     try:
         assert guard._handler(2) == 1
+        loop.call_soon_threadsafe.assert_called_once_with(request_stop)
     finally:
         guard.complete()
         guard.uninstall()

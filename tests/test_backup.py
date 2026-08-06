@@ -230,6 +230,30 @@ def test_restore_rejects_inexact_update_state_schema(backup_env, change):
     assert not (backup_env / "update_state.json").exists()
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "last_checked_at",
+        "latest_version",
+        "release_url",
+        "last_notified_version",
+    ],
+)
+def test_restore_rejects_non_string_update_state_value(backup_env, key):
+    state = {
+        "last_checked_at": None,
+        "latest_version": "v1.2.0",
+        "release_url": "https://release",
+        "last_notified_version": "v1.2.0",
+    }
+    state[key] = 42
+    raw = _zip_bytes({"update_state.json": json.dumps(state)})
+
+    with pytest.raises(ValueError, match="нет валидных файлов"):
+        backup.restore_backup_zip(raw)
+    assert not (backup_env / "update_state.json").exists()
+
+
 def test_restore_rolls_back_first_file_when_second_publish_fails(
     backup_env,
     monkeypatch,
@@ -266,6 +290,33 @@ def test_restore_rolls_back_first_file_when_second_publish_fails(
         "period": "old",
         "events": [],
     }
+
+
+def test_restore_removes_new_file_when_second_publish_fails(
+    backup_env,
+    monkeypatch,
+):
+    raw = _zip_bytes({
+        "subscribers.json": '{"subscribers": {"2": "New"}}',
+        "stats_current.json": '{"period": "new", "events": []}',
+    })
+    real_publish = backup._publish_staged_file
+    calls = 0
+
+    def fail_second_publish(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("disk failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(backup, "_publish_staged_file", fail_second_publish)
+
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        backup.restore_backup_zip(raw)
+
+    assert not (backup_env / "subscribers.json").exists()
+    assert not (backup_env / "stats_current.json").exists()
 
 
 def test_restore_no_valid_members_raises(backup_env):

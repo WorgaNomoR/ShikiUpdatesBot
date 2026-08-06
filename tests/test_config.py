@@ -4,13 +4,13 @@
 
 import importlib
 import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
+from dotenv.main import load_dotenv as real_load_dotenv
 
-from config import _int_env, _required_env, _required_int_env
+import config
+import storage
+from config import _int_env, _load_local_env, _required_env, _required_int_env
 
 
 # ── _required_env ──────────────────────────────────────────────────
@@ -73,35 +73,21 @@ def test_required_int_env_names_invalid_variable_without_value(monkeypatch):
 
 def test_load_local_env_accepts_utf8_bom(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
-    env_file.write_bytes(
-        b"\xef\xbb\xbfBOT_TOKEN=bom-token\n"
-        b"OWNER_ID=123456\n"
-        b"SHIKI_USER=bom-user\n"
+    storage._atomic_write(
+        env_file,
+        "\ufeffBOT_TOKEN=bom-token\n"
+        "OWNER_ID=123456\n"
+        "SHIKI_USER=bom-user\n",
     )
-    repo_root = Path(__file__).resolve().parents[1]
-    executable = tmp_path / "ShikiUpdatesBot.exe"
-    script = (
-        "import sys; "
-        f"sys.path.insert(0, {str(repo_root)!r}); "
-        "sys.frozen = True; "
-        f"sys.executable = {str(executable)!r}; "
-        "import config; "
-        "print(config.BOT_TOKEN)"
-    )
-    child_env = os.environ.copy()
     for name in ("BOT_TOKEN", "OWNER_ID", "SHIKI_USER", "DATA_DIR"):
-        child_env.pop(name, None)
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(config, "load_dotenv", real_load_dotenv)
 
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        check=False,
-        env=child_env,
-        text=True,
-    )
+    _load_local_env(env_file)
 
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "bom-token"
+    assert os.environ["BOT_TOKEN"] == "bom-token"
+    assert os.environ["OWNER_ID"] == "123456"
+    assert os.environ["SHIKI_USER"] == "bom-user"
 
 
 # ── чтение конфигурации из окружения (conftest задаёт значения) ─────

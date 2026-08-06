@@ -3,8 +3,10 @@
 """Проверка GitHub Release: парсинг, кэш и однократная доставка."""
 
 import asyncio
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 
 import updates
@@ -62,6 +64,14 @@ async def test_fetch_latest_release_rejects_missing_windows_asset(release_build)
 
 
 @pytest.mark.asyncio
+async def test_fetch_latest_release_returns_none_on_network_error(release_build):
+    session = MagicMock()
+    session.get.side_effect = aiohttp.ClientError("network unavailable")
+
+    assert await updates.fetch_latest_release(session) is None
+
+
+@pytest.mark.asyncio
 async def test_refresh_update_state_persists_success(release_build, monkeypatch):
     state = {
         "last_checked_at": None,
@@ -82,6 +92,38 @@ async def test_refresh_update_state_persists_success(release_build, monkeypatch)
     assert result["latest_version"] == "v1.3.0"
     assert result["last_checked_at"]
     assert saved[-1]["release_url"] == "https://release"
+
+
+@pytest.mark.asyncio
+async def test_refresh_update_state_honors_recent_naive_timestamp(
+    release_build,
+    monkeypatch,
+):
+    now = datetime(2026, 8, 6, 12, 0, 0)
+    state = {
+        "last_checked_at": now.isoformat(),
+        "latest_version": "v1.3.0",
+        "release_url": "https://release",
+        "last_notified_version": None,
+    }
+    fetch = AsyncMock()
+    save = MagicMock()
+    monkeypatch.setattr(updates, "_utcnow", lambda: now)
+    monkeypatch.setattr(updates, "load_update_state", lambda: state.copy())
+    monkeypatch.setattr(updates, "save_update_state", save)
+    monkeypatch.setattr(updates, "fetch_latest_release", fetch)
+
+    assert await updates.refresh_update_state(force=False) == state
+    fetch.assert_not_awaited()
+    save.assert_not_called()
+
+
+def test_checked_recently_normalizes_aware_timestamp(monkeypatch):
+    monkeypatch.setattr(updates, "_utcnow", lambda: datetime(2026, 8, 6, 12, 0, 0))
+
+    assert updates._checked_recently({
+        "last_checked_at": "2026-08-06T15:00:00+03:00",
+    }) is True
 
 
 @pytest.mark.asyncio

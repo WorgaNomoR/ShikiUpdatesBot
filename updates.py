@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 import aiohttp
@@ -26,7 +26,7 @@ from config import OWNER_ID, log
 from project_meta import PROJECT_SUMMARY
 from runtime import IS_FROZEN
 from storage import load_update_state, save_update_state
-from utils import _utcnow
+from utils import _utcnow, h
 
 UPDATE_CHECK_INTERVAL = timedelta(hours=24)
 UPDATE_INITIAL_DELAY = 5.0
@@ -116,8 +116,8 @@ def _checked_recently(state: dict) -> bool:
         return False
     try:
         checked = datetime.fromisoformat(raw)
-        if checked.tzinfo is None:
-            return False
+        if checked.tzinfo is not None:
+            checked = checked.astimezone(timezone.utc).replace(tzinfo=None)
         return _utcnow() - checked < UPDATE_CHECK_INTERVAL
     except (TypeError, ValueError):
         return False
@@ -162,11 +162,11 @@ def build_version_text(state: dict) -> str:
     )
     return (
         "🎌 <b>ShikiUpdatesBot</b>\n"
-        f"{escape(PROJECT_SUMMARY)}\n\n"
-        f"Версия: <code>{escape(APP_VERSION)}</code>\n"
+        f"{h(PROJECT_SUMMARY)}\n\n"
+        f"Версия: <code>{h(APP_VERSION)}</code>\n"
         f"Режим запуска: {launch_mode}\n"
-        f"Последняя: <code>{escape(str(latest))}</code>\n"
-        f"Проверено: {escape(str(checked))}\n"
+        f"Последняя: <code>{h(latest)}</code>\n"
+        f"Проверено: {h(checked)}\n"
         f"Проверка релиза: {check_mode}\n\n"
         f"{repository}"
     )
@@ -180,8 +180,8 @@ async def check_and_notify_update(bot: Bot) -> None:
         return
     text = (
         "🆕 <b>Доступна новая версия ShikiUpdatesBot</b>\n\n"
-        f"Установлена: <code>{escape(APP_VERSION)}</code>\n"
-        f"Последняя: <code>{escape(str(latest))}</code>\n\n"
+        f"Установлена: <code>{h(APP_VERSION)}</code>\n"
+        f"Последняя: <code>{h(latest)}</code>\n\n"
         "Останови бот и замени только <code>ShikiUpdatesBot.exe</code>. "
         "Файлы <code>.env</code>, <code>data/</code> и <code>logs/</code> останутся на месте."
     )

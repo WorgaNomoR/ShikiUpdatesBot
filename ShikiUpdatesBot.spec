@@ -6,6 +6,7 @@
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, copy_metadata
@@ -15,6 +16,27 @@ sys.path.insert(0, str(root))
 
 from project_meta import PROJECT_REPOSITORY, PROJECT_VERSION  # noqa: E402
 
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Атомарно опубликовать генерируемый текстовый файл сборки."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 meta_dir = root / "build" / "pyinstaller-meta"
 meta_dir.mkdir(parents=True, exist_ok=True)
 
@@ -23,7 +45,8 @@ app_repository = os.environ.get("APP_REPOSITORY", PROJECT_REPOSITORY).strip()
 app_server_url = os.environ.get("APP_SERVER_URL", "https://github.com").strip()
 app_api_url = os.environ.get("APP_API_URL", "https://api.github.com").strip()
 
-(meta_dir / "_build_info.py").write_text(
+atomic_write_text(
+    meta_dir / "_build_info.py",
     "\n".join([
         f"APP_VERSION = {app_version!r}",
         f"APP_REPOSITORY = {app_repository!r}",
@@ -31,13 +54,13 @@ app_api_url = os.environ.get("APP_API_URL", "https://api.github.com").strip()
         f"APP_API_URL = {app_api_url!r}",
         "",
     ]),
-    encoding="utf-8",
 )
 
 match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-dev)?", app_version)
 parts = tuple(int(value) for value in match.groups()) if match else (0, 0, 0)
 version_file = meta_dir / "windows-version.txt"
-version_file.write_text(
+atomic_write_text(
+    version_file,
     f"""VSVersionInfo(
   ffi=FixedFileInfo(
     filevers=({parts[0]}, {parts[1]}, {parts[2]}, 0),
@@ -66,7 +89,6 @@ version_file.write_text(
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]
 )""",
-    encoding="utf-8",
 )
 
 datas = collect_data_files("pytrovich")
