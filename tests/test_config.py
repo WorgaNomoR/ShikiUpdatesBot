@@ -3,10 +3,12 @@
 """Тесты config.py — хелперы окружения и чтение env (env-config фолд)."""
 
 import importlib
+from unittest.mock import MagicMock
 
 import pytest
 
-from config import _int_env, _required_env
+import config
+from config import _int_env, _load_local_env, _required_env, _required_int_env
 
 
 # ── _required_env ──────────────────────────────────────────────────
@@ -58,6 +60,30 @@ def test_int_env_bad_value_raises(monkeypatch):
     monkeypatch.setenv("X_INT", "notanumber")
     with pytest.raises(RuntimeError, match="X_INT"):
         _int_env("X_INT", 42)
+
+
+def test_required_int_env_names_invalid_variable_without_value(monkeypatch):
+    monkeypatch.setenv("X_SECRET_INT", "not-a-number")
+    with pytest.raises(RuntimeError, match="X_SECRET_INT") as error:
+        _required_int_env("X_SECRET_INT")
+    assert "not-a-number" not in str(error.value)
+
+
+def test_load_local_env_uses_utf8_sig_without_overriding_environment(
+    tmp_path,
+    monkeypatch,
+):
+    env_file = tmp_path / ".env"
+    load_dotenv = MagicMock()
+    monkeypatch.setattr(config, "load_dotenv", load_dotenv)
+
+    _load_local_env(env_file)
+
+    load_dotenv.assert_called_once_with(
+        dotenv_path=env_file,
+        override=False,
+        encoding="utf-8-sig",
+    )
 
 
 # ── чтение конфигурации из окружения (conftest задаёт значения) ─────

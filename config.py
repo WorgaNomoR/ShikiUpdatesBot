@@ -4,20 +4,27 @@
 Конфигурация ShikiUpdatesBot.
 
 Нижний уровень: грузит локальный .env, читает окружение, задаёт пути к данным
-и настраивает логирование на импорте. Ничего не импортирует из проекта —
-зависимости строго односторонние (как healthcheck.py): остальные модули тянут
-константы и логгер отсюда.
+и настраивает логирование на импорте. Зависит только от нижележащего
+runtime.py; остальные модули приложения импортируют константы и логгер
+отсюда.
 """
 
-import logging
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
 
+from runtime import ENV_FILE, configure_logging, resolve_data_dir
+
+
+def _load_local_env(path=ENV_FILE) -> None:
+    """Загрузить portable .env, принимая распространённый в Windows UTF-8 BOM."""
+    load_dotenv(dotenv_path=path, override=False, encoding="utf-8-sig")
+
+
 # Грузим локальный .env (если есть) ДО любого чтения окружения. override=False:
 # на docker-compose / хостингах переменные уже в окружении — их не перетираем.
-load_dotenv()
+_load_local_env()
+log = configure_logging()
 
 
 def _required_env(name: str, hint: str = "") -> str:
@@ -42,11 +49,20 @@ def _int_env(name: str, default: int) -> int:
         ) from e
 
 
+def _required_int_env(name: str, hint: str = "") -> int:
+    """Прочитать обязательное целое без утечки его значения в тексте ошибки."""
+    raw = _required_env(name, hint)
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"Переменная окружения {name} должна быть целым числом.") from e
+
+
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ (из окружения / .env)
 # ─────────────────────────────────────────────
 BOT_TOKEN = _required_env("BOT_TOKEN", "токен от @BotFather")
-OWNER_ID  = int(_required_env("OWNER_ID", "твой Telegram ID от @userinfobot"))
+OWNER_ID  = _required_int_env("OWNER_ID", "твой Telegram ID от @userinfobot")
 
 SHIKI_USER     = _required_env("SHIKI_USER", "ник на Shikimori, напр. WNR")
 SHIKI_BASE_URL = (os.environ.get("SHIKI_BASE_URL") or "https://shikimori.io").strip()
@@ -67,15 +83,16 @@ WEEKLY_BACKUP_INTERVAL = 7 * 24 * 60 * 60  # еженедельный авто-�
 
 # ─────────────────────────────────────────────
 #  ПУТИ К ФАЙЛАМ ДАННЫХ
-#  По умолчанию всё создаётся в /data.
+#  По умолчанию: /data для Python/Docker, data/ рядом с exe для portable-сборки.
+#  Относительный DATA_DIR в exe считается от portable-папки.
 #  Чтобы хранить в другом месте — задай переменную окружения
 #  DATA_DIR=/путь/к/папке.
 # ─────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATA_DIR = resolve_data_dir(os.environ.get("DATA_DIR"))
 try:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 except OSError as e:
-    logging.getLogger(__name__).warning(
+    log.warning(
         "Не удалось создать DATA_DIR=%s: %s. "
         "Файлы будут недоступны до исправления прав/пути.", DATA_DIR, e
     )
@@ -89,13 +106,4 @@ SEEN_FAVS_FILE = DATA_DIR / "seen_favourites.json"  # ID виденного из
 STATS_ALL_FILE     = DATA_DIR / "stats_all.json"      # вся история: тайтлы + агрегаты
 STATS_CURRENT_FILE = DATA_DIR / "stats_current.json"  # события текущего квартала
 QUARTERS_DIR       = DATA_DIR / "quarters"            # замороженные снапшоты кварталов
-
-# ─────────────────────────────────────────────
-#  ЛОГИРОВАНИЕ
-# ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+UPDATE_STATE_FILE  = DATA_DIR / "update_state.json"   # проверка версии standalone exe
