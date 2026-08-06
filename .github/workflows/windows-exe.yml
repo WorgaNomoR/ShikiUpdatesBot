@@ -72,12 +72,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path $firstRun | Out-Null
           Copy-Item .\dist\ShikiUpdatesBot.exe $firstRun
           Copy-Item .\.env.example $firstRun
-          Push-Location $firstRun
-          & .\ShikiUpdatesBot.exe
-          $exitCode = $LASTEXITCODE
-          Pop-Location
-          if ($exitCode -ne 2 -or -not (Test-Path "$firstRun\.env")) {
-            throw "Frozen first-run bootstrap failed (exit=$exitCode)"
+          & {
+            $PSNativeCommandUseErrorActionPreference = $false
+            Push-Location $firstRun
+            try {
+              & .\ShikiUpdatesBot.exe
+              $exitCode = $LASTEXITCODE
+            } finally {
+              Pop-Location
+            }
+            if ($exitCode -ne 2 -or -not (Test-Path "$firstRun\.env")) {
+              throw "Frozen first-run bootstrap failed (exit=$exitCode)"
+            }
           }
 
       - name: Smoke version and configuration

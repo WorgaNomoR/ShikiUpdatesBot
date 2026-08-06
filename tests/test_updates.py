@@ -126,6 +126,14 @@ def test_checked_recently_normalizes_aware_timestamp(monkeypatch):
     }) is True
 
 
+def test_checked_recently_rejects_future_timestamp(monkeypatch):
+    monkeypatch.setattr(updates, "_utcnow", lambda: datetime(2026, 8, 6, 12, 0, 0))
+
+    assert updates._checked_recently({
+        "last_checked_at": "2026-08-06T12:00:01",
+    }) is False
+
+
 @pytest.mark.asyncio
 async def test_forced_source_check_uses_release_api(release_build, monkeypatch):
     monkeypatch.setattr(updates, "IS_FROZEN", False)

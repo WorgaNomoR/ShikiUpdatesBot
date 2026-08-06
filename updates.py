@@ -118,7 +118,8 @@ def _checked_recently(state: dict) -> bool:
         checked = datetime.fromisoformat(raw)
         if checked.tzinfo is not None:
             checked = checked.astimezone(timezone.utc).replace(tzinfo=None)
-        return _utcnow() - checked < UPDATE_CHECK_INTERVAL
+        age = _utcnow() - checked
+        return timedelta(0) <= age < UPDATE_CHECK_INTERVAL
     except (TypeError, ValueError):
         return False
 

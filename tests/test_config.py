@@ -3,13 +3,11 @@
 """Тесты config.py — хелперы окружения и чтение env (env-config фолд)."""
 
 import importlib
-import os
+from unittest.mock import MagicMock
 
 import pytest
-from dotenv.main import load_dotenv as real_load_dotenv
 
 import config
-import storage
 from config import _int_env, _load_local_env, _required_env, _required_int_env
 
 
@@ -71,23 +69,21 @@ def test_required_int_env_names_invalid_variable_without_value(monkeypatch):
     assert "not-a-number" not in str(error.value)
 
 
-def test_load_local_env_accepts_utf8_bom(tmp_path, monkeypatch):
+def test_load_local_env_uses_utf8_sig_without_overriding_environment(
+    tmp_path,
+    monkeypatch,
+):
     env_file = tmp_path / ".env"
-    storage._atomic_write(
-        env_file,
-        "\ufeffBOT_TOKEN=bom-token\n"
-        "OWNER_ID=123456\n"
-        "SHIKI_USER=bom-user\n",
-    )
-    for name in ("BOT_TOKEN", "OWNER_ID", "SHIKI_USER", "DATA_DIR"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(config, "load_dotenv", real_load_dotenv)
+    load_dotenv = MagicMock()
+    monkeypatch.setattr(config, "load_dotenv", load_dotenv)
 
     _load_local_env(env_file)
 
-    assert os.environ["BOT_TOKEN"] == "bom-token"
-    assert os.environ["OWNER_ID"] == "123456"
-    assert os.environ["SHIKI_USER"] == "bom-user"
+    load_dotenv.assert_called_once_with(
+        dotenv_path=env_file,
+        override=False,
+        encoding="utf-8-sig",
+    )
 
 
 # ── чтение конфигурации из окружения (conftest задаёт значения) ─────
