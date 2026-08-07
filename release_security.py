@@ -21,6 +21,7 @@ LARGE_FILE_THRESHOLD = 32 * 1024 * 1024
 POLL_INTERVAL = 30.0
 POLL_TIMEOUT = 10 * 60.0
 HTTP_TIMEOUT = 60.0
+UPLOAD_TIMEOUT = 5 * 60.0
 _FLAGGED_CATEGORIES = frozenset({"malicious", "suspicious"})
 _REPORT_START_MARKER = "<!-- shikiupdatesbot-security-report:start -->"
 _REPORT_END_MARKER = "<!-- shikiupdatesbot-security-report:end -->"
@@ -130,9 +131,10 @@ async def _request_json(
     *,
     data=None,
     allow_not_found: bool = False,
+    timeout_total: float = HTTP_TIMEOUT,
 ) -> dict | None:
     headers = {"x-apikey": api_key}
-    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(total=timeout_total)
     async with session.request(
         method,
         url,
@@ -210,7 +212,14 @@ async def _upload_file(
             filename=path.name,
             content_type="application/octet-stream",
         )
-        payload = await _request_json(session, "POST", upload_url, api_key, data=form)
+        payload = await _request_json(
+            session,
+            "POST",
+            upload_url,
+            api_key,
+            data=form,
+            timeout_total=UPLOAD_TIMEOUT,
+        )
     assert payload is not None
     return _analysis_id(payload)
 

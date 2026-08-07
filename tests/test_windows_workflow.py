@@ -5,7 +5,10 @@
 import os
 import re
 import shutil
-import subprocess
+
+# Модуль нужен только контролируемой тестовой функции без shell-выполнения.
+import subprocess  # nosec B404
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +20,7 @@ WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / 
 WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8")
 SPEC = yaml.safe_load(WORKFLOW)
 POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
+POWERSHELL_TESTS_UNAVAILABLE = sys.platform != "win32" or POWERSHELL is None
 
 
 def _step(job: dict, name: str) -> dict:
@@ -39,7 +43,8 @@ def _run_powershell(script: str, workdir: Path, env: dict[str, str]):
     script_path.write_text(script, encoding="utf-8-sig", newline="\n")
     process_env = os.environ.copy()
     process_env.update(env)
-    return subprocess.run(
+    # Команда, аргументы и временный файл задаются тестом; shell не используется.
+    return subprocess.run(  # nosec B603  # nosemgrep
         [
             POWERSHELL,
             "-NoProfile",
@@ -98,7 +103,10 @@ def test_virustotal_secret_is_scoped_to_single_release_step():
     )
 
 
-@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell недоступен")
+@pytest.mark.skipif(
+    POWERSHELL_TESTS_UNAVAILABLE,
+    reason="Поведенческие PowerShell-тесты выполняются только под Windows",
+)
 @pytest.mark.parametrize(
     ("event_name", "ref", "expected"),
     [
@@ -146,7 +154,10 @@ def test_unexpected_scan_failure_has_independent_non_blocking_fallback():
     assert "Исходный код ShikiUpdatesBot открыт" not in fallback["run"]
 
 
-@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell недоступен")
+@pytest.mark.skipif(
+    POWERSHELL_TESTS_UNAVAILABLE,
+    reason="Поведенческие PowerShell-тесты выполняются только под Windows",
+)
 @pytest.mark.parametrize("initial_state", ["valid", "missing", "empty", "damaged"])
 def test_security_notes_fallback_behavior(tmp_path, initial_state):
     fallback = _step(SPEC["jobs"]["build"], "Ensure release security notes exist")
@@ -192,7 +203,10 @@ def test_security_notes_fallback_behavior(tmp_path, initial_state):
         )
 
 
-@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell недоступен")
+@pytest.mark.skipif(
+    POWERSHELL_TESTS_UNAVAILABLE,
+    reason="Поведенческие PowerShell-тесты выполняются только под Windows",
+)
 def test_security_notes_fallback_hashes_existing_executable(tmp_path):
     fallback = _step(SPEC["jobs"]["build"], "Ensure release security notes exist")
     executable = tmp_path / "dist" / "ShikiUpdatesBot.exe"

@@ -157,6 +157,8 @@ async def test_missing_report_is_uploaded_and_queued_analysis_is_polled(tmp_path
     assert clock.sleeps == [30.0, 30.0]
     assert [call[0] for call in session.calls] == ["GET", "POST", "GET", "GET"]
     assert session.calls[1][1] == f"{release_security.VIRUSTOTAL_API_URL}/files"
+    assert session.calls[0][2]["timeout"].total == release_security.HTTP_TIMEOUT
+    assert session.calls[1][2]["timeout"].total == release_security.UPLOAD_TIMEOUT
 
 
 @pytest.mark.asyncio

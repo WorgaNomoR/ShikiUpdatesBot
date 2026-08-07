@@ -114,7 +114,7 @@ def _utcnow() -> datetime:
 
 
 def _parse_iso_utc(value) -> datetime | None:
-    """ISO timestamp -> naive UTC; пустое или повреждённое значение -> None."""
+    """Метка времени ISO -> наивное UTC-время; пустое или повреждённое -> None."""
     if not isinstance(value, str) or not value:
         return None
     try:
