@@ -130,6 +130,21 @@ def _is_newer(latest: str | None) -> bool:
     return bool(current_tuple and latest_tuple and latest_tuple > current_tuple)
 
 
+def _format_checked_at(value) -> str:
+    """Показать сохранённый ISO timestamp как короткое время UTC."""
+    if not isinstance(value, str) or not value:
+        return "ещё не проверялась"
+    try:
+        checked = datetime.fromisoformat(value)
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=timezone.utc)
+        else:
+            checked = checked.astimezone(timezone.utc)
+        return checked.strftime("%d.%m.%Y, %H:%M UTC")
+    except (OverflowError, ValueError):
+        return "время последней проверки неизвестно"
+
+
 async def refresh_update_state(*, force: bool = False) -> dict:
     """Обновить кэш последнего релиза без исключений для вызывающего кода."""
     state = load_update_state()
@@ -148,7 +163,7 @@ async def refresh_update_state(*, force: bool = False) -> dict:
 
 def build_version_text(state: dict) -> str:
     latest = state.get("latest_version") or "неизвестна"
-    checked = state.get("last_checked_at") or "ещё не проверялась"
+    checked = _format_checked_at(state.get("last_checked_at"))
     launch_mode = "portable Windows exe" if IS_FROZEN else "Python/source"
     if update_checks_enabled():
         check_mode = "автоматически раз в сутки и вручную через /version"
@@ -166,7 +181,7 @@ def build_version_text(state: dict) -> str:
         f"{h(PROJECT_SUMMARY)}\n\n"
         f"Версия: <code>{h(APP_VERSION)}</code>\n"
         f"Режим запуска: {launch_mode}\n"
-        f"Последняя: <code>{h(latest)}</code>\n"
+        f"Последняя версия: <code>{h(latest)}</code>\n"
         f"Проверено: {h(checked)}\n"
         f"Проверка релиза: {check_mode}\n\n"
         f"{repository}"
