@@ -56,7 +56,7 @@ The former `main.py` monolith was split into single-responsibility modules with 
 - `runtime.py` — stdlib-only frozen/source detection, physical app-root paths, first-run `.env` copy, rotating portable logs, and the Windows single-instance mutex. Lowest foundation; imports nothing project-local.
 - `project_meta.py` / `build_info.py` — canonical project version/description and runtime build identity (`APP_VERSION`, repository/server/API URLs), strict SemVer parsing, and PyInstaller overrides injected through `_build_info`.
 - `config.py` — explicit app-root `.env` loading (`load_dotenv`), data-dir paths, and shared logging. Depends only on `runtime`.
-- `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_subscriber_link`, `_utcnow`, `quarter_*`, `_safe_int`, `_safe_float`, `_normalize_homoglyphs`.
+- `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_subscriber_link`, `_utcnow`, `_parse_iso_utc`, `quarter_*`, `_safe_int`, `_safe_float`, `_normalize_homoglyphs`.
 - `name_grammar.py` — startup-time validation, gender detection, first-name inflection, immutable display-name context, and `{g:male|female}` formatting. Pure domain layer over `pytrovich`; imports nothing project-local.
 - `storage.py` — file persistence: `_atomic_write`, load/save of every JSON state file (including standalone `update_state.json`), the `stats_all` in-memory cache.
 - `updates.py` — notification-only GitHub Release check, daily cache/state, owner notification, and update-loop lifecycle. It never downloads or replaces files and does not use the Shikimori throttle.
@@ -68,6 +68,7 @@ The former `main.py` monolith was split into single-responsibility modules with 
 - `healthcheck.py` — isolated HTTP healthcheck server + heartbeat watchdog. Imports nothing from the app; the dependency is one-way.
 - `main.py` — application entrypoint: builds the Bot/Dispatcher, registers handlers, runs the owner gate, source/Docker healthcheck, update loop, and polling.
 - `launcher.py` — frozen console entrypoint: `--version`, `--check-config`, first-run diagnostics, single-instance ownership, and delegation to `main.main()`.
+- `release_security.py` — build-time-only VirusTotal client invoked by the Windows release workflow. It imports no project-local modules and is never part of bot runtime.
 
 Dependency graph (each module depends only on those below it; `healthcheck` is fully isolated):
 
@@ -103,6 +104,9 @@ graph TD
     shiki_api --> base
     config --> runtime
     healthcheck["healthcheck (isolated)"]
+    subgraph build_time["Build-time only"]
+        windows_workflow["windows-exe.yml"] --> release_security["release_security.py"]
+    end
 ```
 
 When adding or moving code, keep dependencies one-directional (import from lower modules only) and pass runtime values (like `CHECK_INTERVAL`) as parameters where that avoids a cycle. `healthcheck.py` is the reference pattern.

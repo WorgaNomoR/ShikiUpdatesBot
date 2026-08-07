@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from html import escape
 
 import aiohttp
@@ -26,7 +26,7 @@ from config import OWNER_ID, log
 from project_meta import PROJECT_SUMMARY
 from runtime import IS_FROZEN
 from storage import load_update_state, save_update_state
-from utils import _utcnow, h
+from utils import _parse_iso_utc, _utcnow, h
 
 UPDATE_CHECK_INTERVAL = timedelta(hours=24)
 UPDATE_INITIAL_DELAY = 5.0
@@ -111,17 +111,11 @@ async def fetch_latest_release(session: aiohttp.ClientSession | None = None) -> 
 
 
 def _checked_recently(state: dict) -> bool:
-    raw = state.get("last_checked_at")
-    if not isinstance(raw, str):
+    checked = _parse_iso_utc(state.get("last_checked_at"))
+    if checked is None:
         return False
-    try:
-        checked = datetime.fromisoformat(raw)
-        if checked.tzinfo is not None:
-            checked = checked.astimezone(timezone.utc).replace(tzinfo=None)
-        age = _utcnow() - checked
-        return timedelta(0) <= age < UPDATE_CHECK_INTERVAL
-    except (TypeError, ValueError):
-        return False
+    age = _utcnow() - checked
+    return timedelta(0) <= age < UPDATE_CHECK_INTERVAL
 
 
 def _is_newer(latest: str | None) -> bool:
@@ -134,15 +128,10 @@ def _format_checked_at(value) -> str:
     """Показать сохранённый ISO timestamp как короткое время UTC."""
     if not isinstance(value, str) or not value:
         return "ещё не проверялась"
-    try:
-        checked = datetime.fromisoformat(value)
-        if checked.tzinfo is None:
-            checked = checked.replace(tzinfo=timezone.utc)
-        else:
-            checked = checked.astimezone(timezone.utc)
-        return checked.strftime("%d.%m.%Y, %H:%M UTC")
-    except (OverflowError, ValueError):
+    checked = _parse_iso_utc(value)
+    if checked is None:
         return "время последней проверки неизвестно"
+    return checked.strftime("%d.%m.%Y, %H:%M UTC")
 
 
 async def refresh_update_state(*, force: bool = False) -> dict:

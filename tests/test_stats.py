@@ -295,6 +295,16 @@ def test_smoke_build_stats_all_returns_list():
     assert msgs  # непустой
 
 
+def test_stats_all_normalizes_aware_updated_at_to_utc_date():
+    stats = _populated_stats()
+    stats["updated_at"] = "2026-08-06T01:30:00+03:00"
+
+    message = smod.build_stats_all_messages(stats)[0]
+
+    assert "актуально на 05.08.2026" in message
+    assert "актуально на 06.08.2026" not in message
+
+
 @pytest.mark.parametrize("kind", ["light_novel", "ranobe"])
 def test_stats_all_translates_ranobe_kinds(kind):
     stats = _populated_stats()

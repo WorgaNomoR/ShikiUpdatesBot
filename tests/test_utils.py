@@ -13,6 +13,7 @@ from utils import (
     _human_ago,
     _is_partial_quarter,
     _normalize_homoglyphs,
+    _parse_iso_utc,
     _quarter_end,
     _rel_url,
     _safe_float,
@@ -184,7 +185,23 @@ def test_safe_float_garbage_uses_default():
     assert _safe_float(None, default=2.5) == 2.5
 
 
-# ── _fmt_dt_short / _human_ago: относительное время стартового снапшота ──
+# ── ISO/UTC и относительное время стартового снапшота ──
+def test_parse_iso_utc_preserves_naive_utc():
+    assert _parse_iso_utc("2026-08-06T12:12:30.388825") == datetime(
+        2026, 8, 6, 12, 12, 30, 388825
+    )
+
+
+def test_parse_iso_utc_normalizes_aware_value():
+    assert _parse_iso_utc("2026-08-06T15:12:30+03:00") == datetime(2026, 8, 6, 12, 12, 30)
+
+
+def test_parse_iso_utc_rejects_missing_and_malformed_values():
+    assert _parse_iso_utc(None) is None
+    assert _parse_iso_utc(123) is None
+    assert _parse_iso_utc("not-an-iso-timestamp") is None
+
+
 def test_fmt_dt_short_numeric_locale_free():
     assert _fmt_dt_short(datetime(2026, 7, 2, 14, 30)) == "02.07.2026 14:30"
     assert _fmt_dt_short(datetime(2026, 1, 9, 8, 5)) == "09.01.2026 08:05"
