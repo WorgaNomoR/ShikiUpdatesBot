@@ -22,7 +22,15 @@ from name_grammar import (
     format_name_template,
 )
 from shiki_api import RANOBE_KINDS, get_media_info
-from utils import _fmt_dt_short, _human_ago, _normalize_homoglyphs, _rel_url, _safe_int, h
+from utils import (
+    _fmt_dt_short,
+    _human_ago,
+    _normalize_homoglyphs,
+    _parse_iso_utc,
+    _rel_url,
+    _safe_int,
+    h,
+)
 
 # ═══════════════════════════════════════════════════════════════════
 #  БАНК СООБЩЕНИЙ
@@ -967,18 +975,6 @@ def format_rate_entry(item: dict, media: str) -> str:
 #  шлётся как есть, тем же каналом, что и голый пинг).
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    """ISO-строка -> naive-UTC datetime; кривое/пустое -> None. tzinfo срезаем:
-    updated_at от _utcnow всегда naive, но защищаемся от tz-aware входа, иначе
-    _human_ago упадёт на 'naive - aware' вычитании."""
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value).replace(tzinfo=None)
-    except (ValueError, TypeError):
-        return None
-
-
 def _parse_ts(value: float | None) -> datetime | None:
     """epoch-секунды (time.time) -> наивный-UTC datetime; кривое -> None."""
     if value is None:
@@ -1026,7 +1022,7 @@ def build_startup_snapshot(
         f"👥 Подписчиков: {subscriber_count}",
     ]
 
-    stats_dt = _parse_iso(stats_updated_at)
+    stats_dt = _parse_iso_utc(stats_updated_at)
 
     # Полный вайп: состояние отсутствует целиком — один громкий сигнал.
     if seen_ids_count == 0 and stats_dt is None:

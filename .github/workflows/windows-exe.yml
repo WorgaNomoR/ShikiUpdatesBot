@@ -22,6 +22,7 @@ jobs:
     runs-on: windows-2022
     outputs:
       version: ${{ steps.version.outputs.version }}
+      is_release: ${{ steps.version.outputs.is_release }}
     env:
       APP_REPOSITORY: ${{ vars.UPDATE_REPOSITORY || github.repository }}
       APP_SERVER_URL: ${{ github.server_url }}
@@ -54,8 +55,13 @@ jobs:
           } else {
             $buildVersion = "$projectVersion-dev"
           }
+          $isRelease = (
+            $env:GITHUB_EVENT_NAME -eq "push" -and
+            $env:GITHUB_REF -like "refs/tags/*"
+          ).ToString().ToLowerInvariant()
           "APP_VERSION=$buildVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "version=$buildVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Install build dependencies
         run: |
@@ -112,6 +118,60 @@ jobs:
             Remove-Item .\dist\.env -ErrorAction SilentlyContinue
           }
 
+      - name: Scan release executable with VirusTotal
+        id: virustotal
+        if: steps.version.outputs.is_release == 'true'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          python release_security.py .\dist\ShikiUpdatesBot.exe `
+            --notes-path .\release\security-notes.md `
+            --summary-path $env:GITHUB_STEP_SUMMARY
+
+      - name: Ensure release security notes exist
+        if: always() && steps.version.outputs.is_release == 'true'
+        shell: pwsh
+        run: |
+          $notesPath = ".\release\security-notes.md"
+          $notesContent = if (Test-Path $notesPath -PathType Leaf) {
+            Get-Content $notesPath -Raw
+          } else {
+            $null
+          }
+          $notesAreValid = (
+            -not [string]::IsNullOrWhiteSpace($notesContent) -and
+            $notesContent.TrimStart().StartsWith(
+              "<!-- shikiupdatesbot-security-report:start -->"
+            ) -and
+            $notesContent.TrimEnd().EndsWith(
+              "<!-- shikiupdatesbot-security-report:end -->"
+            )
+          )
+          if (-not $notesAreValid) {
+            New-Item -ItemType Directory -Force -Path .\release | Out-Null
+            $exePath = ".\dist\ShikiUpdatesBot.exe"
+            $sha256 = if (Test-Path $exePath) {
+              (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            } else {
+              "недоступен"
+            }
+            # Независимый минимальный fallback обязан работать даже при ошибке импорта Python-модуля.
+            $fallback = @"
+          <!-- shikiupdatesbot-security-report:start -->
+          ### 🛡️ Проверка безопасности
+
+          - **Результат:** автоматический анализ недоступен
+          - **Причина:** непредвиденная ошибка интеграции VirusTotal
+          - **SHA-256:** ``$sha256``
+          <!-- shikiupdatesbot-security-report:end -->
+          "@
+            $fallback | Set-Content $notesPath -Encoding utf8
+            $fallback | Add-Content $env:GITHUB_STEP_SUMMARY -Encoding utf8
+            Write-Output "::warning::Анализ VirusTotal недоступен: непредвиденная ошибка интеграции"
+          }
+
       - name: Assemble portable ZIP and checksum
         shell: pwsh
         run: |
@@ -140,10 +200,11 @@ jobs:
           path: |
             release/*.zip
             release/*.sha256
+            release/security-notes.md
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.build.outputs.is_release == 'true'
     needs: build
     runs-on: windows-2022
     permissions:
@@ -166,4 +227,5 @@ jobs:
           $archive = "release\ShikiUpdatesBot-windows-x64.zip"
           $checksum = "$archive.sha256"
           gh release create $env:APP_VERSION $archive $checksum `
-            --verify-tag --draft --generate-notes --title $env:APP_VERSION
+            --verify-tag --draft --generate-notes `
+            --notes-file .\release\security-notes.md --title $env:APP_VERSION

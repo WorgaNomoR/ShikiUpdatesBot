@@ -201,6 +201,28 @@ def test_build_version_text_marks_source_mode(monkeypatch):
     assert "Shikimori" in text
 
 
+@pytest.mark.parametrize(
+    ("stored", "rendered"),
+    [
+        ("2026-08-06T12:12:30.388825", "06.08.2026, 12:12 UTC"),
+        ("2026-08-06T15:12:30+03:00", "06.08.2026, 12:12 UTC"),
+        (None, "ещё не проверялась"),
+        ("", "ещё не проверялась"),
+        (123, "ещё не проверялась"),
+        ("not-an-iso-timestamp", "время последней проверки неизвестно"),
+    ],
+)
+def test_build_version_text_formats_checked_at_safely(monkeypatch, stored, rendered):
+    monkeypatch.setattr(updates, "IS_FROZEN", False)
+
+    text = updates.build_version_text({"last_checked_at": stored})
+
+    assert "Последняя версия:" in text
+    assert f"Проверено: {rendered}" in text
+    if isinstance(stored, str) and stored:
+        assert stored not in text
+
+
 def test_version_keyboard_contains_repository_and_release(monkeypatch):
     monkeypatch.setattr(updates, "REPOSITORY_URL", "https://github.test/project")
     monkeypatch.setattr(updates, "RELEASES_URL", "https://github.test/releases/latest")

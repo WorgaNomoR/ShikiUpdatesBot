@@ -1,7 +1,7 @@
 # 🎌 [ShikiUpdatesBot](https://github.com/WorgaNomoR/ShikiUpdatesBot) — Shikimori Activity Tracker
 
-[![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions)
 [![Latest release](https://img.shields.io/github/v/release/WorgaNomoR/ShikiUpdatesBot?display_name=tag&sort=semver)](https://github.com/WorgaNomoR/ShikiUpdatesBot/releases/latest)
+[![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions)
 [![Windows executable](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/windows-exe.yml/badge.svg)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/windows-exe.yml)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![Docker](https://img.shields.io/badge/-Docker-2496ED?style=flat&logo=docker&logoColor=white)
@@ -161,7 +161,10 @@ EXE проверяет последний полноценный GitHub Release 
 > ⚠️ Сборка пока не подписана и может вызвать предупреждение SmartScreen,
 > Smart App Control или антивируса. Запуск от администратора не требуется и не
 > рекомендуется. Проверяй, что архив скачан с ожидаемой страницы Release; рядом
-> с ним публикуется SHA-256.
+> с ним публикуется SHA-256. Для прозрачности релизный EXE также автоматически
+> отправляется в VirusTotal, а результат или честное сообщение о недоступности
+> анализа добавляется в описание релиза. Эта проверка информационная и не
+> заменяет самостоятельную оценку исходников и процесса сборки.
 
 Подробная инструкция находится в `README-Windows.txt` внутри архива.
 

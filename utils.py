@@ -10,7 +10,8 @@
 Содержимое:
   • h / _rel_url            — экранирование HTML и нормализация ссылок;
   • _subscriber_link        — безопасная Telegram-ссылка на подписчика;
-  • _utcnow / quarter_*      — работа с датами и кварталами;
+  • _utcnow / _parse_iso_utc — безопасная нормализация времени UTC;
+  • quarter_*                — работа с кварталами;
   • _safe_int / _safe_float  — аккуратное приведение типов из API.
 """
 
@@ -110,6 +111,19 @@ def _utcnow() -> datetime:
     сравнения дат не меняются.
     """
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_iso_utc(value) -> datetime | None:
+    """Метка времени ISO -> наивное UTC-время; пустое или повреждённое -> None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except (OverflowError, ValueError):
+        return None
 
 
 def _fmt_dt_short(dt: datetime) -> str:

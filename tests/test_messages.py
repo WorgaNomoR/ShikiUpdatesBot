@@ -456,6 +456,13 @@ def test_startup_snapshot_survives_bad_timestamps():
     assert "нет данных" in txt
 
 
+def test_startup_snapshot_normalizes_aware_stats_timestamp_to_utc():
+    txt = _snap(stats_updated_at="2026-08-06T15:12:30+03:00")
+
+    assert "06.08.2026 12:12" in txt
+    assert "06.08.2026 15:12" not in txt
+
+
 # ==========================================================
 # _strip_html
 # ==========================================================

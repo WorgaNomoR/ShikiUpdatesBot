@@ -10,7 +10,6 @@
 """
 
 import json
-from datetime import datetime
 
 import aiohttp
 
@@ -43,6 +42,7 @@ from storage import (
 )
 from utils import (
     _is_partial_quarter,
+    _parse_iso_utc,
     _rel_url,
     _safe_int,
     _utcnow,
@@ -816,13 +816,10 @@ def build_stats_all_messages(stats: dict) -> list[str]:
     a_agg = (stats.get("anime") or {}).get("aggregates") or {}
     m_agg = (stats.get("manga") or {}).get("aggregates") or {}
 
-    updated = stats.get("updated_at") or ""
+    updated = _parse_iso_utc(stats.get("updated_at"))
     upd_str = ""
-    if updated:
-        try:
-            upd_str = datetime.fromisoformat(updated).strftime("%d.%m.%Y")
-        except ValueError:
-            pass
+    if updated is not None:
+        upd_str = updated.strftime("%d.%m.%Y")
 
     # Пустая статистика — одно короткое сообщение
     if a_agg.get("total_completed", 0) == 0 and m_agg.get("total_completed", 0) == 0:
