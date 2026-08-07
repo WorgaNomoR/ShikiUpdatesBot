@@ -86,25 +86,29 @@ def parse_analysis(payload: dict, sha256: str) -> ScanReport:
         raise VirusTotalError("VirusTotal не вернул результаты движков")
 
     detections: list[Detection] = []
+    valid_engines = 0
     for engine_id, item in results.items():
         if not isinstance(engine_id, str) or not isinstance(item, dict):
-            raise VirusTotalError("VirusTotal вернул повреждённые результаты")
+            continue
         engine = item.get("engine_name")
         category = item.get("category")
         verdict = item.get("result")
         if not isinstance(engine, str) or not engine or not isinstance(category, str):
-            raise VirusTotalError("VirusTotal вернул повреждённые результаты")
+            continue
         if verdict is not None and not isinstance(verdict, str):
-            raise VirusTotalError("VirusTotal вернул повреждённые результаты")
+            verdict = None
+        valid_engines += 1
         if category in _FLAGGED_CATEGORIES:
             detections.append(Detection(engine=engine, verdict=verdict or category))
 
+    if valid_engines == 0:
+        raise VirusTotalError("VirusTotal не вернул пригодные результаты движков")
     detections.sort(key=lambda item: (item.engine.casefold(), item.verdict.casefold()))
     return ScanReport(
         sha256=sha256,
         available=True,
         detections=tuple(detections),
-        total_engines=len(results),
+        total_engines=valid_engines,
     )
 
 
@@ -127,7 +131,14 @@ async def _request_json(
 ) -> dict | None:
     headers = {"x-apikey": api_key}
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-    async with session.request(method, url, headers=headers, data=data, timeout=timeout) as response:
+    async with session.request(
+        method,
+        url,
+        headers=headers,
+        data=data,
+        timeout=timeout,
+        allow_redirects=False,
+    ) as response:
         if allow_not_found and response.status == 404:
             return None
         if not 200 <= response.status < 300:
@@ -274,6 +285,11 @@ def _md_text(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ")
 
 
+def _md_code(value: str) -> str:
+    """Подготовить текст code span, не оставляя способный закрыть его backtick."""
+    return value.replace("`", "'").replace("\r", " ").replace("\n", " ")
+
+
 def build_security_markdown(report: ScanReport) -> str:
     """Собрать общий русский блок для summary и GitHub Release."""
     lines = [
@@ -295,7 +311,7 @@ def build_security_markdown(report: ScanReport) -> str:
                 "движков сообщили о срабатывании"
             )
             rendered = "; ".join(
-                f"{_md_text(item.engine)} — `{_md_text(item.verdict)}`"
+                f"{_md_text(item.engine)} — `{_md_code(item.verdict)}`"
                 for item in report.detections
             )
             lines.append(f"- **Срабатывания:** {rendered}")

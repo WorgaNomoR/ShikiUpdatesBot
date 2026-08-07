@@ -207,6 +207,8 @@ def test_build_version_text_marks_source_mode(monkeypatch):
         ("2026-08-06T12:12:30.388825", "06.08.2026, 12:12 UTC"),
         ("2026-08-06T15:12:30+03:00", "06.08.2026, 12:12 UTC"),
         (None, "ещё не проверялась"),
+        ("", "ещё не проверялась"),
+        (123, "ещё не проверялась"),
         ("not-an-iso-timestamp", "время последней проверки неизвестно"),
     ],
 )
@@ -217,7 +219,7 @@ def test_build_version_text_formats_checked_at_safely(monkeypatch, stored, rende
 
     assert "Последняя версия:" in text
     assert f"Проверено: {rendered}" in text
-    if stored:
+    if isinstance(stored, str) and stored:
         assert stored not in text
 
 

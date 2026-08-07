@@ -198,6 +198,7 @@ def test_parse_iso_utc_normalizes_aware_value():
 
 def test_parse_iso_utc_rejects_missing_and_malformed_values():
     assert _parse_iso_utc(None) is None
+    assert _parse_iso_utc("") is None
     assert _parse_iso_utc(123) is None
     assert _parse_iso_utc("not-an-iso-timestamp") is None
 

@@ -136,30 +136,24 @@ jobs:
         run: |
           $notesPath = ".\release\security-notes.md"
           $notesAreValid = (
-            (Test-Path $notesPath) -and
-            (Select-String -Path $notesPath -Pattern "### 🛡️ Проверка безопасности" -Quiet) -and
-            (Select-String -Path $notesPath -Pattern "\*\*Результат:\*\*" -Quiet)
+            (Test-Path $notesPath -PathType Leaf) -and
+            (Get-Item $notesPath).Length -gt 0
           )
           if (-not $notesAreValid) {
             New-Item -ItemType Directory -Force -Path .\release | Out-Null
-            $sha256 = (Get-FileHash .\dist\ShikiUpdatesBot.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            $exePath = ".\dist\ShikiUpdatesBot.exe"
+            $sha256 = if (Test-Path $exePath) {
+              (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            } else {
+              "недоступен"
+            }
+            # Независимый минимальный fallback обязан работать даже при ошибке импорта Python-модуля.
             $fallback = @"
           ### 🛡️ Проверка безопасности
-
-          Исходный код ShikiUpdatesBot открыт и не содержит намеренно вредоносной
-          логики. Windows-версия автоматически собрана из него с помощью публичного
-          workflow GitHub Actions.
-
-          Для прозрачности готовый EXE также проверяется антивирусными движками
-          VirusTotal. У неподписанных PyInstaller-сборок возможны отдельные
-          ложноположительные срабатывания.
 
           - **Результат:** автоматический анализ недоступен
           - **Причина:** непредвиденная ошибка интеграции VirusTotal
           - **SHA-256:** ``$sha256``
-
-          Исходники, процесс сборки и результаты проверки доступны для самостоятельной
-          оценки.
           "@
             $fallback | Set-Content $notesPath -Encoding utf8
             $fallback | Add-Content $env:GITHUB_STEP_SUMMARY -Encoding utf8

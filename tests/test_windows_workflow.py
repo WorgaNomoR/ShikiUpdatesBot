@@ -4,41 +4,67 @@
 
 from pathlib import Path
 
-WORKFLOW = (
-    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "windows-exe.yml"
-).read_text(encoding="utf-8")
+import yaml
+
+WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "windows-exe.yml"
+WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8")
+SPEC = yaml.safe_load(WORKFLOW)
 
 
-def test_virustotal_secret_is_scoped_to_tag_push_step():
-    scan_step = WORKFLOW.split("- name: Scan release executable with VirusTotal", 1)[1]
-    scan_step = scan_step.split("- name: Ensure release security notes exist", 1)[0]
+def _step(job: dict, name: str) -> dict:
+    return next(step for step in job["steps"] if step.get("name") == name)
 
-    assert "$env:GITHUB_EVENT_NAME -eq \"push\"" in WORKFLOW
-    assert "$env:GITHUB_REF -like \"refs/tags/*\"" in WORKFLOW
-    assert "if: steps.version.outputs.is_release == 'true'" in scan_step
-    assert "VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}" in scan_step
-    assert "continue-on-error: true" in scan_step
-    assert "VIRUSTOTAL_API_KEY" not in WORKFLOW.split("jobs:", 1)[0]
+
+def test_virustotal_secret_is_scoped_to_single_release_step():
+    build = SPEC["jobs"]["build"]
+    scan_steps = [
+        step for step in build["steps"] if "VIRUSTOTAL_API_KEY" in (step.get("env") or {})
+    ]
+
+    assert "VIRUSTOTAL_API_KEY" not in (SPEC.get("env") or {})
+    assert "VIRUSTOTAL_API_KEY" not in (build.get("env") or {})
+    assert len(scan_steps) == 1
+    assert scan_steps[0]["if"] == "steps.version.outputs.is_release == 'true'"
+    assert scan_steps[0]["continue-on-error"] is True
+    assert scan_steps[0]["env"] == {
+        "VIRUSTOTAL_API_KEY": "${{ secrets.VIRUSTOTAL_API_KEY }}"
+    }
+
+    version_step = _step(build, "Resolve and validate build version")
+    assert '$env:GITHUB_EVENT_NAME -eq "push"' in version_step["run"]
+    assert '$env:GITHUB_REF -like "refs/tags/*"' in version_step["run"]
 
 
 def test_release_notes_keep_generated_changelog_and_security_block():
-    assert "release/security-notes.md" in WORKFLOW
-    assert "--generate-notes" in WORKFLOW
-    assert "--notes-file .\\release\\security-notes.md" in WORKFLOW
-    assert "if: needs.build.outputs.is_release == 'true'" in WORKFLOW
+    build = SPEC["jobs"]["build"]
+    upload = _step(build, "Upload verification artifact")
+    publish = SPEC["jobs"]["publish"]
+    create = _step(publish, "Create draft GitHub Release")
+
+    assert "release/security-notes.md" in upload["with"]["path"]
+    assert publish["if"] == "needs.build.outputs.is_release == 'true'"
+    assert "--generate-notes" in create["run"]
+    assert "--notes-file .\\release\\security-notes.md" in create["run"]
 
 
 def test_unexpected_scan_failure_has_non_blocking_fallback():
-    fallback = WORKFLOW.split("- name: Ensure release security notes exist", 1)[1]
-    fallback = fallback.split("- name: Assemble portable ZIP and checksum", 1)[0]
+    build = SPEC["jobs"]["build"]
+    fallback = _step(build, "Ensure release security notes exist")
 
-    assert "if: always() && steps.version.outputs.is_release == 'true'" in fallback
-    assert "автоматический анализ недоступен" in fallback
-    assert "::warning::" in fallback
-    assert "GITHUB_STEP_SUMMARY" in fallback
+    assert fallback["if"] == "always() && steps.version.outputs.is_release == 'true'"
+    assert "автоматический анализ недоступен" in fallback["run"]
+    assert "$sha256 = if (Test-Path $exePath)" in fallback["run"]
+    assert '"недоступен"' in fallback["run"]
+    assert "::warning::" in fallback["run"]
+    assert "GITHUB_STEP_SUMMARY" in fallback["run"]
+    assert "import release_security" not in fallback["run"]
+    assert "Исходный код ShikiUpdatesBot открыт" not in fallback["run"]
 
 
 def test_workflow_permissions_remain_narrow():
-    assert "permissions:\n  contents: read" in WORKFLOW
-    publish = WORKFLOW.split("  publish:", 1)[1]
-    assert "permissions:\n      actions: read\n      contents: write" in publish
+    assert SPEC["permissions"] == {"contents": "read"}
+    assert SPEC["jobs"]["build"].get("permissions") is None
+    assert SPEC["jobs"]["publish"]["permissions"] == {
+        "actions": "read",
+        "contents": "write",
+    }

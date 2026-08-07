@@ -82,6 +82,52 @@ async def test_cached_report_is_used_without_upload(tmp_path):
         "GET",
         f"{release_security.VIRUSTOTAL_API_URL}/files/{report.sha256}",
     )
+    assert session.calls[0][2]["allow_redirects"] is False
+
+
+def test_parse_analysis_skips_broken_engine_entries():
+    payload = completed_payload(
+        {
+            "clean": engine_result("CleanAV"),
+            "missing-category": {"engine_name": "BrokenAV"},
+            "not-an-object": None,
+            "flagged": engine_result("FlagAV", "malicious", result=123),
+        },
+        cached=True,
+    )
+
+    report = release_security.parse_analysis(payload, "a" * 64)
+
+    assert report.available is True
+    assert report.total_engines == 2
+    assert report.detections == (release_security.Detection("FlagAV", "malicious"),)
+
+
+def test_parse_analysis_rejects_report_without_any_valid_engine():
+    payload = completed_payload(
+        {
+            "missing-category": {"engine_name": "BrokenAV"},
+            "not-an-object": None,
+        },
+        cached=True,
+    )
+
+    with pytest.raises(release_security.VirusTotalError, match="пригодные результаты"):
+        release_security.parse_analysis(payload, "a" * 64)
+
+
+@pytest.mark.asyncio
+async def test_api_redirect_is_not_followed_with_secret_header(tmp_path):
+    executable = tmp_path / "app.exe"
+    executable.write_bytes(b"release")
+    session = FakeSession(FakeResponse(status=302))
+
+    report = await release_security.scan_file(executable, "secret", session=session)
+
+    assert report.available is False
+    assert "HTTP 302" in report.reason
+    assert len(session.calls) == 1
+    assert session.calls[0][2]["allow_redirects"] is False
 
 
 @pytest.mark.asyncio
@@ -249,6 +295,22 @@ def test_detected_markdown_contains_exact_verdicts_and_warning():
     assert "2 из 71" in release_security.action_warning(report)
 
 
+def test_markdown_uses_separate_escaping_for_engine_and_code_verdict():
+    report = release_security.ScanReport(
+        sha256="e" * 64,
+        available=True,
+        detections=(
+            release_security.Detection("Engine[One]", "Unsafe[.]`AI"),
+        ),
+        total_engines=1,
+    )
+
+    markdown = release_security.build_security_markdown(report)
+
+    assert "Engine\\[One\\] — `Unsafe[.]'AI`" in markdown
+    assert "Unsafe\\[.\\]" not in markdown
+
+
 def test_clean_and_unavailable_markdown_are_explicit():
     clean = release_security.ScanReport(
         sha256="b" * 64,
@@ -294,3 +356,23 @@ def test_sha256_matches_known_value(tmp_path):
     assert release_security._sha256(executable) == (
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     )
+
+
+def test_main_survives_unexpected_error(tmp_path, monkeypatch):
+    executable = tmp_path / "app.exe"
+    executable.write_bytes(b"release")
+    notes = tmp_path / "release" / "security-notes.md"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(release_security, "scan_file", boom)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["release_security.py", str(executable), "--notes-path", str(notes)],
+    )
+
+    assert release_security.main() == 0
+    text = notes.read_text(encoding="utf-8")
+    assert "автоматический анализ недоступен" in text
+    assert release_security._sha256(executable) in text
