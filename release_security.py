@@ -22,6 +22,8 @@ POLL_INTERVAL = 30.0
 POLL_TIMEOUT = 10 * 60.0
 HTTP_TIMEOUT = 60.0
 _FLAGGED_CATEGORIES = frozenset({"malicious", "suspicious"})
+_REPORT_START_MARKER = "<!-- shikiupdatesbot-security-report:start -->"
+_REPORT_END_MARKER = "<!-- shikiupdatesbot-security-report:end -->"
 
 
 class VirusTotalError(Exception):
@@ -293,6 +295,7 @@ def _md_code(value: str) -> str:
 def build_security_markdown(report: ScanReport) -> str:
     """Собрать общий русский блок для summary и GitHub Release."""
     lines = [
+        _REPORT_START_MARKER,
         "### 🛡️ Проверка безопасности",
         "",
         "Исходный код ShikiUpdatesBot открыт и не содержит намеренно вредоносной",
@@ -332,6 +335,7 @@ def build_security_markdown(report: ScanReport) -> str:
             "",
             "Исходники, процесс сборки и результаты проверки доступны для самостоятельной",
             "оценки.",
+            _REPORT_END_MARKER,
         ]
     )
     return "\n".join(lines) + "\n"
