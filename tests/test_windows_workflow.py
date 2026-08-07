@@ -192,6 +192,31 @@ def test_security_notes_fallback_behavior(tmp_path, initial_state):
         )
 
 
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell недоступен")
+def test_security_notes_fallback_hashes_existing_executable(tmp_path):
+    fallback = _step(SPEC["jobs"]["build"], "Ensure release security notes exist")
+    executable = tmp_path / "dist" / "ShikiUpdatesBot.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"abc")
+    summary = tmp_path / "summary.md"
+
+    result = _run_powershell(
+        fallback["run"],
+        tmp_path,
+        {"GITHUB_STEP_SUMMARY": str(summary)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    expected_sha256 = (
+        "ba7816bf8f01cfea414140de5dae2223"
+        "b00361a396177a9cb410ff61f20015ad"
+    )
+    notes = tmp_path / "release" / "security-notes.md"
+    assert f"- **SHA-256:** `{expected_sha256}`" in notes.read_text(
+        encoding="utf-8-sig"
+    )
+
+
 def test_workflow_permissions_remain_narrow():
     assert SPEC["permissions"] == {"contents": "read"}
     assert SPEC["jobs"]["build"].get("permissions") is None
