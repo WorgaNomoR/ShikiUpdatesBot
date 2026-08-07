@@ -24,15 +24,24 @@ def test_virustotal_secret_is_scoped_to_single_release_step():
     assert "VIRUSTOTAL_API_KEY" not in (SPEC.get("env") or {})
     assert "VIRUSTOTAL_API_KEY" not in (build.get("env") or {})
     assert len(scan_steps) == 1
+    assert scan_steps[0]["name"] == "Scan release executable with VirusTotal"
     assert scan_steps[0]["if"] == "steps.version.outputs.is_release == 'true'"
     assert scan_steps[0]["continue-on-error"] is True
     assert scan_steps[0]["env"] == {
         "VIRUSTOTAL_API_KEY": "${{ secrets.VIRUSTOTAL_API_KEY }}"
     }
+    assert "python release_security.py" in scan_steps[0]["run"]
+    assert "--notes-path .\\release\\security-notes.md" in scan_steps[0]["run"]
+    assert "--summary-path $env:GITHUB_STEP_SUMMARY" in scan_steps[0]["run"]
 
     version_step = _step(build, "Resolve and validate build version")
+    assert build["outputs"]["is_release"] == "${{ steps.version.outputs.is_release }}"
     assert '$env:GITHUB_EVENT_NAME -eq "push"' in version_step["run"]
     assert '$env:GITHUB_REF -like "refs/tags/*"' in version_step["run"]
+    assert (
+        '"is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT'
+        in version_step["run"]
+    )
 
 
 def test_release_notes_keep_generated_changelog_and_security_block():
@@ -55,6 +64,9 @@ def test_unexpected_scan_failure_has_non_blocking_fallback():
     assert "автоматический анализ недоступен" in fallback["run"]
     assert "$sha256 = if (Test-Path $exePath)" in fallback["run"]
     assert '"недоступен"' in fallback["run"]
+    assert "(Test-Path $notesPath -PathType Leaf) -and" in fallback["run"]
+    assert "(Get-Item $notesPath).Length -gt 0" in fallback["run"]
+    assert "if (-not $notesAreValid)" in fallback["run"]
     assert "::warning::" in fallback["run"]
     assert "GITHUB_STEP_SUMMARY" in fallback["run"]
     assert "import release_security" not in fallback["run"]
