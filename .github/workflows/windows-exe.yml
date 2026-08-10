@@ -125,6 +125,7 @@ jobs:
         shell: pwsh
         env:
           VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+          PYTHONUTF8: "1"
         run: |
           python release_security.py .\dist\ShikiUpdatesBot.exe `
             --notes-path .\release\security-notes.md `

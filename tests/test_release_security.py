@@ -7,6 +7,23 @@ import pytest
 import release_security
 
 
+class LegacyStdout:
+    """Поток Windows, который принимает только текст в cp1252."""
+
+    encoding = "cp1252"
+
+    def __init__(self):
+        self.text = ""
+
+    def write(self, value):
+        value.encode(self.encoding)
+        self.text += value
+        return len(value)
+
+    def flush(self):
+        pass
+
+
 def engine_result(name, category="undetected", result=None):
     return {"engine_name": name, "category": category, "result": result}
 
@@ -378,3 +395,28 @@ def test_main_survives_unexpected_error(tmp_path, monkeypatch):
     text = notes.read_text(encoding="utf-8")
     assert "автоматический анализ недоступен" in text
     assert release_security._sha256(executable) in text
+
+
+def test_main_missing_key_survives_legacy_stdout(tmp_path, monkeypatch):
+    executable = tmp_path / "app.exe"
+    executable.write_bytes(b"release")
+    notes = tmp_path / "release" / "security-notes.md"
+    stdout = LegacyStdout()
+    monkeypatch.delenv("VIRUSTOTAL_API_KEY", raising=False)
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["release_security.py", str(executable), "--notes-path", str(notes)],
+    )
+
+    assert release_security.main() == 0
+
+    text = notes.read_text(encoding="utf-8")
+    assert text.startswith("<!-- shikiupdatesbot-security-report:start -->")
+    assert text.rstrip().endswith("<!-- shikiupdatesbot-security-report:end -->")
+    assert "автоматический анализ недоступен" in text
+    assert "VIRUSTOTAL\\_API\\_KEY" in text
+    assert release_security._sha256(executable) in text
+    assert stdout.text.isascii()
+    assert stdout.text.startswith("::warning::")
+    assert "VirusTotal" in stdout.text
