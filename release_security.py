@@ -366,6 +366,15 @@ def _workflow_command_text(value: str) -> str:
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+def _print_action_warning(warning: str) -> None:
+    """Напечатать warning, сохранив ASCII-fallback для старой Windows-консоли."""
+    command = f"::warning::{_workflow_command_text(warning)}"
+    try:
+        print(command)
+    except UnicodeEncodeError:
+        print("::warning::VirusTotal warning; see the security report")
+
+
 def write_report(report: ScanReport, notes_path: Path, summary_path: Path | None) -> None:
     """Записать release notes и дополнить GitHub Actions summary."""
     markdown = build_security_markdown(report)
@@ -377,7 +386,7 @@ def write_report(report: ScanReport, notes_path: Path, summary_path: Path | None
             stream.write(markdown)
     warning = action_warning(report)
     if warning:
-        print(f"::warning::{_workflow_command_text(warning)}")
+        _print_action_warning(warning)
 
 
 def _parser() -> argparse.ArgumentParser:

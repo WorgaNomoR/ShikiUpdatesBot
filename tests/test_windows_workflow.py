@@ -83,7 +83,8 @@ def test_virustotal_secret_is_scoped_to_single_release_step():
     assert scan_step["if"] == "steps.version.outputs.is_release == 'true'"
     assert scan_step["continue-on-error"] is True
     assert scan_step["env"] == {
-        "VIRUSTOTAL_API_KEY": "${{ secrets.VIRUSTOTAL_API_KEY }}"
+        "VIRUSTOTAL_API_KEY": "${{ secrets.VIRUSTOTAL_API_KEY }}",
+        "PYTHONUTF8": "1",
     }
     scan_index = build["steps"].index(scan_step)
     assert list(_value_paths(SPEC, "secrets.VIRUSTOTAL_API_KEY")) == [
