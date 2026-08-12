@@ -92,6 +92,7 @@ from utils import (
     _subscriber_link,
     current_quarter,
     h,
+    previous_quarter,
     quarter_label,
 )
 
@@ -203,8 +204,9 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
         except Exception as e:
             log.error("rotate_quarter: sync_stats_all упал: %s", e)
 
-    # Сравнение с прошлым кварталом (читаем снапшот предыдущего, если есть)
-    prev_quarter = _load_prev_quarter_summary(old_period)
+    # Сравниваем закрываемый квартал с предшествующим ему снапшотом.
+    prev_period = previous_quarter(old_period)
+    prev_quarter = _load_prev_quarter_summary(prev_period) if prev_period else None
 
     try:
         report_msgs = build_quarterly_report_messages(cur, stats_all, prev_quarter)

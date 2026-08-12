@@ -156,6 +156,19 @@ def current_quarter(dt: datetime | None = None) -> str:
     return f"{dt.year}-Q{q}"
 
 
+def previous_quarter(period: str) -> str | None:
+    """Квартал перед ``YYYY-QN``; повреждённое значение -> None."""
+    if not isinstance(period, str):
+        return None
+    match = re.fullmatch(r"(\d{4})-Q([1-4])", period)
+    if not match:
+        return None
+    year, quarter = map(int, match.groups())
+    if quarter == 1:
+        return f"{year - 1}-Q4"
+    return f"{year}-Q{quarter - 1}"
+
+
 def quarter_start(dt: datetime | None = None) -> datetime:
     """Первый день текущего (или переданного) квартала, UTC."""
     if dt is None:
