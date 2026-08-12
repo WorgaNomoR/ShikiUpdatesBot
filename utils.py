@@ -164,9 +164,11 @@ def previous_quarter(period: str) -> str | None:
     if not match:
         return None
     year, quarter = map(int, match.groups())
+    if year == 0 or (year == 1 and quarter == 1):
+        return None
     if quarter == 1:
-        return f"{year - 1}-Q4"
-    return f"{year}-Q{quarter - 1}"
+        return f"{year - 1:04d}-Q4"
+    return f"{year:04d}-Q{quarter - 1}"
 
 
 def quarter_start(dt: datetime | None = None) -> datetime:

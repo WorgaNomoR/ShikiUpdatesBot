@@ -98,14 +98,19 @@ def test_current_quarter_known_dates():
 
 def test_previous_quarter_same_year():
     assert previous_quarter("2026-Q2") == "2026-Q1"
+    assert previous_quarter("0001-Q2") == "0001-Q1"
 
 
 def test_previous_quarter_crosses_year_boundary():
     assert previous_quarter("2026-Q1") == "2025-Q4"
+    assert previous_quarter("0002-Q1") == "0001-Q4"
 
 
 def test_previous_quarter_rejects_malformed_period():
     assert previous_quarter("2026-Q5") is None
+    assert previous_quarter("0000-Q1") is None
+    assert previous_quarter("0000-Q2") is None
+    assert previous_quarter("0001-Q1") is None
     assert previous_quarter("мусор") is None
     assert previous_quarter(None) is None
 

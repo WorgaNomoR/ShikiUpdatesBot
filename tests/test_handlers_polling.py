@@ -529,6 +529,13 @@ async def test_quarter_rotation_without_preceding_snapshot_omits_comparison(
     monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
     monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
 
+    # Снапшот закрываемого Q2 — приманка для прежней ошибочной загрузки.
+    # Настоящий предшествующий Q1 отсутствует, поэтому сравнения быть не должно.
+    (backup_env / "quarters" / "2026-Q2.json").write_text(
+        '{"period":"2026-Q2","anime_completed":1,"manga_completed":1}',
+        encoding="utf-8",
+    )
+
     async def _no_sleep(*a, **k):
         return None
     monkeypatch.setattr(handlers.asyncio, "sleep", _no_sleep)
