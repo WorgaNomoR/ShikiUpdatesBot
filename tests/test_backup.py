@@ -7,6 +7,7 @@
 пропатченном. Полные aiogram-объекты — через unittest.mock; узкая поверхность —
 ручными стабами. Файлы DATA_DIR редиректятся в tmp_path фикстурой backup_env.
 """
+import asyncio
 import io
 import json
 import lzma
@@ -20,7 +21,6 @@ import pytest
 
 import backup
 import handlers
-import main
 import storage
 
 # ─────────────────────────────────────────────────────────────
@@ -35,6 +35,15 @@ def _zip_bytes(members: dict[str, str]) -> bytes:
         for name, content in members.items():
             zf.writestr(name, content)
     return buf.getvalue()
+
+
+async def _cancel_after_started(awaitable, started: asyncio.Event) -> None:
+    """Отменить awaitable после подтверждённого входа в проверяемую операцию."""
+    task = asyncio.create_task(awaitable)
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def _corrupt_stored_member(raw: bytes, name: str) -> bytes:
@@ -563,25 +572,40 @@ async def test_shutdown_backup_debounced_when_recent(backup_env, monkeypatch):
 @pytest.mark.asyncio
 async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
     monkeypatch.setattr("backup._last_backup_sent_at", None)
-    monkeypatch.setattr("backup.SHUTDOWN_BACKUP_TIMEOUT", 0.01)
+    started = asyncio.Event()
 
     async def _slow(_bot, _caption):
-        await main.asyncio.sleep(0.2)
+        started.set()
+        await asyncio.Event().wait()
         return True
 
+    async def _cancel_on_timeout(awaitable, timeout):
+        assert timeout == backup.SHUTDOWN_BACKUP_TIMEOUT
+        await _cancel_after_started(awaitable, started)
+        raise TimeoutError
+
     monkeypatch.setattr("backup.send_backup", _slow)
+    monkeypatch.setattr(backup.asyncio, "wait_for", _cancel_on_timeout)
     await backup._shutdown_backup(AsyncMock())   # не должно бросить
 
 
 @pytest.mark.asyncio
 async def test_shutdown_backup_timeout_cancels_retry_sequence(backup_env, monkeypatch):
     monkeypatch.setattr("backup._last_backup_sent_at", None)
-    monkeypatch.setattr("backup.SHUTDOWN_BACKUP_TIMEOUT", 0.01)
+    first_attempt = asyncio.Event()
+
+    async def _fail_send(*args, **kwargs):
+        first_attempt.set()
+        raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+    async def _cancel_on_timeout(awaitable, timeout):
+        assert timeout == backup.SHUTDOWN_BACKUP_TIMEOUT
+        await _cancel_after_started(awaitable, first_attempt)
+        raise TimeoutError
+
     bot = AsyncMock()
-    bot.send_document.side_effect = aiohttp.ClientOSError(
-        104,
-        "Connection reset by peer",
-    )
+    bot.send_document.side_effect = _fail_send
+    monkeypatch.setattr(backup.asyncio, "wait_for", _cancel_on_timeout)
 
     await backup._shutdown_backup(bot)
 
