@@ -83,6 +83,8 @@ from storage import (
     save_stats_current,
     save_subscribers,
 )
+from telegram_delivery import is_blocked_error as _is_blocked_error
+from telegram_delivery import send_with_retry
 from updates import (
     build_version_keyboard,
     build_version_text,
@@ -591,15 +593,6 @@ async def check_and_notify_favourites(
     return seen, found_new
 
 
-def _is_blocked_error(exc: Exception) -> bool:
-    """Вернуть True, если ошибка отправки означает, что получатель недоступен
-    (заблокировал бота / удалён / чат не найден) — повод его отписать."""
-    err = str(exc).lower()
-    return ("bot was blocked" in err
-            or "user is deactivated" in err
-            or "chat not found" in err)
-
-
 def _unsubscribe_blocked(subs: dict[int, str], to_remove: list[int]) -> None:
     """Удаляет заблокировавших из subs и сохраняет актуальный список."""
     if not to_remove:
@@ -628,10 +621,12 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
 
     for chat_id, name in subs.items():
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
+            await send_with_retry(
+                lambda: bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
             )
             log.info("  → Отправлено подписчику %s (chat_id=%d)", name, chat_id)
         except Exception as e:

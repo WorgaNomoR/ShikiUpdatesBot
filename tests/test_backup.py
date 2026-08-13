@@ -13,8 +13,9 @@ import lzma
 import time
 import zipfile
 import zlib
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+import aiohttp
 import pytest
 
 import backup
@@ -358,6 +359,59 @@ async def test_send_backup_swallows_send_errors(backup_env):
     assert ok is False   # сбой не пробрасывается
 
 
+@pytest.mark.asyncio
+async def test_send_backup_retries_transient_upload_with_fresh_file(
+    backup_env,
+    monkeypatch,
+):
+    build = Mock(return_value=b"zip-data")
+    monkeypatch.setattr(backup, "_build_backup_zip", build)
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    documents = []
+
+    async def _send_document(*args, **kwargs):
+        documents.append(kwargs["document"])
+        if len(documents) == 1:
+            raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+    bot = AsyncMock()
+    bot.send_document.side_effect = _send_document
+
+    assert await backup.send_backup(bot, "x") is True
+    build.assert_called_once_with()
+    assert bot.send_document.await_count == 2
+    assert documents[0] is not documents[1]
+    assert backup._last_backup_sent_at is not None
+
+
+@pytest.mark.asyncio
+async def test_send_backup_exhausted_retries_do_not_advance_clock(
+    backup_env,
+    monkeypatch,
+):
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    bot = AsyncMock()
+    bot.send_document.side_effect = aiohttp.ClientOSError(
+        104,
+        "Connection reset by peer",
+    )
+
+    assert await backup.send_backup(bot, "x") is False
+    assert bot.send_document.await_count == 3
+    assert backup._last_backup_sent_at is None
+
+
+@pytest.mark.asyncio
+async def test_send_backup_build_failure_is_not_retried(backup_env, monkeypatch):
+    build = Mock(side_effect=OSError("archive failed"))
+    monkeypatch.setattr(backup, "_build_backup_zip", build)
+    bot = AsyncMock()
+
+    assert await backup.send_backup(bot, "x") is False
+    build.assert_called_once_with()
+    bot.send_document.assert_not_awaited()
+
+
 # ─────────────────────────────────────────────────────────────
 #  Авто-бэкап на под/отписку
 # ─────────────────────────────────────────────────────────────
@@ -517,6 +571,21 @@ async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
 
     monkeypatch.setattr("backup.send_backup", _slow)
     await backup._shutdown_backup(AsyncMock())   # не должно бросить
+
+
+@pytest.mark.asyncio
+async def test_shutdown_backup_timeout_cancels_retry_sequence(backup_env, monkeypatch):
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
+    monkeypatch.setattr("backup.SHUTDOWN_BACKUP_TIMEOUT", 0.01)
+    bot = AsyncMock()
+    bot.send_document.side_effect = aiohttp.ClientOSError(
+        104,
+        "Connection reset by peer",
+    )
+
+    await backup._shutdown_backup(bot)
+
+    bot.send_document.assert_awaited_once()
 
 
 # ─────────────────────────────────────────────────────────────
