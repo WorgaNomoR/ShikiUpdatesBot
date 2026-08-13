@@ -20,6 +20,10 @@ def test_read_only_workflow_permissions_are_explicit(workflow_name):
     workflow = _load_workflow(workflow_name)
 
     assert workflow["permissions"] == {"contents": "read"}
+    assert all(
+        job.get("permissions") in (None, {"contents": "read"})
+        for job in workflow["jobs"].values()
+    )
 
 
 @pytest.mark.parametrize("workflow_name", READ_ONLY_WORKFLOWS)
