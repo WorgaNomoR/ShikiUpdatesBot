@@ -19,13 +19,16 @@ def _load_service() -> dict:
 
 def test_compose_requires_every_application_setting():
     environment = _load_service()["environment"]
-    required = {
-        match.group(1)
-        for value in environment.values()
-        if isinstance(value, str) and (match := REQUIRED_INTERPOLATION.fullmatch(value))
-    }
+    for name in REQUIRED_ENV_VARS:
+        value = environment.get(name)
+        match = (
+            REQUIRED_INTERPOLATION.fullmatch(value)
+            if isinstance(value, str)
+            else None
+        )
 
-    assert required == REQUIRED_ENV_VARS
+        assert match is not None
+        assert match.group(1) == name
 
 
 def test_compose_loads_env_file_but_keeps_data_volume_invariant():
