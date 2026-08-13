@@ -224,10 +224,15 @@ subscribers.json
 seen_favourites.json
 stats_all.json
 stats_current.json
+update_state.json
 quarters/
 
 # Локальные данные при монтировании ./data (Docker / DATA_DIR)
 data/
+
+# Локальные логи и артефакты сборки релиза
+logs/
+release/
 
 # Конфиги хостингов
 amvera.yml

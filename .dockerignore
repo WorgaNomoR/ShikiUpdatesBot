@@ -1,10 +1,59 @@
-__pycache__
+# VCS, CI и метаданные редакторов
+.git/
+.gitignore
+.github/
+.coderabbit.yaml
+.vscode/
+.idea/
+
+# Локальные секреты, состояние бота и portable-логи
+.env*
+seen_ids.json
+subscribers.json
+seen_favourites.json
+stats_all.json
+stats_current.json
+update_state.json
+quarters/
+data/
+logs/
+
+# Python-кэши, результаты тестов и виртуальные окружения
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
-.env
-*.json
-venv
-.git
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller и артефакты подготовки релиза
+build/
+dist/
+release/
+
+# Тесты, dev-конфигурация и Windows-only build inputs
 tests/
 requirements-dev.txt
+requirements-build.txt
+pytest.ini
+ruff.toml
+.coveragerc
+ShikiUpdatesBot.spec
+release_security.py
+assets/
+
+# Документация, не нужная во время выполнения контейнера
+README.md
+README-Windows.txt
+AGENTS.md
+ideas.md

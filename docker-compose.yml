@@ -2,9 +2,12 @@ services:
   ShikiUpdatesBot:
     build: .
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - OWNER_ID=${OWNER_ID}
-      - DATA_DIR=/data
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
+      OWNER_ID: ${OWNER_ID:?OWNER_ID is required}
+      SHIKI_USER: ${SHIKI_USER:?SHIKI_USER is required}
+      DATA_DIR: /data
     volumes:
       - ./data:/data
