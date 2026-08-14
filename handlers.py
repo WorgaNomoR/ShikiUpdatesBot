@@ -40,6 +40,7 @@ from healthcheck import heartbeat
 from messages import (
     BROADCAST_HEADER,
     DISPLAY_NAME_CONTEXT,
+    _clean_description,
     build_favourite_message,
     build_message,
     build_startup_snapshot,
@@ -702,14 +703,28 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
         # Фиксируем событие в статистике квартала (до отправки — независимо от неё)
         description = entry.get("description", "") or ""
         event_type  = classify_event(description)
-        if event_type == "completed":
-            score = extract_score(description)
-        elif event_type == "score_changed":
-            chg = extract_score_change(description)
-            score = chg[1] if chg else None
+        if event_type == "ignored":
+            log.info(
+                "Пропускаем служебную запись истории entry id=%d: %r",
+                entry_id,
+                _clean_description(description),
+            )
+            continue
+        if event_type == "unknown":
+            log.warning(
+                "Неизвестное описание истории entry id=%d: %r",
+                entry_id,
+                _clean_description(description),
+            )
         else:
-            score = None
-        cur = record_current_event(cur, entry, event_type, media_type, score)
+            if event_type in ("completed", "score_set"):
+                score = extract_score(description)
+            elif event_type == "score_changed":
+                chg = extract_score_change(description)
+                score = chg[1] if chg else None
+            else:
+                score = None
+            cur = record_current_event(cur, entry, event_type, media_type, score)
 
         text = build_message(entry)
         await send_to_all_chats(bot, text)

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
+import json
 import random
 import time
+from pathlib import Path
 from string import Formatter
 
 import pytest
@@ -49,6 +51,12 @@ def make_entry(
 
 
 FALLBACK_NAME_CONTEXT = build_display_name_context("WorgaNomoR", "none")
+
+
+@pytest.fixture(scope="module")
+def history_event_fixtures():
+    path = Path(__file__).with_name("fixtures") / "history_event_types.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def expected_score_changed_messages(bank_key, old, new, media_label=None):
@@ -164,17 +172,20 @@ def test_status_block_empty_aggregate_returns_empty_list():
 
 @pytest.mark.parametrize("desc, score, key", [
     ("просмотрено", None, "completed_no_score"),
-    ("оценено на 3", 3, "completed_score_low"),
-    ("оценено на 6", 6, "completed_score_mid"),
-    ("оценено на 9", 9, "completed_score_high"),
-    ("оценено на 10", 10, "completed_score_perfect"),
+    ("просмотрено и оценено на 3", 3, "completed_score_low"),
+    ("просмотрено и оценено на 6", 6, "completed_score_mid"),
+    ("просмотрено и оценено на 9", 9, "completed_score_high"),
+    ("просмотрено и оценено на 10", 10, "completed_score_perfect"),
 ])
 def test_build_message_completed_selects_bank_by_score(monkeypatch, desc, score, key):
     # с fixed_choice шаблон детерминирован -> точная сверка ВЫБРАННОГО банка,
     # а не «цифра где-то в тексте» (та проходит на любом банке -> мутационно дырява)
     monkeypatch.setattr(random, "choice", fixed_choice)
     msg = build_message(make_entry(desc))
-    title = f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">Ergo Proxy</a>'
+    title = (
+        f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">'
+        "Ergo Proxy</a> (аниме)"
+    )
     expected = messages.format_name_template(
         messages.MESSAGES["anime"][key][0],
         messages.DISPLAY_NAME_CONTEXT,
@@ -188,12 +199,15 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     # media_type определяется по target.type (не по url) -> проверяем банк manga
     monkeypatch.setattr(random, "choice", fixed_choice)
     entry = {
-        "description": "оценено на 3",
+        "description": "прочитано и оценено на 3",
         "target": {"name": "Berserk", "url": "/mangas/25-berserk", "type": "Manga"},
         "created_at": "2025-01-01T12:00:00.000Z",
     }
     msg = build_message(entry)
-    title = f'<a href="{messages.SHIKI_BASE_URL}/mangas/25-berserk">Berserk</a>'
+    title = (
+        f'<a href="{messages.SHIKI_BASE_URL}/mangas/25-berserk">'
+        "Berserk</a> (манга)"
+    )
     expected = messages.format_name_template(
         messages.MESSAGES["manga"]["completed_score_low"][0],
         messages.DISPLAY_NAME_CONTEXT,
@@ -203,6 +217,69 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     assert msg == expected
 
 
+@pytest.mark.parametrize("locale", ["ru", "en"])
+@pytest.mark.parametrize(("target_type", "kind", "bank_key", "label", "url"), [
+    ("Anime", "tv", "anime", "аниме", "/animes/1-title"),
+    ("Manga", "manga", "manga", "манга", "/mangas/1-title"),
+    ("Manga", "light_novel", "ranobe", "ранобэ", "/mangas/1-title"),
+])
+def test_on_hold_fixtures_route_to_media_bank(
+    monkeypatch,
+    history_event_fixtures,
+    locale,
+    target_type,
+    kind,
+    bank_key,
+    label,
+    url,
+):
+    monkeypatch.setattr(random, "choice", fixed_choice)
+    description = history_event_fixtures["on_hold"][locale]["entry"]["description"]
+    entry = make_entry(
+        description,
+        title="Title",
+        url=url,
+        target_type=target_type,
+        kind=kind,
+    )
+    title = f'<a href="{messages.SHIKI_BASE_URL}{url}">Title</a> ({label})'
+    expected = messages.format_name_template(
+        messages.MESSAGES[bank_key]["on_hold"][0],
+        messages.DISPLAY_NAME_CONTEXT,
+        title=title,
+        score="?",
+    )
+
+    assert build_message(entry) == expected
+
+
+def test_unknown_history_message_is_neutral_and_html_safe(monkeypatch):
+    monkeypatch.setattr(random, "choice", fixed_choice)
+
+    msg = build_message(make_entry("<script>alert('&')</script>"))
+
+    assert "Неизвест" not in msg
+    assert "alert(&#x27;&amp;&#x27;)" in msg
+    assert "&lt;script&gt;" not in msg
+    assert "<script>" not in msg
+
+
+def test_score_set_has_own_notification_and_is_not_completion(monkeypatch):
+    monkeypatch.setattr(random, "choice", fixed_choice)
+
+    msg = build_message(make_entry("Оценено на <b>8</b>"))
+
+    assert msg == messages.format_name_template(
+        messages.MESSAGES["score_set"][0],
+        messages.DISPLAY_NAME_CONTEXT,
+        title=(
+            f'<a href="{messages.SHIKI_BASE_URL}/animes/790-ergo-proxy">'
+            "Ergo Proxy</a> (аниме)"
+        ),
+        score=8,
+    )
+
+
 @pytest.mark.parametrize("kind", ["light_novel", "novel", "ranobe"])
 @pytest.mark.parametrize(("description", "bank_key", "score"), [
     ("добавлено в список", "planned", "?"),
@@ -210,10 +287,10 @@ def test_build_message_manga_uses_manga_bank(monkeypatch):
     ("перечитываю", "rewatching", "?"),
     ("брошено", "dropped", "?"),
     ("прочитано", "completed_no_score", "?"),
-    ("оценено на 3", "completed_score_low", 3),
-    ("оценено на 6", "completed_score_mid", 6),
-    ("оценено на 9", "completed_score_high", 9),
-    ("оценено на 10", "completed_score_perfect", 10),
+    ("прочитано и оценено на 3", "completed_score_low", 3),
+    ("прочитано и оценено на 6", "completed_score_mid", 6),
+    ("прочитано и оценено на 9", "completed_score_high", 9),
+    ("прочитано и оценено на 10", "completed_score_perfect", 10),
 ])
 def test_build_message_ranobe_kinds_use_every_ranobe_bank(
     kind,
@@ -223,7 +300,8 @@ def test_build_message_ranobe_kinds_use_every_ranobe_bank(
 ):
     relative_url = "/mangas/1-book"
     title = (
-        f'<a href="{messages.SHIKI_BASE_URL}{relative_url}">Ergo Proxy</a>'
+        f'<a href="{messages.SHIKI_BASE_URL}{relative_url}">'
+        "Ergo Proxy</a> (ранобэ)"
     )
     expected_messages = {
         messages.format_name_template(
@@ -297,6 +375,40 @@ def test_score_changed_includes_human_media_label(
 
     assert f"Ergo Proxy</a> ({label})</b>" in msg
     assert msg.count(messages.SHIKI_BASE_URL) == 1
+
+
+@pytest.mark.parametrize("description", [
+    "добавлено в список",
+    "смотрю",
+    "пересматриваю",
+    "отложено",
+    "брошено",
+    "просмотрено",
+    "просмотрено и оценено на 8",
+    "оценено на 8",
+    "изменена оценка с 5 на 8",
+    "неизвестный новый формат",
+])
+@pytest.mark.parametrize(("target_type", "kind", "label", "url"), [
+    ("Anime", "tv", "аниме", "/animes/1-title"),
+    ("Manga", "manga", "манга", "/mangas/1-title"),
+    ("Manga", "light_novel", "ранобэ", "/mangas/1-title"),
+])
+def test_every_history_path_includes_media_label_once(
+    description,
+    target_type,
+    kind,
+    label,
+    url,
+):
+    msg = build_message(make_entry(
+        description,
+        url=url,
+        target_type=target_type,
+        kind=kind,
+    ))
+
+    assert msg.count(f"({label})") == 1
 
 
 @pytest.mark.parametrize(
@@ -612,12 +724,61 @@ def test_classify_dropped():
     assert classify_event("брошено") == "dropped"
 
 
-def test_classify_completed_fallback():
+@pytest.mark.parametrize("locale", ["ru", "en"])
+def test_classify_real_on_hold_fixture(history_event_fixtures, locale):
+    description = history_event_fixtures["on_hold"][locale]["entry"]["description"]
+    assert classify_event(description) == "on_hold"
+
+
+def test_classify_completed_without_score():
     assert classify_event("просмотрено") == "completed"
 
 
 def test_classify_completed_with_score():
-    assert classify_event("оценено на 8") == "completed"
+    assert classify_event("Просмотрено и оценено на <b>8</b>") == "completed"
+
+
+def test_classify_live_completion_descriptions(history_event_fixtures):
+    for description in history_event_fixtures["live_ru_descriptions"]["completed"]:
+        assert classify_event(description) == "completed"
+
+
+def test_classify_live_score_descriptions(history_event_fixtures):
+    for description in history_event_fixtures["live_ru_descriptions"]["score_set"]:
+        assert classify_event(description) == "score_set"
+    for description in history_event_fixtures["live_ru_descriptions"]["score_changed"]:
+        assert classify_event(description) == "score_changed"
+
+
+def test_classify_live_progress_descriptions_as_ignored(history_event_fixtures):
+    for description in history_event_fixtures["live_ru_descriptions"]["progress"]:
+        assert classify_event(description) == "ignored"
+
+
+def test_classify_official_non_product_descriptions_as_ignored(history_event_fixtures):
+    for description in history_event_fixtures["official_ignored_descriptions"]:
+        assert classify_event(description) == "ignored"
+
+
+@pytest.mark.parametrize("description", [
+    "Completed",
+    "Completed and rated 8",
+])
+def test_classify_official_english_completion_descriptions(description):
+    assert classify_event(description) == "completed"
+
+
+@pytest.mark.parametrize("description", ["Rated 8", "Scored 8"])
+def test_classify_official_english_score_descriptions(description):
+    assert classify_event(description) == "score_set"
+
+
+def test_ignored_history_message_is_empty():
+    assert build_message(make_entry("Просмотрено 15 эпизодов")) == ""
+
+
+def test_classify_unknown_is_explicit():
+    assert classify_event("неизвестный новый формат") == "unknown"
 
 
 # ============================================================
@@ -880,6 +1041,7 @@ def test_every_message_template_renders_with_independent_name_forms(gender):
         "score",
         "old",
         "new",
+        "description",
     }
 
     for template in _all_message_templates():
@@ -896,6 +1058,7 @@ def test_every_message_template_renders_with_independent_name_forms(gender):
             score=8,
             old=4,
             new=8,
+            description="ОПИСАНИЕ",
         )
         assert "{" not in rendered and "}" not in rendered, template
         for field, sentinel in {
@@ -919,6 +1082,7 @@ def test_kostya_regressions_cover_every_required_case():
             score=8,
             old=4,
             new=8,
+            description="ОПИСАНИЕ",
         )
         for template in _all_message_templates()
     )

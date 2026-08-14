@@ -93,6 +93,14 @@ MESSAGES = {
             "🌀 {n} {g:вернулся|вернулась} к <b>{title}</b>. Некоторые вещи тянет пересмотреть.",
         ],
 
+        # ⏸️ Отложил просмотр
+        "on_hold": [
+            "⏸️ {n} {g:поставил|поставила} просмотр <b>{title}</b> на паузу. Вернётся позже.",
+            "🕰️ <b>{title}</b> временно отложено. Иногда истории нужно немного подождать.",
+            "📦 {n} {g:убрал|убрала} <b>{title}</b> на полку «продолжу потом». Не дроп, а передышка.",
+            "⏯️ У <b>{title}</b> антракт. {n} ещё продолжит просмотр.",
+        ],
+
         # 💀 Бросил (dropped)
         "dropped": [
             "🗑️ <b>{title}</b> — в мусор. {n} не {g:пощадил|пощадила}.",
@@ -216,6 +224,14 @@ MESSAGES = {
             "📖 {n} {g:взялся|взялась} за <b>{title}</b> по второму кругу. Детали проявляются только так.",
         ],
 
+        # ⏸️ Отложил чтение
+        "on_hold": [
+            "⏸️ {n} {g:поставил|поставила} чтение <b>{title}</b> на паузу. Закладка сохранена.",
+            "🕰️ <b>{title}</b> временно отложена. Главы никуда не денутся.",
+            "📚 {n} {g:закрыл|закрыла} <b>{title}</b> до лучших времён. Это пауза, не дроп.",
+            "🔖 Закладка в <b>{title}</b> пока не двигается. {n} ещё продолжит чтение.",
+        ],
+
         # 💀 Бросил
         "dropped": [
             "🗑️ Манга <b>{title}</b> — дропнута. {n} не {g:пощадил|пощадила}.",
@@ -325,6 +341,14 @@ MESSAGES = {
             "👏 Ранобэ <b>{title}</b> удостоилось перечитывания у {n_gen}. Это уже знак качества.",
         ],
 
+        # ⏸️ Отложил чтение
+        "on_hold": [
+            "⏸️ {n} {g:поставил|поставила} ранобэ <b>{title}</b> на паузу. Закладка сохранена.",
+            "🕰️ Ранобэ <b>{title}</b> временно отложено. История дождётся возвращения.",
+            "📚 {n} {g:закрыл|закрыла} ранобэ <b>{title}</b> до лучших времён. Это не финал.",
+            "🔖 Закладка в ранобэ <b>{title}</b> пока не двигается. Продолжение будет позже.",
+        ],
+
         # 💀 Бросил
         "dropped": [
             "🗑️ Ранобэ <b>{title}</b> отправлено в дроп. {n} не {g:пощадил|пощадила} историю.",
@@ -413,6 +437,16 @@ MESSAGES = {
         "🤷 Было {old}, стало {new}: {n} ещё {g:подумал|подумала} о <b>{title}</b> и {g:решил|решила} быть честнее.",
         "🧊 <b>{title}</b> теперь получает {new}/10 вместо {old}. Послевкусие немного остыло.",
         "🔍 Чем дольше {n} размышляет о <b>{title}</b>, тем скромнее становится оценка: {old} → {new}.",
+    ],
+
+    # Первая отдельная оценка не означает завершение тайтла.
+    "score_set": [
+        "⭐ {n} {g:поставил|поставила} <b>{title}</b> оценку <b>{score}</b>.",
+    ],
+
+    # Неизвестное описание показываем без внутренних диагностических формулировок.
+    "unknown": [
+        "ℹ️ <b>{title}</b> — {description}",
     ],
 
     # ────────────────────────────────
@@ -522,6 +556,12 @@ def extract_score_change(description: str) -> tuple[int, int] | None:
     )
     if match:
         return int(match.group(1)), int(match.group(2))
+    match = re.search(
+        r"score\s+changed\s+from\s+(\d+)\s+to\s+(\d+)",
+        desc, re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1)), int(match.group(2))
     return None
 
 
@@ -562,53 +602,93 @@ def classify_event(description: str) -> str:
       "читаю"                    -> watching
       "пересматриваю"            -> rewatching
       "перечитываю"              -> rewatching
+      "отложено"                 -> on_hold
       "брошено"                  -> dropped
       "просмотрено"              -> completed  (без оценки)
       "прочитано"                -> completed  (без оценки)
-      "оценено на 9"             -> completed  (с оценкой, парсим отдельно)
+      "оценено на 9"             -> score_set
+      прогресс и служебные записи -> ignored
     """
-    desc = _clean_description(description).lower()
+    desc = " ".join(_clean_description(description).casefold().split())
 
-    # Порядок важен: специфичные — выше, чтобы не поглотил более общий паттерн
-
-    # Score change — проверяем первым, т.к. содержит «оценка» и может пересечься
-    if any(w in desc for w in ["изменена оценка", "score changed"]):
+    # В истории нет структурированного action, поэтому матчим полную строку:
+    # основы «просмотрен»/«прочитан» также используются для счётчиков прогресса.
+    if desc in {"изменена оценка", "score changed"} or re.fullmatch(
+        r"(?:изменена оценка с \d+ на \d+|score changed from \d+ to \d+)",
+        desc,
+    ):
         return "score_changed"
 
-    # Dropped — проверяем первым, т.к. «брошено» короткое и не пересекается
-    if any(w in desc for w in [
-        "dropped", "брошено", "бросил", "бросила", "удалил из", "удалила из",
-    ]):
-        return "dropped"
+    ignored_exact = {
+        "удалено из списка",
+        "отменена оценка",
+        "сброшено число эпизодов",
+        "сброшено число томов и глав",
+        "removed from list",
+        "score removed",
+        "reset episodes count",
+        "reset volumes and chapters count",
+    }
+    if desc in ignored_exact:
+        return "ignored"
 
-    # Rewatching / re-reading (пере-)
-    if any(w in desc for w in [
-        "rewatching", "re-reading",
-        "пересматриваю", "перечитываю",
-        "перечитывает", "пересматривает",
-    ]):
-        return "rewatching"
+    exact_statuses = {
+        "отложено": "on_hold",
+        "on hold": "on_hold",
+        "брошено": "dropped",
+        "бросил": "dropped",
+        "бросила": "dropped",
+        "dropped": "dropped",
+        "пересматриваю": "rewatching",
+        "перечитываю": "rewatching",
+        "пересматривает": "rewatching",
+        "перечитывает": "rewatching",
+        "rewatching": "rewatching",
+        "rereading": "rewatching",
+        "re-reading": "rewatching",
+        "добавлено в список": "planned",
+        "добавлено": "planned",
+        "planned": "planned",
+        "планирует": "planned",
+        "добавил в планируемое": "planned",
+        "добавила в планируемое": "planned",
+        "want to watch": "planned",
+        "want to read": "planned",
+        "смотрю": "watching",
+        "просматриваю": "watching",
+        "читаю": "watching",
+        "смотрит": "watching",
+        "читает": "watching",
+        "watching": "watching",
+        "reading": "watching",
+        "начал смотреть": "watching",
+        "начала смотреть": "watching",
+        "начал читать": "watching",
+        "начала читать": "watching",
+    }
+    if desc in exact_statuses:
+        return exact_statuses[desc]
 
-    # Planned — "добавлено в список" это главный реальный формат
-    if any(w in desc for w in [
-        "добавлено в список", "добавлено",
-        "planned", "планирует",
-        "добавил в планируемое", "добавила в планируемое",
-        "want to watch", "want to read",
-    ]):
-        return "planned"
+    if desc in {"просмотрено", "прочитано", "completed"} or re.fullmatch(
+        r"(?:(?:просмотрено|прочитано) и оценено на \d+|"
+        r"completed and rated \d+)",
+        desc,
+    ):
+        return "completed"
 
-    # Watching / reading — текущий просмотр
-    if any(w in desc for w in [
-        "смотрю", "просматриваю", "читаю",
-        "watching", "reading", "смотрит", "читает",
-        "начал смотреть", "начала смотреть",
-        "начал читать", "начала читать",
-    ]):
-        return "watching"
+    if re.fullmatch(r"(?:оценено на|rated|scored) \d+", desc):
+        return "score_set"
 
-    # Всё остальное: "просмотрено", "прочитано", "оценено на N" -> completed
-    return "completed"
+    counter_ru = re.fullmatch(
+        r"(?:просмотрен|просмотрены|просмотрено|прочитан|прочитана|"
+        r"прочитаны|прочитано)\s+.+",
+        desc,
+    )
+    counter_en = re.fullmatch(r"(?:watched|read)\s+.+", desc)
+    if counter_ru or counter_en:
+        return "ignored"
+
+    return "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -642,8 +722,16 @@ def build_message(entry: dict) -> str:
     title = (f'<a href="{SHIKI_BASE_URL}{target_url}">{title_text}</a>'
              if target_url else title_text)
 
+    # Одна центральная метка делает media_type явным для любого случайно
+    # выбранного history-шаблона. На /favs этот путь не влияет.
+    media_label = _HISTORY_MEDIA_LABELS.get(bank_key, "тайтл")
+    labeled_title = f"{title} ({media_label})"
+
     description = entry.get("description", "") or ""
     event_type = classify_event(description)
+
+    if event_type == "ignored":
+        return ""
 
     score = None
 
@@ -661,14 +749,30 @@ def build_message(entry: dict) -> str:
         else:
             key = "score_changed_down"
         template = random.choice(MESSAGES[key])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
-        media_label = _HISTORY_MEDIA_LABELS.get(bank_key, "тайтл")
-        labeled_title = f"{title} ({media_label})"
         text = format_name_template(
             template,
             DISPLAY_NAME_CONTEXT,
             title=labeled_title,
             old=old_score if old_score is not None else "?",
             new=new_score if new_score is not None else "?",
+        )
+    elif event_type == "score_set":
+        score = extract_score(description)
+        template = random.choice(MESSAGES["score_set"])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
+        text = format_name_template(
+            template,
+            DISPLAY_NAME_CONTEXT,
+            title=labeled_title,
+            score=score if score is not None else "?",
+        )
+    elif event_type == "unknown":
+        template = random.choice(MESSAGES["unknown"])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
+        clean_description = " ".join(_clean_description(str(description)).split())
+        text = format_name_template(
+            template,
+            DISPLAY_NAME_CONTEXT,
+            title=labeled_title,
+            description=h(clean_description) if clean_description else "без описания",
         )
     elif event_type == "completed":
         # Завершение — уточняем по оценке
@@ -687,7 +791,7 @@ def build_message(entry: dict) -> str:
         text = format_name_template(
             template,
             DISPLAY_NAME_CONTEXT,
-            title=title,
+            title=labeled_title,
             score=score if score is not None else "?",
         )
     else:
@@ -696,7 +800,7 @@ def build_message(entry: dict) -> str:
         text = format_name_template(
             template,
             DISPLAY_NAME_CONTEXT,
-            title=title,
+            title=labeled_title,
             score="?",
         )
 

@@ -648,6 +648,16 @@ def test_score_change_updates_existing_completed_event():
     assert all(e["event"] != "score_changed" for e in out["events"])
 
 
+def test_score_set_updates_existing_completed_event_without_duplicate():
+    """Первая оценка после завершения обновляет запись, но не создаёт completed."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"].append(_completed_event(123, None))
+
+    out = smod.record_current_event(cur, {"target": {"id": 123}}, "score_set", "anime", 8)
+
+    assert out["events"] == [_completed_event(123, 8)]
+
+
 def test_score_change_without_completed_is_noop():
     """score_changed по тайтлу вне событий квартала ⇒ ничего не добавляем/не меняем."""
     cur = storage._empty_stats_current(utils.current_quarter())

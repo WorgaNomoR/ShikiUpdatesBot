@@ -528,11 +528,10 @@ def record_current_event(
     Учитываем только значимые для статистики типы.
     Дедупликация: один (id, event_type) на квартал.
     """
-    # Смена оценки внутри квартала: обновляем score уже записанного
-    # completed-события того же тайтла. Если completed-события в этом квартале
-    # нет (тайтл завершён в прошлом квартале/до старта отслеживания) —
-    # игнорируем: в текущем отчёте его всё равно нет.
-    if event_type == "score_changed":
+    # Первая или изменённая оценка внутри квартала обновляет score уже
+    # записанного completed-события того же тайтла. Если completed-события
+    # в этом квартале нет, оценку не добавляем: в отчёте тайтла всё равно нет.
+    if event_type in ("score_set", "score_changed"):
         if score is None:
             return cur
         try:
@@ -546,7 +545,7 @@ def record_current_event(
                         log.info("Обновлена оценка в квартале: id=%s → %s", tid, score)
                     break
         except Exception as e:
-            log.error("record_current_event(score_changed): %s", e)
+            log.error("record_current_event(%s): %s", event_type, e)
         return cur
 
     if event_type not in ("completed", "dropped", "planned", "rewatching"):
