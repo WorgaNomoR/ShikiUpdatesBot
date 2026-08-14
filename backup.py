@@ -33,6 +33,7 @@ from storage import (
     load_subscribers,
     save_stats_current,
 )
+from telegram_delivery import send_with_retry
 from utils import (
     _subscriber_link,
     _utcnow,
@@ -92,13 +93,18 @@ async def send_backup(bot: Bot, caption: str) -> bool:
     except Exception as e:
         log.error("send_backup: не удалось собрать архив: %s", e)
         return False
-    try:
-        await bot.send_document(
+    filename = _backup_filename()
+
+    async def _send_document():
+        return await bot.send_document(
             OWNER_ID,
-            document=BufferedInputFile(data, filename=_backup_filename()),
+            document=BufferedInputFile(data, filename=filename),
             caption=caption,
             parse_mode=ParseMode.HTML,
         )
+
+    try:
+        await send_with_retry(_send_document)
         log.info("send_backup: архив отправлен владельцу (%d байт).", len(data))
         _last_backup_sent_at = time.monotonic()
         return True

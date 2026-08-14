@@ -56,6 +56,7 @@
 The former `main.py` monolith was split into single-responsibility modules with a strictly one-way (acyclic) dependency graph. `main.py` is now a thin application entrypoint; `launcher.py` is the PyInstaller console entrypoint.
 
 - `runtime.py` — stdlib-only frozen/source detection, physical app-root paths, first-run `.env` copy, rotating portable logs, and the Windows single-instance mutex. Lowest foundation; imports nothing project-local.
+- `telegram_delivery.py` — shared bounded retry helper for subscriber notifications and owner backup uploads. Classifies blocked, flood-control, transient transport/server, and permanent failures; imports nothing project-local.
 - `project_meta.py` / `build_info.py` — canonical project version/description and runtime build identity (`APP_VERSION`, repository/server/API URLs), strict SemVer parsing, and PyInstaller overrides injected through `_build_info`.
 - `config.py` — explicit app-root `.env` loading (`load_dotenv`), data-dir paths, and shared logging. Depends only on `runtime`.
 - `utils.py` — pure stdlib-only helpers: `h`, `_rel_url`, `_subscriber_link`, `_utcnow`, `_parse_iso_utc`, `quarter_*`, `_safe_int`, `_safe_float`, `_normalize_homoglyphs`.
@@ -91,6 +92,7 @@ graph TD
     handlers --> shiki_api
     handlers --> storage
     handlers --> updates
+    handlers --> telegram_delivery
     updates --> storage
     updates --> build_info
     build_info --> project_meta
@@ -102,6 +104,7 @@ graph TD
     messages --> name_grammar
     messages --> shiki_api
     backup --> storage
+    backup --> telegram_delivery
     storage --> base["config + utils (foundation)"]
     shiki_api --> base
     config --> runtime
@@ -120,7 +123,7 @@ When adding or moving code, keep dependencies one-directional (import from lower
 - `release_security.py` / `.github/workflows/windows-exe.yml` — build-time VirusTotal client and tagged Windows release pipeline. The client looks up SHA-256 before upload, handles the large-file upload URL, respects the public polling limit, and renders the shared Russian Actions/Release Markdown; it is not imported by bot runtime.
 - `requirements.txt` / `requirements-dev.txt` — runtime and development dependencies (`python-dotenv` is a runtime dep for `.env` loading).
 - `.env.example` — template for the environment variables.
-- `tests/` — pytest coverage for configuration, pure helpers, storage, the Shikimori API, messages and name grammar, statistics, backup, handler flows, the polling loop, the owner-gate, and Telegram send behaviour.
+- `tests/` — pytest coverage for configuration, pure helpers, storage, the Shikimori API, messages and name grammar, statistics, backup, handler flows, the polling loop, the owner-gate, and Telegram delivery/retry behaviour.
 
 ## Key patterns and conventions
 - Environment variables (read in `config.py`, except `PORT`, which `healthcheck.py` reads directly; `.env` is loaded explicitly from the source/exe root and never overrides the process environment): **required** — `BOT_TOKEN`, `OWNER_ID`, `SHIKI_USER`. **Optional with defaults** — `DISPLAY_NAME` (defaults to the `SHIKI_USER` nick), `DISPLAY_NAME_GENDER` (`auto`; also `male`, `female`, `none`), `SHIKI_BASE_URL`, `CHECK_INTERVAL`, `ERROR_NOTIFY_INTERVAL`, `FULL_SYNC_INTERVAL`, `DATA_DIR` (`/data` for source/Docker, `<exe>/data` frozen), `PORT` (`8080`, source/Docker only). Frozen relative `DATA_DIR` overrides resolve from the portable root.
@@ -132,6 +135,7 @@ When adding or moving code, keep dependencies one-directional (import from lower
 - **Portable Windows contract.** Persistent files stay beside the physical exe (`sys.executable`), never under `%APPDATA%` or PyInstaller `_MEI`. A missing `.env` is copied once from the adjacent example and never overwritten; healthcheck is skipped frozen; the named mutex prevents a second process in the same folder. Updating means replacing only the stopped exe.
 - All file writes go through `_atomic_write()` (temp file + `os.replace()`) for crash safety.
 - All Telegram messages use `ParseMode.HTML`; user-facing strings from the API are escaped via `h()` (`html.escape`).
+- **Telegram delivery retry is bounded and in-process.** `telegram_delivery.send_with_retry()` accepts a fresh async send-operation factory and retries only `TelegramRetryAfter`, transient aiogram network/server failures, and transient aiohttp connection/payload failures, at most twice after the initial call. Subscriber iteration/removal remains in `handlers.py`; ZIP creation, owner targeting, and the successful-backup clock remain in `backup.py`. Backup retries reuse one ZIP byte payload but create a fresh `BufferedInputFile` for every upload. Permanent failures are not retried, and the shutdown wrapper retains its outer timeout/cancellation budget.
 - **Stability is the top priority.** Every function must be exception-safe: unexpected or missing data must never crash the bot. Network fetches return `None` on any error (not empty collections) to distinguish API failures from genuinely empty results. Statistics degrade gracefully — a failed export or GraphQL call yields a report without enriched metadata rather than a crash.
 - Statistics data sources: user lists come from the public `list_export` JSON endpoints (no auth); title metadata comes from the GraphQL `animes`/`mangas` batch queries with `censored: false`. Do NOT reintroduce per-title REST calls or OAuth — these were evaluated and rejected.
 - A single relevance filter `is_relevant(media, kind)` governs BOTH notifications and statistics. OVA/ONA are kept; specials/clips/PV are dropped. Do not duplicate or diverge this logic.

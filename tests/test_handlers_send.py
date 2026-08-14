@@ -2,9 +2,11 @@
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
 
+import aiohttp
 import pytest
 
 import handlers
+import telegram_delivery
 from handlers import send_to_all_chats
 
 
@@ -22,6 +24,7 @@ def _no_sleep(monkeypatch):
     async def _fast(*args, **kwargs):
         pass
     monkeypatch.setattr(asyncio, "sleep", _fast)
+    monkeypatch.setattr(telegram_delivery, "_sleep", _fast)
 
 
 @pytest.mark.asyncio
@@ -102,16 +105,22 @@ async def test_blocked_user_removed(monkeypatch):
 
 
     class BotWithBlockedUser:
+        def __init__(self):
+            self.calls = []
+
         async def send_message(self, chat_id, text, parse_mode=None):
+            self.calls.append(chat_id)
             if chat_id == 111:
                 raise Exception("bot was blocked")
             return
 
+    bot = BotWithBlockedUser()
     await send_to_all_chats(
-        BotWithBlockedUser(),
+        bot,
         "hello",
     )
 
+    assert bot.calls == [111, 222]
     assert len(saved) == 1
     assert 111 not in saved[0]
     assert 222 in saved[0]
@@ -176,6 +185,41 @@ async def test_generic_error_does_not_remove_user(monkeypatch):
     )
 
     assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_exhausted_transient_retries_continue_with_next_subscriber(monkeypatch):
+    monkeypatch.setattr(
+        "handlers.load_subscribers",
+        lambda: {111: "Alice", 222: "Bob"},
+    )
+    retry_delays = []
+    flood_delays = []
+
+    async def _retry_sleep(delay):
+        retry_delays.append(delay)
+
+    async def _flood_sleep(delay):
+        flood_delays.append(delay)
+
+    monkeypatch.setattr(telegram_delivery, "_sleep", _retry_sleep)
+    monkeypatch.setattr(handlers.asyncio, "sleep", _flood_sleep)
+
+    class BotWithTransientFailure:
+        def __init__(self):
+            self.calls = []
+
+        async def send_message(self, chat_id, text, parse_mode=None):
+            self.calls.append(chat_id)
+            if chat_id == 111:
+                raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+    bot = BotWithTransientFailure()
+    await send_to_all_chats(bot, "hello")
+
+    assert bot.calls == [111, 111, 111, 222]
+    assert retry_delays == [0.5, 1.0]
+    assert flood_delays == [0.3, 0.3]
 
 
 # ── _is_blocked_error: единый детектор «получатель недоступен» ──────
