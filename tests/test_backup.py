@@ -573,6 +573,7 @@ async def test_shutdown_backup_debounced_when_recent(backup_env, monkeypatch):
 async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
     monkeypatch.setattr("backup._last_backup_sent_at", None)
     started = asyncio.Event()
+    wait_for_calls = 0
 
     async def _slow(_bot, _caption):
         started.set()
@@ -580,6 +581,8 @@ async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
         return True
 
     async def _cancel_on_timeout(awaitable, timeout):
+        nonlocal wait_for_calls
+        wait_for_calls += 1
         assert timeout == backup.SHUTDOWN_BACKUP_TIMEOUT
         await _cancel_after_started(awaitable, started)
         raise TimeoutError
@@ -587,18 +590,22 @@ async def test_shutdown_backup_timeout_is_swallowed(backup_env, monkeypatch):
     monkeypatch.setattr("backup.send_backup", _slow)
     monkeypatch.setattr(backup.asyncio, "wait_for", _cancel_on_timeout)
     await backup._shutdown_backup(AsyncMock())   # не должно бросить
+    assert wait_for_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_shutdown_backup_timeout_cancels_retry_sequence(backup_env, monkeypatch):
     monkeypatch.setattr("backup._last_backup_sent_at", None)
     first_attempt = asyncio.Event()
+    wait_for_calls = 0
 
     async def _fail_send(*args, **kwargs):
         first_attempt.set()
         raise aiohttp.ClientOSError(104, "Connection reset by peer")
 
     async def _cancel_on_timeout(awaitable, timeout):
+        nonlocal wait_for_calls
+        wait_for_calls += 1
         assert timeout == backup.SHUTDOWN_BACKUP_TIMEOUT
         await _cancel_after_started(awaitable, first_attempt)
         raise TimeoutError
@@ -609,6 +616,7 @@ async def test_shutdown_backup_timeout_cancels_retry_sequence(backup_env, monkey
 
     await backup._shutdown_backup(bot)
 
+    assert wait_for_calls == 1
     bot.send_document.assert_awaited_once()
 
 
