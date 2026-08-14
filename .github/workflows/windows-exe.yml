@@ -228,5 +228,6 @@ jobs:
           $archive = "release\ShikiUpdatesBot-windows-x64.zip"
           $checksum = "$archive.sha256"
           gh release create $env:APP_VERSION $archive $checksum `
-            --verify-tag --draft --generate-notes `
-            --notes-file .\release\security-notes.md --title $env:APP_VERSION
+            --verify-tag --draft `
+            --notes-file .\release\security-notes.md `
+            --title "ShikiUpdatesBot $env:APP_VERSION"

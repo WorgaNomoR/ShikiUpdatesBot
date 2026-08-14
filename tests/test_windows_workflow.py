@@ -134,7 +134,7 @@ def test_is_release_uses_push_and_tag_together(tmp_path, event_name, ref, expect
     assert f"is_release={expected}" in result.stdout
 
 
-def test_release_notes_keep_generated_changelog_and_security_block():
+def test_release_draft_uses_curated_notes_title_and_security_block():
     build = SPEC["jobs"]["build"]
     upload = _step(build, "Upload verification artifact")
     publish = SPEC["jobs"]["publish"]
@@ -142,8 +142,11 @@ def test_release_notes_keep_generated_changelog_and_security_block():
 
     assert "release/security-notes.md" in upload["with"]["path"]
     assert publish["if"] == "needs.build.outputs.is_release == 'true'"
-    assert "--generate-notes" in create["run"]
+    assert "--generate-notes" not in create["run"]
+    assert "gh release create $env:APP_VERSION $archive $checksum" in create["run"]
+    assert "--verify-tag --draft" in create["run"]
     assert "--notes-file .\\release\\security-notes.md" in create["run"]
+    assert '--title "ShikiUpdatesBot $env:APP_VERSION"' in create["run"]
 
 
 def test_unexpected_scan_failure_has_independent_non_blocking_fallback():
