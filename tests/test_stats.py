@@ -665,6 +665,29 @@ def test_score_change_without_completed_is_noop():
     assert out["events"] == []
 
 
+def test_score_removed_clears_existing_completed_without_duplicate():
+    """Отмена оценки очищает score завершения текущего квартала без нового события."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"].append(_completed_event(123, 5))
+
+    out = smod.record_current_event(
+        cur, {"target": {"id": 123}}, "score_removed", "anime", None,
+    )
+
+    assert out["events"] == [_completed_event(123, None)]
+
+
+def test_score_removed_without_completed_is_noop():
+    """Отмена оценки вне завершений текущего квартала не создаёт событие."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+
+    out = smod.record_current_event(
+        cur, {"target": {"id": 999}}, "score_removed", "anime", None,
+    )
+
+    assert out["events"] == []
+
+
 @pytest.mark.asyncio
 async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatch):
     """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,

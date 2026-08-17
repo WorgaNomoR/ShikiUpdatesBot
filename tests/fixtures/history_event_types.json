@@ -70,14 +70,16 @@
     "Сброшено число эпизодов",
     "Сброшено число томов и глав",
     "Удалено из списка",
-    "Отменена оценка",
     "Watched movie",
     "Watched all episodes",
     "Read novel",
     "Read manga",
     "Reset episodes count",
     "Reset volumes and chapters count",
-    "Removed from list",
+    "Removed from list"
+  ],
+  "score_removed_descriptions": [
+    "Отменена оценка",
     "Score removed"
   ]
 }

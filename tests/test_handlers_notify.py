@@ -194,11 +194,6 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
             "description": "Удалено из списка",
             "target": {"id": 78, "type": "Anime", "kind": "tv"},
         },
-        {
-            "id": 125,
-            "description": "Отменена оценка",
-            "target": {"id": 79, "type": "Anime", "kind": "tv"},
-        },
     ]
     _patch_history(monkeypatch, entries)
     monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
@@ -218,10 +213,57 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
     with caplog.at_level(logging.WARNING):
         result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
 
-    assert result == {999, 123, 124, 125}
-    assert saved == [{999, 123, 124, 125}]
+    assert result == {999, 123, 124}
+    assert saved == [{999, 123, 124}]
     assert sent == []
     assert returned_cur == cur
+    assert not caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_score_removed_is_seen_and_clears_current_score_without_send(
+    monkeypatch,
+    caplog,
+):
+    entry = {
+        "id": 125,
+        "description": "Отменена оценка",
+        "target": {"id": 79, "type": "Anime", "kind": "tv"},
+    }
+    _patch_history(monkeypatch, [entry])
+    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    calls = []
+
+    def _record(cur, item, event_type, media_type, score):
+        calls.append((item, event_type, media_type, score))
+        cur["events"][0]["score"] = None
+        return cur
+
+    monkeypatch.setattr("handlers.record_current_event", _record)
+    monkeypatch.setattr(
+        "handlers.build_message",
+        lambda item: pytest.fail("для score_removed начали строить сообщение"),
+    )
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    cur = _empty_cur()
+    cur["events"].append({
+        "id": "79",
+        "media": "anime",
+        "event": "completed",
+        "score": 5,
+        "recorded_at": "2026-04-01T00:00:00+00:00",
+    })
+
+    with caplog.at_level(logging.WARNING):
+        result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+
+    assert result == {999, 125}
+    assert saved == [{999, 125}]
+    assert sent == []
+    assert calls == [(entry, "score_removed", "anime", None)]
+    assert returned_cur["events"][0]["score"] is None
     assert not caplog.messages
 
 

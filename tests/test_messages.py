@@ -760,6 +760,11 @@ def test_classify_official_non_product_descriptions_as_ignored(history_event_fix
         assert classify_event(description) == "ignored"
 
 
+def test_classify_rating_removal_as_silent_state_correction(history_event_fixtures):
+    for description in history_event_fixtures["score_removed_descriptions"]:
+        assert classify_event(description) == "score_removed"
+
+
 @pytest.mark.parametrize("description", [
     "Completed",
     "Completed and rated 8",
@@ -775,6 +780,10 @@ def test_classify_official_english_score_descriptions(description):
 
 def test_ignored_history_message_is_empty():
     assert build_message(make_entry("Просмотрено 15 эпизодов")) == ""
+
+
+def test_score_removed_history_message_is_empty():
+    assert build_message(make_entry("Отменена оценка")) == ""
 
 
 def test_classify_unknown_is_explicit():

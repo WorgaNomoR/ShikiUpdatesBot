@@ -710,6 +710,14 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
                 _clean_description(description),
             )
             continue
+        if event_type == "score_removed":
+            cur = record_current_event(cur, entry, event_type, media_type, None)
+            log.info(
+                "Отмена оценки учтена без уведомления entry id=%d: %r",
+                entry_id,
+                _clean_description(description),
+            )
+            continue
         if event_type == "unknown":
             log.warning(
                 "Неизвестное описание истории entry id=%d: %r",

@@ -607,7 +607,8 @@ def classify_event(description: str) -> str:
       "просмотрено"              -> completed  (без оценки)
       "прочитано"                -> completed  (без оценки)
       "оценено на 9"             -> score_set
-      прогресс и служебные записи -> ignored
+      "отменена оценка"          -> score_removed
+      прогресс и прочие служебные записи -> ignored
     """
     desc = " ".join(_clean_description(description).casefold().split())
 
@@ -619,13 +620,14 @@ def classify_event(description: str) -> str:
     ):
         return "score_changed"
 
+    if desc in {"отменена оценка", "score removed"}:
+        return "score_removed"
+
     ignored_exact = {
         "удалено из списка",
-        "отменена оценка",
         "сброшено число эпизодов",
         "сброшено число томов и глав",
         "removed from list",
-        "score removed",
         "reset episodes count",
         "reset volumes and chapters count",
     }
@@ -730,7 +732,7 @@ def build_message(entry: dict) -> str:
     description = entry.get("description", "") or ""
     event_type = classify_event(description)
 
-    if event_type == "ignored":
+    if event_type in ("ignored", "score_removed"):
         return ""
 
     score = None
