@@ -73,7 +73,6 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
     # нерелевантных тест прошёл бы и с удалённой baseline-веткой (их отсеет
     # is_relevant) — т.е. не охранял бы её.
     _patch_history(monkeypatch, [_relevant_entry(1), _relevant_entry(2)])
-    monkeypatch.setattr("handlers.record_current_event", lambda cur, *a, **k: cur)
     monkeypatch.setattr("handlers.build_message", lambda e: "SHOULD_NOT_SEND")
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
@@ -157,13 +156,10 @@ async def test_unknown_event_sends_and_marks_seen_without_quarter_event(
     monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
     monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
     monkeypatch.setattr("handlers.build_message", lambda item: "NEUTRAL")
-    monkeypatch.setattr(
-        "handlers.record_current_event",
-        lambda *args, **kwargs: pytest.fail("unknown попал в квартальную статистику"),
-    )
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
     cur = _empty_cur()
+    expected_cur = _empty_cur()
 
     with caplog.at_level(logging.WARNING):
         result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
@@ -171,7 +167,7 @@ async def test_unknown_event_sends_and_marks_seen_without_quarter_event(
     assert result == {999, 123}
     assert saved == [{999, 123}]
     assert sent == ["NEUTRAL"]
-    assert returned_cur == cur
+    assert returned_cur == expected_cur
     assert any(
         "Неизвестно & новое" in message
         for message in caplog.messages
@@ -199,16 +195,13 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
     monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
     monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
     monkeypatch.setattr(
-        "handlers.record_current_event",
-        lambda *args, **kwargs: pytest.fail("ignored попал в квартальную статистику"),
-    )
-    monkeypatch.setattr(
         "handlers.build_message",
         lambda item: pytest.fail("для ignored начали строить сообщение"),
     )
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
     cur = _empty_cur()
+    expected_cur = _empty_cur()
 
     with caplog.at_level(logging.WARNING):
         result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
@@ -216,7 +209,7 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
     assert result == {999, 123, 124}
     assert saved == [{999, 123, 124}]
     assert sent == []
-    assert returned_cur == cur
+    assert returned_cur == expected_cur
     assert not caplog.messages
 
 
@@ -233,14 +226,6 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
     _patch_history(monkeypatch, [entry])
     monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
     monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
-    calls = []
-
-    def _record(cur, item, event_type, media_type, score):
-        calls.append((item, event_type, media_type, score))
-        cur["events"][0]["score"] = None
-        return cur
-
-    monkeypatch.setattr("handlers.record_current_event", _record)
     monkeypatch.setattr(
         "handlers.build_message",
         lambda item: pytest.fail("для score_removed начали строить сообщение"),
@@ -262,7 +247,6 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
     assert result == {999, 125}
     assert saved == [{999, 125}]
     assert sent == []
-    assert calls == [(entry, "score_removed", "anime", None)]
     assert returned_cur["events"][0]["score"] is None
     assert not caplog.messages
 

@@ -688,6 +688,57 @@ def test_score_removed_without_completed_is_noop():
     assert out["events"] == []
 
 
+def test_record_current_event_distinguishes_same_id_across_media():
+    """Одинаковые числовые ID аниме и манги не считаются одним событием."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    entry = {"target": {"id": 123}}
+
+    smod.record_current_event(cur, entry, "completed", "anime", 7)
+    smod.record_current_event(cur, entry, "completed", "manga", 8)
+
+    assert [
+        (event["id"], event["media"], event["event"], event["score"])
+        for event in cur["events"]
+    ] == [
+        ("123", "anime", "completed", 7),
+        ("123", "manga", "completed", 8),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "score", "expected_manga_score"),
+    [
+        ("score_set", 8, 8),
+        ("score_changed", 9, 9),
+        ("score_removed", None, None),
+    ],
+)
+def test_score_event_updates_only_matching_media(
+    event_type,
+    score,
+    expected_manga_score,
+):
+    """Оценка меняется у совпавшей пары media + id, а не у первого такого ID."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"] = [
+        _completed_event(123, 3, "anime"),
+        _completed_event(123, 6, "manga"),
+    ]
+
+    smod.record_current_event(
+        cur,
+        {"target": {"id": 123}},
+        event_type,
+        "manga",
+        score,
+    )
+
+    assert cur["events"] == [
+        _completed_event(123, 3, "anime"),
+        _completed_event(123, expected_manga_score, "manga"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatch):
     """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,
