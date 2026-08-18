@@ -53,6 +53,7 @@ from shiki_api import (
     _FAV_CATEGORIES,
     _INDUSTRY_CATEGORIES,
     ANIME_ALLOWED_KINDS,
+    HISTORY_PAGE_LIMIT,
     fetch_current_rates,
     fetch_favourites,
     fetch_history,
@@ -102,6 +103,7 @@ from utils import (
 # Фиксированная пауза между фазами стартовых фетчей (анти-429, boot-throttle).
 # Без джиттера — предсказуемый ритм (firewall-философия).
 BOOT_PHASE_DELAY = 2.0  # секунд
+_HISTORY_CATCHUP_MAX_PAGES = 5
 
 
 class BroadcastStates(StatesGroup):
@@ -642,6 +644,50 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
     _unsubscribe_blocked(subs, to_remove)
 
 
+async def _fetch_history_catchup(
+    session: aiohttp.ClientSession,
+    seen_ids: set[int],
+) -> list[dict] | None:
+    """Собирает пропущенную историю до известного ID или конца выдачи."""
+    entries_by_id: dict[int, dict] = {}
+
+    for page in range(1, _HISTORY_CATCHUP_MAX_PAGES + 1):
+        page_entries = await fetch_history(session, page=page)
+        if page_entries is None:
+            log.warning(
+                "История: страница %d не загрузилась, catch-up отменён без обновления seen_ids.",
+                page,
+            )
+            return None
+
+        try:
+            page_ids = {entry["id"] for entry in page_entries}
+            for entry in page_entries:
+                entries_by_id.setdefault(entry["id"], entry)
+        except (KeyError, TypeError) as e:
+            log.warning(
+                "История: некорректная страница %d (%s), catch-up отменён без обновления seen_ids.",
+                page,
+                e,
+            )
+            return None
+
+        if page_ids & seen_ids:
+            return list(entries_by_id.values())
+
+        # API Shikimori читает limit + 1 запись как признак следующей страницы.
+        # При limit=50 короткая выдача содержит меньше 51 записи и означает конец.
+        if len(page_entries) < HISTORY_PAGE_LIMIT + 1:
+            return list(entries_by_id.values())
+
+    log.warning(
+        "История: за %d страниц не найдена известная граница; "
+        "catch-up отменён без обновления seen_ids.",
+        _HISTORY_CATCHUP_MAX_PAGES,
+    )
+    return None
+
+
 async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set[int], dict]:
     """
     Главная функция проверки:
@@ -652,7 +698,11 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
     5. Параллельно фиксируем значимые события в cur (статистика квартала)
     """
     async with aiohttp.ClientSession() as session:
-        entries = await fetch_history(session)
+        if seen_ids:
+            entries = await _fetch_history_catchup(session, seen_ids)
+        else:
+            # Первый baseline намеренно ограничен одной страницей.
+            entries = await fetch_history(session)
 
     if entries is None:
         log.info("Запрос истории не удался — пропускаем цикл.")

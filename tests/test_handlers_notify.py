@@ -15,8 +15,30 @@ def _empty_cur():
 def _relevant_entry(eid):
     # запись, которая прошла бы is_relevant (anime/tv) и без baseline-ветки
     # ушла бы в чат — тем и докажем, что baseline возвращает ДО отправки
-    return {"id": eid, "target": {"type": "Anime", "kind": "tv"},
-            "description": "просмотрено"}
+    return {
+        "id": eid,
+        "target": {
+            "id": eid,
+            "type": "Anime",
+            "kind": "tv",
+            "name": f"Title {eid}",
+            "russian": f"Тайтл {eid}",
+            "url": f"/animes/{eid}",
+        },
+        "description": "Смотрю",
+    }
+
+
+def _history_entries(newest_id, count):
+    return [
+        _relevant_entry(eid)
+        for eid in range(newest_id, newest_id - count, -1)
+    ]
+
+
+def _full_history_page(newest_id):
+    # Shikimori при limit=50 возвращает 50 записей + lookahead-запись.
+    return _history_entries(newest_id, 51)
 
 
 class DummyBot:
@@ -32,9 +54,24 @@ def _no_sleep(monkeypatch):
 
 
 def _patch_history(monkeypatch, entries):
-    async def _fetch(session):
+    calls = []
+
+    async def _fetch(session, page=1):
+        calls.append(page)
         return entries
     monkeypatch.setattr("handlers.fetch_history", _fetch)
+    return calls
+
+
+def _patch_history_pages(monkeypatch, pages):
+    calls = []
+
+    async def _fetch(session, page=1):
+        calls.append(page)
+        return pages[page]
+
+    monkeypatch.setattr("handlers.fetch_history", _fetch)
+    return calls
 
 
 def _capture_sends(monkeypatch):
@@ -43,6 +80,13 @@ def _capture_sends(monkeypatch):
         sent.append(text)
     monkeypatch.setattr("handlers.send_to_all_chats", _send)
     return sent
+
+
+def _sent_history_ids(messages):
+    return [
+        int(message.split("/animes/", 1)[1].split('"', 1)[0])
+        for message in messages
+    ]
 
 
 def _capture_saves(monkeypatch):
@@ -72,16 +116,129 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
     # (иначе первый запуск спамит всю историю). Релевантность критична: на
     # нерелевантных тест прошёл бы и с удалённой baseline-веткой (их отсеет
     # is_relevant) — т.е. не охранял бы её.
-    _patch_history(monkeypatch, [_relevant_entry(1), _relevant_entry(2)])
-    monkeypatch.setattr("handlers.build_message", lambda e: "SHOULD_NOT_SEND")
+    entries = _full_history_page(51)
+    calls = _patch_history(monkeypatch, entries)
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
     result, cur = await check_and_notify(DummyBot(), set(), _empty_cur())
 
-    assert result == {1, 2}
-    assert saved == [{1, 2}]
+    assert result == set(range(1, 52))
+    assert saved == [set(range(1, 52))]
     assert sent == []
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_known_boundary_on_full_first_page_uses_one_request(monkeypatch):
+    page = _full_history_page(200)
+    calls = _patch_history_pages(monkeypatch, {1: page})
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, _cur = await check_and_notify(DummyBot(), {150}, _empty_cur())
+
+    assert calls == [1]
+    assert _sent_history_ids(sent) == list(range(151, 201))
+    assert result == {150, *range(151, 201)}
+    assert saved == [result]
+
+
+@pytest.mark.asyncio
+async def test_exact_limit_page_without_boundary_is_exhausted(monkeypatch):
+    page = _history_entries(500, 50)
+    calls = _patch_history_pages(monkeypatch, {1: page})
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, _cur = await check_and_notify(DummyBot(), {1}, _empty_cur())
+
+    assert calls == [1]
+    assert _sent_history_ids(sent) == list(range(451, 501))
+    assert result == {1, *range(451, 501)}
+    assert saved == [result]
+
+
+@pytest.mark.asyncio
+async def test_catchup_fetches_until_boundary_deduplicates_and_orders(monkeypatch):
+    pages = {
+        1: _full_history_page(250),
+        2: _full_history_page(200),
+    }
+    calls = _patch_history_pages(monkeypatch, pages)
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, _cur = await check_and_notify(DummyBot(), {150}, _empty_cur())
+
+    assert calls == [1, 2]
+    sent_ids = _sent_history_ids(sent)
+    assert sent_ids == list(range(151, 251))
+    assert sent_ids.count(200) == 1
+    assert result == {150, *range(151, 251)}
+    assert saved == [result]
+
+
+@pytest.mark.asyncio
+async def test_catchup_short_page_without_boundary_is_exhausted(monkeypatch):
+    pages = {
+        1: _full_history_page(350),
+        2: [_relevant_entry(eid) for eid in (300, 299, 298)],
+    }
+    calls = _patch_history_pages(monkeypatch, pages)
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, _cur = await check_and_notify(DummyBot(), {1}, _empty_cur())
+
+    assert calls == [1, 2]
+    assert _sent_history_ids(sent) == list(range(298, 351))
+    assert result == {1, *range(298, 351)}
+    assert saved == [result]
+
+
+@pytest.mark.asyncio
+async def test_catchup_failure_on_second_page_keeps_seen_unpublished(monkeypatch):
+    pages = {
+        1: _full_history_page(450),
+        2: None,
+    }
+    calls = _patch_history_pages(monkeypatch, pages)
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    original_seen = {1}
+    original_cur = _empty_cur()
+
+    result, returned_cur = await check_and_notify(
+        DummyBot(), original_seen, original_cur,
+    )
+
+    assert calls == [1, 2]
+    assert result is original_seen
+    assert returned_cur is original_cur
+    assert saved == []
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_catchup_cap_without_boundary_is_incomplete(monkeypatch, caplog):
+    pages = {
+        page: _full_history_page(1000 - (page - 1) * 50)
+        for page in range(1, 6)
+    }
+    calls = _patch_history_pages(monkeypatch, pages)
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    original_seen = {1}
+
+    with caplog.at_level(logging.WARNING):
+        result, _cur = await check_and_notify(DummyBot(), original_seen, _empty_cur())
+
+    assert calls == [1, 2, 3, 4, 5]
+    assert result is original_seen
+    assert saved == []
+    assert sent == []
+    assert any("за 5 страниц не найдена известная граница" in msg for msg in caplog.messages)
 
 
 @pytest.mark.asyncio

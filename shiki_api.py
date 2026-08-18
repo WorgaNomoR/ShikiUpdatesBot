@@ -67,7 +67,8 @@ LIST_EXPORT_ANIME = f"{SHIKI_BASE_URL}/{SHIKI_USER}/list_export/animes.json"
 
 LIST_EXPORT_MANGA = f"{SHIKI_BASE_URL}/{SHIKI_USER}/list_export/mangas.json"
 
-HISTORY_URL    = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/history?limit=50"
+HISTORY_URL        = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/history"
+HISTORY_PAGE_LIMIT = 50
 
 FAVOURITES_URL = f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/favourites"
 
@@ -437,13 +438,34 @@ async def fetch_meta_batch(media: str, ids: list[str],
     return result
 
 
-async def fetch_history(session: aiohttp.ClientSession) -> list[dict] | None:
-    """Запрашиваем историю с API Shikimori.
+async def fetch_history(
+    session: aiohttp.ClientSession,
+    page: int = 1,
+) -> list[dict] | None:
+    """Запрашиваем одну страницу истории с API Shikimori.
     Возвращает список записей при успехе или None при любой ошибке.
     """
+    url = f"{HISTORY_URL}?limit={HISTORY_PAGE_LIMIT}&page={page}"
+
+    async def _parse(resp):
+        data = await resp.json()
+        if (
+            not isinstance(data, list)
+            or any(
+                not isinstance(entry, dict)
+                or type(entry.get("id")) is not int
+                for entry in data
+            )
+        ):
+            log.warning("fetch_history(page=%d): некорректный ответ.", page)
+            return None
+        return data
+
     return await _fetch(
-        session, "GET", HISTORY_URL,
-        parse=lambda resp: resp.json(), label="fetch_history", timeout=15,
+        session, "GET", url,
+        parse=_parse,
+        label=f"fetch_history(page={page})",
+        timeout=15,
     )
 
 

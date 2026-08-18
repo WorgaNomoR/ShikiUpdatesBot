@@ -44,8 +44,10 @@ class _FakeSession:
     def __init__(self, *, response=None, raise_exc=None):
         self._response = response
         self._raise_exc = raise_exc
+        self.requests = []
 
     def get(self, *args, **kwargs):
+        self.requests.append((args, kwargs))
         if self._raise_exc is not None:
             raise self._raise_exc
         return self._response
@@ -100,6 +102,32 @@ async def test_fetch_history_returns_parsed_list_on_success():
     payload = [{"id": 1, "description": "оценено на 9"}]
     resp = _FakeResponse(200, json_value=payload)
     assert await fetch_history(_FakeSession(response=resp)) == payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_returns_none_on_object_payload():
+    resp = _FakeResponse(200, json_value={"id": 1})
+
+    assert await fetch_history(_FakeSession(response=resp)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_id", ["2", True], ids=["string", "bool"])
+async def test_fetch_history_returns_none_on_invalid_entry_id(invalid_id):
+    payload = [{"id": 1}, {"id": invalid_id}]
+    resp = _FakeResponse(200, json_value=payload)
+
+    assert await fetch_history(_FakeSession(response=resp)) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_requests_explicit_page_with_fixed_limit():
+    session = _FakeSession(response=_FakeResponse(200, json_value=[]))
+
+    await fetch_history(session, page=3)
+
+    args, _kwargs = session.requests[0]
+    assert args[0].endswith("/history?limit=50&page=3")
 
 
 @pytest.mark.asyncio
