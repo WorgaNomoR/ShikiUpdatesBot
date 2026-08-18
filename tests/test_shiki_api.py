@@ -105,6 +105,22 @@ async def test_fetch_history_returns_parsed_list_on_success():
 
 
 @pytest.mark.asyncio
+async def test_fetch_history_returns_none_on_object_payload():
+    resp = _FakeResponse(200, json_value={"id": 1})
+
+    assert await fetch_history(_FakeSession(response=resp)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_id", ["2", True], ids=["string", "bool"])
+async def test_fetch_history_returns_none_on_invalid_entry_id(invalid_id):
+    payload = [{"id": 1}, {"id": invalid_id}]
+    resp = _FakeResponse(200, json_value=payload)
+
+    assert await fetch_history(_FakeSession(response=resp)) is None
+
+
+@pytest.mark.asyncio
 async def test_fetch_history_requests_explicit_page_with_fixed_limit():
     session = _FakeSession(response=_FakeResponse(200, json_value=[]))
 

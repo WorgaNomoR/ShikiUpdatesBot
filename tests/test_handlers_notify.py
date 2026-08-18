@@ -15,8 +15,18 @@ def _empty_cur():
 def _relevant_entry(eid):
     # запись, которая прошла бы is_relevant (anime/tv) и без baseline-ветки
     # ушла бы в чат — тем и докажем, что baseline возвращает ДО отправки
-    return {"id": eid, "target": {"type": "Anime", "kind": "tv"},
-            "description": "просмотрено"}
+    return {
+        "id": eid,
+        "target": {
+            "id": eid,
+            "type": "Anime",
+            "kind": "tv",
+            "name": f"Title {eid}",
+            "russian": f"Тайтл {eid}",
+            "url": f"/animes/{eid}",
+        },
+        "description": "Смотрю",
+    }
 
 
 class DummyBot:
@@ -52,23 +62,19 @@ def _patch_history_pages(monkeypatch, pages):
     return calls
 
 
-def _patch_notifying_entries(monkeypatch):
-    monkeypatch.setattr("handlers.get_media_info", lambda entry: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
-    monkeypatch.setattr("handlers.classify_event", lambda description: "started")
-    monkeypatch.setattr(
-        "handlers.record_current_event",
-        lambda cur, entry, event_type, media_type, score: cur,
-    )
-    monkeypatch.setattr("handlers.build_message", lambda entry: str(entry["id"]))
-
-
 def _capture_sends(monkeypatch):
     sent = []
     async def _send(bot, text):
         sent.append(text)
     monkeypatch.setattr("handlers.send_to_all_chats", _send)
     return sent
+
+
+def _sent_history_ids(messages):
+    return [
+        int(message.split("/animes/", 1)[1].split('"', 1)[0])
+        for message in messages
+    ]
 
 
 def _capture_saves(monkeypatch):
@@ -100,7 +106,6 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
     # is_relevant) — т.е. не охранял бы её.
     entries = [_relevant_entry(eid) for eid in range(51, 0, -1)]
     calls = _patch_history(monkeypatch, entries)
-    monkeypatch.setattr("handlers.build_message", lambda e: "SHOULD_NOT_SEND")
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
@@ -114,16 +119,15 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_known_boundary_on_full_first_page_uses_one_request(monkeypatch):
-    page = [{"id": eid} for eid in range(200, 149, -1)]
+    page = [_relevant_entry(eid) for eid in range(200, 149, -1)]
     calls = _patch_history_pages(monkeypatch, {1: page})
-    _patch_notifying_entries(monkeypatch)
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
     result, _cur = await check_and_notify(DummyBot(), {150}, _empty_cur())
 
     assert calls == [1]
-    assert sent == [str(eid) for eid in range(151, 201)]
+    assert _sent_history_ids(sent) == list(range(151, 201))
     assert result == {150, *range(151, 201)}
     assert saved == [result]
 
@@ -131,19 +135,19 @@ async def test_known_boundary_on_full_first_page_uses_one_request(monkeypatch):
 @pytest.mark.asyncio
 async def test_catchup_fetches_until_boundary_deduplicates_and_orders(monkeypatch):
     pages = {
-        1: [{"id": eid} for eid in range(250, 199, -1)],
-        2: [{"id": eid} for eid in range(200, 149, -1)],
+        1: [_relevant_entry(eid) for eid in range(250, 199, -1)],
+        2: [_relevant_entry(eid) for eid in range(200, 149, -1)],
     }
     calls = _patch_history_pages(monkeypatch, pages)
-    _patch_notifying_entries(monkeypatch)
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
     result, _cur = await check_and_notify(DummyBot(), {150}, _empty_cur())
 
     assert calls == [1, 2]
-    assert sent == [str(eid) for eid in range(151, 251)]
-    assert sent.count("200") == 1
+    sent_ids = _sent_history_ids(sent)
+    assert sent_ids == list(range(151, 251))
+    assert sent_ids.count(200) == 1
     assert result == {150, *range(151, 251)}
     assert saved == [result]
 
@@ -151,18 +155,17 @@ async def test_catchup_fetches_until_boundary_deduplicates_and_orders(monkeypatc
 @pytest.mark.asyncio
 async def test_catchup_short_page_without_boundary_is_exhausted(monkeypatch):
     pages = {
-        1: [{"id": eid} for eid in range(350, 299, -1)],
-        2: [{"id": 300}, {"id": 299}, {"id": 298}],
+        1: [_relevant_entry(eid) for eid in range(350, 299, -1)],
+        2: [_relevant_entry(eid) for eid in (300, 299, 298)],
     }
     calls = _patch_history_pages(monkeypatch, pages)
-    _patch_notifying_entries(monkeypatch)
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
     result, _cur = await check_and_notify(DummyBot(), {1}, _empty_cur())
 
     assert calls == [1, 2]
-    assert sent == [str(eid) for eid in range(298, 351)]
+    assert _sent_history_ids(sent) == list(range(298, 351))
     assert result == {1, *range(298, 351)}
     assert saved == [result]
 

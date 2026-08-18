@@ -446,9 +446,24 @@ async def fetch_history(
     Возвращает список записей при успехе или None при любой ошибке.
     """
     url = f"{HISTORY_URL}?limit={HISTORY_PAGE_LIMIT}&page={page}"
+
+    async def _parse(resp):
+        data = await resp.json()
+        if (
+            not isinstance(data, list)
+            or any(
+                not isinstance(entry, dict)
+                or type(entry.get("id")) is not int
+                for entry in data
+            )
+        ):
+            log.warning("fetch_history(page=%d): некорректный ответ.", page)
+            return None
+        return data
+
     return await _fetch(
         session, "GET", url,
-        parse=lambda resp: resp.json(),
+        parse=_parse,
         label=f"fetch_history(page={page})",
         timeout=15,
     )
