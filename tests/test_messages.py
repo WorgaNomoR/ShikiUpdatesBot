@@ -15,6 +15,7 @@ from messages import (
     build_message,
     build_startup_snapshot,
     classify_event,
+    clean_description,
     extract_score,
     extract_score_change,
     format_rate_entry,
@@ -592,6 +593,18 @@ def test_strip_html_multiple_tags():
         _strip_html("изменена оценка с <b>5</b> на <i>9</i>")
         == "изменена оценка с 5 на 9"
     )
+
+
+@pytest.mark.parametrize(
+    ("description", "expected"),
+    [
+        (None, ""),
+        (7, "7"),
+        ({"unexpected": True}, "{'unexpected': True}"),
+    ],
+)
+def test_clean_description_normalizes_non_string(description, expected):
+    assert clean_description(description) == expected
 
 
 # ==========================================================

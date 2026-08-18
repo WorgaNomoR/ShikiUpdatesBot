@@ -536,12 +536,13 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
-def clean_description(description: str) -> str:
+def clean_description(description: object) -> str:
     """Строка истории, готовая к русскому матчингу: снимаем HTML-теги,
     затем чиним латинские омоглифы (issue #28). Один порядок на все
     парсеры — чтобы strip→normalize не разошёлся при будущих правках.
     """
-    return _normalize_homoglyphs(_strip_html(description))
+    text = description if isinstance(description, str) else str(description or "")
+    return _normalize_homoglyphs(_strip_html(text))
 
 
 def extract_score_change(description: str) -> tuple[int, int] | None:
