@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
+import logging
 
 import pytest
 
@@ -72,7 +73,6 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
     # нерелевантных тест прошёл бы и с удалённой baseline-веткой (их отсеет
     # is_relevant) — т.е. не охранял бы её.
     _patch_history(monkeypatch, [_relevant_entry(1), _relevant_entry(2)])
-    monkeypatch.setattr("handlers.record_current_event", lambda cur, *a, **k: cur)
     monkeypatch.setattr("handlers.build_message", lambda e: "SHOULD_NOT_SEND")
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
@@ -140,3 +140,170 @@ async def test_new_irrelevant_entry_records_but_no_send(monkeypatch):
 
     assert 999 in result     # ID запомнен даже для нерелевантного
     assert sent == []        # но сообщение не отправлено (фильтр)
+
+
+@pytest.mark.asyncio
+async def test_unknown_event_sends_and_marks_seen_without_quarter_event(
+    monkeypatch,
+    caplog,
+):
+    entry = {
+        "id": 123,
+        "description": "<b>Неизвестнo & новое</b>",
+        "target": {"id": 77, "type": "Anime", "kind": "tv"},
+    }
+    _patch_history(monkeypatch, [entry])
+    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda item: "NEUTRAL")
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    cur = _empty_cur()
+    expected_cur = _empty_cur()
+
+    with caplog.at_level(logging.WARNING):
+        result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+
+    assert result == {999, 123}
+    assert saved == [{999, 123}]
+    assert sent == ["NEUTRAL"]
+    assert returned_cur == expected_cur
+    assert any(
+        "Неизвестно & новое" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_ignored_events_are_seen_without_send_stats_or_warning(
+    monkeypatch,
+    caplog,
+):
+    entries = [
+        {
+            "id": 123,
+            "description": "Просмотрено 15 эпизодов",
+            "target": {"id": 77, "type": "Anime", "kind": "tv"},
+        },
+        {
+            "id": 124,
+            "description": "Удалено из списка",
+            "target": {"id": 78, "type": "Anime", "kind": "tv"},
+        },
+    ]
+    _patch_history(monkeypatch, entries)
+    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr(
+        "handlers.build_message",
+        lambda item: pytest.fail("для ignored начали строить сообщение"),
+    )
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    cur = _empty_cur()
+    expected_cur = _empty_cur()
+
+    with caplog.at_level(logging.WARNING):
+        result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+
+    assert result == {999, 123, 124}
+    assert saved == [{999, 123, 124}]
+    assert sent == []
+    assert returned_cur == expected_cur
+    assert not caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_score_removed_is_seen_and_clears_current_score_without_send(
+    monkeypatch,
+    caplog,
+):
+    entry = {
+        "id": 125,
+        "description": "Отменена оценка",
+        "target": {"id": 79, "type": "Anime", "kind": "tv"},
+    }
+    _patch_history(monkeypatch, [entry])
+    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr(
+        "handlers.build_message",
+        lambda item: pytest.fail("для score_removed начали строить сообщение"),
+    )
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    cur = _empty_cur()
+    cur["events"].append({
+        "id": "79",
+        "media": "anime",
+        "event": "completed",
+        "score": 5,
+        "recorded_at": "2026-04-01T00:00:00+00:00",
+    })
+
+    with caplog.at_level(logging.WARNING):
+        result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+
+    assert result == {999, 125}
+    assert saved == [{999, 125}]
+    assert sent == []
+    assert returned_cur["events"][0]["score"] is None
+    assert not caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_score_set_notifies_and_updates_completed_without_duplicate(monkeypatch):
+    entry = {
+        "id": 123,
+        "description": "Оценено на <b>8</b>",
+        "target": {"id": 77, "type": "Anime", "kind": "tv"},
+    }
+    _patch_history(monkeypatch, [entry])
+    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda item: "SCORE")
+    _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    cur = _empty_cur()
+    cur["events"].append({
+        "id": "77",
+        "media": "anime",
+        "event": "completed",
+        "score": None,
+        "recorded_at": "2026-04-01T00:00:00+00:00",
+    })
+
+    _, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+
+    assert sent == ["SCORE"]
+    assert len(returned_cur["events"]) == 1
+    assert returned_cur["events"][0]["score"] == 8
+
+
+@pytest.mark.asyncio
+async def test_score_change_updates_completion_through_handler(monkeypatch):
+    entries = [
+        {
+            "id": 123,
+            "description": "Просмотрено и оценено на <b>3</b>",
+            "target": {"id": 77, "type": "Anime", "kind": "tv"},
+        },
+        {
+            "id": 124,
+            "description": "Изменена оценка c <b>3</b> на <b>9</b>",
+            "target": {"id": 77, "type": "Anime", "kind": "tv"},
+        },
+    ]
+    _patch_history(monkeypatch, entries)
+    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda item: f"EVENT-{item['id']}")
+    _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    _, returned_cur = await check_and_notify(DummyBot(), {999}, _empty_cur())
+
+    assert sent == ["EVENT-123", "EVENT-124"]
+    assert len(returned_cur["events"]) == 1
+    assert returned_cur["events"][0]["event"] == "completed"
+    assert returned_cur["events"][0]["score"] == 9

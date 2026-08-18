@@ -526,27 +526,35 @@ def record_current_event(
     """
     Фиксируем событие истории в stats_current (для хронологии квартала).
     Учитываем только значимые для статистики типы.
-    Дедупликация: один (id, event_type) на квартал.
+    Дедупликация: один (media_type, id, event_type) на квартал.
     """
-    # Смена оценки внутри квартала: обновляем score уже записанного
-    # completed-события того же тайтла. Если completed-события в этом квартале
-    # нет (тайтл завершён в прошлом квартале/до старта отслеживания) —
-    # игнорируем: в текущем отчёте его всё равно нет.
-    if event_type == "score_changed":
-        if score is None:
+    # Первая, изменённая или отменённая оценка внутри квартала обновляет score
+    # уже записанного completed-события того же тайтла. Если completed-события
+    # в этом квартале нет, оценку не добавляем: в отчёте тайтла всё равно нет.
+    if event_type in ("score_set", "score_changed", "score_removed"):
+        if event_type != "score_removed" and score is None:
             return cur
         try:
             tid = str((entry.get("target") or {}).get("id") or "")
             if not tid:
                 return cur
+            new_score = None if event_type == "score_removed" else score
             for ev in cur.get("events", []):
-                if ev.get("id") == tid and ev.get("event") == "completed":
-                    if ev.get("score") != score:
-                        ev["score"] = score
-                        log.info("Обновлена оценка в квартале: id=%s → %s", tid, score)
+                if (
+                    ev.get("media") == media_type
+                    and ev.get("id") == tid
+                    and ev.get("event") == "completed"
+                ):
+                    if ev.get("score") != new_score:
+                        ev["score"] = new_score
+                        log.info(
+                            "Обновлена оценка в квартале: id=%s → %s",
+                            tid,
+                            new_score,
+                        )
                     break
         except Exception as e:
-            log.error("record_current_event(score_changed): %s", e)
+            log.error("record_current_event(%s): %s", event_type, e)
         return cur
 
     if event_type not in ("completed", "dropped", "planned", "rewatching"):
@@ -558,7 +566,11 @@ def record_current_event(
             return cur
         # Дедуп
         for ev in cur.get("events", []):
-            if ev.get("id") == tid and ev.get("event") == event_type:
+            if (
+                ev.get("media") == media_type
+                and ev.get("id") == tid
+                and ev.get("event") == event_type
+            ):
                 return cur
         cur.setdefault("events", []).append({
             "id":          tid,

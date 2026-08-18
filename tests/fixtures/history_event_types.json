@@ -1,0 +1,85 @@
+{
+  "on_hold": {
+    "ru": {
+      "source": "Live public API response from the Wtgsea test profile on 2026-08-14",
+      "entry": {
+        "id": 481618202,
+        "created_at": "2026-08-14T15:25:02.242+03:00",
+        "description": "Отложено",
+        "target": {
+          "id": 743,
+          "name": "21st Century Boys",
+          "russian": "Мальчишки двадцать первого века",
+          "image": {
+            "original": "/system/mangas/original/743.jpg?1712715066",
+            "preview": "/system/mangas/preview/743.jpg?1712715066",
+            "x96": "/system/mangas/x96/743.jpg?1712715066",
+            "x48": "/system/mangas/x48/743.jpg?1712715066"
+          },
+          "url": "/mangas/743-21st-century-boys",
+          "kind": "manga",
+          "score": "8.43",
+          "status": "released",
+          "volumes": 2,
+          "chapters": 16,
+          "aired_on": "2006-12-25",
+          "released_on": "2007-07-14"
+        }
+      }
+    },
+    "en": {
+      "source": "Official Shikimori user-rate status translation",
+      "entry": {
+        "id": 481618202,
+        "created_at": "2026-08-14T15:25:02.242+03:00",
+        "description": "On Hold",
+        "target": {
+          "id": 743,
+          "name": "21st Century Boys",
+          "russian": "Мальчишки двадцать первого века",
+          "url": "/mangas/743-21st-century-boys",
+          "kind": "manga"
+        }
+      }
+    }
+  },
+  "live_ru_descriptions": {
+    "completed": [
+      "Просмотрено",
+      "Прочитано",
+      "Просмотрено и оценено на <b>4</b>",
+      "Прочитано и оценено на <b>6</b>"
+    ],
+    "score_set": [
+      "Оценено на <b>5</b>"
+    ],
+    "score_changed": [
+      "Изменена оценка c <b>8</b> на <b>7</b>"
+    ],
+    "progress": [
+      "Просмотрены 4 эпизода",
+      "Просмотрены 1-й, 2-й и 3-й эпизоды",
+      "Просмотрено 15 эпизодов"
+    ]
+  },
+  "official_ignored_descriptions": [
+    "Просмотрен фильм",
+    "Просмотрены все эпизоды",
+    "Прочитана новелла",
+    "Прочитана манга",
+    "Сброшено число эпизодов",
+    "Сброшено число томов и глав",
+    "Удалено из списка",
+    "Watched movie",
+    "Watched all episodes",
+    "Read novel",
+    "Read manga",
+    "Reset episodes count",
+    "Reset volumes and chapters count",
+    "Removed from list"
+  ],
+  "score_removed_descriptions": [
+    "Отменена оценка",
+    "Score removed"
+  ]
+}

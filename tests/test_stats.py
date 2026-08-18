@@ -648,11 +648,95 @@ def test_score_change_updates_existing_completed_event():
     assert all(e["event"] != "score_changed" for e in out["events"])
 
 
+def test_score_set_updates_existing_completed_event_without_duplicate():
+    """Первая оценка после завершения обновляет запись, но не создаёт completed."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"].append(_completed_event(123, None))
+
+    out = smod.record_current_event(cur, {"target": {"id": 123}}, "score_set", "anime", 8)
+
+    assert out["events"] == [_completed_event(123, 8)]
+
+
 def test_score_change_without_completed_is_noop():
     """score_changed по тайтлу вне событий квартала ⇒ ничего не добавляем/не меняем."""
     cur = storage._empty_stats_current(utils.current_quarter())
     out = smod.record_current_event(cur, {"target": {"id": 999}}, "score_changed", "anime", 9)
     assert out["events"] == []
+
+
+def test_score_removed_clears_existing_completed_without_duplicate():
+    """Отмена оценки очищает score завершения текущего квартала без нового события."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"].append(_completed_event(123, 5))
+
+    out = smod.record_current_event(
+        cur, {"target": {"id": 123}}, "score_removed", "anime", None,
+    )
+
+    assert out["events"] == [_completed_event(123, None)]
+
+
+def test_score_removed_without_completed_is_noop():
+    """Отмена оценки вне завершений текущего квартала не создаёт событие."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+
+    out = smod.record_current_event(
+        cur, {"target": {"id": 999}}, "score_removed", "anime", None,
+    )
+
+    assert out["events"] == []
+
+
+def test_record_current_event_distinguishes_same_id_across_media():
+    """Одинаковые числовые ID аниме и манги не считаются одним событием."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    entry = {"target": {"id": 123}}
+
+    smod.record_current_event(cur, entry, "completed", "anime", 7)
+    smod.record_current_event(cur, entry, "completed", "manga", 8)
+
+    assert [
+        (event["id"], event["media"], event["event"], event["score"])
+        for event in cur["events"]
+    ] == [
+        ("123", "anime", "completed", 7),
+        ("123", "manga", "completed", 8),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "score", "expected_manga_score"),
+    [
+        ("score_set", 8, 8),
+        ("score_changed", 9, 9),
+        ("score_removed", None, None),
+    ],
+)
+def test_score_event_updates_only_matching_media(
+    event_type,
+    score,
+    expected_manga_score,
+):
+    """Оценка меняется у совпавшей пары media + id, а не у первого такого ID."""
+    cur = storage._empty_stats_current(utils.current_quarter())
+    cur["events"] = [
+        _completed_event(123, 3, "anime"),
+        _completed_event(123, 6, "manga"),
+    ]
+
+    smod.record_current_event(
+        cur,
+        {"target": {"id": 123}},
+        event_type,
+        "manga",
+        score,
+    )
+
+    assert cur["events"] == [
+        _completed_event(123, 3, "anime"),
+        _completed_event(123, expected_manga_score, "manga"),
+    ]
 
 
 @pytest.mark.asyncio
