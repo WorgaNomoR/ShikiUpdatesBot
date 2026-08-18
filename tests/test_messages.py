@@ -599,6 +599,8 @@ def test_strip_html_multiple_tags():
     ("description", "expected"),
     [
         (None, ""),
+        (0, "0"),
+        (False, "False"),
         (7, "7"),
         ({"unexpected": True}, "{'unexpected': True}"),
     ],

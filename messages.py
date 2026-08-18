@@ -541,7 +541,12 @@ def clean_description(description: object) -> str:
     затем чиним латинские омоглифы (issue #28). Один порядок на все
     парсеры — чтобы strip→normalize не разошёлся при будущих правках.
     """
-    text = description if isinstance(description, str) else str(description or "")
+    if isinstance(description, str):
+        text = description
+    elif description is None:
+        text = ""
+    else:
+        text = str(description)
     return _normalize_homoglyphs(_strip_html(text))
 
 
