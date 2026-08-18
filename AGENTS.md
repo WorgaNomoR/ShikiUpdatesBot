@@ -43,7 +43,7 @@
 ### Live Shikimori contract verification
 
 - Shikimori's public source repositories are archival evidence, not authority for the current site. When documentation is unclear or archived code may differ from production, verify the disputed point with the smallest bounded set of read-only requests to the live API.
-- Always send an explicit descriptive `User-Agent` containing the bot name/version and a contact or repository URL. Keep manual verification bounded and paced; production code must continue to use the central throttle and 429 retry described in `ARCHITECTURE.md`.
+- Always send an explicit non-browser `User-Agent` that identifies the application, as required by Shikimori. A bot version and contact or repository URL may be added for manual verification but are not part of Shikimori's required header contract. Keep manual verification bounded and paced; production code must continue to use the central throttle and 429 retry described in `ARCHITECTURE.md`.
 - The maintainer's Shikimori profile `WNR` is public and may be used for production-shaped API verification, including inspection of its public history responses. Do not invent a privacy restriction for this data.
 - A live sample is evidence, not an eternal guarantee. Record stable conclusions in focused regression tests and update `ARCHITECTURE.md` when the internal contract or its rationale changes.
 
