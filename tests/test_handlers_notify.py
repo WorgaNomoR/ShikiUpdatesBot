@@ -29,6 +29,18 @@ def _relevant_entry(eid):
     }
 
 
+def _history_entries(newest_id, count):
+    return [
+        _relevant_entry(eid)
+        for eid in range(newest_id, newest_id - count, -1)
+    ]
+
+
+def _full_history_page(newest_id):
+    # Shikimori при limit=50 возвращает 50 записей + lookahead-запись.
+    return _history_entries(newest_id, 51)
+
+
 class DummyBot:
     pass
 
@@ -104,7 +116,7 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
     # (иначе первый запуск спамит всю историю). Релевантность критична: на
     # нерелевантных тест прошёл бы и с удалённой baseline-веткой (их отсеет
     # is_relevant) — т.е. не охранял бы её.
-    entries = [_relevant_entry(eid) for eid in range(51, 0, -1)]
+    entries = _full_history_page(51)
     calls = _patch_history(monkeypatch, entries)
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
@@ -119,7 +131,7 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_known_boundary_on_full_first_page_uses_one_request(monkeypatch):
-    page = [_relevant_entry(eid) for eid in range(200, 149, -1)]
+    page = _full_history_page(200)
     calls = _patch_history_pages(monkeypatch, {1: page})
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
@@ -133,10 +145,25 @@ async def test_known_boundary_on_full_first_page_uses_one_request(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_exact_limit_page_without_boundary_is_exhausted(monkeypatch):
+    page = _history_entries(500, 50)
+    calls = _patch_history_pages(monkeypatch, {1: page})
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+
+    result, _cur = await check_and_notify(DummyBot(), {1}, _empty_cur())
+
+    assert calls == [1]
+    assert _sent_history_ids(sent) == list(range(451, 501))
+    assert result == {1, *range(451, 501)}
+    assert saved == [result]
+
+
+@pytest.mark.asyncio
 async def test_catchup_fetches_until_boundary_deduplicates_and_orders(monkeypatch):
     pages = {
-        1: [_relevant_entry(eid) for eid in range(250, 199, -1)],
-        2: [_relevant_entry(eid) for eid in range(200, 149, -1)],
+        1: _full_history_page(250),
+        2: _full_history_page(200),
     }
     calls = _patch_history_pages(monkeypatch, pages)
     saved = _capture_saves(monkeypatch)
@@ -155,7 +182,7 @@ async def test_catchup_fetches_until_boundary_deduplicates_and_orders(monkeypatc
 @pytest.mark.asyncio
 async def test_catchup_short_page_without_boundary_is_exhausted(monkeypatch):
     pages = {
-        1: [_relevant_entry(eid) for eid in range(350, 299, -1)],
+        1: _full_history_page(350),
         2: [_relevant_entry(eid) for eid in (300, 299, 298)],
     }
     calls = _patch_history_pages(monkeypatch, pages)
@@ -173,7 +200,7 @@ async def test_catchup_short_page_without_boundary_is_exhausted(monkeypatch):
 @pytest.mark.asyncio
 async def test_catchup_failure_on_second_page_keeps_seen_unpublished(monkeypatch):
     pages = {
-        1: [{"id": eid} for eid in range(450, 399, -1)],
+        1: _full_history_page(450),
         2: None,
     }
     calls = _patch_history_pages(monkeypatch, pages)
@@ -196,10 +223,7 @@ async def test_catchup_failure_on_second_page_keeps_seen_unpublished(monkeypatch
 @pytest.mark.asyncio
 async def test_catchup_cap_without_boundary_is_incomplete(monkeypatch, caplog):
     pages = {
-        page: [
-            {"id": eid}
-            for eid in range(1000 - (page - 1) * 50, 949 - (page - 1) * 50, -1)
-        ]
+        page: _full_history_page(1000 - (page - 1) * 50)
         for page in range(1, 6)
     }
     calls = _patch_history_pages(monkeypatch, pages)
