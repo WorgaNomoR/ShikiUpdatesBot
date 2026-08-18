@@ -536,7 +536,7 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
 
 
-def _clean_description(description: str) -> str:
+def clean_description(description: str) -> str:
     """Строка истории, готовая к русскому матчингу: снимаем HTML-теги,
     затем чиним латинские омоглифы (issue #28). Один порядок на все
     парсеры — чтобы strip→normalize не разошёлся при будущих правках.
@@ -549,7 +549,7 @@ def extract_score_change(description: str) -> tuple[int, int] | None:
     Парсим «изменена оценка с X на Y» → возвращаем (old, new).
     Если не распознали — None.
     """
-    desc = _clean_description(description)
+    desc = clean_description(description)
     match = re.search(
         r"изменена\s+оценка\s+с\s+(\d+)\s+на\s+(\d+)",
         desc, re.IGNORECASE
@@ -573,7 +573,7 @@ def extract_score(description: str) -> int | None:
       "выставил оценку 8"     <- альтернативный
       "rated 7" / "scored 7"  <- английский
     """
-    desc = _clean_description(description)
+    desc = clean_description(description)
     # Основной русский формат: «оценено на 9» (число может быть в <b>9</b>)
     match = re.search(r"оценено\s+на\s+(\d+)", desc, re.IGNORECASE)
     if match:
@@ -587,6 +587,64 @@ def extract_score(description: str) -> int | None:
     if match:
         return int(match.group(1))
     return None
+
+
+_IGNORED_DESCRIPTIONS = {
+    "удалено из списка",
+    "сброшено число эпизодов",
+    "сброшено число томов и глав",
+    "removed from list",
+    "reset episodes count",
+    "reset volumes and chapters count",
+}
+
+_EXACT_STATUS_EVENTS = {
+    "отложено": "on_hold",
+    "on hold": "on_hold",
+    "брошено": "dropped",
+    "бросил": "dropped",
+    "бросила": "dropped",
+    "dropped": "dropped",
+    "пересматриваю": "rewatching",
+    "перечитываю": "rewatching",
+    "пересматривает": "rewatching",
+    "перечитывает": "rewatching",
+    "rewatching": "rewatching",
+    "rereading": "rewatching",
+    "re-reading": "rewatching",
+    "добавлено в список": "planned",
+    "добавлено": "planned",
+    "planned": "planned",
+    "планирует": "planned",
+    "добавил в планируемое": "planned",
+    "добавила в планируемое": "planned",
+    "want to watch": "planned",
+    "want to read": "planned",
+    "смотрю": "watching",
+    "просматриваю": "watching",
+    "читаю": "watching",
+    "смотрит": "watching",
+    "читает": "watching",
+    "watching": "watching",
+    "reading": "watching",
+    "начал смотреть": "watching",
+    "начала смотреть": "watching",
+    "начал читать": "watching",
+    "начала читать": "watching",
+}
+
+_SCORE_CHANGED_DESCRIPTION_RE = re.compile(
+    r"(?:изменена оценка с \d+ на \d+|score changed from \d+ to \d+)",
+)
+_COMPLETED_DESCRIPTION_RE = re.compile(
+    r"(?:(?:просмотрено|прочитано) и оценено на \d+|completed and rated \d+)",
+)
+_SCORE_SET_DESCRIPTION_RE = re.compile(r"(?:оценено на|rated|scored) \d+")
+_PROGRESS_RU_DESCRIPTION_RE = re.compile(
+    r"(?:просмотрен|просмотрены|просмотрено|прочитан|прочитана|"
+    r"прочитаны|прочитано)\s+.+",
+)
+_PROGRESS_EN_DESCRIPTION_RE = re.compile(r"(?:watched|read)\s+.+")
 
 
 def classify_event(description: str) -> str:
@@ -610,84 +668,38 @@ def classify_event(description: str) -> str:
       "отменена оценка"          -> score_removed
       прогресс и прочие служебные записи -> ignored
     """
-    desc = " ".join(_clean_description(description).casefold().split())
+    desc = " ".join(clean_description(description).casefold().split())
 
     # В истории нет структурированного action, поэтому матчим полную строку:
     # основы «просмотрен»/«прочитан» также используются для счётчиков прогресса.
-    if desc in {"изменена оценка", "score changed"} or re.fullmatch(
-        r"(?:изменена оценка с \d+ на \d+|score changed from \d+ to \d+)",
-        desc,
+    if (
+        desc in {"изменена оценка", "score changed"}
+        or _SCORE_CHANGED_DESCRIPTION_RE.fullmatch(desc)
     ):
         return "score_changed"
 
     if desc in {"отменена оценка", "score removed"}:
         return "score_removed"
 
-    ignored_exact = {
-        "удалено из списка",
-        "сброшено число эпизодов",
-        "сброшено число томов и глав",
-        "removed from list",
-        "reset episodes count",
-        "reset volumes and chapters count",
-    }
-    if desc in ignored_exact:
+    if desc in _IGNORED_DESCRIPTIONS:
         return "ignored"
 
-    exact_statuses = {
-        "отложено": "on_hold",
-        "on hold": "on_hold",
-        "брошено": "dropped",
-        "бросил": "dropped",
-        "бросила": "dropped",
-        "dropped": "dropped",
-        "пересматриваю": "rewatching",
-        "перечитываю": "rewatching",
-        "пересматривает": "rewatching",
-        "перечитывает": "rewatching",
-        "rewatching": "rewatching",
-        "rereading": "rewatching",
-        "re-reading": "rewatching",
-        "добавлено в список": "planned",
-        "добавлено": "planned",
-        "planned": "planned",
-        "планирует": "planned",
-        "добавил в планируемое": "planned",
-        "добавила в планируемое": "planned",
-        "want to watch": "planned",
-        "want to read": "planned",
-        "смотрю": "watching",
-        "просматриваю": "watching",
-        "читаю": "watching",
-        "смотрит": "watching",
-        "читает": "watching",
-        "watching": "watching",
-        "reading": "watching",
-        "начал смотреть": "watching",
-        "начала смотреть": "watching",
-        "начал читать": "watching",
-        "начала читать": "watching",
-    }
-    if desc in exact_statuses:
-        return exact_statuses[desc]
+    if desc in _EXACT_STATUS_EVENTS:
+        return _EXACT_STATUS_EVENTS[desc]
 
-    if desc in {"просмотрено", "прочитано", "completed"} or re.fullmatch(
-        r"(?:(?:просмотрено|прочитано) и оценено на \d+|"
-        r"completed and rated \d+)",
-        desc,
+    if (
+        desc in {"просмотрено", "прочитано", "completed"}
+        or _COMPLETED_DESCRIPTION_RE.fullmatch(desc)
     ):
         return "completed"
 
-    if re.fullmatch(r"(?:оценено на|rated|scored) \d+", desc):
+    if _SCORE_SET_DESCRIPTION_RE.fullmatch(desc):
         return "score_set"
 
-    counter_ru = re.fullmatch(
-        r"(?:просмотрен|просмотрены|просмотрено|прочитан|прочитана|"
-        r"прочитаны|прочитано)\s+.+",
-        desc,
-    )
-    counter_en = re.fullmatch(r"(?:watched|read)\s+.+", desc)
-    if counter_ru or counter_en:
+    if (
+        _PROGRESS_RU_DESCRIPTION_RE.fullmatch(desc)
+        or _PROGRESS_EN_DESCRIPTION_RE.fullmatch(desc)
+    ):
         return "ignored"
 
     return "unknown"
@@ -769,12 +781,12 @@ def build_message(entry: dict) -> str:
         )
     elif event_type == "unknown":
         template = random.choice(MESSAGES["unknown"])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
-        clean_description = " ".join(_clean_description(str(description)).split())
+        cleaned_description = " ".join(clean_description(str(description)).split())
         text = format_name_template(
             template,
             DISPLAY_NAME_CONTEXT,
             title=labeled_title,
-            description=h(clean_description) if clean_description else "без описания",
+            description=h(cleaned_description) if cleaned_description else "без описания",
         )
     elif event_type == "completed":
         # Завершение — уточняем по оценке

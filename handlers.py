@@ -40,11 +40,11 @@ from healthcheck import heartbeat
 from messages import (
     BROADCAST_HEADER,
     DISPLAY_NAME_CONTEXT,
-    _clean_description,
     build_favourite_message,
     build_message,
     build_startup_snapshot,
     classify_event,
+    clean_description,
     extract_score,
     extract_score_change,
     format_rate_entry,
@@ -707,7 +707,7 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
             log.info(
                 "Пропускаем служебную запись истории entry id=%d: %r",
                 entry_id,
-                _clean_description(description),
+                clean_description(description),
             )
             continue
         if event_type == "score_removed":
@@ -715,14 +715,14 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
             log.info(
                 "Отмена оценки учтена без уведомления entry id=%d: %r",
                 entry_id,
-                _clean_description(description),
+                clean_description(description),
             )
             continue
         if event_type == "unknown":
             log.warning(
                 "Неизвестное описание истории entry id=%d: %r",
                 entry_id,
-                _clean_description(description),
+                clean_description(description),
             )
         else:
             if event_type in ("completed", "score_set"):
