@@ -52,6 +52,27 @@ def make_entry(
     return entry
 
 
+def render_message_template(
+    template,
+    context,
+    *,
+    media_key,
+    title,
+    url="",
+    **values,
+):
+    title_html = h(title)
+    if url:
+        title_html = f'<a href="{messages.SHIKI_BASE_URL}{url}">{title_html}</a>'
+    labeled_title = messages._label_media_title(title_html, media_key)
+    return messages.format_name_template(
+        template,
+        context,
+        title=labeled_title,
+        **values,
+    )
+
+
 FALLBACK_NAME_CONTEXT = build_display_name_context("WorgaNomoR", "none")
 
 
@@ -486,27 +507,22 @@ def _history_description(bank_key, message_key):
     ids=["male", "female", "fallback"],
 )
 def test_every_history_template_renders_final_media_title_once(
-    monkeypatch,
     context,
 ):
-    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", context)
-
-    for bank_key, (target_type, kind, label, url) in HISTORY_MEDIA_CASES.items():
+    for bank_key, (_target_type, _kind, label, url) in HISTORY_MEDIA_CASES.items():
         for message_key, templates in messages.MESSAGES[bank_key].items():
-            entry = make_entry(
-                _history_description(bank_key, message_key),
-                title="AuditTitle",
-                url=url,
-                target_type=target_type,
-                kind=kind,
-            )
             for template in templates:
-                monkeypatch.setattr(
-                    messages.random,
-                    "choice",
-                    lambda _templates, selected=template: selected,
+                rendered = render_message_template(
+                    template,
+                    context,
+                    media_key=bank_key,
+                    title="AuditTitle",
+                    url=url,
+                    score=8,
+                    old=4,
+                    new=9,
+                    description="новый формат события",
                 )
-                rendered = build_message(entry)
                 plain = _strip_html(rendered)
 
                 assert rendered.count(f"({label})") == 1, template
@@ -534,27 +550,24 @@ SHARED_HISTORY_CASES = {
     ids=["male", "female", "fallback"],
 )
 def test_every_shared_history_template_renders_for_every_media(
-    monkeypatch,
     context,
 ):
-    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", context)
-
-    for target_type, kind, label, url in HISTORY_MEDIA_CASES.values():
+    for media_key, (_target_type, _kind, label, url) in HISTORY_MEDIA_CASES.items():
         for message_key, description in SHARED_HISTORY_CASES.items():
-            entry = make_entry(
-                description,
-                title="AuditTitle",
-                url=url,
-                target_type=target_type,
-                kind=kind,
-            )
             for template in messages.MESSAGES[message_key]:
-                monkeypatch.setattr(
-                    messages.random,
-                    "choice",
-                    lambda _templates, selected=template: selected,
+                change = extract_score_change(description) or ("?", "?")
+                score = extract_score(description)
+                rendered = render_message_template(
+                    template,
+                    context,
+                    media_key=media_key,
+                    title="AuditTitle",
+                    url=url,
+                    score=score if score is not None else "?",
+                    old=change[0],
+                    new=change[1],
+                    description=description,
                 )
-                rendered = build_message(entry)
 
                 assert rendered.count(f"({label})") == 1, template
                 assert rendered.count(messages.SHIKI_BASE_URL) == 1, template
@@ -631,30 +644,31 @@ def test_every_shared_history_template_renders_for_every_media(
     ],
 )
 def test_history_media_agreement_uses_independent_expected_sentences(
-    monkeypatch,
     bank_key,
     message_key,
     template_index,
     description,
     expected,
 ):
-    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
-    target_type, kind, _label, _url = HISTORY_MEDIA_CASES[bank_key]
     templates = (
         messages.MESSAGES[message_key]
         if message_key in SHARED_HISTORY_CASES
         else messages.MESSAGES[bank_key][message_key]
     )
     selected = templates[template_index]
-    monkeypatch.setattr(messages.random, "choice", lambda _templates: selected)
-
-    rendered = build_message(make_entry(
-        description,
+    change = extract_score_change(description) or ("?", "?")
+    score = extract_score(description)
+    rendered = render_message_template(
+        selected,
+        FALLBACK_NAME_CONTEXT,
+        media_key=bank_key,
         title="Title",
         url="",
-        target_type=target_type,
-        kind=kind,
-    ))
+        score=score if score is not None else "?",
+        old=change[0],
+        new=change[1],
+        description=description,
+    )
 
     assert rendered == expected
 
@@ -744,26 +758,22 @@ RANOBE_BANK_SIZES_AFTER_EXPANSION = {
 }
 
 
-def test_new_ranobe_templates_match_independent_final_sentences(monkeypatch):
-    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
+def test_new_ranobe_templates_match_independent_final_sentences():
     for message_key, expected_messages in NEW_RANOBE_EXPECTED.items():
         templates = messages.MESSAGES["ranobe"][message_key]
         assert len(templates) == RANOBE_BANK_SIZES_AFTER_EXPANSION[message_key]
         description = _history_description("ranobe", message_key)
         for template, expected in zip(templates[-2:], expected_messages):
             assert "{n" in template
-            monkeypatch.setattr(
-                messages.random,
-                "choice",
-                lambda _templates, selected=template: selected,
-            )
-            rendered = build_message(make_entry(
-                description,
+            score = extract_score(description)
+            rendered = render_message_template(
+                template,
+                FALLBACK_NAME_CONTEXT,
+                media_key="ranobe",
                 title="Книга",
                 url="/mangas/1-book",
-                target_type="Manga",
-                kind="light_novel",
-            ))
+                score=score if score is not None else "?",
+            )
 
             assert rendered == expected
 
@@ -1363,25 +1373,23 @@ def test_build_favourite_message_ranobe_uses_dedicated_bank():
     ids=["male", "female", "fallback"],
 )
 def test_every_favourite_template_uses_expected_media_label(
-    monkeypatch,
     context,
 ):
-    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", context)
     media_cases = {
-        "anime": ("animes", "аниме", "/animes/1-audit"),
-        "manga": ("mangas", "манга", "/mangas/1-audit"),
-        "ranobe": ("ranobe", "ранобэ", "/mangas/1-audit"),
+        "anime": ("аниме", "/animes/1-audit"),
+        "manga": ("манга", "/mangas/1-audit"),
+        "ranobe": ("ранобэ", "/mangas/1-audit"),
     }
 
-    for bank_key, (category, label, url) in media_cases.items():
-        item = {"name": "AuditTitle", "url": url}
+    for bank_key, (label, url) in media_cases.items():
         for template in messages.MESSAGES["favourites"][bank_key]:
-            monkeypatch.setattr(
-                messages.random,
-                "choice",
-                lambda _templates, selected=template: selected,
+            rendered = render_message_template(
+                template,
+                context,
+                media_key=bank_key,
+                title="AuditTitle",
+                url=url,
             )
-            rendered = build_favourite_message(category, item)
             plain = _strip_html(rendered)
 
             assert rendered.count(f"({label})") == 1, template
@@ -1393,15 +1401,15 @@ def test_every_favourite_template_uses_expected_media_label(
                 plain,
             ) is None, template
 
-    for bank_key, category in (("character", "characters"), ("person", "people")):
-        item = {"name": "AuditTitle", "url": "/people/1-audit"}
+    for bank_key in ("character", "person"):
         for template in messages.MESSAGES["favourites"][bank_key]:
-            monkeypatch.setattr(
-                messages.random,
-                "choice",
-                lambda _templates, selected=template: selected,
+            rendered = render_message_template(
+                template,
+                context,
+                media_key=bank_key,
+                title="AuditTitle",
+                url="/people/1-audit",
             )
-            rendered = build_favourite_message(category, item)
 
             assert "(аниме)" not in rendered, template
             assert "(манга)" not in rendered, template
@@ -1438,31 +1446,30 @@ RANOBE_FAVOURITE_REWRITES = [
 ]
 
 
-def test_rewritten_favourite_templates_match_independent_sentences(monkeypatch):
-    monkeypatch.setattr(messages, "DISPLAY_NAME_CONTEXT", FALLBACK_NAME_CONTEXT)
-    manga_item = {
-        "name": "Berserk",
-        "url": "/mangas/25-berserk",
-    }
+def test_rewritten_favourite_templates_match_independent_sentences():
     for index, expected in MANGA_FAVOURITE_REWRITES.items():
         selected = messages.MESSAGES["favourites"]["manga"][index]
-        monkeypatch.setattr(messages.random, "choice", lambda _templates: selected)
-        assert build_favourite_message("mangas", manga_item) == expected
+        rendered = render_message_template(
+            selected,
+            FALLBACK_NAME_CONTEXT,
+            media_key="manga",
+            title="Berserk",
+            url="/mangas/25-berserk",
+        )
+        assert rendered == expected
 
-    ranobe_item = {
-        "name": "Re:Zero",
-        "url": "/mangas/74697-re-zero",
-    }
     for selected, expected in zip(
         messages.MESSAGES["favourites"]["ranobe"],
         RANOBE_FAVOURITE_REWRITES,
     ):
-        monkeypatch.setattr(
-            messages.random,
-            "choice",
-            lambda _templates, template=selected: template,
+        rendered = render_message_template(
+            selected,
+            FALLBACK_NAME_CONTEXT,
+            media_key="ranobe",
+            title="Re:Zero",
+            url="/mangas/74697-re-zero",
         )
-        assert build_favourite_message("ranobe", ranobe_item) == expected
+        assert rendered == expected
 
 
 def test_every_ranobe_template_uses_title_and_avoids_manga_wording():
