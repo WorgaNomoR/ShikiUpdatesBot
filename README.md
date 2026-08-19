@@ -1,5 +1,7 @@
 # 🎌 [ShikiUpdatesBot](https://github.com/WorgaNomoR/ShikiUpdatesBot) — Shikimori Activity Tracker
 
+![ShikiUpdatesBot: уведомления об активности Shikimori в Telegram](assets/repository-social-preview.png)
+
 [![Latest release](https://img.shields.io/github/v/release/WorgaNomoR/ShikiUpdatesBot?display_name=tag&sort=semver)](https://github.com/WorgaNomoR/ShikiUpdatesBot/releases/latest)
 [![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions)
 [![Windows executable](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/windows-exe.yml/badge.svg)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/windows-exe.yml)
