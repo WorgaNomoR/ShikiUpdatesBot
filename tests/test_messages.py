@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 import json
 import random
+import re
 import time
 from pathlib import Path
 from string import Formatter
@@ -51,6 +52,27 @@ def make_entry(
     return entry
 
 
+def render_message_template(
+    template,
+    context,
+    *,
+    media_key,
+    title,
+    url="",
+    **values,
+):
+    title_html = h(title)
+    if url:
+        title_html = f'<a href="{messages.SHIKI_BASE_URL}{url}">{title_html}</a>'
+    labeled_title = messages._label_media_title(title_html, media_key)
+    return messages.format_name_template(
+        template,
+        context,
+        title=labeled_title,
+        **values,
+    )
+
+
 FALLBACK_NAME_CONTEXT = build_display_name_context("WorgaNomoR", "none")
 
 
@@ -69,7 +91,7 @@ def expected_score_changed_messages(bank_key, old, new, media_label=None):
     banks = {
         "score_changed": {
             f"🔄 {n} пересмотрел оценку {title}: было {old}, стало {new}. Что-то изменилось.",
-            f"🤔 {title} переоценено: {old} → {new}. {n} явно что-то переосмыслил.",
+            f"🤔 Оценка {title} пересмотрена: {old} → {new}. {n} явно что-то переосмыслил.",
             f"🏹 {old} → {new} за {title}. {n} дал второй шанс (или отобрал).",
             f"⚖️ Весы справедливости скорректированы: {title} теперь {new}/10 вместо {old}.",
             f"✏️ {n} исправил оценку {title} с {old} на {new}. Бывает, мнения меняются.",
@@ -77,7 +99,7 @@ def expected_score_changed_messages(bank_key, old, new, media_label=None):
         },
         "score_changed_up": {
             f"📈 {title}: {old} → {new}. {n} пересмотрел и проникся.",
-            f"✨ Оценка {title} выросла с {old} до {new}. Раскрылось со временем — и {n} это оценил.",
+            f"✨ Оценка {title} выросла с {old} до {new}. Со временем впечатление стало лучше — и {n} это оценил.",
             f"🤝 Второй шанс сработал: {title} получает от {n} уже {new}/10 вместо {old}.",
             f"🧠 Послевкусие оказалось приятнее: {n} поднял {title} с {old} до {new}.",
             f"🚀 {title} идёт на повышение: {old} → {new}. Уважение заслужено.",
@@ -410,6 +432,350 @@ def test_every_history_path_includes_media_label_once(
     ))
 
     assert msg.count(f"({label})") == 1
+
+
+FINAL_RENDER_CONTEXTS = [
+    DisplayNameContext(
+        nominative="Иван",
+        genitive="Ивана",
+        dative="Ивану",
+        accusative="Ивана",
+        instrumental="Иваном",
+        gender="male",
+        inflection_applied=True,
+    ),
+    DisplayNameContext(
+        nominative="Анна",
+        genitive="Анны",
+        dative="Анне",
+        accusative="Анну",
+        instrumental="Анной",
+        gender="female",
+        inflection_applied=True,
+    ),
+    DisplayNameContext(
+        nominative="WNR",
+        genitive="WNR",
+        dative="WNR",
+        accusative="WNR",
+        instrumental="WNR",
+        gender=None,
+        inflection_applied=False,
+    ),
+]
+
+
+HISTORY_MEDIA_CASES = {
+    "anime": ("Anime", "tv", "аниме", "/animes/1-audit"),
+    "manga": ("Manga", "manga", "манга", "/mangas/1-audit"),
+    "ranobe": ("Manga", "light_novel", "ранобэ", "/mangas/1-audit"),
+}
+
+
+def _history_description(bank_key, message_key):
+    reading = bank_key != "anime"
+    descriptions = {
+        "planned": "добавлено в список",
+        "watching": "читаю" if reading else "смотрю",
+        "rewatching": "перечитываю" if reading else "пересматриваю",
+        "on_hold": "отложено",
+        "dropped": "брошено",
+        "completed_no_score": "прочитано" if reading else "просмотрено",
+        "completed_score_low": (
+            "прочитано и оценено на 3" if reading
+            else "просмотрено и оценено на 3"
+        ),
+        "completed_score_mid": (
+            "прочитано и оценено на 6" if reading
+            else "просмотрено и оценено на 6"
+        ),
+        "completed_score_high": (
+            "прочитано и оценено на 9" if reading
+            else "просмотрено и оценено на 9"
+        ),
+        "completed_score_perfect": (
+            "прочитано и оценено на 10" if reading
+            else "просмотрено и оценено на 10"
+        ),
+    }
+    return descriptions[message_key]
+
+
+@pytest.mark.parametrize(
+    "context",
+    FINAL_RENDER_CONTEXTS,
+    ids=["male", "female", "fallback"],
+)
+def test_every_history_template_renders_final_media_title_once(
+    context,
+):
+    for bank_key, (_target_type, _kind, label, url) in HISTORY_MEDIA_CASES.items():
+        for message_key, templates in messages.MESSAGES[bank_key].items():
+            for template in templates:
+                rendered = render_message_template(
+                    template,
+                    context,
+                    media_key=bank_key,
+                    title="AuditTitle",
+                    url=url,
+                    score=8,
+                    old=4,
+                    new=9,
+                    description="новый формат события",
+                )
+                plain = _strip_html(rendered)
+
+                assert rendered.count(f"({label})") == 1, template
+                assert rendered.count(messages.SHIKI_BASE_URL) == 1, template
+                assert "{" not in rendered and "}" not in rendered, template
+                assert re.search(
+                    rf"(?iu)\b(?:аниме|манг\w*|ранобэ)\s+"
+                    rf"AuditTitle \({label}\)",
+                    plain,
+                ) is None, template
+
+
+SHARED_HISTORY_CASES = {
+    "score_changed": "изменена оценка с 5 на 5",
+    "score_changed_up": "изменена оценка с 4 на 9",
+    "score_changed_down": "изменена оценка с 9 на 4",
+    "score_set": "оценено на 8",
+    "unknown": "новый формат события",
+}
+
+
+@pytest.mark.parametrize(
+    "context",
+    FINAL_RENDER_CONTEXTS,
+    ids=["male", "female", "fallback"],
+)
+def test_every_shared_history_template_renders_for_every_media(
+    context,
+):
+    for media_key, (_target_type, _kind, label, url) in HISTORY_MEDIA_CASES.items():
+        for message_key, description in SHARED_HISTORY_CASES.items():
+            for template in messages.MESSAGES[message_key]:
+                change = extract_score_change(description) or ("?", "?")
+                score = extract_score(description)
+                rendered = render_message_template(
+                    template,
+                    context,
+                    media_key=media_key,
+                    title="AuditTitle",
+                    url=url,
+                    score=score if score is not None else "?",
+                    old=change[0],
+                    new=change[1],
+                    description=description,
+                )
+
+                assert rendered.count(f"({label})") == 1, template
+                assert rendered.count(messages.SHIKI_BASE_URL) == 1, template
+                assert "{" not in rendered and "}" not in rendered, template
+
+
+@pytest.mark.parametrize(
+    ("bank_key", "message_key", "template_index", "description", "expected"),
+    [
+        (
+            "anime",
+            "planned",
+            1,
+            "добавлено в список",
+            "🗂️ <b>Title (аниме)</b> заняло своё место в очереди. "
+            "Дождётся ли? Обязательно! Скоро ли? Ну, как повезет!",
+        ),
+        (
+            "manga",
+            "rewatching",
+            0,
+            "перечитываю",
+            "🔁 WorgaNomoR перечитывает <b>Title (манга)</b>. "
+            "Значит, она того стоила.",
+        ),
+        (
+            "manga",
+            "completed_no_score",
+            1,
+            "прочитано",
+            "🏁 <b>Title (манга)</b> — прочитана. "
+            "WorgaNomoR ставит точку без комментариев.",
+        ),
+        (
+            "manga",
+            "completed_no_score",
+            9,
+            "прочитано",
+            "📚 <b>Title (манга)</b> прочитана. "
+            "WorgaNomoR приберёг оценку, видимо.",
+        ),
+        (
+            "manga",
+            "completed_score_low",
+            5,
+            "прочитано и оценено на 3",
+            "🔥 <b>Title (манга)</b> — 3/10. "
+            "Сожжена, забыта, не рекомендуется.",
+        ),
+        (
+            "manga",
+            "completed_score_mid",
+            6,
+            "прочитано и оценено на 6",
+            "⚖️ 6/10 за <b>Title (манга)</b>. "
+            "Прочитана, оценена, забыта к утру.",
+        ),
+        (
+            "manga",
+            "score_changed",
+            1,
+            "изменена оценка с 5 на 5",
+            "🤔 Оценка <b>Title (манга)</b> пересмотрена: 5 → 5. "
+            "WorgaNomoR явно что-то переосмыслил.",
+        ),
+        (
+            "manga",
+            "score_changed_up",
+            1,
+            "изменена оценка с 4 на 9",
+            "✨ Оценка <b>Title (манга)</b> выросла с 4 до 9. "
+            "Со временем впечатление стало лучше — и WorgaNomoR это оценил.",
+        ),
+    ],
+)
+def test_history_media_agreement_uses_independent_expected_sentences(
+    bank_key,
+    message_key,
+    template_index,
+    description,
+    expected,
+):
+    templates = (
+        messages.MESSAGES[message_key]
+        if message_key in SHARED_HISTORY_CASES
+        else messages.MESSAGES[bank_key][message_key]
+    )
+    selected = templates[template_index]
+    change = extract_score_change(description) or ("?", "?")
+    score = extract_score(description)
+    rendered = render_message_template(
+        selected,
+        FALLBACK_NAME_CONTEXT,
+        media_key=bank_key,
+        title="Title",
+        url="",
+        score=score if score is not None else "?",
+        old=change[0],
+        new=change[1],
+        description=description,
+    )
+
+    assert rendered == expected
+
+
+NEW_RANOBE_EXPECTED = {
+    "planned": [
+        "📖 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> пополнило планы WorgaNomoR. Для хорошего ранобэ место "
+        "в очереди найдётся.",
+        "🗒️ WorgaNomoR записал <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> в книжную очередь. Для нового ранобэ место нашлось.",
+    ],
+    "watching": [
+        "🔦 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> уже открыто у WorgaNomoR. Похоже, это ранобэ украдёт не один вечер.",
+        "📕 WorgaNomoR начал знакомство с <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b>. Вечер официально отдан новому ранобэ.",
+    ],
+    "rewatching": [
+        "📖 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> снова в руках у WorgaNomoR. Хорошее ранобэ при перечитывании "
+        "только богатеет.",
+        "🔄 WorgaNomoR открыл <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> ещё раз. Это ранобэ явно не отпустило после первого прочтения.",
+    ],
+    "on_hold": [
+        "📕 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> ждёт возвращения WorgaNomoR. Даже увлекательное ранобэ "
+        "иногда приходится отложить.",
+        "⏳ WorgaNomoR оставил <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> до более подходящего вечера. Ранобэ никуда не денется.",
+    ],
+    "dropped": [
+        "📕 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> не прошло проверку WorgaNomoR. Не всякое ранобэ добирается "
+        "до последней страницы.",
+        "🧹 WorgaNomoR убрал <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> с книжной полки. Для этого ранобэ чтение закончилось "
+        "раньше финала.",
+    ],
+    "completed_no_score": [
+        "📘 WorgaNomoR добрался до финала <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b>. Ранобэ дочитано, оценка ещё обдумывается.",
+        "📝 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> закончено, а WorgaNomoR пока хранит молчание. Для этого ранобэ "
+        "вердикт ещё не написан.",
+    ],
+    "completed_score_low": [
+        "🗑️ WorgaNomoR оценил <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> на 3/10. Это ранобэ не спас даже финальный том.",
+        "📕 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> получило от WorgaNomoR всего 3/10. К этому ранобэ WorgaNomoR "
+        "точно не вернётся.",
+    ],
+    "completed_score_mid": [
+        "📚 WorgaNomoR поставил <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> 6/10. Нормальное ранобэ, но без места на любимой полке.",
+        "📝 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> получило 6/10 от WorgaNomoR. Это ранобэ оказалось ровно на один раз.",
+    ],
+    "completed_score_high": [
+        "📚 WorgaNomoR оценил <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> на 9/10. Ранобэ уверенно поселилось в памяти.",
+        "💛 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> получило от WorgaNomoR 9/10. К этому ранобэ приятно будет вернуться.",
+    ],
+    "completed_score_perfect": [
+        "🌠 WorgaNomoR отдал <b><a href=\"https://shikimori.io/mangas/1-book\">"
+        "Книга</a> (ранобэ)</b> безоговорочные 10/10. Это ранобэ попало точно в сердце.",
+        "📚 <b><a href=\"https://shikimori.io/mangas/1-book\">Книга</a> "
+        "(ранобэ)</b> получило десятку от WorgaNomoR. Ранобэ отправляется на самую "
+        "почётную полку.",
+    ],
+}
+
+RANOBE_BANK_SIZES_AFTER_EXPANSION = {
+    "planned": 8,
+    "watching": 8,
+    "rewatching": 8,
+    "on_hold": 6,
+    "dropped": 8,
+    "completed_no_score": 8,
+    "completed_score_low": 8,
+    "completed_score_mid": 8,
+    "completed_score_high": 8,
+    "completed_score_perfect": 8,
+}
+
+
+def test_new_ranobe_templates_match_independent_final_sentences():
+    for message_key, expected_messages in NEW_RANOBE_EXPECTED.items():
+        templates = messages.MESSAGES["ranobe"][message_key]
+        assert len(templates) == RANOBE_BANK_SIZES_AFTER_EXPANSION[message_key]
+        description = _history_description("ranobe", message_key)
+        for template, expected in zip(templates[-2:], expected_messages):
+            assert "{n" in template
+            score = extract_score(description)
+            rendered = render_message_template(
+                template,
+                FALLBACK_NAME_CONTEXT,
+                media_key="ranobe",
+                title="Книга",
+                url="/mangas/1-book",
+                score=score if score is not None else "?",
+            )
+
+            assert rendered == expected
 
 
 @pytest.mark.parametrize(
@@ -972,12 +1338,14 @@ def test_build_favourite_message_ranobe_uses_dedicated_bank():
         "russian": "Re:Zero",
         "url": relative_url,
     }
-    title = f'<a href="{messages.SHIKI_BASE_URL}{relative_url}">Re:Zero</a>'
+    linked_title = f'<a href="{messages.SHIKI_BASE_URL}{relative_url}">Re:Zero</a>'
+    ranobe_title = f"{linked_title} (ранобэ)"
+    manga_title = f"{linked_title} (манга)"
     ranobe_bank = {
         messages.format_name_template(
             template,
             messages.DISPLAY_NAME_CONTEXT,
-            title=title,
+            title=ranobe_title,
         )
         for template in messages.MESSAGES["favourites"]["ranobe"]
     }
@@ -985,7 +1353,7 @@ def test_build_favourite_message_ranobe_uses_dedicated_bank():
         messages.format_name_template(
             template,
             messages.DISPLAY_NAME_CONTEXT,
-            title=title,
+            title=manga_title,
         )
         for template in messages.MESSAGES["favourites"]["manga"]
     }
@@ -999,7 +1367,114 @@ def test_build_favourite_message_ranobe_uses_dedicated_bank():
     assert manga_text.count(messages.SHIKI_BASE_URL) == 1
 
 
-def test_every_ranobe_template_is_explicit_and_avoids_manga_wording():
+@pytest.mark.parametrize(
+    "context",
+    FINAL_RENDER_CONTEXTS,
+    ids=["male", "female", "fallback"],
+)
+def test_every_favourite_template_uses_expected_media_label(
+    context,
+):
+    media_cases = {
+        "anime": ("аниме", "/animes/1-audit"),
+        "manga": ("манга", "/mangas/1-audit"),
+        "ranobe": ("ранобэ", "/mangas/1-audit"),
+    }
+
+    for bank_key, (label, url) in media_cases.items():
+        for template in messages.MESSAGES["favourites"][bank_key]:
+            rendered = render_message_template(
+                template,
+                context,
+                media_key=bank_key,
+                title="AuditTitle",
+                url=url,
+            )
+            plain = _strip_html(rendered)
+
+            assert rendered.count(f"({label})") == 1, template
+            assert rendered.count(messages.SHIKI_BASE_URL) == 1, template
+            assert "{" not in rendered and "}" not in rendered, template
+            assert re.search(
+                rf"(?iu)\b(?:аниме|манг\w*|ранобэ)\s+"
+                rf"AuditTitle \({label}\)",
+                plain,
+            ) is None, template
+
+    for bank_key in ("character", "person"):
+        for template in messages.MESSAGES["favourites"][bank_key]:
+            rendered = render_message_template(
+                template,
+                context,
+                media_key=bank_key,
+                title="AuditTitle",
+                url="/people/1-audit",
+            )
+
+            assert "(аниме)" not in rendered, template
+            assert "(манга)" not in rendered, template
+            assert "(ранобэ)" not in rendered, template
+            assert rendered.count(messages.SHIKI_BASE_URL) == 1, template
+            assert _strip_html(rendered).count("AuditTitle") == 1, template
+
+
+MANGA_FAVOURITE_REWRITES = {
+    0: "⭐ WorgaNomoR добавил <b><a href=\"https://shikimori.io/mangas/25-berserk\">"
+       "Berserk</a> (манга)</b> в избранное. Художник может гордиться.",
+    2: "🏅 Особая отметка: <b><a href=\"https://shikimori.io/mangas/25-berserk\">"
+       "Berserk</a> (манга)</b> в избранном WorgaNomoR. Это не просто хорошо.",
+    6: "🌟 WorgaNomoR занёс <b><a href=\"https://shikimori.io/mangas/25-berserk\">"
+       "Berserk</a> (манга)</b> в избранное. Высшая полка, рядом с любимыми.",
+}
+
+
+RANOBE_FAVOURITE_REWRITES = [
+    "⭐ WorgaNomoR добавил <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">"
+    "Re:Zero</a> (ранобэ)</b> в избранное. Это ранобэ действительно запало в душу.",
+    "💫 <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">Re:Zero</a> "
+    "(ранобэ)</b> теперь в избранном у WorgaNomoR. Место на любимой книжной полке заслужено.",
+    "🏅 Особая отметка: <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">"
+    "Re:Zero</a> (ранобэ)</b> попало в избранное WorgaNomoR. Это дорогого стоит.",
+    "✨ WorgaNomoR выделил <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">"
+    "Re:Zero</a> (ранобэ)</b> среди всех прочитанных историй.",
+    "🌟 <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">Re:Zero</a> "
+    "(ранобэ)</b> — в избранном. Значит, это ранобэ не закончилось с последней страницей.",
+    "📚 WorgaNomoR занёс <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">"
+    "Re:Zero</a> (ранобэ)</b> на любимую книжную полку.",
+    "❤️ <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">Re:Zero</a> "
+    "(ранобэ)</b> зацепило WorgaNomoR по-настоящему — прямиком в избранное.",
+    "🔖 <b><a href=\"https://shikimori.io/mangas/74697-re-zero\">Re:Zero</a> "
+    "(ранобэ)</b> стало одним из любимых у WorgaNomoR. Такие ранобэ остаются надолго.",
+]
+
+
+def test_rewritten_favourite_templates_match_independent_sentences():
+    for index, expected in MANGA_FAVOURITE_REWRITES.items():
+        selected = messages.MESSAGES["favourites"]["manga"][index]
+        rendered = render_message_template(
+            selected,
+            FALLBACK_NAME_CONTEXT,
+            media_key="manga",
+            title="Berserk",
+            url="/mangas/25-berserk",
+        )
+        assert rendered == expected
+
+    for selected, expected in zip(
+        messages.MESSAGES["favourites"]["ranobe"],
+        RANOBE_FAVOURITE_REWRITES,
+    ):
+        rendered = render_message_template(
+            selected,
+            FALLBACK_NAME_CONTEXT,
+            media_key="ranobe",
+            title="Re:Zero",
+            url="/mangas/74697-re-zero",
+        )
+        assert rendered == expected
+
+
+def test_every_ranobe_template_uses_title_and_avoids_manga_wording():
     history_templates = [
         template
         for templates in messages.MESSAGES["ranobe"].values()
@@ -1010,7 +1485,6 @@ def test_every_ranobe_template_is_explicit_and_avoids_manga_wording():
     for template in [*history_templates, *favourite_templates]:
         lowered = template.lower()
         assert "{title}" in template, template
-        assert "ранобэ" in lowered, template
         assert "манг" not in lowered, template
         assert "художник" not in lowered, template
 
