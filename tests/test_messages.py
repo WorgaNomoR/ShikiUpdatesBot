@@ -1414,6 +1414,8 @@ def test_every_favourite_template_uses_expected_media_label(
             assert "(аниме)" not in rendered, template
             assert "(манга)" not in rendered, template
             assert "(ранобэ)" not in rendered, template
+            assert rendered.count(messages.SHIKI_BASE_URL) == 1, template
+            assert _strip_html(rendered).count("AuditTitle") == 1, template
 
 
 MANGA_FAVOURITE_REWRITES = {
