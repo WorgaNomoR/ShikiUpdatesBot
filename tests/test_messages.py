@@ -1358,6 +1358,26 @@ def test_format_rate_entry_escapes_url_inside_html_attribute():
     )
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param([], id="list"),
+        pytest.param({}, id="dict"),
+        pytest.param(123, id="number"),
+    ],
+)
+def test_format_rate_entry_treats_non_string_url_as_absent(url):
+    result = format_rate_entry(
+        {
+            "_status": "watching",
+            "anime": {"name": "Title", "kind": "tv", "url": url},
+        },
+        "anime",
+    )
+
+    assert result == "▶️ Title (аниме)"
+
+
 def test_format_rate_entry_unlinked_label_follows_title():
     result = format_rate_entry(
         {
