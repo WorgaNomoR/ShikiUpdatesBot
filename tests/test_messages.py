@@ -1284,6 +1284,73 @@ def test_format_rate_entry_without_link():
     assert "href=" not in result
 
 
+@pytest.mark.parametrize(
+    ("media", "kind", "expected_label"),
+    [
+        ("anime", "tv", "аниме"),
+        ("manga", "manga", "манга"),
+        ("manga", "light_novel", "ранобэ"),
+        ("manga", "novel", "ранобэ"),
+        ("manga", "ranobe", "ранобэ"),
+        ("manga", None, "манга"),
+        ("manga", "unknown", "манга"),
+    ],
+)
+def test_format_rate_entry_uses_independent_media_label_matrix(
+    media, kind, expected_label,
+):
+    target = {
+        "name": "Title",
+        "kind": kind,
+        "url": f"/{media}s/1-title",
+    }
+    result = format_rate_entry(
+        {"_status": "watching", media: target},
+        media,
+    )
+
+    assert result == (
+        f'▶️ <a href="https://shikimori.io/{media}s/1-title">Title</a> '
+        f"({expected_label})"
+    )
+    assert result.count("Title") == 1
+    assert result.count(f"({expected_label})") == 1
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/animes/1-title",
+        "https://shikimori.io/animes/1-title",
+    ],
+)
+def test_format_rate_entry_normalizes_relative_and_full_urls(url):
+    result = format_rate_entry(
+        {
+            "_status": "watching",
+            "anime": {"name": "Title", "kind": "tv", "url": url},
+        },
+        "anime",
+    )
+
+    assert result == (
+        '▶️ <a href="https://shikimori.io/animes/1-title">Title</a> (аниме)'
+    )
+    assert result.count("https://shikimori.io") == 1
+
+
+def test_format_rate_entry_unlinked_label_follows_title():
+    result = format_rate_entry(
+        {
+            "_status": "watching",
+            "manga": {"name": "Title", "kind": "manga"},
+        },
+        "manga",
+    )
+
+    assert result == "▶️ Title (манга)"
+
+
 # ============================================================
 # Message building
 # ============================================================

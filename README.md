@@ -2,9 +2,10 @@
 
 ![ShikiUpdatesBot: уведомления об активности Shikimori в Telegram](assets/repository-social-preview.png)
 
+[![Source version](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2FWorgaNomoR%2FShikiUpdatesBot%2Frefs%2Fheads%2Fmain%2Fproject_meta.py&search=PROJECT_VERSION%20%3D%20%22(v%5B%5E%22%5D%2B)%22&replace=%241&label=source%20version&color=blue)](https://github.com/WorgaNomoR/ShikiUpdatesBot/blob/main/project_meta.py)
 [![Latest release](https://img.shields.io/github/v/release/WorgaNomoR/ShikiUpdatesBot?display_name=tag&sort=semver)](https://github.com/WorgaNomoR/ShikiUpdatesBot/releases/latest)
 [![Tests](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions)
-[![Windows executable](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/windows-exe.yml/badge.svg)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/windows-exe.yml)
+[![Windows build](https://img.shields.io/github/actions/workflow/status/WorgaNomoR/ShikiUpdatesBot/windows-exe.yml?label=Windows%20build)](https://github.com/WorgaNomoR/ShikiUpdatesBot/actions/workflows/windows-exe.yml)
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![Docker](https://img.shields.io/badge/-Docker-2496ED?style=flat&logo=docker&logoColor=white)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
