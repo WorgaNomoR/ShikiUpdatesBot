@@ -1107,10 +1107,11 @@ def format_rate_entry(item: dict, media: str) -> str:
         "rewatching": "🔁",
     }.get(status, "•")
 
-    url = target.get("url", "")
-    if url:
-        return f'{icon} <a href="{SHIKI_BASE_URL}{url}">{title}</a>'
-    return f"{icon} {title}"
+    raw_url = target.get("url")
+    url = _rel_url(raw_url) if isinstance(raw_url, str) else ""
+    linked_title = f'<a href="{SHIKI_BASE_URL}{h(url)}">{title}</a>' if url else title
+    media_key = "ranobe" if media == "manga" and target.get("kind") in RANOBE_KINDS else media
+    return f"{icon} {_label_media_title(linked_title, media_key)}"
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -104,6 +104,50 @@ from utils import (
 # Без джиттера — предсказуемый ритм (firewall-философия).
 BOOT_PHASE_DELAY = 2.0  # секунд
 _HISTORY_CATCHUP_MAX_PAGES = 5
+_STATUS_CACHE_TTL = 60.0
+_status_cache: tuple[list[dict], list[dict]] | None = None
+_status_cache_at = 0.0
+_status_cache_lock: asyncio.Lock | None = None
+
+
+def _get_status_cache_lock() -> asyncio.Lock:
+    """Лениво создаёт лок, схлопывающий конкурентные обновления /status."""
+    global _status_cache_lock
+    if _status_cache_lock is None:
+        _status_cache_lock = asyncio.Lock()
+    return _status_cache_lock
+
+
+def _cached_status_rates(now: float) -> tuple[list[dict], list[dict]] | None:
+    """Возвращает свежий внутрипроцессный кеш /status или None."""
+    if _status_cache is None or now - _status_cache_at >= _STATUS_CACHE_TTL:
+        return None
+    return _status_cache
+
+
+async def _get_status_rates() -> tuple[list[dict], list[dict]] | None:
+    """Получает свежие rates, переиспользуя общий успешный результат 60 секунд."""
+    global _status_cache, _status_cache_at
+
+    cached = _cached_status_rates(time.monotonic())
+    if cached is not None:
+        return cached
+
+    async with _get_status_cache_lock():
+        cached = _cached_status_rates(time.monotonic())
+        if cached is not None:
+            return cached
+
+        anime_list, manga_list = await asyncio.gather(
+            fetch_current_rates("anime", ["watching", "rewatching"]),
+            fetch_current_rates("manga", ["watching", "rewatching"]),
+        )
+        if anime_list is None or manga_list is None:
+            return None
+
+        _status_cache = (anime_list, manga_list)
+        _status_cache_at = time.monotonic()
+        return _status_cache
 
 
 class BroadcastStates(StatesGroup):
@@ -1352,19 +1396,14 @@ async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> Non
 async def cmd_status(message: Message) -> None:
     """
     /status — показывает что сейчас смотрит/читает пользователь.
-    Запрашивает аниме и мангу в статусах watching + rewatching
-    параллельно, затем собирает ответ с учётом всех комбинаций.
+    Переиспользует общий свежий результат для всех чатов, затем собирает
+    ответ с учётом всех комбинаций.
     """
-    # Оба запроса параллельно — быстрее
-    anime_list, manga_list = await asyncio.gather(
-        fetch_current_rates("anime", ["watching", "rewatching"]),
-        fetch_current_rates("manga", ["watching", "rewatching"]),
-    )
-
-    # Если хотя бы один запрос вернул None — API недоступен
-    if anime_list is None or manga_list is None:
+    rates = await _get_status_rates()
+    if rates is None:
         await message.answer("⚠️ Не удалось получить данные от Shikimori. Попробуй позже.")
         return
+    anime_list, manga_list = rates
 
     # Фильтруем аниме по разрешённым видам
     anime_list = [
