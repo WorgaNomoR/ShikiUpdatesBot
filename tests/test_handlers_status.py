@@ -39,7 +39,7 @@ def _patch_rates(monkeypatch, *, anime=(), manga=()):
 
 @pytest.fixture(autouse=True)
 def _reset_status_cache(monkeypatch):
-    """Process-local кеш и его лок не должны утекать между event loop тестов."""
+    """Внутрипроцессный кеш и его лок не должны утекать между event loop тестов."""
     monkeypatch.setattr(handlers, "_status_cache", None)
     monkeypatch.setattr(handlers, "_status_cache_at", 0.0)
     monkeypatch.setattr(handlers, "_status_cache_lock", None)

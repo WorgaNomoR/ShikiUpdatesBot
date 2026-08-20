@@ -119,7 +119,7 @@ def _get_status_cache_lock() -> asyncio.Lock:
 
 
 def _cached_status_rates(now: float) -> tuple[list[dict], list[dict]] | None:
-    """Возвращает свежий process-local кеш /status или None."""
+    """Возвращает свежий внутрипроцессный кеш /status или None."""
     if _status_cache is None or now - _status_cache_at >= _STATUS_CACHE_TTL:
         return None
     return _status_cache

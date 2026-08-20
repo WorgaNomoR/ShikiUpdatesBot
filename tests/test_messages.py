@@ -1339,6 +1339,25 @@ def test_format_rate_entry_normalizes_relative_and_full_urls(url):
     assert result.count("https://shikimori.io") == 1
 
 
+def test_format_rate_entry_escapes_url_inside_html_attribute():
+    result = format_rate_entry(
+        {
+            "_status": "watching",
+            "anime": {
+                "name": "Title",
+                "kind": "tv",
+                "url": '/animes/1-title?from=<status>&label="quoted"',
+            },
+        },
+        "anime",
+    )
+
+    assert result == (
+        '▶️ <a href="https://shikimori.io/animes/1-title?'
+        'from=&lt;status&gt;&amp;label=&quot;quoted&quot;">Title</a> (аниме)'
+    )
+
+
 def test_format_rate_entry_unlinked_label_follows_title():
     result = format_rate_entry(
         {
