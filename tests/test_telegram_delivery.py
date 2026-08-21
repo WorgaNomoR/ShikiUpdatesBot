@@ -14,7 +14,10 @@ from aiogram.exceptions import (
 )
 from aiogram.methods import SendMessage
 
-from telegram_delivery import is_blocked_error, send_with_retry
+from telegram_delivery import (
+    is_blocked_error,
+    send_with_retry,
+)
 
 _METHOD = SendMessage(chat_id=1, text="test")
 

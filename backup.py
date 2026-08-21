@@ -30,7 +30,9 @@ from config import (
 )
 from storage import (
     _atomic_write,
+    load_stats_current,
     load_subscribers,
+    restorable_state_transaction,
     save_stats_current,
 )
 from telegram_delivery import send_with_retry
@@ -44,6 +46,11 @@ from utils import (
 # ═══════════════════════════════════════════════════════════════════
 
 BACKUP_TAG = "#backup"
+
+IMPORT_DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
+_IMPORT_ARCHIVE_MAX_MEMBERS = 256
+_IMPORT_MEMBER_MAX_BYTES = 8 * 1024 * 1024
+_IMPORT_TOTAL_MAX_BYTES = 32 * 1024 * 1024
 
 SHUTDOWN_BACKUP_DEBOUNCE = 60   # с: не дублировать shutdown-бэкап после свежего
 
@@ -260,10 +267,34 @@ def _publish_restore_files(pending: dict[str, str]) -> list[str]:
         raise ValueError(f"не удалось подготовить восстановление: {e}") from e
 
 
-def restore_backup_zip(raw: bytes) -> dict:
+def _validate_import_metadata(infos: list[zipfile.ZipInfo]) -> None:
+    """Проверить ресурсные границы архива до чтения его содержимого."""
+    if len(infos) > _IMPORT_ARCHIVE_MAX_MEMBERS:
+        raise ValueError(
+            f"в архиве больше {_IMPORT_ARCHIVE_MAX_MEMBERS} файлов и каталогов"
+        )
+
+    restorable_size = 0
+    for info in infos:
+        if info.is_dir() or not _is_allowed_import_member(info.filename):
+            continue
+        if info.file_size > _IMPORT_MEMBER_MAX_BYTES:
+            raise ValueError(
+                f"файл {info.filename} больше {_IMPORT_MEMBER_MAX_BYTES // (1024 * 1024)} МиБ"
+            )
+        restorable_size += info.file_size
+        if restorable_size > _IMPORT_TOTAL_MAX_BYTES:
+            raise ValueError(
+                "суммарный размер восстанавливаемых файлов больше "
+                f"{_IMPORT_TOTAL_MAX_BYTES // (1024 * 1024)} МиБ"
+            )
+
+
+async def restore_backup_zip(raw: bytes) -> dict:
     """Восстанавливаем состояние из архива по белому списку.
     Все разрешённые члены сперва валидируем как JSON, затем публикуем из
-    staging-каталога; ошибка публикации запускает откат уже заменённых файлов.
+    staging-каталога под общим lock; ошибка публикации запускает откат уже
+    заменённых файлов.
     Возвращаем {'restored': [...], 'skipped': [...]}.
     Бросаем ValueError, если архив битый или в нём нет ни одного валидного
     файла из белого списка."""
@@ -276,7 +307,9 @@ def restore_backup_zip(raw: bytes) -> dict:
     skipped: list[str] = []
     pending: dict[str, str] = {}
     with zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        _validate_import_metadata(infos)
+        for info in infos:
             name = info.filename
             if info.is_dir():
                 continue
@@ -284,7 +317,7 @@ def restore_backup_zip(raw: bytes) -> dict:
                 skipped.append(name)
                 continue
             try:
-                payload = zf.read(name).decode("utf-8")
+                payload = zf.read(info).decode("utf-8")
                 obj = json.loads(payload)   # синтаксически валидный JSON?
             except (
                 UnicodeDecodeError,
@@ -309,7 +342,8 @@ def restore_backup_zip(raw: bytes) -> dict:
     if not pending:
         raise ValueError("в архиве нет валидных файлов из белого списка")
 
-    restored = _publish_restore_files(pending)
+    async with restorable_state_transaction():
+        restored = _publish_restore_files(pending)
     log.info("restore_backup_zip: восстановлено %d, пропущено %d.",
              len(restored), len(skipped))
     return {"restored": restored, "skipped": skipped}
@@ -335,18 +369,22 @@ async def _weekly_backup_if_due(bot: Bot, cur: dict) -> dict:
     рестарте эфемерного хоста улетал бы бэкап. Первый плановый уйдёт через
     WEEKLY_BACKUP_INTERVAL аптайма; под/отписки и ротация бэкапят независимо."""
     now = time.time()
-    last = cur.get("last_backup_at")
-    if last is None:
-        cur["last_backup_at"] = now
-        save_stats_current(cur)
-        return cur
+    async with restorable_state_transaction():
+        cur = load_stats_current()
+        last = cur.get("last_backup_at")
+        if last is None:
+            cur["last_backup_at"] = now
+            save_stats_current(cur)
+            return cur
     if (now - last) < WEEKLY_BACKUP_INTERVAL:
         return cur
     caption = (f"🗓️ Еженедельный бэкап состояния.\n"
                f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}")
     if await send_backup(bot, caption):
-        cur["last_backup_at"] = now
-        save_stats_current(cur)
+        async with restorable_state_transaction():
+            cur = load_stats_current()
+            cur["last_backup_at"] = now
+            save_stats_current(cur)
     return cur
 
 

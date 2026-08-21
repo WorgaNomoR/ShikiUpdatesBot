@@ -9,7 +9,13 @@ import sys
 from collections.abc import Sequence
 
 from build_info import APP_VERSION
-from runtime import APP_ROOT, ENV_FILE, IS_FROZEN, SingleInstance, ensure_frozen_env
+from runtime import (
+    APP_ROOT,
+    ENV_FILE,
+    IS_FROZEN,
+    SingleInstance,
+    ensure_frozen_env,
+)
 
 
 def _configure_standard_streams() -> None:

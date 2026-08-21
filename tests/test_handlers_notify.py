@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
+import io
+import json
 import logging
+import zipfile
 
 import pytest
 
+import backup
+import storage
 from handlers import check_and_notify
 
 
@@ -89,9 +94,11 @@ def _sent_history_ids(messages):
     ]
 
 
-def _capture_saves(monkeypatch):
+def _capture_saves(monkeypatch, current=None):
     saved = []
+    current = current if current is not None else _empty_cur()
     monkeypatch.setattr("handlers.save_seen_ids", lambda ids: saved.append(set(ids)))
+    monkeypatch.setattr("handlers.load_stats_current", lambda: current)
     monkeypatch.setattr("handlers.save_stats_current", lambda cur: None)
     return saved
 
@@ -204,10 +211,10 @@ async def test_catchup_failure_on_second_page_keeps_seen_unpublished(monkeypatch
         2: None,
     }
     calls = _patch_history_pages(monkeypatch, pages)
-    saved = _capture_saves(monkeypatch)
-    sent = _capture_sends(monkeypatch)
     original_seen = {1}
     original_cur = _empty_cur()
+    saved = _capture_saves(monkeypatch, original_cur)
+    sent = _capture_sends(monkeypatch)
 
     result, returned_cur = await check_and_notify(
         DummyBot(), original_seen, original_cur,
@@ -387,8 +394,6 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
         "handlers.build_message",
         lambda item: pytest.fail("для score_removed начали строить сообщение"),
     )
-    saved = _capture_saves(monkeypatch)
-    sent = _capture_sends(monkeypatch)
     cur = _empty_cur()
     cur["events"].append({
         "id": "79",
@@ -397,6 +402,8 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
         "score": 5,
         "recorded_at": "2026-04-01T00:00:00+00:00",
     })
+    saved = _capture_saves(monkeypatch, cur)
+    sent = _capture_sends(monkeypatch)
 
     with caplog.at_level(logging.WARNING):
         result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
@@ -419,8 +426,6 @@ async def test_score_set_notifies_and_updates_completed_without_duplicate(monkey
     monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
     monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
     monkeypatch.setattr("handlers.build_message", lambda item: "SCORE")
-    _capture_saves(monkeypatch)
-    sent = _capture_sends(monkeypatch)
     cur = _empty_cur()
     cur["events"].append({
         "id": "77",
@@ -429,6 +434,8 @@ async def test_score_set_notifies_and_updates_completed_without_duplicate(monkey
         "score": None,
         "recorded_at": "2026-04-01T00:00:00+00:00",
     })
+    _capture_saves(monkeypatch, cur)
+    sent = _capture_sends(monkeypatch)
 
     _, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
 
@@ -455,12 +462,61 @@ async def test_score_change_updates_completion_through_handler(monkeypatch):
     monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
     monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
     monkeypatch.setattr("handlers.build_message", lambda item: f"EVENT-{item['id']}")
-    _capture_saves(monkeypatch)
+    cur = _empty_cur()
+    _capture_saves(monkeypatch, cur)
     sent = _capture_sends(monkeypatch)
 
-    _, returned_cur = await check_and_notify(DummyBot(), {999}, _empty_cur())
+    _, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
 
     assert sent == ["EVENT-123", "EVENT-124"]
     assert len(returned_cur["events"]) == 1
     assert returned_cur["events"][0]["event"] == "completed"
     assert returned_cur["events"][0]["score"] == 9
+
+
+@pytest.mark.asyncio
+async def test_stale_history_writer_rebases_on_imported_current_state(
+    backup_env,
+    monkeypatch,
+):
+    old_cur = {"period": "2026-Q2", "events": []}
+    storage.save_stats_current(old_cur)
+    entry = {
+        "id": 123,
+        "description": "Просмотрено",
+        "target": {"id": 77, "type": "Anime", "kind": "tv"},
+    }
+    _patch_history(monkeypatch, [entry])
+    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
+    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda item: "COMPLETED")
+    started = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def pause_send(bot, text):
+        started.set()
+        await resume.wait()
+
+    monkeypatch.setattr("handlers.send_to_all_chats", pause_send)
+    writer = asyncio.create_task(check_and_notify(DummyBot(), {999}, old_cur))
+    await started.wait()
+
+    imported = {
+        "period": "2026-Q2",
+        "events": [{
+            "id": "88",
+            "media": "anime",
+            "event": "completed",
+            "score": 7,
+            "recorded_at": "2026-04-01T00:00:00+00:00",
+        }],
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("stats_current.json", json.dumps(imported))
+    await backup.restore_backup_zip(buf.getvalue())
+    resume.set()
+    await writer
+
+    event_ids = {event["id"] for event in storage.load_stats_current()["events"]}
+    assert event_ids == {"77", "88"}

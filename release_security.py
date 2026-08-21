@@ -10,8 +10,14 @@ import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
-from urllib.parse import urlsplit, urlunsplit
+from typing import (
+    Awaitable,
+    Callable,
+)
+from urllib.parse import (
+    urlsplit,
+    urlunsplit,
+)
 
 import aiohttp
 

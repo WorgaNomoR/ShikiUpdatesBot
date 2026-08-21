@@ -2,7 +2,10 @@
 # Copyright (C) 2026  WorgaNomoR
 """Авторитетные тесты общей очистки inline-меню и исходной команды."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 

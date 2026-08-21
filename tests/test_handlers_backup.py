@@ -9,7 +9,12 @@ zip, whitelist, авто-бэкап) живёт в test_backup.py. Фиксту�
 в conftest.py (общая с test_backup.py). Дисциплина: тест падает на
 непропатченном коде и проходит на пропатченном.
 """
-from unittest.mock import ANY, AsyncMock, MagicMock, call
+from unittest.mock import (
+    ANY,
+    AsyncMock,
+    MagicMock,
+    call,
+)
 
 import pytest
 
@@ -38,6 +43,7 @@ async def test_cmd_backup_owner_shows_menu(backup_env):
     await handlers.cmd_backup(msg)
     kwargs = msg.reply.call_args.kwargs
     assert "reply_markup" in kwargs   # инлайн-меню есть
+    assert "проверки обновлений" in msg.reply.call_args.args[0]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -213,6 +219,7 @@ async def test_backup_import_enters_fsm_and_stores_prompt(backup_env):
     cb.answer.assert_awaited_once()            # тихий ack (без show_alert)
     state.set_state.assert_awaited_once_with(handlers.BackupStates.waiting_import_file)
     cb.message.edit_text.assert_awaited_once()  # промпт-сообщение переписано
+    assert "проверки обновлений" in cb.message.edit_text.call_args.args[0]
     state.update_data.assert_awaited_once_with(prompt_msg_id=555)  # id промпта сохранён для чистки
 
 
@@ -220,13 +227,20 @@ async def test_backup_import_enters_fsm_and_stores_prompt(backup_env):
 #  backup_receive — приём .zip и восстановление (оркестрация)
 # ─────────────────────────────────────────────────────────────
 
-def _import_message(*, owner=True, with_doc=True, file_name="backup.zip"):
+def _import_message(
+    *,
+    owner=True,
+    with_doc=True,
+    file_name="backup.zip",
+    file_size=1_024,
+):
     """Мок Message для backup_receive. bot — AsyncMock (download awaitable),
     answer — AsyncMock. Реальное состояние не трогаем: I/O-границы мокаются в тесте."""
     msg = MagicMock()
     msg.from_user.id = handlers.OWNER_ID if owner else 1
     if with_doc:
         msg.document.file_name = file_name
+        msg.document.file_size = file_size
     else:
         msg.document = None
     msg.chat.id = 999
@@ -270,8 +284,48 @@ async def test_backup_receive_rejects_non_zip(backup_env, monkeypatch, with_doc,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_size",
+    [None, handlers.IMPORT_DOCUMENT_MAX_BYTES + 1],
+    ids=["unknown", "oversized"],
+)
+async def test_backup_receive_rejects_invalid_size_before_download(
+    backup_env,
+    monkeypatch,
+    file_size,
+):
+    restore = AsyncMock()
+    monkeypatch.setattr(handlers, "restore_backup_zip", restore)
+    state = AsyncMock()
+    msg = _import_message(file_size=file_size)
+
+    await handlers.backup_receive(msg, state)
+
+    msg.bot.download.assert_not_awaited()
+    restore.assert_not_awaited()
+    state.clear.assert_not_awaited()
+    assert "20 МиБ" in msg.answer.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_backup_receive_accepts_exact_document_size(backup_env, monkeypatch):
+    restore = AsyncMock(return_value={"restored": ["update_state.json"], "skipped": []})
+    monkeypatch.setattr(handlers, "restore_backup_zip", restore)
+    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+    state = AsyncMock()
+    state.get_data = AsyncMock(return_value={})
+    msg = _import_message(file_size=handlers.IMPORT_DOCUMENT_MAX_BYTES)
+
+    await handlers.backup_receive(msg, state)
+
+    msg.bot.download.assert_awaited_once()
+    restore.assert_awaited_once()
+    assert "проверки обновлений восстановлено" in msg.answer.call_args.args[0]
+
+
+@pytest.mark.asyncio
 async def test_backup_receive_download_failure(backup_env, monkeypatch):
-    restore = MagicMock()
+    restore = AsyncMock()
     monkeypatch.setattr(handlers, "restore_backup_zip", restore)
     monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
     state = AsyncMock()
@@ -286,13 +340,13 @@ async def test_backup_receive_download_failure(backup_env, monkeypatch):
     assert "❌" in text and "скачать" in text
     assert "&lt;net&gt;" in text and "&amp;" in text   # h(): текст исключения экранирован
     assert "<net>" not in text                         # сырой тег не протёк
-    restore.assert_not_called()          # битую загрузку в restore не потащили
+    restore.assert_not_awaited()          # битую загрузку в restore не потащили
 
 
 @pytest.mark.asyncio
 async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
     monkeypatch.setattr(handlers, "restore_backup_zip",
-                        MagicMock(side_effect=ValueError("битый <b>zip</b>-архив & мусор")))
+                        AsyncMock(side_effect=ValueError("битый <b>zip</b>-архив & мусор")))
     monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
     state = AsyncMock()
     state.get_data = AsyncMock(return_value={"prompt_msg_id": 55})
@@ -311,7 +365,7 @@ async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_backup_receive_success_reports_and_refreshes(backup_env, monkeypatch):
-    monkeypatch.setattr(handlers, "restore_backup_zip", MagicMock(return_value={
+    monkeypatch.setattr(handlers, "restore_backup_zip", AsyncMock(return_value={
         "restored": ["subscribers.json", "stats_current.json"],
         "skipped": ["junk.txt"],
     }))
@@ -344,7 +398,7 @@ async def test_backup_receive_success_reports_and_refreshes(backup_env, monkeypa
 
 @pytest.mark.asyncio
 async def test_backup_receive_success_without_subscribers_skips_refresh(backup_env, monkeypatch):
-    monkeypatch.setattr(handlers, "restore_backup_zip", MagicMock(return_value={
+    monkeypatch.setattr(handlers, "restore_backup_zip", AsyncMock(return_value={
         "restored": ["stats_current.json"],
         "skipped": [],
     }))

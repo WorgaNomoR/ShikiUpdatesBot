@@ -13,7 +13,11 @@ import os
 
 from dotenv import load_dotenv
 
-from runtime import ENV_FILE, configure_logging, resolve_data_dir
+from runtime import (
+    ENV_FILE,
+    configure_logging,
+    resolve_data_dir,
+)
 
 
 def _load_local_env(path=ENV_FILE) -> None:

@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
+import io
+import json
+import zipfile
 
 import aiohttp
 import pytest
 
+import backup
 import handlers
+import storage
 import telegram_delivery
 from handlers import send_to_all_chats
 
@@ -220,6 +225,37 @@ async def test_exhausted_transient_retries_continue_with_next_subscriber(monkeyp
     assert bot.calls == [111, 111, 111, 222]
     assert retry_delays == [0.5, 1.0]
     assert flood_delays == [0.3, 0.3]
+
+
+@pytest.mark.asyncio
+async def test_stale_broadcast_removal_preserves_imported_subscribers(
+    backup_env,
+    monkeypatch,
+):
+    storage.save_subscribers({111: "Blocked"})
+    started = asyncio.Event()
+    resume = asyncio.Event()
+
+    class PausedBlockedBot:
+        async def send_message(self, chat_id, text, parse_mode=None):
+            started.set()
+            await resume.wait()
+            raise Exception("bot was blocked")
+
+    writer = asyncio.create_task(send_to_all_chats(PausedBlockedBot(), "hello"))
+    await started.wait()
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "subscribers.json",
+            json.dumps({"subscribers": {"111": "Blocked", "222": "Imported"}}),
+        )
+    await backup.restore_backup_zip(buf.getvalue())
+    resume.set()
+    await writer
+
+    assert storage.load_subscribers() == {222: "Imported"}
 
 
 # ── _is_blocked_error: единый детектор «получатель недоступен» ──────

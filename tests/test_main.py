@@ -3,7 +3,10 @@
 """Сборка приложения и lifecycle frozen-запуска."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 

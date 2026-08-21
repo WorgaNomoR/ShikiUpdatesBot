@@ -9,7 +9,10 @@
 о доменной логике статистики не знает — она зависит от него, не наоборот.
 """
 
+import asyncio
 import json
+import weakref
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from config import (
@@ -21,7 +24,32 @@ from config import (
     UPDATE_STATE_FILE,
     log,
 )
-from utils import _utcnow, current_quarter, quarter_start
+from utils import (
+    _utcnow,
+    current_quarter,
+    quarter_start,
+)
+
+_restorable_state_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _restorable_state_lock() -> asyncio.Lock:
+    """Вернуть общий lock импортируемого состояния для текущего event loop."""
+    loop = asyncio.get_running_loop()
+    lock = _restorable_state_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _restorable_state_locks[loop] = lock
+    return lock
+
+
+@asynccontextmanager
+async def restorable_state_transaction():
+    """Сериализовать импорт и публикацию изменений восстанавливаемых файлов."""
+    async with _restorable_state_lock():
+        yield
 
 # ═══════════════════════════════════════════════════════════════════
 #  АТОМАРНАЯ ЗАПИСЬ
@@ -198,6 +226,7 @@ def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict
         "tracking_since": tracking_since or qs,
         "last_report_sent": None,
         "last_backup_at": None,   # время последнего авто-бэкапа (для еженедельной отправки)
+        "pending_quarter_delivery": None,
         "events": [],   # [{id, media, event, score, recorded_at}]
     }
 
@@ -220,6 +249,7 @@ def load_stats_current() -> dict:
                     data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
                 # Бэкофилл для файлов до появления last_backup_at (еженедельный авто-бэкап)
                 data.setdefault("last_backup_at", None)
+                data.setdefault("pending_quarter_delivery", None)
                 return data
             log.warning("load_stats_current: неожиданная структура, сбрасываем.")
     except (json.JSONDecodeError, OSError, ValueError) as e:

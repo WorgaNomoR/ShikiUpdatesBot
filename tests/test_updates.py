@@ -3,12 +3,20 @@
 """Проверка GitHub Release: парсинг, кэш и однократная доставка."""
 
 import asyncio
+import io
+import json
+import zipfile
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import aiohttp
 import pytest
 
+import backup
+import storage
 import updates
 
 
@@ -164,6 +172,7 @@ async def test_notification_marks_version_only_after_delivery(release_build, mon
     }
     saved = []
     monkeypatch.setattr(updates, "refresh_update_state", AsyncMock(return_value=state))
+    monkeypatch.setattr(updates, "load_update_state", lambda: state.copy())
     monkeypatch.setattr(updates, "save_update_state", lambda value: saved.append(value.copy()))
     bot = AsyncMock()
 
@@ -191,6 +200,94 @@ async def test_notification_delivery_failure_is_retried_later(release_build, mon
 
     save.assert_not_called()
     assert state["last_notified_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_stale_update_refresh_preserves_imported_notification_state(
+    backup_env,
+    release_build,
+    monkeypatch,
+):
+    storage.save_update_state(storage._empty_update_state())
+    started = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def paused_fetch():
+        started.set()
+        await resume.wait()
+        return updates.ReleaseInfo("v1.3.0", "https://new-release")
+
+    monkeypatch.setattr(updates, "fetch_latest_release", paused_fetch)
+    writer = asyncio.create_task(updates.refresh_update_state(force=True))
+    await started.wait()
+
+    imported = {
+        "last_checked_at": "2026-08-01T00:00:00+00:00",
+        "latest_version": "v1.2.5",
+        "release_url": "https://imported-release",
+        "last_notified_version": "v1.2.5",
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("update_state.json", json.dumps(imported))
+    await backup.restore_backup_zip(buf.getvalue())
+    resume.set()
+    await writer
+
+    state = storage.load_update_state()
+    assert state["latest_version"] == "v1.3.0"
+    assert state["release_url"] == "https://new-release"
+    assert state["last_notified_version"] == "v1.2.5"
+
+
+@pytest.mark.asyncio
+async def test_overlapping_update_refresh_keeps_newer_completed_check(
+    release_build,
+    monkeypatch,
+):
+    state = storage._empty_update_state()
+    started = asyncio.Event()
+    resume = asyncio.Event()
+    checked_times = iter(
+        [
+            datetime(2026, 8, 21, 12, 0, 0),
+            datetime(2026, 8, 21, 12, 1, 0),
+        ]
+    )
+    fetch_count = 0
+
+    async def fetch_release():
+        nonlocal fetch_count
+        fetch_count += 1
+        if fetch_count == 1:
+            started.set()
+            await resume.wait()
+            return updates.ReleaseInfo("v1.3.0", "https://older-check")
+        return updates.ReleaseInfo("v1.4.0", "https://newer-check")
+
+    def load_state():
+        return state.copy()
+
+    def save_state(value):
+        state.clear()
+        state.update(value)
+
+    monkeypatch.setattr(updates, "_utcnow", lambda: next(checked_times))
+    monkeypatch.setattr(updates, "fetch_latest_release", fetch_release)
+    monkeypatch.setattr(updates, "load_update_state", load_state)
+    monkeypatch.setattr(updates, "save_update_state", save_state)
+
+    older_writer = asyncio.create_task(updates.refresh_update_state(force=True))
+    await started.wait()
+    newer_result = await updates.refresh_update_state(force=True)
+    resume.set()
+    older_result = await older_writer
+
+    assert newer_result["latest_version"] == "v1.4.0"
+    assert older_result["latest_version"] == "v1.4.0"
+    assert state["latest_version"] == "v1.4.0"
+    assert state["release_url"] == "https://newer-check"
+    assert state["last_checked_at"] == "2026-08-21T12:01:00"
 
 
 def test_build_version_text_marks_source_mode(monkeypatch):
