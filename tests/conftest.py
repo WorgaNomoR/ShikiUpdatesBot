@@ -26,10 +26,11 @@ os.environ.setdefault("SHIKI_USER", "WNR")
 os.environ.pop("DISPLAY_NAME", None)
 os.environ.pop("DISPLAY_NAME_GENDER", None)
 
-# Изолированная папка данных — чтобы тесты не лезли в реальный /data
-_test_data_dir = Path(tempfile.gettempdir()) / "shikibot_test_data"
-_test_data_dir.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("DATA_DIR", str(_test_data_dir))
+# Уникальная папка данных на тестовую сессию: внешнее DATA_DIR не должно
+# направить тесты в реальное состояние бота. Объект живёт до завершения Python
+# и затем удаляет созданный временный каталог.
+_test_data_dir = tempfile.TemporaryDirectory(prefix="shikibot_test_data_")
+os.environ["DATA_DIR"] = _test_data_dir.name
 
 
 

@@ -275,9 +275,7 @@ async def test_no_new_entries_no_send(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_new_relevant_entry_sends_and_saves(monkeypatch):
-    _patch_history(monkeypatch, [{"id": 123}])
-    monkeypatch.setattr("handlers.get_media_info", lambda entry: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    _patch_history(monkeypatch, [_relevant_entry(123)])
     monkeypatch.setattr("handlers.build_message", lambda entry: "MESSAGE")
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
@@ -293,9 +291,9 @@ async def test_new_relevant_entry_sends_and_saves(monkeypatch):
 async def test_new_irrelevant_entry_records_but_no_send(monkeypatch):
     # ВАЖНО: непустой seen_ids — иначе код уходит в baseline-ветку ДО фильтра,
     # и тест на нерелевантность становится холостым (проходит при сломанном фильтре).
-    _patch_history(monkeypatch, [{"id": 999}])
-    monkeypatch.setattr("handlers.get_media_info", lambda entry: ("anime", "special"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: False)
+    entry = _relevant_entry(999)
+    entry["target"]["kind"] = "special"
+    _patch_history(monkeypatch, [entry])
     monkeypatch.setattr("handlers.build_message", lambda entry: "SHOULD_NOT_SEND")
     _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
@@ -448,19 +446,17 @@ async def test_score_set_notifies_and_updates_completed_without_duplicate(monkey
 async def test_score_change_updates_completion_through_handler(monkeypatch):
     entries = [
         {
-            "id": 123,
-            "description": "Просмотрено и оценено на <b>3</b>",
-            "target": {"id": 77, "type": "Anime", "kind": "tv"},
-        },
-        {
             "id": 124,
             "description": "Изменена оценка c <b>3</b> на <b>9</b>",
             "target": {"id": 77, "type": "Anime", "kind": "tv"},
         },
+        {
+            "id": 123,
+            "description": "Просмотрено и оценено на <b>3</b>",
+            "target": {"id": 77, "type": "Anime", "kind": "tv"},
+        },
     ]
     _patch_history(monkeypatch, entries)
-    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
     monkeypatch.setattr("handlers.build_message", lambda item: f"EVENT-{item['id']}")
     cur = _empty_cur()
     _capture_saves(monkeypatch, cur)

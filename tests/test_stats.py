@@ -177,25 +177,56 @@ def test_aggregates_manga_chapters():
 
 
 # ════════════════════════════════════════════════════════════════
-#  Регрессия: фильтр мусора по kind (баг с раздутым счётчиком студии)
+#  Регрессия: фильтр нерелевантных kind в sync_stats_all
 # ════════════════════════════════════════════════════════════════
 
-def test_garbage_kind_inflates_nothing_after_filter():
-    """
-    Регрессия. Спецвыпуски НЕ должны попадать в titles (фильтруются в
-    sync_stats_all через is_relevant). Здесь проверяем следствие: если в
-    titles только релевантные записи, счётчик студии = числу релевантных,
-    а не раздут спецвыпусками (был баг: Studio Deen 11 вместо 8 из-за
-    того, что спецвыпуски Цикад накручивали счётчик).
-    """
-    # titles уже отфильтрованы (как после sync) — только tv/ova
-    titles = {
-        "1": _anime_rec(kind="tv",  studios=["Studio Deen"]),
-        "2": _anime_rec(kind="ova", studios=["Studio Deen"]),
+@pytest.mark.asyncio
+async def test_sync_stats_all_filters_special_before_aggregating(monkeypatch):
+    """Спецвыпуск не попадает в titles и не раздувает счётчик студии."""
+    stats = storage._empty_stats_all()
+    export_anime = [
+        {
+            "target_id": tid,
+            "target_type": "Anime",
+            "target_title": f"Title {tid}",
+            "target_title_ru": f"Тайтл {tid}",
+            "score": 8,
+            "status": "completed",
+            "rewatches": 0,
+            "episodes": 1,
+        }
+        for tid in (1, 2, 3)
+    ]
+    metadata = {
+        "1": {"kind": "tv", "studios": ["Studio Deen"]},
+        "2": {"kind": "ova", "studios": ["Studio Deen"]},
+        "3": {"kind": "special", "studios": ["Studio Deen"]},
     }
-    agg = smod.recompute_aggregates("anime", titles)
-    # Ровно 2 — оба релевантны, спецвыпусков нет
-    assert agg["studios"].get("Studio Deen") == 2
+
+    async def fake_export(session, media):
+        return export_anime if media == "anime" else []
+
+    async def fake_meta(media, ids, session=None):
+        assert media == "anime"
+        assert ids == ["1", "2", "3"]
+        return {tid: metadata[tid] for tid in ids}
+
+    async def fake_collect(session, current, fav=None):
+        return current
+
+    saved = []
+    monkeypatch.setattr("stats.load_stats_all", lambda use_cache=False: stats)
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda data: saved.append(data))
+
+    result, ok = await smod.sync_stats_all(session=object())
+
+    assert ok is True
+    assert set(result["anime"]["titles"]) == {"1", "2"}
+    assert result["anime"]["aggregates"]["studios"] == {"Studio Deen": 2}
+    assert saved == [result]
 
 
 # ════════════════════════════════════════════════════════════════
