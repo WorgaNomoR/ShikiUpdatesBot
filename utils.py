@@ -17,7 +17,11 @@
 
 import html
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
 
 
 def h(text: str) -> str:

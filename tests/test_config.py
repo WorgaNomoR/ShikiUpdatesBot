@@ -8,7 +8,12 @@ from unittest.mock import MagicMock
 import pytest
 
 import config
-from config import _int_env, _load_local_env, _required_env, _required_int_env
+from config import (
+    _int_env,
+    _load_local_env,
+    _required_env,
+    _required_int_env,
+)
 
 
 # ── _required_env ──────────────────────────────────────────────────

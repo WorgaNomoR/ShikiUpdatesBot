@@ -20,7 +20,10 @@ from config import (
     SHIKI_USER,
     log,
 )
-from utils import _rel_url, _safe_float
+from utils import (
+    _rel_url,
+    _safe_float,
+)
 
 # ═══════════════════════════════════════════════════════════════════
 #  КОНСТАНТЫ: ФИЛЬТРЫ ТИПОВ, КАТЕГОРИИ, URL, ЗАГОЛОВКИ, GraphQL

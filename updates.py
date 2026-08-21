@@ -12,7 +12,10 @@ from html import escape
 import aiohttp
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 from build_info import (
     APP_VERSION,
@@ -22,11 +25,22 @@ from build_info import (
     REPOSITORY_URL,
     semver_tuple,
 )
-from config import OWNER_ID, log
+from config import (
+    OWNER_ID,
+    log,
+)
 from project_meta import PROJECT_SUMMARY
 from runtime import IS_FROZEN
-from storage import load_update_state, save_update_state
-from utils import _parse_iso_utc, _utcnow, h
+from storage import (
+    load_update_state,
+    restorable_state_transaction,
+    save_update_state,
+)
+from utils import (
+    _parse_iso_utc,
+    _utcnow,
+    h,
+)
 
 UPDATE_CHECK_INTERVAL = timedelta(hours=24)
 UPDATE_INITIAL_DELAY = 5.0
@@ -141,12 +155,23 @@ async def refresh_update_state(*, force: bool = False) -> dict:
         return state
     if not force and (not update_checks_enabled() or _checked_recently(state)):
         return state
-    state["last_checked_at"] = _utcnow().isoformat()
+    checked_at = _utcnow().isoformat()
     latest = await fetch_latest_release()
-    if latest is not None:
-        state["latest_version"] = latest.version
-        state["release_url"] = latest.url
-    save_update_state(state)
+    async with restorable_state_transaction():
+        state = load_update_state()
+        stored_checked_at = _parse_iso_utc(state.get("last_checked_at"))
+        incoming_checked_at = _parse_iso_utc(checked_at)
+        if (
+            stored_checked_at is not None
+            and incoming_checked_at is not None
+            and stored_checked_at > incoming_checked_at
+        ):
+            return state
+        state["last_checked_at"] = checked_at
+        if latest is not None:
+            state["latest_version"] = latest.version
+            state["release_url"] = latest.url
+        save_update_state(state)
     return state
 
 
@@ -200,8 +225,12 @@ async def check_and_notify_update(bot: Bot) -> None:
     except Exception as e:
         log.warning("Уведомление об обновлении не доставлено: %s", e)
         return
-    state["last_notified_version"] = latest
-    save_update_state(state)
+    async with restorable_state_transaction():
+        state = load_update_state()
+        if state.get("latest_version") != latest:
+            return
+        state["last_notified_version"] = latest
+        save_update_state(state)
 
 
 async def update_loop(bot: Bot) -> None:

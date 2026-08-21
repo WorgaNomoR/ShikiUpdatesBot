@@ -14,7 +14,10 @@ import lzma
 import time
 import zipfile
 import zlib
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import (
+    AsyncMock,
+    Mock,
+)
 
 import aiohttp
 import pytest
@@ -35,6 +38,13 @@ def _zip_bytes(members: dict[str, str]) -> bytes:
         for name, content in members.items():
             zf.writestr(name, content)
     return buf.getvalue()
+
+
+def _quarter_payload(size: int, period: str) -> str:
+    """Собрать валидный квартальный JSON ровно заданного UTF-8-размера."""
+    prefix = f'{{"period":"{period}","padding":"'
+    suffix = '"}'
+    return prefix + ("x" * (size - len(prefix) - len(suffix))) + suffix
 
 
 async def _cancel_after_started(awaitable, started: asyncio.Event) -> None:
@@ -113,11 +123,81 @@ def test_is_allowed_import_member_rejects_junk_and_zip_slip(name):
     assert backup._is_allowed_import_member(name) is False
 
 
+@pytest.mark.asyncio
+async def test_restore_accepts_exact_archive_boundaries(backup_env):
+    member_size = backup._IMPORT_MEMBER_MAX_BYTES
+    members = {
+        f"quarters/2026-Q{quarter}.json": _quarter_payload(
+            member_size,
+            f"2026-Q{quarter}",
+        )
+        for quarter in range(1, 5)
+    }
+    for index in range(backup._IMPORT_ARCHIVE_MAX_MEMBERS - len(members)):
+        members[f"ignored-{index}.txt"] = "x"
+
+    result = await backup.restore_backup_zip(_zip_bytes(members))
+
+    assert len(result["restored"]) == 4
+    assert len(result["skipped"]) == backup._IMPORT_ARCHIVE_MAX_MEMBERS - 4
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_too_many_members_before_publication(backup_env):
+    members = {
+        "subscribers.json": '{"subscribers": {"1": "Alice"}}',
+        **{
+            f"ignored-{index}.txt": "x"
+            for index in range(backup._IMPORT_ARCHIVE_MAX_MEMBERS)
+        },
+    }
+
+    with pytest.raises(ValueError, match="больше 256"):
+        await backup.restore_backup_zip(_zip_bytes(members))
+
+    assert not (backup_env / "subscribers.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_oversized_member_before_publication(backup_env):
+    raw = _zip_bytes({
+        "subscribers.json": '{"subscribers": {"1": "Alice"}}',
+        "quarters/oversized.json": _quarter_payload(
+            backup._IMPORT_MEMBER_MAX_BYTES + 1,
+            "oversized",
+        ),
+    })
+
+    with pytest.raises(ValueError, match="больше 8 МиБ"):
+        await backup.restore_backup_zip(raw)
+
+    assert not (backup_env / "subscribers.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_oversized_total_before_publication(backup_env):
+    member_size = backup._IMPORT_MEMBER_MAX_BYTES
+    members = {
+        f"quarters/2026-Q{quarter}.json": _quarter_payload(
+            member_size,
+            f"2026-Q{quarter}",
+        )
+        for quarter in range(1, 5)
+    }
+    members["quarters/extra.json"] = _quarter_payload(1_024, "extra")
+
+    with pytest.raises(ValueError, match="больше 32 МиБ"):
+        await backup.restore_backup_zip(_zip_bytes(members))
+
+    assert not list((backup_env / "quarters").glob("*.json"))
+
+
 # ─────────────────────────────────────────────────────────────
 #  Восстановление
 # ─────────────────────────────────────────────────────────────
 
-def test_restore_round_trip(backup_env):
+@pytest.mark.asyncio
+async def test_restore_round_trip(backup_env):
     raw = _zip_bytes({
         "subscribers.json": '{"subscribers": {"123": "Alice"}}',
         "stats_current.json": '{"period": "2026-Q2", "events": []}',
@@ -128,7 +208,7 @@ def test_restore_round_trip(backup_env):
         "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
         "seen_ids.json": '{"seen_ids": [1, 2, 3]}',   # должен быть отброшен
     })
-    result = backup.restore_backup_zip(raw)
+    result = await backup.restore_backup_zip(raw)
 
     assert set(result["restored"]) == {
         "subscribers.json",
@@ -144,30 +224,33 @@ def test_restore_round_trip(backup_env):
     assert not (backup_env / "seen_ids.json").exists()
 
 
-def test_restore_skips_corrupt_json(backup_env):
+@pytest.mark.asyncio
+async def test_restore_skips_corrupt_json(backup_env):
     raw = _zip_bytes({
         "subscribers.json": '{"subscribers": {"1": "Bob"}}',
         "stats_current.json": "{ это не json",   # битый — пропускаем
     })
-    result = backup.restore_backup_zip(raw)
+    result = await backup.restore_backup_zip(raw)
     assert "subscribers.json" in result["restored"]
     assert "stats_current.json" in result["skipped"]
     assert not (backup_env / "stats_current.json").exists()
 
 
-def test_restore_bad_zip_raises(backup_env):
+@pytest.mark.asyncio
+async def test_restore_bad_zip_raises(backup_env):
     with pytest.raises(ValueError):
-        backup.restore_backup_zip(b"this is not a zip")
+        await backup.restore_backup_zip(b"this is not a zip")
 
 
-def test_restore_skips_corrupt_crc_member(backup_env):
+@pytest.mark.asyncio
+async def test_restore_skips_corrupt_crc_member(backup_env):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
         zf.writestr("subscribers.json", '{"subscribers": {"1": "Bob"}}')
         zf.writestr("stats_current.json", '{"period": "2026-Q2", "events": []}')
     raw = _corrupt_stored_member(buf.getvalue(), "subscribers.json")
 
-    result = backup.restore_backup_zip(raw)
+    result = await backup.restore_backup_zip(raw)
 
     assert "subscribers.json" in result["skipped"]
     assert result["restored"] == ["stats_current.json"]
@@ -196,7 +279,8 @@ def test_restore_skips_corrupt_crc_member(backup_env):
         "lzma-error",
     ],
 )
-def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read_error):
+@pytest.mark.asyncio
+async def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read_error):
     raw = _zip_bytes({
         "subscribers.json": '{"subscribers": {"1": "Bob"}}',
         "stats_current.json": '{"period": "2026-Q2", "events": []}',
@@ -204,13 +288,13 @@ def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read_error
     real_read = zipfile.ZipFile.read
 
     def fail_selected_member(zf, name, *args, **kwargs):
-        if name == "subscribers.json":
+        if name.filename == "subscribers.json":
             raise read_error
         return real_read(zf, name, *args, **kwargs)
 
     monkeypatch.setattr(zipfile.ZipFile, "read", fail_selected_member)
 
-    result = backup.restore_backup_zip(raw)
+    result = await backup.restore_backup_zip(raw)
 
     assert "subscribers.json" in result["skipped"]
     assert result["restored"] == ["stats_current.json"]
@@ -221,7 +305,8 @@ def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read_error
 
 
 @pytest.mark.parametrize("change", ["missing", "extra"])
-def test_restore_rejects_inexact_update_state_schema(backup_env, change):
+@pytest.mark.asyncio
+async def test_restore_rejects_inexact_update_state_schema(backup_env, change):
     state = {
         "last_checked_at": None,
         "latest_version": "v1.2.0",
@@ -236,7 +321,7 @@ def test_restore_rejects_inexact_update_state_schema(backup_env, change):
     raw = _zip_bytes({"update_state.json": json.dumps(state)})
 
     with pytest.raises(ValueError, match="нет валидных файлов"):
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
     assert not (backup_env / "update_state.json").exists()
 
 
@@ -249,7 +334,8 @@ def test_restore_rejects_inexact_update_state_schema(backup_env, change):
         "last_notified_version",
     ],
 )
-def test_restore_rejects_non_string_update_state_value(backup_env, key):
+@pytest.mark.asyncio
+async def test_restore_rejects_non_string_update_state_value(backup_env, key):
     state = {
         "last_checked_at": None,
         "latest_version": "v1.2.0",
@@ -260,11 +346,12 @@ def test_restore_rejects_non_string_update_state_value(backup_env, key):
     raw = _zip_bytes({"update_state.json": json.dumps(state)})
 
     with pytest.raises(ValueError, match="нет валидных файлов"):
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
     assert not (backup_env / "update_state.json").exists()
 
 
-def test_restore_rolls_back_first_file_when_second_publish_fails(
+@pytest.mark.asyncio
+async def test_restore_rolls_back_first_file_when_second_publish_fails(
     backup_env,
     monkeypatch,
 ):
@@ -293,7 +380,7 @@ def test_restore_rolls_back_first_file_when_second_publish_fails(
     monkeypatch.setattr(backup, "_publish_staged_file", fail_second_publish)
 
     with pytest.raises(ValueError, match="исходное состояние восстановлено"):
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
 
     assert storage.load_subscribers() == {1: "Old"}
     assert json.loads((backup_env / "stats_current.json").read_text(encoding="utf-8")) == {
@@ -302,7 +389,8 @@ def test_restore_rolls_back_first_file_when_second_publish_fails(
     }
 
 
-def test_restore_removes_new_file_when_second_publish_fails(
+@pytest.mark.asyncio
+async def test_restore_removes_new_file_when_second_publish_fails(
     backup_env,
     monkeypatch,
 ):
@@ -323,23 +411,25 @@ def test_restore_removes_new_file_when_second_publish_fails(
     monkeypatch.setattr(backup, "_publish_staged_file", fail_second_publish)
 
     with pytest.raises(ValueError, match="исходное состояние восстановлено"):
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
 
     assert not (backup_env / "subscribers.json").exists()
     assert not (backup_env / "stats_current.json").exists()
 
 
-def test_restore_no_valid_members_raises(backup_env):
+@pytest.mark.asyncio
+async def test_restore_no_valid_members_raises(backup_env):
     raw = _zip_bytes({"seen_ids.json": "{}", "junk.txt": "x"})
     with pytest.raises(ValueError):
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
 
 
-def test_restore_partial_corrupt_does_not_write_before_validation(backup_env):
+@pytest.mark.asyncio
+async def test_restore_partial_corrupt_does_not_write_before_validation(backup_env):
     # битый stats_current не должен оставить полузаписанный файл
     raw = _zip_bytes({"stats_current.json": "{bad"})
     with pytest.raises(ValueError):
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
     assert not (backup_env / "stats_current.json").exists()
 
 
@@ -464,6 +554,7 @@ async def test_weekly_backup_first_time_marks_without_sending(backup_env, monkey
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr("backup.send_backup", sent)
     cur = {"period": "2026-Q2", "events": []}   # нет last_backup_at
+    storage.save_stats_current(cur)
 
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
@@ -477,6 +568,7 @@ async def test_weekly_backup_not_due_does_nothing(backup_env, monkeypatch):
     monkeypatch.setattr("backup.send_backup", sent)
     ts = time.time()
     cur = {"period": "2026-Q2", "events": [], "last_backup_at": ts}
+    storage.save_stats_current(cur)
 
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
@@ -490,6 +582,7 @@ async def test_weekly_backup_due_sends_and_updates(backup_env, monkeypatch):
     monkeypatch.setattr("backup.send_backup", sent)
     old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
     cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
+    storage.save_stats_current(cur)
 
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
@@ -502,6 +595,7 @@ async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monk
     monkeypatch.setattr("backup.send_backup", AsyncMock(return_value=False))
     old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
     cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
+    storage.save_stats_current(cur)
 
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
@@ -516,6 +610,7 @@ def test_empty_stats_current_has_last_backup_at():
     fresh = storage._empty_stats_current("2026-Q2")
     assert "last_backup_at" in fresh
     assert fresh["last_backup_at"] is None
+    assert fresh["pending_quarter_delivery"] is None
 
 
 def test_load_stats_current_backfills_last_backup_at(backup_env):
@@ -529,6 +624,7 @@ def test_load_stats_current_backfills_last_backup_at(backup_env):
     }), encoding="utf-8")
     data = storage.load_stats_current()
     assert data["last_backup_at"] is None
+    assert data["pending_quarter_delivery"] is None
 
 # ─────────────────────────────────────────────────────────────
 #  Бэкап при остановке (SIGTERM) + monotonic-метка для дебаунса
@@ -630,28 +726,31 @@ async def test_shutdown_backup_timeout_cancels_retry_sequence(backup_env, monkey
     '{"subscribers": [1, 2, 3]}',    # subscribers не словарь
     '{"subscribers": {"abc": "x"}}', # ключ не приводится к int (не chat_id)
 ])
-def test_restore_rejects_malformed_subscribers(backup_env, payload):
+@pytest.mark.asyncio
+async def test_restore_rejects_malformed_subscribers(backup_env, payload):
     raw = _zip_bytes({"subscribers.json": payload})
     with pytest.raises(ValueError):          # единственный файл невалиден → нечего восстанавливать
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
     assert not (backup_env / "subscribers.json").exists()
 
 
-def test_restore_skips_bad_shape_keeps_good(backup_env):
+@pytest.mark.asyncio
+async def test_restore_skips_bad_shape_keeps_good(backup_env):
     raw = _zip_bytes({
         "subscribers.json": '{"subscribers": {"5": "Ok"}}',
         "stats_current.json": '{"period": "2026-Q2"}',   # нет events-списка → пропуск
     })
-    result = backup.restore_backup_zip(raw)
+    result = await backup.restore_backup_zip(raw)
     assert "subscribers.json" in result["restored"]
     assert "stats_current.json" in result["skipped"]
     assert not (backup_env / "stats_current.json").exists()
 
 
-def test_restore_rejects_quarter_without_period(backup_env):
+@pytest.mark.asyncio
+async def test_restore_rejects_quarter_without_period(backup_env):
     raw = _zip_bytes({"quarters/x.json": '{"events": []}'})
     with pytest.raises(ValueError):
-        backup.restore_backup_zip(raw)
+        await backup.restore_backup_zip(raw)
 
 
 def test_valid_import_payload_accepts_canonical_shapes():
@@ -665,13 +764,14 @@ def test_valid_import_payload_accepts_canonical_shapes():
 # ─────────────────────────────────────────────────────────────
 
 
-def test_restore_creates_missing_quarters_dir(backup_env):
+@pytest.mark.asyncio
+async def test_restore_creates_missing_quarters_dir(backup_env):
     # эмулируем свежий том: каталога quarters/ ещё нет (кейс из «HIGH RISK» Codacy)
     import shutil
     shutil.rmtree(backup_env / "quarters")
     assert not (backup_env / "quarters").exists()
     raw = _zip_bytes({"quarters/2026-Q1.json": '{"period": "2026-Q1"}'})
-    result = backup.restore_backup_zip(raw)
+    result = await backup.restore_backup_zip(raw)
     assert "quarters/2026-Q1.json" in result["restored"]
     # _atomic_write сам создаёт parent — краша на свежем томе нет
     assert (backup_env / "quarters" / "2026-Q1.json").exists()

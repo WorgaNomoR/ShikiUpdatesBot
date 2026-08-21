@@ -21,8 +21,14 @@ from messages import (
     extract_score_change,
     format_rate_entry,
 )
-from name_grammar import DisplayNameContext, build_display_name_context
-from utils import _utcnow, h
+from name_grammar import (
+    DisplayNameContext,
+    build_display_name_context,
+)
+from utils import (
+    _utcnow,
+    h,
+)
 
 
 def fixed_choice(seq):

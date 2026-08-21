@@ -3,7 +3,10 @@
 """Ограниченные повторы отдельных операций доставки через Telegram."""
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import (
+    Awaitable,
+    Callable,
+)
 from typing import TypeVar
 
 import aiohttp

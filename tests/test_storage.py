@@ -317,6 +317,7 @@ def test_load_stats_current_backfills_tracking_since_from_period_start(monkeypat
     data = storage.load_stats_current()
     assert data["tracking_since"] == "2026-04-01T00:00:00"
     assert data["last_backup_at"] is None          # заодно бэкофилл last_backup_at
+    assert data["pending_quarter_delivery"] is None
 
 
 def test_load_stats_current_backfills_tracking_since_defaults_to_quarter(monkeypatch, tmp_path):

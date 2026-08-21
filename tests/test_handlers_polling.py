@@ -497,6 +497,7 @@ async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
     monkeypatch.setattr(handlers.asyncio, "sleep", _no_sleep)
 
     bot = AsyncMock()
+    storage.save_stats_current(old_cur)
     await handlers.rotate_quarter_if_needed(bot, old_cur, {})   # resync=True (дефолт)
 
     # 1. Бэкап-снапшот ротации ушёл владельцу с тегом.
@@ -542,6 +543,7 @@ async def test_quarter_rotation_without_preceding_snapshot_omits_comparison(
 
     cur = {"period": "2026-Q2", "events": []}
     bot = AsyncMock()
+    storage.save_stats_current(cur)
     await handlers.rotate_quarter_if_needed(bot, cur, storage._empty_stats_all(), resync=False)
 
     report = [call.args[1] for call in bot.send_message.await_args_list]
@@ -563,6 +565,7 @@ async def test_rotation_skips_resync_at_boot(backup_env, monkeypatch):
     monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
 
     old_cur = {"period": "2025-Q1", "events": []}
+    storage.save_stats_current(old_cur)
     await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {}, resync=False)
     sync.assert_not_awaited()
 
@@ -580,5 +583,103 @@ async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
     monkeypatch.setattr("handlers.save_stats_all", lambda *a, **k: None)
 
     old_cur = {"period": "2025-Q1", "events": []}
+    storage.save_stats_current(old_cur)
     await handlers.rotate_quarter_if_needed(AsyncMock(), old_cur, {})
     sync.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rotation_retries_report_before_marking_delivery(
+    backup_env,
+    monkeypatch,
+):
+    monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
+    monkeypatch.setattr(
+        "handlers.build_quarterly_report_messages",
+        lambda *args: ["REPORT"],
+    )
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *args: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *args: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *args: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *args: None)
+    backup_send = AsyncMock(return_value=True)
+    monkeypatch.setattr("handlers.send_backup", backup_send)
+    monkeypatch.setattr(handlers.asyncio, "sleep", AsyncMock())
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = [RuntimeError("owner unavailable"), None]
+    old_cur = {"period": "2026-Q2", "events": []}
+    storage.save_stats_current(old_cur)
+
+    first = await handlers.rotate_quarter_if_needed(
+        bot,
+        old_cur,
+        {},
+        resync=False,
+    )
+
+    assert first["period"] == "2026-Q3"
+    assert first["last_report_sent"] is None
+    assert first["last_backup_at"] is None
+    assert first["pending_quarter_delivery"]["report_sent"] is False
+    backup_send.assert_not_awaited()
+
+    second = await handlers.rotate_quarter_if_needed(
+        bot,
+        first,
+        {},
+        resync=False,
+    )
+
+    assert bot.send_message.await_count == 2
+    backup_send.assert_awaited_once()
+    assert second["last_report_sent"] == "2026-Q3"
+    assert isinstance(second["last_backup_at"], float)
+    assert second["pending_quarter_delivery"] is None
+
+
+@pytest.mark.asyncio
+async def test_rotation_retries_backup_without_repeating_report(
+    backup_env,
+    monkeypatch,
+):
+    monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
+    monkeypatch.setattr(
+        "handlers.build_quarterly_report_messages",
+        lambda *args: ["REPORT"],
+    )
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *args: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *args: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *args: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *args: None)
+    backup_send = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr("handlers.send_backup", backup_send)
+    monkeypatch.setattr(handlers.asyncio, "sleep", AsyncMock())
+
+    bot = AsyncMock()
+    old_cur = {"period": "2026-Q2", "events": []}
+    storage.save_stats_current(old_cur)
+
+    first = await handlers.rotate_quarter_if_needed(
+        bot,
+        old_cur,
+        {},
+        resync=False,
+    )
+
+    assert first["last_report_sent"] == "2026-Q3"
+    assert first["last_backup_at"] is None
+    assert first["pending_quarter_delivery"]["report_sent"] is True
+
+    second = await handlers.rotate_quarter_if_needed(
+        bot,
+        first,
+        {},
+        resync=False,
+    )
+
+    bot.send_message.assert_awaited_once()
+    assert backup_send.await_count == 2
+    assert second["last_report_sent"] == "2026-Q3"
+    assert isinstance(second["last_backup_at"], float)
+    assert second["pending_quarter_delivery"] is None

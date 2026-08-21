@@ -6,7 +6,10 @@
 реализации (правка мутацией). Сетевых/IO-зависимостей нет.
 """
 
-from datetime import datetime, timedelta
+from datetime import (
+    datetime,
+    timedelta,
+)
 
 from utils import (
     _fmt_dt_short,

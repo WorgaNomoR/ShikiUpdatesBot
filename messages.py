@@ -10,7 +10,10 @@
 
 import random
 import re
-from datetime import datetime, timezone
+from datetime import (
+    datetime,
+    timezone,
+)
 
 from config import (
     DISPLAY_NAME,
@@ -21,7 +24,10 @@ from name_grammar import (
     build_display_name_context,
     format_name_template,
 )
-from shiki_api import RANOBE_KINDS, get_media_info
+from shiki_api import (
+    RANOBE_KINDS,
+    get_media_info,
+)
 from utils import (
     _fmt_dt_short,
     _human_ago,

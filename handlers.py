@@ -17,11 +17,20 @@ import aiohttp
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.fsm.state import (
+    State,
+    StatesGroup,
+)
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from backup import (
     BACKUP_TAG,
+    IMPORT_DOCUMENT_MAX_BYTES,
     _backup_after_subscription,
     _weekly_backup_if_due,
     restore_backup_zip,
@@ -79,6 +88,7 @@ from storage import (
     load_stats_all,
     load_stats_current,
     load_subscribers,
+    restorable_state_transaction,
     save_seen_favourites,
     save_seen_ids,
     save_stats_all,
@@ -216,6 +226,92 @@ async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> list[Me
 #  РОТАЦИЯ КВАРТАЛА
 # ═══════════════════════════════════════════════════════════════════
 
+_PENDING_QUARTER_DELIVERY = "pending_quarter_delivery"
+
+
+def _valid_pending_quarter_delivery(cur: dict) -> dict | None:
+    """Вернуть корректное состояние отложенной доставки квартала."""
+    pending = cur.get(_PENDING_QUARTER_DELIVERY)
+    if pending is None:
+        return None
+    if not isinstance(pending, dict) or set(pending) != {
+        "old_period",
+        "new_period",
+        "report_messages",
+        "report_sent",
+    }:
+        return None
+    messages = pending.get("report_messages")
+    if (
+        not isinstance(pending.get("old_period"), str)
+        or not pending["old_period"]
+        or not isinstance(pending.get("new_period"), str)
+        or pending["new_period"] != cur.get("period")
+        or not isinstance(messages, list)
+        or not all(isinstance(message, str) for message in messages)
+        or not isinstance(pending.get("report_sent"), bool)
+    ):
+        return None
+    return pending
+
+
+async def _deliver_pending_quarter(bot: Bot, cur: dict) -> dict:
+    """Дослать квартальный отчёт и бэкап, отмечая только успешные этапы."""
+    pending = _valid_pending_quarter_delivery(cur)
+    if pending is None:
+        if cur.get(_PENDING_QUARTER_DELIVERY) is None:
+            return cur
+        log.warning("rotate_quarter: повреждённое состояние доставки сброшено.")
+        async with restorable_state_transaction():
+            cur = load_stats_current()
+            if (
+                cur.get(_PENDING_QUARTER_DELIVERY) is not None
+                and _valid_pending_quarter_delivery(cur) is None
+            ):
+                cur[_PENDING_QUARTER_DELIVERY] = None
+                save_stats_current(cur)
+        return cur
+
+    if not pending["report_sent"]:
+        for msg in pending["report_messages"]:
+            if not await _send_long(bot, OWNER_ID, msg):
+                return load_stats_current()
+            await asyncio.sleep(0.4)
+
+        async with restorable_state_transaction():
+            cur = load_stats_current()
+            if cur.get(_PENDING_QUARTER_DELIVERY) != pending:
+                return cur
+            pending = dict(pending)
+            pending["report_sent"] = True
+            cur["last_report_sent"] = pending["new_period"]
+            cur[_PENDING_QUARTER_DELIVERY] = pending
+            save_stats_current(cur)
+        log.info(
+            "rotate_quarter: отчёт за %s отправлен владельцу (%d сообщ.).",
+            pending["old_period"],
+            len(pending["report_messages"]),
+        )
+
+    backup_sent = await send_backup(
+        bot,
+        f"🗓️ Ротация квартала: {h(quarter_label(pending['old_period']))} → "
+        f"{h(quarter_label(pending['new_period']))}.\n"
+        f"Снапшот состояния.\n\n{BACKUP_TAG}",
+    )
+    if not backup_sent:
+        return load_stats_current()
+
+    async with restorable_state_transaction():
+        cur = load_stats_current()
+        if cur.get(_PENDING_QUARTER_DELIVERY) != pending:
+            return cur
+        cur["last_backup_at"] = time.time()
+        cur[_PENDING_QUARTER_DELIVERY] = None
+        save_stats_current(cur)
+    return cur
+
+
 async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
     """
     Проверяем смену квартала. Если сменился:
@@ -229,20 +325,12 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
     Возвращает (возможно новый) stats_current.
     """
     now_period = current_quarter()
-    if cur.get("period") == now_period:
-        return cur  # квартал не сменился
+    async with restorable_state_transaction():
+        cur = load_stats_current()
+        rotation_needed = cur.get("period") != now_period
 
-    old_period = cur.get("period", "???")
-
-    if cur.get("last_report_sent") == now_period:
-        # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
-        log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
-        fresh = _empty_stats_current(now_period)
-        fresh["last_report_sent"] = now_period
-        save_stats_current(fresh)
-        return fresh
-
-    log.info("rotate_quarter: квартал сменился %s → %s.", old_period, now_period)
+    if not rotation_needed:
+        return await _deliver_pending_quarter(bot, cur)
 
     # Свежие метаданные перед отчётом. На старте (resync=False) пропускаем:
     # polling_loop уже синкнул stats_all на общей сессии, а второй синк своей
@@ -253,47 +341,54 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
         except Exception as e:
             log.error("rotate_quarter: sync_stats_all упал: %s", e)
 
-    # Сравниваем закрываемый квартал с предшествующим ему снапшотом.
-    prev_period = previous_quarter(old_period)
-    prev_quarter = _load_prev_quarter_summary(prev_period) if prev_period else None
+    async with restorable_state_transaction():
+        cur = load_stats_current()
+        if cur.get("period") == now_period:
+            return cur
 
-    try:
-        report_msgs = build_quarterly_report_messages(cur, stats_all, prev_quarter)
-    except Exception as e:
-        log.error("rotate_quarter: build_quarterly_report_messages упал: %s", e)
-        report_msgs = [f"⚠️ Отчёт за {h(quarter_label(old_period))} не удалось сформировать: {h(str(e))}"]
+        old_period = cur.get("period", "???")
+        if cur.get("last_report_sent") == now_period:
+            # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
+            log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
+            fresh = _empty_stats_current(now_period)
+            fresh["last_report_sent"] = now_period
+            save_stats_current(fresh)
+            return fresh
 
-    # Снапшот квартала
-    _save_quarter_snapshot(old_period, cur, stats_all)
+        log.info("rotate_quarter: квартал сменился %s → %s.", old_period, now_period)
 
-    # Обновляем by_quarter в агрегатах
-    try:
-        _update_by_quarter(stats_all, old_period, cur)
-        save_stats_all(stats_all)
-    except Exception as e:
-        log.error("rotate_quarter: обновление by_quarter: %s", e)
+        # Сравниваем закрываемый квартал с предшествующим ему снапшотом.
+        prev_period = previous_quarter(old_period)
+        prev_quarter = _load_prev_quarter_summary(prev_period) if prev_period else None
 
-    # Новый текущий квартал
-    fresh = _empty_stats_current(now_period)
-    fresh["last_report_sent"] = now_period
-    save_stats_current(fresh)
+        try:
+            report_msgs = build_quarterly_report_messages(cur, stats_all, prev_quarter)
+        except Exception as e:
+            log.error("rotate_quarter: build_quarterly_report_messages упал: %s", e)
+            report_msgs = [
+                f"⚠️ Отчёт за {h(quarter_label(old_period))} "
+                f"не удалось сформировать: {h(str(e))}"
+            ]
 
-    # Отправка отчёта владельцу — по сообщению на тему
-    for msg in report_msgs:
-        await _send_long(bot, OWNER_ID, msg)
-        await asyncio.sleep(0.4)
-    log.info("rotate_quarter: отчёт за %s отправлен владельцу (%d сообщ.).", old_period, len(report_msgs))
+        # Снапшот квартала и новый текущий квартал публикуются под одним lock.
+        _save_quarter_snapshot(old_period, cur, stats_all)
 
-    # Снапшот состояния по случаю ротации (страховка + сбрасывает недельный таймер)
-    fresh["last_backup_at"] = time.time()
-    save_stats_current(fresh)
-    await send_backup(
-        bot,
-        f"🗓️ Ротация квартала: {h(quarter_label(old_period))} → "
-        f"{h(quarter_label(now_period))}.\nСнапшот состояния.\n\n{BACKUP_TAG}",
-    )
+        try:
+            _update_by_quarter(stats_all, old_period, cur)
+            save_stats_all(stats_all)
+        except Exception as e:
+            log.error("rotate_quarter: обновление by_quarter: %s", e)
 
-    return fresh
+        fresh = _empty_stats_current(now_period)
+        fresh[_PENDING_QUARTER_DELIVERY] = {
+            "old_period": old_period,
+            "new_period": now_period,
+            "report_messages": report_msgs,
+            "report_sent": False,
+        }
+        save_stats_current(fresh)
+
+    return await _deliver_pending_quarter(bot, fresh)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -301,7 +396,7 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
 # ═══════════════════════════════════════════════════════════════════
 
 async def _send_long(bot: Bot, chat_id: int, text: str,
-                     disable_preview: bool = False) -> None:
+                     disable_preview: bool = False) -> bool:
     """
     Отправка с разбивкой по строкам если > 4000 символов (не рвём HTML-теги).
 
@@ -315,7 +410,7 @@ async def _send_long(bot: Bot, chat_id: int, text: str,
         if len(text) <= MAX:
             await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                    disable_web_page_preview=disable_preview)
-            return
+            return True
         chunks: list[str] = []
         buf = ""
         for line in text.splitlines(keepends=True):
@@ -331,8 +426,10 @@ async def _send_long(bot: Bot, chat_id: int, text: str,
             await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML,
                                    disable_web_page_preview=disable_preview)
             await asyncio.sleep(0.5)
+        return True
     except Exception as e:
         log.error("_send_long: не удалось отправить (chat_id=%d): %s", chat_id, e)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -640,14 +737,19 @@ async def check_and_notify_favourites(
     return seen, found_new
 
 
-def _unsubscribe_blocked(subs: dict[int, str], to_remove: list[int]) -> None:
+async def _unsubscribe_blocked(to_remove: list[int]) -> None:
     """Удаляет заблокировавших из subs и сохраняет актуальный список."""
     if not to_remove:
         return
-    for cid in to_remove:
-        subs.pop(cid, None)
-    save_subscribers(subs)
-    log.info("Отписано %d пользователей, заблокировавших бота.", len(to_remove))
+    async with restorable_state_transaction():
+        subs = load_subscribers()
+        removed = 0
+        for cid in to_remove:
+            if subs.pop(cid, None) is not None:
+                removed += 1
+        if removed:
+            save_subscribers(subs)
+    log.info("Отписано %d пользователей, заблокировавших бота.", removed)
 
 
 async def send_to_all_chats(bot: Bot, text: str) -> None:
@@ -685,7 +787,7 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
         # Небольшая пауза между отправками — не триггерим flood control
         await asyncio.sleep(0.3)
 
-    _unsubscribe_blocked(subs, to_remove)
+    await _unsubscribe_blocked(to_remove)
 
 
 async def _fetch_history_catchup(
@@ -750,7 +852,7 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
 
     if entries is None:
         log.info("Запрос истории не удался — пропускаем цикл.")
-        return seen_ids, cur
+        return seen_ids, load_stats_current()
 
     # baseline пуст (первый запуск либо стартовая инициализация не прошла
     # из-за 429/сети) — молча фиксируем текущую историю как baseline и
@@ -759,19 +861,20 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
         seen_ids = {e["id"] for e in entries}
         save_seen_ids(seen_ids)
         log.info("История: baseline инициализирован в цикле (%d ID), без отправки.", len(seen_ids))
-        return seen_ids, cur
+        return seen_ids, load_stats_current()
 
     new_entries = [e for e in entries if e["id"] not in seen_ids]
 
     if not new_entries:
         log.info("Новых записей нет.")
-        return seen_ids, cur
+        return seen_ids, load_stats_current()
 
     log.info("Найдено новых записей: %d", len(new_entries))
 
     # Сортируем по ID: от старых к новым — хронологический порядок сообщений
     new_entries.sort(key=lambda e: e["id"])
 
+    state_updates: list[tuple[dict, str, str, int | None]] = []
     for entry in new_entries:
         entry_id   = entry["id"]
         media_type, kind = get_media_info(entry)
@@ -794,7 +897,7 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
             entry_id, media_type, kind, entry.get("description", ""),
         )
 
-        # Фиксируем событие в статистике квартала (до отправки — независимо от неё)
+        # Готовим дельту квартальной статистики независимо от результата отправки.
         description = entry.get("description", "") or ""
         event_type  = classify_event(description)
         if event_type == "ignored":
@@ -805,7 +908,7 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
             )
             continue
         if event_type == "score_removed":
-            cur = record_current_event(cur, entry, event_type, media_type, None)
+            state_updates.append((entry, event_type, media_type, None))
             log.info(
                 "Отмена оценки учтена без уведомления entry id=%d: %r",
                 entry_id,
@@ -826,7 +929,7 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
                 score = chg[1] if chg else None
             else:
                 score = None
-            cur = record_current_event(cur, entry, event_type, media_type, score)
+            state_updates.append((entry, event_type, media_type, score))
 
         text = build_message(entry)
         await send_to_all_chats(bot, text)
@@ -835,7 +938,12 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
         await asyncio.sleep(1)
 
     save_seen_ids(seen_ids)
-    save_stats_current(cur)
+    async with restorable_state_transaction():
+        cur = load_stats_current()
+        for entry, event_type, media_type, score in state_updates:
+            cur = record_current_event(cur, entry, event_type, media_type, score)
+        if state_updates:
+            save_stats_current(cur)
     return seen_ids, cur
 
 
@@ -1053,7 +1161,7 @@ async def probe_owner_and_start(bot: Bot) -> None:
 # ═══════════════════════════════════════════════════════════════
 #
 #  Экспорт = zip всего DATA_DIR (минус *.tmp-огрызки _atomic_write).
-#  Импорт  = по белому списку (subscribers, stats_current, quarters/*);
+#  Импорт  = по белому списку (subscribers, stats_current, update_state, quarters/*);
 #            всё прочее в архиве намеренно отбрасывается — seen_ids,
 #            seen_favourites и stats_all регенерируются сами, тащить их
 #            обратно незачем. Асимметрия экспорт(всё)/импорт(бел.список)
@@ -1096,8 +1204,8 @@ async def cmd_backup(message: Message) -> None:
         "💾 <b>Резервное копирование</b>\n\n"
         "📤 <b>Экспорт</b> — пришлю zip-архив всего состояния "
         "(подписчики, статистика, кварталы).\n"
-        "📥 <b>Импорт</b> — восстановлю из архива подписчиков, текущий квартал "
-        "и снапшоты кварталов.",
+        "📥 <b>Импорт</b> — восстановлю из архива подписчиков, текущий квартал, "
+        "состояние проверки обновлений и снапшоты кварталов.",
         reply_markup=_backup_menu_kb(),
         parse_mode=ParseMode.HTML,
     )
@@ -1126,8 +1234,9 @@ async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(BackupStates.waiting_import_file)
     prompt = await callback.message.edit_text(
         "📥 Пришли <b>.zip</b>-архив бэкапа (как файл-документ).\n\n"
-        "Возьму из него только нужное — подписчиков, текущий квартал и снапшоты "
-        "кварталов. Лишнее в архиве не помешает, спокойно пропущу.\n\n/cancel — отмена",
+        "Возьму из него только нужное — подписчиков, текущий квартал, состояние "
+        "проверки обновлений и снапшоты кварталов. Лишнее в архиве не помешает, "
+        "спокойно пропущу.\n\n/cancel — отмена",
         parse_mode=ParseMode.HTML,
     )
     await state.update_data(prompt_msg_id=prompt.message_id)
@@ -1154,6 +1263,12 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
         await message.answer("📎 Жду <b>.zip</b>-архив бэкапа. Или /cancel.",
                              parse_mode=ParseMode.HTML)
         return
+    if not isinstance(doc.file_size, int) or doc.file_size > IMPORT_DOCUMENT_MAX_BYTES:
+        await message.answer(
+            "📦 Архив должен иметь известный размер не больше <b>20 МиБ</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     fsm = await state.get_data()
     await state.clear()
@@ -1171,7 +1286,7 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        result = restore_backup_zip(raw)
+        result = await restore_backup_zip(raw)
     except ValueError as e:
         await message.answer(f"❌ Архив не восстановлен: {h(str(e))}",
                              parse_mode=ParseMode.HTML)
@@ -1182,6 +1297,8 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
     lines += [f"  • <code>{h(n)}</code>" for n in restored]
     if "subscribers.json" in restored:
         lines.append(f"\n👥 Подписчиков теперь: <b>{len(load_subscribers())}</b>")
+    if "update_state.json" in restored:
+        lines.append("\n🔄 Состояние проверки обновлений восстановлено.")
     if skipped:
         lines.append(f"\n⏭️ Пропущено (вне белого списка/битые): {len(skipped)}")
     await _safe_delete(message.bot, message.chat.id, message.message_id)
@@ -1198,11 +1315,17 @@ async def cmd_start(message: Message) -> None:
         if start_polling_loop(message.bot):
             log.info("Фоновый цикл добужен владельцем через /start.")
 
-    subs = load_subscribers()
     chat_id = message.chat.id
     name = message.from_user.full_name if message.from_user else str(chat_id)
 
-    if chat_id in subs:
+    async with restorable_state_transaction():
+        subs = load_subscribers()
+        already_subscribed = chat_id in subs
+        if not already_subscribed:
+            subs[chat_id] = name
+            save_subscribers(subs)
+
+    if already_subscribed:
         await message.answer(
             f"☕ Ты уже подписан, {h(name)}! Буду слать новости об активности "
             f"{h(DISPLAY_NAME_CONTEXT.genitive)}.",
@@ -1210,8 +1333,6 @@ async def cmd_start(message: Message) -> None:
         )
         return
 
-    subs[chat_id] = name
-    save_subscribers(subs)
     log.info("Новый подписчик: %s (chat_id=%d). Всего: %d.", name, chat_id, len(subs))
     await _backup_after_subscription(message.bot, chat_id, name, subscribed=True)
     reply = (
@@ -1225,18 +1346,22 @@ async def cmd_start(message: Message) -> None:
 
 async def cmd_stop(message: Message) -> None:
     """Отписаться от уведомлений."""
-    subs = load_subscribers()
     chat_id = message.chat.id
     name = message.from_user.full_name if message.from_user else str(chat_id)
 
-    if chat_id not in subs:
+    async with restorable_state_transaction():
+        subs = load_subscribers()
+        was_subscribed = chat_id in subs
+        if was_subscribed:
+            subs.pop(chat_id)
+            save_subscribers(subs)
+
+    if not was_subscribed:
         await message.answer(
             "🤔 Ты и так не подписан. Напиши /start чтобы подписаться."
         )
         return
 
-    subs.pop(chat_id)
-    save_subscribers(subs)
     log.info("Отписался: %s (chat_id=%d). Осталось: %d.", name, chat_id, len(subs))
     await _backup_after_subscription(message.bot, chat_id, name, subscribed=False)
     reply = (
@@ -1375,7 +1500,7 @@ async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> No
             failed += 1
         await asyncio.sleep(0.3)
 
-    _unsubscribe_blocked(subs, to_remove)
+    await _unsubscribe_blocked(to_remove)
 
     await callback.message.edit_text(
         f"✅ Отправлено: {sent}" + (f", ошибок: {failed}" if failed else "") + "."

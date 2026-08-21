@@ -6,7 +6,10 @@ build_favourite_message (leaf messages) вынесен в test_messages.py."""
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 

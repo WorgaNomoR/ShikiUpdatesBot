@@ -2,7 +2,10 @@
 # Copyright (C) 2026  WorgaNomoR
 """Владелецкая команда /version."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 from aiogram.enums import ParseMode

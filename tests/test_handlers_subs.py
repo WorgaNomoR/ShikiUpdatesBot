@@ -4,7 +4,10 @@
 (отписка). Ассертим оркестрацию (кого зовём, что сохраняем), не рендер-текст.
 Границы ввода-вывода (storage, авто-бэкап) мокаем."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 from aiogram.enums import ParseMode

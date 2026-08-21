@@ -9,7 +9,11 @@ from html import escape
 from typing import Literal
 
 from pytrovich.detector import PetrovichGenderDetector
-from pytrovich.enums import Case, Gender, NamePart
+from pytrovich.enums import (
+    Case,
+    Gender,
+    NamePart,
+)
 from pytrovich.maker import PetrovichDeclinationMaker
 
 DisplayGender = Literal["male", "female"]

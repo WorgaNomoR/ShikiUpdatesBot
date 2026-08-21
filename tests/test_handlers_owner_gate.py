@@ -3,7 +3,10 @@
 """Тесты owner-reachability gate: запуск/гейт фонового цикла на старте."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 

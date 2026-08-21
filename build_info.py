@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import re
 
-from project_meta import PROJECT_REPOSITORY, PROJECT_VERSION
+from project_meta import (
+    PROJECT_REPOSITORY,
+    PROJECT_VERSION,
+)
 
 try:
     from _build_info import (  # type: ignore[import-not-found]

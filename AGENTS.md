@@ -17,6 +17,7 @@
 ### Language and code comments
 
 - Write Python and build-script comments, module docstrings, and function/class docstrings in Russian. Keep identifiers, protocol names, library/API names, command-line flags, and standard license headers in their canonical form. GitHub issues, commit/PR metadata, and unavoidable third-party configuration fields remain in English where the workflow requires it.
+- Format every `from ... import ...` with multiple names as a parenthesized vertical list with one name per line and trailing commas; keep single-name imports on one line.
 
 ### Canon and durable knowledge
 

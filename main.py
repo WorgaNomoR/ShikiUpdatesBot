@@ -8,7 +8,11 @@ Shikimori History Watcher Bot
 
 import asyncio
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import (
+    Bot,
+    Dispatcher,
+    F,
+)
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
@@ -44,7 +48,10 @@ from handlers import (
     stats_menu_cb,
 )
 from healthcheck import start_health_server
-from runtime import IS_FROZEN, WindowsConsoleCloseGuard
+from runtime import (
+    IS_FROZEN,
+    WindowsConsoleCloseGuard,
+)
 from updates import start_update_loop
 
 

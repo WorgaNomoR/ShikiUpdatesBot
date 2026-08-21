@@ -13,7 +13,10 @@
   - @pytest.mark.asyncio на async-тестах
   - тест обязан падать на непропатченном коде и проходить на пропатченном
 """
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 
