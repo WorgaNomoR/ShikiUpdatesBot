@@ -1,0 +1,61 @@
+version: 2
+
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    groups:
+      runtime-minor-and-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "aiogram"
+          - "aiohttp"
+          - "python-dotenv"
+          - "pytrovich"
+        update-types:
+          - "minor"
+          - "patch"
+      test-minor-and-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "pytest"
+          - "pytest-*"
+          - "pyyaml"
+        update-types:
+          - "minor"
+          - "patch"
+      build-minor-and-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "pyinstaller"
+          - "pyinstaller-hooks-contrib"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 1
+    ignore:
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    groups:
+      actions-minor-and-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
