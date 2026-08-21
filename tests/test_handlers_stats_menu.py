@@ -31,6 +31,13 @@ async def test_cmd_stats_menu_is_reply():
 
     message.reply.assert_awaited_once()
     message.answer.assert_not_called()
+    reply_markup = message.reply.await_args.kwargs["reply_markup"]
+    assert reply_markup == handlers._stats_menu_kb()
+    assert any(
+        button.callback_data == "stats:close"
+        for row in reply_markup.inline_keyboard
+        for button in row
+    )
 
 
 @pytest.mark.asyncio

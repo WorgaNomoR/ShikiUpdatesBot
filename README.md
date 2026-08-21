@@ -413,9 +413,9 @@ pip install -r requirements.txt -r requirements-dev.txt
 Запуск тестов:
 
 ```bash
-pytest tests/                        # все тесты
-pytest tests/test_notify.py -v       # конкретный файл, подробный вывод
-pytest tests/ -v --cov               # с измерением покрытия
+pytest tests/                            # все тесты
+pytest tests/test_handlers_notify.py -v  # конкретный файл, подробный вывод
+pytest tests/ -v --cov                   # с измерением покрытия
 ```
 
 **Важно:** тесты требуют переменные окружения `BOT_TOKEN` и `OWNER_ID` — они автоматически выставляются в `tests/conftest.py`, отдельно настраивать ничего не нужно.

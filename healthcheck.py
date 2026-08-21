@@ -101,7 +101,7 @@ async def start_health_server(
     check_interval: int,
     misses: int = 3,
     port: int | None = None,
-) -> web.AppRunner:
+) -> web.AppRunner | None:
     """
     Поднимает HTTP-сервер для healthcheck параллельно с ботом.
 

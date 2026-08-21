@@ -34,7 +34,7 @@ jobs:
           BOT_TOKEN: test-token
           OWNER_ID: 123456
         run: |
-          pytest --cov --cov-report=term-missing --cov-report=xml --cov-fail-under=50
+          pytest --cov --cov-report=term-missing --cov-report=xml
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4

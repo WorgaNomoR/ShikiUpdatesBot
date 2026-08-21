@@ -178,7 +178,7 @@ def test_get_media_info_anime_by_type():
 
 @pytest.mark.parametrize("kind", ["light_novel", "novel", "ranobe"])
 def test_get_media_info_ranobe_kind_is_manga(kind):
-    """Ranobe kind determines the manga domain even without target.type."""
+    """Вид ранобэ определяет домен манги даже без target.type."""
     assert get_media_info({"target": {"kind": kind}}) == ("manga", kind)
 
 
