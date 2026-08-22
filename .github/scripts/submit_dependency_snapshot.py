@@ -36,9 +36,12 @@ PIP_REPORT_PATHS = {
     "requirements-dev.txt": Path("dependency-report-dev.json"),
     "requirements-build.txt": Path("dependency-report-build.json"),
 }
-DETECTOR_NAME = "shikiupdatesbot-pip-report"
-DETECTOR_VERSION = "1"
-DETECTOR_URL = "https://github.com/WorgaNomoR/ShikiUpdatesBot"
+DETECTOR_NAME = "Component Detection"
+DETECTOR_VERSION = "0.0.1"
+DETECTOR_URL = (
+    "https://github.com/advanced-security/"
+    "component-detection-dependency-submission-action"
+)
 API_VERSION = "2026-03-10"
 
 
