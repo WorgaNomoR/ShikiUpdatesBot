@@ -3,11 +3,9 @@
 """Статические гарантии отправки разрешённого Python dependency graph."""
 
 import importlib.util
-import json
-import subprocess  # nosec B404 - subprocess нужен для чёрного ящика CLI.
-import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +38,24 @@ EXPECTED_ACTIONS = [
 ]
 EXPECTED_RUN_STEPS = [
     (
+        "Resolve runtime dependencies",
+        "python -m pip install --disable-pip-version-check --dry-run "
+        "--ignore-installed --report dependency-report-runtime.json "
+        "--requirement requirements.txt",
+    ),
+    (
+        "Resolve development dependencies",
+        "python -m pip install --disable-pip-version-check --dry-run "
+        "--ignore-installed --report dependency-report-dev.json "
+        "--requirement requirements-dev.txt",
+    ),
+    (
+        "Resolve build dependencies",
+        "python -m pip install --disable-pip-version-check --dry-run "
+        "--ignore-installed --report dependency-report-build.json "
+        "--requirement requirements-build.txt",
+    ),
+    (
         "Build resolved Python dependency snapshot",
         "python .github/scripts/submit_dependency_snapshot.py "
         "build dependency-snapshot.json",
@@ -63,6 +79,14 @@ def _load_workflow() -> dict:
 
 def _load_submitter():
     spec = importlib.util.spec_from_file_location("dependency_submitter", SUBMITTER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_validator():
+    spec = importlib.util.spec_from_file_location("dependency_validator", VALIDATOR_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -221,42 +245,25 @@ def _resolved_manifest(manifest: str) -> dict:
     }
 
 
-def _run_validator(tmp_path: Path, manifests: object) -> subprocess.CompletedProcess:
-    output_path = tmp_path / "dependency-snapshot.json"
-    output_path.write_text(
-        json.dumps({"manifests": manifests}),
-        encoding="utf-8",
-    )
-    # shell не используется, команда и временный путь принадлежат тесту.
-    return subprocess.run(  # nosec B603
-        [sys.executable, str(VALIDATOR_PATH), str(output_path)],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def test_dependency_submission_validator_accepts_three_resolved_root_manifests(tmp_path):
+def test_dependency_submission_validator_accepts_three_resolved_root_manifests():
+    validator = _load_validator()
     manifests = {
         manifest.name: _resolved_manifest(manifest.name)
         for manifest in EXPECTED_MANIFESTS
     }
 
-    result = _run_validator(tmp_path, manifests)
-
-    assert result.returncode == 0
-    assert "validation passed" in result.stdout
+    validator.validate_dependency_submission({"manifests": manifests})
 
 
-def test_dependency_submission_validator_rejects_empty_snapshot(tmp_path):
-    result = _run_validator(tmp_path, {})
+def test_dependency_submission_validator_rejects_empty_snapshot():
+    validator = _load_validator()
 
-    assert result.returncode == 1
-    assert "Missing manifests" in result.stderr
+    with pytest.raises(ValueError, match="Missing manifests"):
+        validator.validate_dependency_submission({"manifests": {}})
 
 
-def test_dependency_submission_validator_rejects_wrong_source_location(tmp_path):
+def test_dependency_submission_validator_rejects_wrong_source_location():
+    validator = _load_validator()
     manifests = {
         manifest.name: _resolved_manifest(manifest.name)
         for manifest in EXPECTED_MANIFESTS
@@ -265,13 +272,12 @@ def test_dependency_submission_validator_rejects_wrong_source_location(tmp_path)
         "source_location": ".github/dependency-submission/requirements.txt",
     }
 
-    result = _run_validator(tmp_path, manifests)
-
-    assert result.returncode == 1
-    assert "Invalid source_location for requirements.txt" in result.stderr
+    with pytest.raises(ValueError, match="Invalid source_location for requirements.txt"):
+        validator.validate_dependency_submission({"manifests": manifests})
 
 
-def test_dependency_submission_validator_rejects_manifest_without_edges(tmp_path):
+def test_dependency_submission_validator_rejects_manifest_without_edges():
+    validator = _load_validator()
     manifests = {
         manifest.name: _resolved_manifest(manifest.name)
         for manifest in EXPECTED_MANIFESTS
@@ -279,7 +285,8 @@ def test_dependency_submission_validator_rejects_manifest_without_edges(tmp_path
     for dependency in manifests["requirements.txt"]["resolved"].values():
         dependency["dependencies"] = []
 
-    result = _run_validator(tmp_path, manifests)
-
-    assert result.returncode == 1
-    assert "No transitive dependency edges resolved for requirements.txt" in result.stderr
+    with pytest.raises(
+        ValueError,
+        match="No transitive dependency edges resolved for requirements.txt",
+    ):
+        validator.validate_dependency_submission({"manifests": manifests})

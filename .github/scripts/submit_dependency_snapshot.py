@@ -6,9 +6,7 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 from datetime import (
     UTC,
     datetime,
@@ -33,6 +31,11 @@ MANIFEST_SCOPES = {
     "requirements-dev.txt": "development",
     "requirements-build.txt": "development",
 }
+PIP_REPORT_PATHS = {
+    "requirements.txt": Path("dependency-report-runtime.json"),
+    "requirements-dev.txt": Path("dependency-report-dev.json"),
+    "requirements-build.txt": Path("dependency-report-build.json"),
+}
 DETECTOR_NAME = "shikiupdatesbot-pip-report"
 DETECTOR_VERSION = "1"
 DETECTOR_URL = "https://github.com/WorgaNomoR/ShikiUpdatesBot"
@@ -50,28 +53,9 @@ def _package_url(name: str, version: str) -> str:
     return f"pkg:pypi/{quote(normalized_name, safe='-')}@{quote(version, safe='.+!-_')}"
 
 
-def _generate_pip_report(manifest_path: Path) -> dict:
-    """Получает разрешённый граф manifest через штатный отчёт pip."""
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        report_path = Path(temporary_directory) / "pip-report.json"
-        # shell не используется, а manifest выбирается из констант ниже.
-        subprocess.run(  # nosec B603
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--dry-run",
-                "--ignore-installed",
-                "--report",
-                str(report_path),
-                "--requirement",
-                str(manifest_path),
-            ],
-            check=True,
-        )
-        return json.loads(report_path.read_text(encoding="utf-8"))
+def _load_pip_report(report_path: Path) -> dict:
+    """Читает созданный workflow отчёт штатной команды pip."""
+    return json.loads(report_path.read_text(encoding="utf-8"))
 
 
 def _marker_applies(requirement: Requirement) -> bool:
@@ -167,7 +151,9 @@ def build_snapshot(repository_root: Path) -> dict:
     manifests = {}
     for manifest_name, scope in MANIFEST_SCOPES.items():
         manifest_path = repository_root / manifest_name
-        pip_report = _generate_pip_report(manifest_path)
+        if not manifest_path.is_file():
+            raise ValueError(f"Missing canonical manifest: {manifest_name}")
+        pip_report = _load_pip_report(repository_root / PIP_REPORT_PATHS[manifest_name])
         manifests[manifest_name] = build_manifest_snapshot(
             manifest_name,
             scope,
@@ -253,7 +239,6 @@ def main() -> int:
             print(response.get("message", "Dependency snapshot submitted"))
     except (
         OSError,
-        subprocess.CalledProcessError,
         json.JSONDecodeError,
         ValueError,
     ) as exc:

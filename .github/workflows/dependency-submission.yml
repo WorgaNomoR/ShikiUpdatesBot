@@ -37,6 +37,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Resolve runtime dependencies
+        run: python -m pip install --disable-pip-version-check --dry-run --ignore-installed --report dependency-report-runtime.json --requirement requirements.txt
+
+      - name: Resolve development dependencies
+        run: python -m pip install --disable-pip-version-check --dry-run --ignore-installed --report dependency-report-dev.json --requirement requirements-dev.txt
+
+      - name: Resolve build dependencies
+        run: python -m pip install --disable-pip-version-check --dry-run --ignore-installed --report dependency-report-build.json --requirement requirements-build.txt
+
       - name: Build resolved Python dependency snapshot
         run: python .github/scripts/submit_dependency_snapshot.py build dependency-snapshot.json
 
