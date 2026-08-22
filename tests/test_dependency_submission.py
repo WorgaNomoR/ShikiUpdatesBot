@@ -4,7 +4,7 @@
 
 import importlib.util
 import json
-import subprocess
+import subprocess  # nosec B404 - subprocess нужен для чёрного ящика CLI.
 import sys
 from pathlib import Path
 
@@ -124,7 +124,7 @@ def test_dependency_submission_uses_python_312_and_scopes_token_to_upload():
         "python-version": "3.12",
     }
     assert named_steps["Submit resolved Python dependency snapshot"]["env"] == {
-        "GITHUB_TOKEN": "${{ github.token }}",
+        "GITHUB_TOKEN": "${{ github.token }}",  # nosec B105 - выражение Actions.
     }
     assert all(
         "env" not in step
@@ -227,7 +227,7 @@ def _run_validator(tmp_path: Path, manifests: object) -> subprocess.CompletedPro
         json.dumps({"manifests": manifests}),
         encoding="utf-8",
     )
-    return subprocess.run(
+    return subprocess.run(  # nosec B603 - shell не используется, команда тестовая.
         [sys.executable, str(VALIDATOR_PATH), str(output_path)],
         cwd=tmp_path,
         capture_output=True,

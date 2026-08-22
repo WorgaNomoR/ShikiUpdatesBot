@@ -54,7 +54,7 @@ def _generate_pip_report(manifest_path: Path) -> dict:
     """Получает разрешённый граф manifest через штатный отчёт pip."""
     with tempfile.TemporaryDirectory() as temporary_directory:
         report_path = Path(temporary_directory) / "pip-report.json"
-        subprocess.run(
+        subprocess.run(  # nosec B603 - shell не используется, manifest задан кодом.
             [
                 sys.executable,
                 "-m",
