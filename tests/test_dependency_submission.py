@@ -92,7 +92,7 @@ def test_dependency_submission_uses_python_312_without_persisted_credentials():
         "python-version": "3.12",
     }
     assert named_steps["Submit resolved Python dependency graph"]["with"] == {
-        "filePath": ".",
+        "filePath": ".github/dependency-submission",
         "correlator": "shikiupdatesbot-python-3.12",
     }
 

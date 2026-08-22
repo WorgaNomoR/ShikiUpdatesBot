@@ -39,5 +39,5 @@ jobs:
       - name: Submit resolved Python dependency graph
         uses: advanced-security/component-detection-dependency-submission-action@31f25a8de68ae5ce2ca274bc28546a78683c15ce # v0.1.4
         with:
-          filePath: "."
+          filePath: ".github/dependency-submission"
           correlator: "shikiupdatesbot-python-3.12"
