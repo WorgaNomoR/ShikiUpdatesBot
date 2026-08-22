@@ -227,7 +227,8 @@ def _run_validator(tmp_path: Path, manifests: object) -> subprocess.CompletedPro
         json.dumps({"manifests": manifests}),
         encoding="utf-8",
     )
-    return subprocess.run(  # nosec B603 - shell не используется, команда тестовая.
+    # shell не используется, команда и временный путь принадлежат тесту.
+    return subprocess.run(  # nosec B603
         [sys.executable, str(VALIDATOR_PATH), str(output_path)],
         cwd=tmp_path,
         capture_output=True,
