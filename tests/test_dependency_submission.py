@@ -168,6 +168,17 @@ def test_dependency_submission_has_exactly_three_canonical_root_manifests():
     assert not adapter.exists()
 
 
+def test_dependency_submission_replaces_legacy_detector_snapshot():
+    submitter = _load_submitter()
+
+    assert submitter.DETECTOR_NAME == "Component Detection"
+    assert submitter.DETECTOR_VERSION == "0.0.1"
+    assert submitter.DETECTOR_URL == (
+        "https://github.com/advanced-security/"
+        "component-detection-dependency-submission-action"
+    )
+
+
 def _pip_report() -> dict:
     return {
         "install": [
