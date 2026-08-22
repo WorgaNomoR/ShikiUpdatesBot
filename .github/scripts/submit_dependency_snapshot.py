@@ -42,6 +42,7 @@ DETECTOR_URL = (
     "https://github.com/advanced-security/"
     "component-detection-dependency-submission-action"
 )
+CORRELATOR = "00-shikiupdatesbot-python-3.12"
 API_VERSION = "2026-03-10"
 
 
@@ -168,7 +169,7 @@ def build_snapshot(repository_root: Path) -> dict:
         "sha": os.environ.get("GITHUB_SHA", "local-dry-run"),
         "ref": os.environ.get("GITHUB_REF", "refs/heads/local-dry-run"),
         "job": {
-            "correlator": "shikiupdatesbot-python-3.12",
+            "correlator": CORRELATOR,
             "id": os.environ.get("GITHUB_RUN_ID", "local-dry-run"),
         },
         "detector": {
