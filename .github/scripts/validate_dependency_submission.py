@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Проверяет, что Component Detection разрешил все корневые Python manifests."""
+"""Проверяет snapshot корневых Python manifests перед отправкой в GitHub."""
 
 import json
 import sys
@@ -13,62 +13,66 @@ EXPECTED_MANIFESTS = (
 )
 
 
-def _repository_relative_path(raw_path: str, repository_root: Path) -> str | None:
-    """Возвращает путь из отчёта относительно корня репозитория."""
-    path = Path(raw_path)
-    if not path.is_absolute():
-        return path.as_posix()
-
-    try:
-        return path.relative_to(repository_root.resolve()).as_posix()
-    except ValueError:
-        return None
-
-
-def validate_dependency_submission(payload: object, repository_root: Path) -> None:
+def validate_dependency_submission(payload: object) -> None:
     """Отклоняет пустой, неполный или неразрешённый dependency graph."""
     if not isinstance(payload, dict):
-        raise ValueError("Component Detection output must be a JSON object")
+        raise ValueError("Dependency snapshot must be a JSON object")
 
-    dependency_graphs = payload.get("dependencyGraphs")
-    if not isinstance(dependency_graphs, dict):
-        raise ValueError("Component Detection output has no dependencyGraphs object")
+    manifests = payload.get("manifests")
+    if not isinstance(manifests, dict):
+        raise ValueError("Dependency snapshot has no manifests object")
 
-    normalized_graphs = {
-        relative_path: graph
-        for raw_path, graph in dependency_graphs.items()
-        if isinstance(raw_path, str)
-        and (relative_path := _repository_relative_path(raw_path, repository_root))
-        is not None
-    }
-    missing = sorted(set(EXPECTED_MANIFESTS) - normalized_graphs.keys())
+    missing = sorted(set(EXPECTED_MANIFESTS) - manifests.keys())
     if missing:
-        raise ValueError(f"Missing dependency graphs: {', '.join(missing)}")
+        raise ValueError(f"Missing manifests: {', '.join(missing)}")
+    unexpected = sorted(manifests.keys() - set(EXPECTED_MANIFESTS))
+    if unexpected:
+        raise ValueError(f"Unexpected manifests: {', '.join(unexpected)}")
 
     for manifest in EXPECTED_MANIFESTS:
-        graph = normalized_graphs[manifest]
-        if not isinstance(graph, dict):
-            raise ValueError(f"Invalid dependency graph for {manifest}")
+        manifest_snapshot = manifests[manifest]
+        if not isinstance(manifest_snapshot, dict):
+            raise ValueError(f"Invalid manifest snapshot for {manifest}")
+        if manifest_snapshot.get("name") != manifest:
+            raise ValueError(f"Invalid manifest name for {manifest}")
+        if manifest_snapshot.get("file") != {"source_location": manifest}:
+            raise ValueError(f"Invalid source_location for {manifest}")
 
-        direct_dependencies = graph.get("explicitlyReferencedComponentIds")
-        if not isinstance(direct_dependencies, list) or not direct_dependencies:
+        resolved = manifest_snapshot.get("resolved")
+        if not isinstance(resolved, dict) or not resolved:
+            raise ValueError(f"No resolved dependencies for {manifest}")
+        if not any(
+            isinstance(dependency, dict)
+            and dependency.get("relationship") == "direct"
+            for dependency in resolved.values()
+        ):
             raise ValueError(f"No direct dependencies resolved for {manifest}")
 
-        dependency_edges = graph.get("graph")
-        has_edges = isinstance(dependency_edges, dict) and any(
-            isinstance(children, list) and children
-            for children in dependency_edges.values()
+        has_edges = any(
+            isinstance(dependency, dict)
+            and isinstance(dependency.get("dependencies"), list)
+            and dependency["dependencies"]
+            for dependency in resolved.values()
         )
         if not has_edges:
             raise ValueError(f"No transitive dependency edges resolved for {manifest}")
 
+        for key, dependency in resolved.items():
+            if not isinstance(key, str) or "@" not in key:
+                raise ValueError(f"Unversioned dependency key in {manifest}")
+            if not isinstance(dependency, dict) or dependency.get("package_url") != key:
+                raise ValueError(f"Invalid dependency entry in {manifest}")
+            children = dependency.get("dependencies")
+            if not isinstance(children, list) or any(child not in resolved for child in children):
+                raise ValueError(f"Invalid dependency edge in {manifest}")
+
 
 def main() -> int:
-    """Читает отчёт Component Detection и возвращает код результата проверки."""
-    output_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("output.json")
+    """Читает snapshot и возвращает код результата проверки."""
+    output_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dependency-snapshot.json")
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
-        validate_dependency_submission(payload, Path.cwd())
+        validate_dependency_submission(payload)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"Dependency submission validation failed: {exc}", file=sys.stderr)
         return 1
