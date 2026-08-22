@@ -2,17 +2,22 @@
 # Copyright (C) 2026  WorgaNomoR
 """Статические гарантии отправки разрешённого Python dependency graph."""
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "dependency-submission.yml"
+VALIDATOR_PATH = ROOT / ".github" / "scripts" / "validate_dependency_submission.py"
 
 EXPECTED_PATHS = [
     "requirements.txt",
     "requirements-dev.txt",
     "requirements-build.txt",
+    ".github/scripts/validate_dependency_submission.py",
     ".github/workflows/dependency-submission.yml",
 ]
 EXPECTED_MANIFESTS = [
@@ -33,6 +38,12 @@ EXPECTED_ACTIONS = [
         "Submit resolved Python dependency graph",
         "advanced-security/component-detection-dependency-submission-action@"
         "31f25a8de68ae5ce2ca274bc28546a78683c15ce",
+    ),
+]
+EXPECTED_RUN_STEPS = [
+    (
+        "Validate submitted Python dependency graph",
+        "python .github/scripts/validate_dependency_submission.py output.json",
     ),
 ]
 
@@ -72,10 +83,16 @@ def test_dependency_submission_has_one_bounded_write_job():
 def test_dependency_submission_actions_match_approved_shas():
     workflow = _load_workflow()
     steps = workflow["jobs"]["submit-python-dependencies"]["steps"]
-    action_steps = [(step["name"], step["uses"]) for step in steps]
+    action_steps = [
+        (step["name"], step["uses"])
+        for step in steps
+        if "uses" in step
+    ]
+    run_steps = [(step["name"], step["run"]) for step in steps if "run" in step]
 
     assert action_steps == EXPECTED_ACTIONS
-    assert all("run" not in step for step in steps)
+    assert run_steps == EXPECTED_RUN_STEPS
+    assert all(("uses" in step) != ("run" in step) for step in steps)
 
 
 def test_dependency_submission_uses_python_312_without_persisted_credentials():
@@ -91,7 +108,7 @@ def test_dependency_submission_uses_python_312_without_persisted_credentials():
     }
     assert named_steps["Submit resolved Python dependency graph"]["with"] == {
         "filePath": ".",
-        "detectorsCategories": "Pip",
+        "detectorsCategories": "Python",
         "correlator": "shikiupdatesbot-python-3.12",
     }
 
@@ -102,3 +119,62 @@ def test_dependency_submission_root_scan_has_exactly_three_canonical_manifests()
 
     assert root_manifests == sorted(EXPECTED_MANIFESTS)
     assert not adapter.exists()
+
+
+def _run_validator(tmp_path: Path, dependency_graphs: object) -> subprocess.CompletedProcess:
+    output_path = tmp_path / "output.json"
+    output_path.write_text(
+        json.dumps({"dependencyGraphs": dependency_graphs}),
+        encoding="utf-8",
+    )
+    return subprocess.run(
+        [sys.executable, str(VALIDATOR_PATH), str(output_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _resolved_graph() -> dict:
+    return {
+        "explicitlyReferencedComponentIds": ["direct"],
+        "graph": {
+            "direct": ["transitive"],
+            "transitive": None,
+        },
+    }
+
+
+def test_dependency_submission_validator_accepts_three_resolved_root_manifests(tmp_path):
+    dependency_graphs = {
+        str(tmp_path / manifest.name): _resolved_graph()
+        for manifest in EXPECTED_MANIFESTS
+    }
+
+    result = _run_validator(tmp_path, dependency_graphs)
+
+    assert result.returncode == 0
+    assert "validation passed" in result.stdout
+
+
+def test_dependency_submission_validator_rejects_empty_snapshot(tmp_path):
+    result = _run_validator(tmp_path, {})
+
+    assert result.returncode == 1
+    assert "Missing dependency graphs" in result.stderr
+
+
+def test_dependency_submission_validator_rejects_manifest_without_edges(tmp_path):
+    dependency_graphs = {
+        str(tmp_path / manifest.name): _resolved_graph()
+        for manifest in EXPECTED_MANIFESTS
+    }
+    dependency_graphs[str(tmp_path / "requirements.txt")]["graph"] = {
+        "direct": None,
+    }
+
+    result = _run_validator(tmp_path, dependency_graphs)
+
+    assert result.returncode == 1
+    assert "No transitive dependency edges resolved for requirements.txt" in result.stderr
