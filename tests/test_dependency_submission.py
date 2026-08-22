@@ -8,14 +8,17 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "dependency-submission.yml"
-ADAPTER_PATH = ROOT / ".github" / "dependency-submission" / "requirements.txt"
 
 EXPECTED_PATHS = [
     "requirements.txt",
     "requirements-dev.txt",
     "requirements-build.txt",
-    ".github/dependency-submission/requirements.txt",
     ".github/workflows/dependency-submission.yml",
+]
+EXPECTED_MANIFESTS = [
+    ROOT / "requirements.txt",
+    ROOT / "requirements-dev.txt",
+    ROOT / "requirements-build.txt",
 ]
 EXPECTED_ACTIONS = [
     (
@@ -31,11 +34,6 @@ EXPECTED_ACTIONS = [
         "advanced-security/component-detection-dependency-submission-action@"
         "31f25a8de68ae5ce2ca274bc28546a78683c15ce",
     ),
-]
-EXPECTED_ADAPTER_REFERENCES = [
-    "-r ../../requirements.txt",
-    "-r ../../requirements-dev.txt",
-    "-r ../../requirements-build.txt",
 ]
 
 
@@ -92,17 +90,15 @@ def test_dependency_submission_uses_python_312_without_persisted_credentials():
         "python-version": "3.12",
     }
     assert named_steps["Submit resolved Python dependency graph"]["with"] == {
-        "filePath": ".github/dependency-submission",
+        "filePath": ".",
+        "detectorsCategories": "Pip",
         "correlator": "shikiupdatesbot-python-3.12",
     }
 
 
-def test_dependency_submission_adapter_references_each_root_manifest_once():
-    references = [
-        line.strip()
-        for line in ADAPTER_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+def test_dependency_submission_root_scan_has_exactly_three_canonical_manifests():
+    adapter = ROOT / ".github" / "dependency-submission" / "requirements.txt"
+    root_manifests = sorted(ROOT.glob("requirements*.txt"))
 
-    assert references == EXPECTED_ADAPTER_REFERENCES
-    assert all((ADAPTER_PATH.parent / line.removeprefix("-r ")).is_file() for line in references)
+    assert root_manifests == sorted(EXPECTED_MANIFESTS)
+    assert not adapter.exists()

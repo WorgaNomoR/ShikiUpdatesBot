@@ -9,7 +9,6 @@ name: Python dependency submission
       - "requirements.txt"
       - "requirements-dev.txt"
       - "requirements-build.txt"
-      - ".github/dependency-submission/requirements.txt"
       - ".github/workflows/dependency-submission.yml"
 
 # Dependency submission API требует contents: write. Существующие workflows остаются read-only.
@@ -39,5 +38,6 @@ jobs:
       - name: Submit resolved Python dependency graph
         uses: advanced-security/component-detection-dependency-submission-action@31f25a8de68ae5ce2ca274bc28546a78683c15ce # v0.1.4
         with:
-          filePath: ".github/dependency-submission"
+          filePath: "."
+          detectorsCategories: "Pip"
           correlator: "shikiupdatesbot-python-3.12"
