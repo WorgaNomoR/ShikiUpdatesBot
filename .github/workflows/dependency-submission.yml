@@ -9,6 +9,8 @@ name: Python dependency submission
       - "requirements.txt"
       - "requirements-dev.txt"
       - "requirements-build.txt"
+      - ".github/scripts/submit_dependency_snapshot.py"
+      - ".github/scripts/validate_dependency_submission.py"
       - ".github/workflows/dependency-submission.yml"
 
 # Dependency submission API требует contents: write. Существующие workflows остаются read-only.
@@ -35,9 +37,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Submit resolved Python dependency graph
-        uses: advanced-security/component-detection-dependency-submission-action@31f25a8de68ae5ce2ca274bc28546a78683c15ce # v0.1.4
-        with:
-          filePath: "."
-          detectorsCategories: "Pip"
-          correlator: "shikiupdatesbot-python-3.12"
+      - name: Resolve runtime dependencies
+        run: python -m pip install --disable-pip-version-check --dry-run --ignore-installed --report dependency-report-runtime.json --requirement requirements.txt
+
+      - name: Resolve development dependencies
+        run: python -m pip install --disable-pip-version-check --dry-run --ignore-installed --report dependency-report-dev.json --requirement requirements-dev.txt
+
+      - name: Resolve build dependencies
+        run: python -m pip install --disable-pip-version-check --dry-run --ignore-installed --report dependency-report-build.json --requirement requirements-build.txt
+
+      - name: Build resolved Python dependency snapshot
+        run: python .github/scripts/submit_dependency_snapshot.py build dependency-snapshot.json
+
+      - name: Validate resolved Python dependency snapshot
+        run: python .github/scripts/validate_dependency_submission.py dependency-snapshot.json
+
+      - name: Submit resolved Python dependency snapshot
+        env:
+          GITHUB_TOKEN: "${{ github.token }}"
+        run: python .github/scripts/submit_dependency_snapshot.py submit dependency-snapshot.json
