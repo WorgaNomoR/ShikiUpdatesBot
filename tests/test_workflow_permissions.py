@@ -70,7 +70,7 @@ def test_ruff_autofix_actions_match_approved_shas():
     assert action_steps == [
         (
             "Checkout repository",
-            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         ),
         (
             "Set up Python",
