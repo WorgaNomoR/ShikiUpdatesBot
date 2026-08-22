@@ -3,7 +3,10 @@
 """Статические гарантии отправки разрешённого Python dependency graph."""
 
 import importlib.util
+from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 import yaml
@@ -222,6 +225,140 @@ def test_dependency_snapshot_builder_preserves_identity_versions_and_edges():
     }
 
 
+@pytest.mark.parametrize(
+    ("report", "message"),
+    [
+        ({}, "contains no packages"),
+        (
+            {
+                "install": [
+                    {
+                        "requested": False,
+                        "metadata": {
+                            "name": "Indirect",
+                            "version": "1.0",
+                            "requires_dist": ["Child"],
+                        },
+                    },
+                    {
+                        "requested": False,
+                        "metadata": {
+                            "name": "Child",
+                            "version": "2.0",
+                            "requires_dist": [],
+                        },
+                    },
+                ],
+            },
+            "contains no direct packages",
+        ),
+        (
+            {
+                "install": [
+                    {
+                        "requested": True,
+                        "metadata": {
+                            "name": "Standalone",
+                            "version": "1.0",
+                            "requires_dist": [],
+                        },
+                    },
+                ],
+            },
+            "contains no dependency edges",
+        ),
+    ],
+)
+def test_dependency_snapshot_builder_rejects_incomplete_reports(report, message):
+    submitter = _load_submitter()
+
+    with pytest.raises(ValueError, match=message):
+        submitter.build_manifest_snapshot("requirements.txt", "runtime", report)
+
+
+class _ResponseStub:
+    """Имитирует минимальный контекстный ответ urllib."""
+
+    def __init__(self, status: int, body: bytes = b"{}"):
+        self.status = status
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def read(self) -> bytes:
+        return self.body
+
+
+def test_dependency_snapshot_submission_requires_github_environment(monkeypatch):
+    submitter = _load_submitter()
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+
+    with pytest.raises(ValueError, match="GITHUB_TOKEN and GITHUB_REPOSITORY"):
+        submitter.submit_snapshot({})
+
+
+def test_dependency_snapshot_submission_uses_documented_api(monkeypatch):
+    submitter = _load_submitter()
+    captured_requests = []
+
+    def urlopen_stub(request, timeout):
+        captured_requests.append((request, timeout))
+        return _ResponseStub(201, b'{"message":"accepted"}')
+
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repository")
+    monkeypatch.setattr(submitter, "urlopen", urlopen_stub)
+
+    response = submitter.submit_snapshot({"version": 0})
+
+    request, timeout = captured_requests[0]
+    assert request.full_url == (
+        "https://api.github.com/repos/owner/repository/dependency-graph/snapshots"
+    )
+    assert request.get_header("Authorization") == "Bearer test-token"
+    assert timeout == 60
+    assert response == {"message": "accepted"}
+
+
+def test_dependency_snapshot_submission_rejects_unexpected_status(monkeypatch):
+    submitter = _load_submitter()
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repository")
+    monkeypatch.setattr(
+        submitter,
+        "urlopen",
+        lambda request, timeout: _ResponseStub(202),
+    )
+
+    with pytest.raises(ValueError, match="unexpected status 202"):
+        submitter.submit_snapshot({})
+
+
+def test_dependency_snapshot_submission_reports_http_error(monkeypatch):
+    submitter = _load_submitter()
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repository")
+
+    def urlopen_stub(request, timeout):
+        raise HTTPError(
+            request.full_url,
+            422,
+            "Unprocessable Entity",
+            hdrs=None,
+            fp=BytesIO(b'{"message":"invalid snapshot"}'),
+        )
+
+    monkeypatch.setattr(submitter, "urlopen", urlopen_stub)
+
+    with pytest.raises(ValueError, match="422.*invalid snapshot"):
+        submitter.submit_snapshot({})
+
+
 def _resolved_manifest(manifest: str) -> dict:
     direct_url = f"pkg:pypi/{manifest.removesuffix('.txt')}@1.0"
     child_url = f"pkg:pypi/{manifest.removesuffix('.txt')}-child@2.0"
@@ -289,4 +426,21 @@ def test_dependency_submission_validator_rejects_manifest_without_edges():
         ValueError,
         match="No transitive dependency edges resolved for requirements.txt",
     ):
+        validator.validate_dependency_submission({"manifests": manifests})
+
+
+def test_dependency_submission_validator_rejects_empty_version():
+    validator = _load_validator()
+    manifests = {
+        manifest.name: _resolved_manifest(manifest.name)
+        for manifest in EXPECTED_MANIFESTS
+    }
+    resolved = manifests["requirements.txt"]["resolved"]
+    direct_url = next(iter(resolved))
+    dependency = deepcopy(resolved.pop(direct_url))
+    empty_version_url = direct_url.rpartition("@")[0] + "@"
+    dependency["package_url"] = empty_version_url
+    resolved[empty_version_url] = dependency
+
+    with pytest.raises(ValueError, match="Unversioned dependency key"):
         validator.validate_dependency_submission({"manifests": manifests})

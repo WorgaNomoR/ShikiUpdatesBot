@@ -58,7 +58,7 @@ def validate_dependency_submission(payload: object) -> None:
             raise ValueError(f"No transitive dependency edges resolved for {manifest}")
 
         for key, dependency in resolved.items():
-            if not isinstance(key, str) or "@" not in key:
+            if not isinstance(key, str) or not key.rpartition("@")[2]:
                 raise ValueError(f"Unversioned dependency key in {manifest}")
             if not isinstance(dependency, dict) or dependency.get("package_url") != key:
                 raise ValueError(f"Invalid dependency entry in {manifest}")
