@@ -177,6 +177,7 @@ def test_dependency_submission_replaces_legacy_detector_snapshot():
         "https://github.com/advanced-security/"
         "component-detection-dependency-submission-action"
     )
+    assert submitter.CORRELATOR == "00-shikiupdatesbot-python-3.12"
 
 
 def _pip_report() -> dict:
