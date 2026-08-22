@@ -83,6 +83,7 @@ When adding or moving code, keep dependencies one-directional and pass runtime v
 - `release_security.py` / `.github/workflows/windows-exe.yml` — build-time VirusTotal client and tagged Windows release pipeline. The client looks up SHA-256 before upload, handles the large-file upload URL, respects the public polling limit, and renders the shared Russian Actions/Release Markdown; it is not imported by bot runtime.
 - `requirements.txt` / `requirements-dev.txt` — runtime and development dependencies (`python-dotenv` is a runtime dependency for `.env` loading).
 - `.env.example` — template for environment variables.
+- `.github/workflows/dependency-submission.yml` / `.github/dependency-submission/requirements.txt` — build-time-only submission of the resolved Python 3.12 dependency graph. GitHub's managed plain-pip graph job remains enabled, but currently submits unpinned root requirements without resolved versions or transitive edges; the committed adapter references all three canonical requirements files without duplicating their versions or introducing a lockfile policy.
 - `tests/` — pytest coverage for configuration, pure helpers, storage, the Shikimori API, messages and name grammar, statistics, backup, handler flows, polling, owner gate, and Telegram delivery/retry behaviour.
 
 ## Runtime and domain contracts

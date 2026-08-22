@@ -1,0 +1,5 @@
+# Этот служебный manifest объединяет исходные списки только для dependency graph.
+# Версии и политика воспроизводимости остаются в корневых requirements-файлах.
+-r ../../requirements.txt
+-r ../../requirements-dev.txt
+-r ../../requirements-build.txt

@@ -1,0 +1,43 @@
+name: Python dependency submission
+
+"on":
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "requirements.txt"
+      - "requirements-dev.txt"
+      - "requirements-build.txt"
+      - ".github/dependency-submission/requirements.txt"
+      - ".github/workflows/dependency-submission.yml"
+
+# Dependency submission API требует contents: write. Существующие workflows остаются read-only.
+permissions:
+  contents: write
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  submit-python-dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Submit resolved Python dependency graph
+        uses: advanced-security/component-detection-dependency-submission-action@31f25a8de68ae5ce2ca274bc28546a78683c15ce # v0.1.4
+        with:
+          filePath: ".github/dependency-submission"
+          correlator: "shikiupdatesbot-python-3.12"
