@@ -7,6 +7,7 @@ on:
       - "**.py"
       - "requirements*.txt"
       - "ShikiUpdatesBot.spec"
+      - "packaging/windows/**"
       - "assets/**"
       - "README-Windows.txt"
       - ".github/workflows/windows-exe.yml"
@@ -179,6 +180,8 @@ jobs:
           $package = "release\ShikiUpdatesBot"
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item dist\ShikiUpdatesBot.exe $package
+          Copy-Item packaging\windows\Enable-Autostart.cmd $package
+          Copy-Item packaging\windows\Disable-Autostart.cmd $package
           Copy-Item .env.example $package
           Copy-Item README-Windows.txt $package
           Copy-Item LICENSE "$package\LICENSE.txt"
