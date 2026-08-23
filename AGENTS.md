@@ -66,7 +66,7 @@
 ### Repository hygiene
 
 - When changing configuration defaults, document them in both `config.py` and `README.md`.
-- Line endings are CRLF (the repository has no `.gitattributes`); preserve them to avoid whole-file diffs.
+- Line endings are CRLF. The scoped `.gitattributes` rule forces `packaging/windows/*.cmd` to CRLF in every checkout; preserve CRLF elsewhere to avoid whole-file diffs.
 - Never commit actual bot tokens or owner IDs.
 
 ### Standard commands

@@ -9,6 +9,7 @@ import shutil
 # Модуль нужен только контролируемой тестовой функции без shell-выполнения.
 import subprocess  # nosec B404
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8")
 SPEC = yaml.safe_load(WORKFLOW)
 POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
 POWERSHELL_TESTS_UNAVAILABLE = sys.platform != "win32" or POWERSHELL is None
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _step(job: dict, name: str) -> dict:
@@ -242,3 +244,54 @@ def test_workflow_permissions_remain_narrow():
         "actions": "read",
         "contents": "write",
     }
+
+
+def test_autostart_helpers_trigger_windows_build_and_are_copied_into_package():
+    triggers = SPEC.get("on") or SPEC[True]
+    paths = triggers["pull_request"]["paths"]
+    assemble = _step(SPEC["jobs"]["build"], "Assemble portable ZIP and checksum")
+
+    assert "packaging/windows/**" in paths
+    for name in ("Enable-Autostart.cmd", "Disable-Autostart.cmd"):
+        assert f"Copy-Item packaging\\windows\\{name} $package" in assemble["run"]
+
+
+@pytest.mark.skipif(
+    POWERSHELL_TESTS_UNAVAILABLE,
+    reason="Состав portable ZIP проверяется только под Windows",
+)
+def test_assembled_portable_zip_contains_exact_autostart_helpers(tmp_path):
+    assemble = _step(SPEC["jobs"]["build"], "Assemble portable ZIP and checksum")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "ShikiUpdatesBot.exe").write_bytes(b"test executable")
+    for name in (".env.example", "README-Windows.txt", "LICENSE"):
+        shutil.copy2(ROOT / name, tmp_path / name)
+    helpers_source = tmp_path / "packaging" / "windows"
+    helpers_source.mkdir(parents=True)
+    for name in ("Enable-Autostart.cmd", "Disable-Autostart.cmd"):
+        shutil.copy2(ROOT / "packaging" / "windows" / name, helpers_source / name)
+
+    result = _run_powershell(
+        assemble["run"],
+        tmp_path,
+        {
+            "APP_SERVER_URL": "https://github.example",
+            "APP_REPOSITORY": "owner/releases",
+            "GITHUB_REPOSITORY": "owner/source",
+            "GITHUB_SHA": "a" * 40,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    archive = tmp_path / "release" / "ShikiUpdatesBot-windows-x64.zip"
+    with zipfile.ZipFile(archive) as package:
+        names = set(package.namelist())
+        for helper_name in ("Enable-Autostart.cmd", "Disable-Autostart.cmd"):
+            member = f"ShikiUpdatesBot/{helper_name}"
+            assert member in names
+            source = ROOT / "packaging" / "windows" / helper_name
+            content = package.read(member)
+            assert content == source.read_bytes()
+            assert b"\r\n" in content
+            assert b"\n" not in content.replace(b"\r\n", b"")

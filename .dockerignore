@@ -49,6 +49,7 @@ pytest.ini
 ruff.toml
 .coveragerc
 ShikiUpdatesBot.spec
+packaging/windows/
 release_security.py
 assets/
 
