@@ -22,7 +22,15 @@ STARTUP_RELATIVE = Path("Microsoft/Windows/Start Menu/Programs/Startup")
 
 
 def _run_helper(helper: Path, *, appdata: Path):
-    """Запустить cmd-помощник без shell-интерполяции тестовых путей."""
+    """
+    Run a CMD helper with the specified application data directory.
+    
+    Parameters:
+        appdata (Path): Directory exposed to the helper through the ``APPDATA`` environment variable.
+    
+    Returns:
+        subprocess.CompletedProcess: The completed helper process and its captured output.
+    """
     env = os.environ.copy()
     env["APPDATA"] = str(appdata)
     env["SHIKI_TEST_HELPER"] = str(helper)
@@ -65,7 +73,12 @@ def _shortcut_properties(shortcut: Path) -> tuple[str, str]:
 
 
 def _write_wrong_shortcut(shortcut: Path) -> None:
-    """Испортить свойства ярлыка, чтобы проверить замену повторным Enable."""
+    """
+    Overwrite a shortcut's target and working directory with incorrect values for replacement testing.
+    
+    Parameters:
+    	shortcut (Path): Path to the shortcut whose properties should be overwritten.
+    """
     env = os.environ.copy()
     env["SHIKI_TEST_SHORTCUT"] = str(shortcut)
     command = (
@@ -131,6 +144,7 @@ def test_helper_sources_keep_narrow_transparent_boundaries():
 
 
 def test_helper_sources_are_checked_out_as_crlf():
+    """Verify that Windows helper scripts use CRLF line endings as configured by Git."""
     attributes = GITATTRIBUTES.read_text(encoding="utf-8").splitlines()
 
     assert "/packaging/windows/*.cmd text eol=crlf" in attributes

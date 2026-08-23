@@ -26,6 +26,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _step(job: dict, name: str) -> dict:
+    """
+    Finds a workflow step with the specified name.
+    
+    Parameters:
+    	job (dict): Workflow job containing the steps to search.
+    	name (str): Name of the step to find.
+    
+    Returns:
+    	dict: The matching workflow step.
+    """
     return next(step for step in job["steps"] if step.get("name") == name)
 
 
@@ -261,6 +271,7 @@ def test_autostart_helpers_trigger_windows_build_and_are_copied_into_package():
     reason="Состав portable ZIP проверяется только под Windows",
 )
 def test_assembled_portable_zip_contains_exact_autostart_helpers(tmp_path):
+    """Verify that the assembled Windows ZIP contains both autostart helper files with their exact CRLF-formatted contents."""
     assemble = _step(SPEC["jobs"]["build"], "Assemble portable ZIP and checksum")
     dist = tmp_path / "dist"
     dist.mkdir()
