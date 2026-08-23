@@ -15,6 +15,7 @@ WINDOWS_PACKAGING = ROOT / "packaging" / "windows"
 ENABLE_SOURCE = WINDOWS_PACKAGING / "Enable-Autostart.cmd"
 DISABLE_SOURCE = WINDOWS_PACKAGING / "Disable-Autostart.cmd"
 DOCKERIGNORE = ROOT / ".dockerignore"
+GITATTRIBUTES = ROOT / ".gitattributes"
 POWERSHELL = shutil.which("powershell")
 WINDOWS_TESTS_UNAVAILABLE = sys.platform != "win32" or POWERSHELL is None
 STARTUP_RELATIVE = Path("Microsoft/Windows/Start Menu/Programs/Startup")
@@ -127,6 +128,16 @@ def test_helper_sources_keep_narrow_transparent_boundaries():
     assert "$env:shiki_autostart_link" in sources[ENABLE_SOURCE.name]
     assert "$env:shiki_autostart_exe" in sources[ENABLE_SOURCE.name]
     assert combined.count("shikiupdatesbot.lnk") == 2
+
+
+def test_helper_sources_are_checked_out_as_crlf():
+    attributes = GITATTRIBUTES.read_text(encoding="utf-8").splitlines()
+
+    assert "/packaging/windows/*.cmd text eol=crlf" in attributes
+    for path in (ENABLE_SOURCE, DISABLE_SOURCE):
+        content = path.read_bytes()
+        assert b"\r\n" in content
+        assert b"\n" not in content.replace(b"\r\n", b"")
 
 
 def test_helpers_are_excluded_from_docker_context():

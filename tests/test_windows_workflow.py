@@ -291,4 +291,7 @@ def test_assembled_portable_zip_contains_exact_autostart_helpers(tmp_path):
             member = f"ShikiUpdatesBot/{helper_name}"
             assert member in names
             source = ROOT / "packaging" / "windows" / helper_name
-            assert package.read(member) == source.read_bytes()
+            content = package.read(member)
+            assert content == source.read_bytes()
+            assert b"\r\n" in content
+            assert b"\n" not in content.replace(b"\r\n", b"")

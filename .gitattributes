@@ -1,0 +1,2 @@
+# Batch-помощники Windows должны попадать в каждый checkout с CRLF.
+/packaging/windows/*.cmd text eol=crlf
