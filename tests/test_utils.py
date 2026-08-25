@@ -46,15 +46,16 @@ def test_h_plain_text_unchanged():
 
 
 # ── _subscriber_link: безопасная ссылка на Telegram-профиль ───────
-def test_subscriber_link_wraps_name_in_tg_profile_link():
+def test_subscriber_link_wraps_name_and_appends_inline_id():
     assert _subscriber_link(42, "Алиса") == (
-        '<a href="tg://user?id=42">Алиса</a>'
+        '<a href="tg://user?id=42">Алиса</a> (<code>42</code>)'
     )
 
 
 def test_subscriber_link_escapes_html_in_name():
     assert _subscriber_link(1, "<b>A&B</b>") == (
-        '<a href="tg://user?id=1">&lt;b&gt;A&amp;B&lt;/b&gt;</a>'
+        '<a href="tg://user?id=1">&lt;b&gt;A&amp;B&lt;/b&gt;</a> '
+        '(<code>1</code>)'
     )
 
 
