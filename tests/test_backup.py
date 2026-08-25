@@ -529,6 +529,7 @@ async def test_backup_after_subscription_subscribe(backup_env, monkeypatch):
     caption = sent.call_args.args[1]
     assert "➕" in caption
     assert 'tg://user?id=7' in caption
+    assert '<code>7</code>' in caption
     assert backup.BACKUP_TAG in caption
 
 
@@ -543,6 +544,7 @@ async def test_backup_after_subscription_unsubscribe(backup_env, monkeypatch):
     caption = sent.call_args.args[1]
     assert "➖" in caption
     assert 'tg://user?id=5' in caption
+    assert '<code>5</code>' in caption
 
 
 # ─────────────────────────────────────────────────────────────

@@ -60,9 +60,9 @@ async def test_cmd_subs_lists_all_subscribers(monkeypatch):
     text = msg.answer.call_args.args[0]
     assert "<b>2</b>" in text                     # счётчик подписчиков
     assert "Alice" in text and "Bob" in text      # оба в списке
-    alice = '<a href="tg://user?id=111">Alice</a>'
-    bob = '<a href="tg://user?id=222">Bob</a>'
-    assert alice in text and bob in text            # кликабельные профили
+    alice = '<a href="tg://user?id=111">Alice</a> (<code>111</code>)'
+    bob = '<a href="tg://user?id=222">Bob</a> (<code>222</code>)'
+    assert alice in text and bob in text            # профили и копируемые ID
     assert text.index(alice) < text.index(bob)      # порядок хранилища сохранён
     assert msg.answer.call_args.kwargs.get("parse_mode") == ParseMode.HTML
 
@@ -81,7 +81,8 @@ async def test_cmd_subs_escapes_html_in_subscriber_names(monkeypatch):
 
     text = msg.answer.call_args.args[0]
     assert (
-        '<a href="tg://user?id=111">&lt;b&gt;A&amp;B&lt;/b&gt;</a>'
+        '<a href="tg://user?id=111">&lt;b&gt;A&amp;B&lt;/b&gt;</a> '
+        '(<code>111</code>)'
         in text
     )                                               # ссылка + экранирование
     assert "<b>A&B</b>" not in text                 # сырой вид не просочился

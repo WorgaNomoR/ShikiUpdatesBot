@@ -33,8 +33,11 @@ def h(text: str) -> str:
 
 
 def _subscriber_link(chat_id: int, name: str) -> str:
-    """Имя как безопасная HTML-ссылка на Telegram-профиль пользователя."""
-    return f'<a href="tg://user?id={chat_id}">{h(name)}</a>'
+    """Безопасная HTML-ссылка на Telegram-профиль и копируемый ID."""
+    return (
+        f'<a href="tg://user?id={chat_id}">{h(name)}</a> '
+        f'(<code>{chat_id}</code>)'
+    )
 
 
 def _rel_url(url: str) -> str:
