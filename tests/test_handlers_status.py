@@ -260,6 +260,7 @@ async def test_status_private_profile_non_owner_gets_no_settings_details(monkeyp
 
 @pytest.mark.asyncio
 async def test_status_private_profile_owner_gets_instruction_and_ready_link(monkeypatch):
+    monkeypatch.setattr(handlers, "SHIKI_BASE_URL", "https://mirror.example/")
     monkeypatch.setattr(handlers, "SHIKI_USER", "ConfiguredUser")
 
     async def _fetch(media, statuses):
@@ -275,7 +276,7 @@ async def test_status_private_profile_owner_gets_instruction_and_ready_link(monk
     text = message.calls[0][0]
     assert "Могут видеть мой список" in text
     assert "Все посетители сайта" in text
-    assert "https://shikimori.io/ConfiguredUser/edit/profile" in text
+    assert "https://mirror.example/ConfiguredUser/edit/profile" in text
     assert "Ergo Proxy" not in text
     assert message.calls[0][1] == {"parse_mode": handlers.ParseMode.HTML}
     assert handlers._status_cache is None

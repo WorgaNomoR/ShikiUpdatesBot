@@ -42,6 +42,7 @@ from config import (
     ERROR_NOTIFY_INTERVAL,
     FULL_SYNC_INTERVAL,
     OWNER_ID,
+    SHIKI_BASE_URL,
     SHIKI_USER,
     log,
 )
@@ -123,7 +124,7 @@ _status_cache_lock: asyncio.Lock | None = None
 
 def _profile_privacy_owner_text() -> str:
     """Полная инструкция владельцу по открытию публичного списка."""
-    settings_url = f"https://shikimori.io/{SHIKI_USER}/edit/profile"
+    settings_url = f"{SHIKI_BASE_URL.rstrip('/')}/{SHIKI_USER}/edit/profile"
     return (
         "⚠️ Профиль Shikimori закрыт.\n\n"
         "ShikiUpdatesBot использует только публичные данные и не может прочитать "
