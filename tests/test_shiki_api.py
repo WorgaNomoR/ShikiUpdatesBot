@@ -237,12 +237,15 @@ class _SeqSession:
 
 # ── Точный privacy-сигнал: только 403 + точное поле message ──
 
+_EXPECTED_PRIVATE_PROFILE_MESSAGE = "You are not authorized to access this page."
+
+
 @pytest.mark.asyncio
 async def test_fetch_classifies_exact_private_profile_response():
     response = _SeqResponse(
         403,
         json_value={
-            "message": shiki_api._PRIVATE_PROFILE_MESSAGE,
+            "message": _EXPECTED_PRIVATE_PROFILE_MESSAGE,
             "code": 403,
         },
     )
@@ -258,7 +261,7 @@ async def test_list_export_propagates_private_profile_response():
     response = _SeqResponse(
         403,
         json_value={
-            "message": shiki_api._PRIVATE_PROFILE_MESSAGE,
+            "message": _EXPECTED_PRIVATE_PROFILE_MESSAGE,
             "code": 403,
         },
     )
@@ -274,7 +277,7 @@ async def test_list_export_propagates_private_profile_response():
         {"message": "You are not authorized to access this page"},
         {"message": "You are not authorized to access this page. "},
         {"message": "you are not authorized to access this page."},
-        {"error": "You are not authorized to access this page."},
+        {"error": _EXPECTED_PRIVATE_PROFILE_MESSAGE},
         "You are not authorized to access this page.",
         None,
     ],
@@ -309,7 +312,7 @@ async def test_fetch_does_not_classify_private_message_on_other_status(status):
     response = _SeqResponse(
         status,
         json_value={
-            "message": shiki_api._PRIVATE_PROFILE_MESSAGE,
+            "message": _EXPECTED_PRIVATE_PROFILE_MESSAGE,
             "code": 403,
         },
     )
@@ -406,7 +409,7 @@ async def test_429_private_message_remains_rate_limit_failure(monkeypatch):
         _SeqResponse(
             429,
             json_value={
-                "message": shiki_api._PRIVATE_PROFILE_MESSAGE,
+                "message": _EXPECTED_PRIVATE_PROFILE_MESSAGE,
                 "code": 403,
             },
             headers={"Retry-After": "0"},
@@ -545,7 +548,7 @@ async def test_fetch_current_rates_private_failure_dominates_partial_success(mon
         _SeqResponse(
             403,
             json_value={
-                "message": shiki_api._PRIVATE_PROFILE_MESSAGE,
+                "message": _EXPECTED_PRIVATE_PROFILE_MESSAGE,
                 "code": 403,
             },
         ),
