@@ -402,7 +402,10 @@ async def test_429_private_message_remains_rate_limit_failure(monkeypatch):
         for _ in range(attempts)
     ]
 
-    assert await fetch_history(_SeqSession(responses)) is None
+    session = _SeqSession(responses)
+
+    assert await fetch_history(session) is None
+    assert session.calls == attempts
 
 
 # ── _retry_after: парсинг Retry-After с фолбэками и клампом ──

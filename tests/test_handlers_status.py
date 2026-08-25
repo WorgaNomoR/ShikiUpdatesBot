@@ -254,6 +254,7 @@ async def test_status_private_profile_non_owner_gets_no_settings_details(monkeyp
     assert "Все посетители сайта" not in text
     assert "edit/profile" not in text
     assert "Berserk" not in text
+    assert message.calls[0][1] == {"parse_mode": handlers.ParseMode.HTML}
     assert handlers._status_cache is None
 
 
@@ -276,6 +277,7 @@ async def test_status_private_profile_owner_gets_instruction_and_ready_link(monk
     assert "Все посетители сайта" in text
     assert "https://shikimori.io/ConfiguredUser/edit/profile" in text
     assert "Ergo Proxy" not in text
+    assert message.calls[0][1] == {"parse_mode": handlers.ParseMode.HTML}
     assert handlers._status_cache is None
 
 

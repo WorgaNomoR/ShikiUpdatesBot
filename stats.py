@@ -10,6 +10,7 @@
 """
 
 import json
+from copy import deepcopy
 
 import aiohttp
 
@@ -359,6 +360,11 @@ async def sync_stats_all(
     if export_anime is None and export_manga is None:
         log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
         return stats, False
+
+    # load_stats_all обновляет процессный кэш и возвращает тот же объект.
+    # Изолируем рабочие изменения, чтобы поздний privacy failure не опубликовал
+    # частичный результат через кэш до атомарного сохранения.
+    stats = deepcopy(stats)
 
     changed = False
 

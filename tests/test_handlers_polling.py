@@ -496,8 +496,8 @@ async def test_startup_private_list_notifies_owner_without_saving_public_favouri
     sent = []
 
     class DummyBot:
-        async def send_message(self, chat_id, text):
-            sent.append((chat_id, text))
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
 
     with pytest.raises(asyncio.CancelledError):
         await handlers.polling_loop(DummyBot())
@@ -507,6 +507,7 @@ async def test_startup_private_list_notifies_owner_without_saving_public_favouri
     assert sent[0][0] == config.OWNER_ID
     assert "Могут видеть мой список" in sent[0][1]
     assert f"/{config.SHIKI_USER}/edit/profile" in sent[0][1]
+    assert sent[0][2] == {"parse_mode": handlers.ParseMode.HTML}
 
 
 @pytest.mark.asyncio
@@ -582,8 +583,8 @@ async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
     sent = []
 
     class DummyBot:
-        async def send_message(self, chat_id, text):
-            sent.append((chat_id, text))
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
 
     with pytest.raises(asyncio.CancelledError):
         await handlers.polling_loop(DummyBot())
@@ -591,6 +592,7 @@ async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
     assert check_calls == 4
     assert len(sent) == 1
     assert sent[0][0] == config.OWNER_ID
+    assert sent[0][2] == {"parse_mode": handlers.ParseMode.HTML}
     assert recovered_favourites_checks == [favourites]
     assert len(heartbeat_calls) == 3
     broadcast.assert_not_awaited()

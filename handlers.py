@@ -993,7 +993,11 @@ async def _notify_profile_privacy_owner(
         return last_notify_at
 
     try:
-        await bot.send_message(OWNER_ID, _profile_privacy_owner_text())
+        await bot.send_message(
+            OWNER_ID,
+            _profile_privacy_owner_text(),
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as notify_error:
         log.exception(
             "Не удалось отправить владельцу диагностику приватности: %s",
@@ -1635,7 +1639,7 @@ async def cmd_status(message: Message) -> None:
             if is_owner
             else _profile_privacy_public_text()
         )
-        await message.answer(text)
+        await message.answer(text, parse_mode=ParseMode.HTML)
         return
     if rates is None:
         await message.answer("⚠️ Не удалось получить данные от Shikimori. Попробуй позже.")
