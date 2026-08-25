@@ -86,6 +86,12 @@ class ProfilePrivacyError(RuntimeError):
     """Shikimori подтвердил, что публичный доступ к профилю закрыт."""
 
     def __init__(self, endpoint: str):
+        """
+        Инициализирует ошибку, указывающую на закрытый профиль Shikimori.
+        
+        Parameters:
+        	endpoint (str): Конечная точка запроса, вызвавшего ошибку.
+        """
         self.endpoint = endpoint
         super().__init__(f"Профиль Shikimori закрыт ({endpoint})")
 
@@ -258,9 +264,16 @@ async def _throttle() -> None:
 
 
 def _retry_after(headers) -> float:
-    """Секунды ожидания из заголовка Retry-After (форма «число секунд»).
-    HTTP-date-форму не поддерживаем — фолбэк на дефолт. Клампим в
-    [0, _RETRY_AFTER_CAP]."""
+    """
+    Determine the retry delay from a numeric ``Retry-After`` header.
+    
+    Parameters:
+        headers: HTTP response headers.
+    
+    Returns:
+        The retry delay in seconds, using the default for missing or invalid
+        values and limiting valid values to the configured maximum.
+    """
     raw = headers.get("Retry-After") if headers is not None else None
     if raw is None:
         return _RETRY_AFTER_DEFAULT
@@ -274,7 +287,12 @@ def _retry_after(headers) -> float:
 
 
 async def _is_private_profile_response(resp) -> bool:
-    """Проверяет только точный JSON-маркер закрытого профиля в HTTP 403."""
+    """
+    Determines whether a response contains the exact closed-profile error marker.
+    
+    Returns:
+        bool: `true` if the response payload is the closed-profile marker, `false` otherwise.
+    """
     try:
         payload = await resp.json(content_type=None)
     except (
@@ -303,13 +321,23 @@ async def _fetch(
     json_body: dict | None = None,
 ):
     """
-    Единый выстрел HTTP через центральный троттл + ретрай на 429.
-
-    Перед КАЖДОЙ попыткой await-им _throttle() (min-gap). При 429 читаем
-    Retry-After, спим, ретраим (до _MAX_429_RETRIES). Точный privacy-ответ
-    поднимаем как ProfilePrivacyError; остальные не-200 дают None. На успехе
-    отдаём await parse(resp). parse разбирает тело под конкретный вызов
-    (list / dict / GraphQL); его исключения парсинга ловим здесь → None.
+    Выполняет HTTP-запрос с ограничением частоты и повторными попытками при ответе 429.
+    
+    Параметры:
+    	session (aiohttp.ClientSession): HTTP-сессия.
+    	method (str): Метод запроса.
+    	url (str): Адрес запроса.
+    	parse: Асинхронная функция разбора успешного ответа.
+    	label (str): Метка запроса для сообщений журнала.
+    	timeout (float): Тайм-аут запроса в секундах.
+    	headers (dict | None): Заголовки запроса.
+    	json_body (dict | None): JSON-тело POST-запроса.
+    
+    Возвращает:
+    	Обработанное значение ответа или None при ошибке запроса, неуспешном статусе либо ошибке разбора.
+    
+    Вызывает:
+    	ProfilePrivacyError: Если Shikimori сообщает о закрытом профиле.
     """
     if headers is None:
         headers = dict(HEADERS)   # копия дефолта: даже будущая in-place мутация не тронет модульный HEADERS

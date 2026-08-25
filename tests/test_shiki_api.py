@@ -24,6 +24,7 @@ from shiki_api import (
 # ── Мок сетевой границы: одна пара вместо копипасты в каждом тесте ──
 class _FakeResponse:
     def __init__(self, status, *, json_value=None, json_exc=None):
+        """Initialize a fake HTTP response with a status and optional JSON result or exception."""
         self.status = status
         self._json_value = json_value
         self._json_exc = json_exc
@@ -230,6 +231,7 @@ class _SeqSession:
         return self._responses.pop(0)
 
     def post(self, *args, **kwargs):
+        """Record a JSON request and return the next configured response."""
         self.calls += 1
         self.requests.append(kwargs.get("json"))
         return self._responses.pop(0)

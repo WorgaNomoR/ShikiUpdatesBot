@@ -443,7 +443,12 @@ async def test_cycle_fetches_favourites_once_and_threads_to_sync(monkeypatch):
 async def test_startup_private_list_notifies_owner_without_saving_public_favourites(
     monkeypatch,
 ):
-    """Доступное favourites не маскирует закрытый list export на старте."""
+    """
+    Verifies that a private profile list during startup preserves existing statistics and sends an HTML diagnostic only to the owner.
+    
+    Parameters:
+    	monkeypatch: Pytest fixture for replacing dependencies used by the polling loop.
+    """
     monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
     monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
     monkeypatch.setattr("handlers.load_subscribers", lambda: {777: "subscriber"})
@@ -497,6 +502,14 @@ async def test_startup_private_list_notifies_owner_without_saving_public_favouri
 
     class DummyBot:
         async def send_message(self, chat_id, text, **kwargs):
+            """
+            Record a message and its options for later inspection.
+            
+            Parameters:
+                chat_id: Destination chat identifier.
+                text: Message content.
+                **kwargs: Additional message options.
+            """
             sent.append((chat_id, text, kwargs))
 
     with pytest.raises(asyncio.CancelledError):
@@ -512,6 +525,7 @@ async def test_startup_private_list_notifies_owner_without_saving_public_favouri
 
 @pytest.mark.asyncio
 async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
+    """Verify that polling debounces profile privacy notifications, recovers after the profile becomes accessible, reuses fetched favourites, and avoids subscriber broadcasts."""
     monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
     monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
     monkeypatch.setattr("handlers.load_subscribers", lambda: {777: "subscriber"})
@@ -584,6 +598,14 @@ async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
 
     class DummyBot:
         async def send_message(self, chat_id, text, **kwargs):
+            """
+            Record a message and its options for later inspection.
+            
+            Parameters:
+                chat_id: Destination chat identifier.
+                text: Message content.
+                **kwargs: Additional message options.
+            """
             sent.append((chat_id, text, kwargs))
 
     with pytest.raises(asyncio.CancelledError):

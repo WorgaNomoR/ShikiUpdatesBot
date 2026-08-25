@@ -143,7 +143,9 @@ def _profile_privacy_public_text() -> str:
 
 
 def _get_status_cache_lock() -> asyncio.Lock:
-    """Лениво создаёт лок, схлопывающий конкурентные обновления /status."""
+    """
+    Return the lock used to serialize concurrent status updates.
+    """
     global _status_cache_lock
     if _status_cache_lock is None:
         _status_cache_lock = asyncio.Lock()
@@ -336,15 +338,16 @@ async def _deliver_pending_quarter(bot: Bot, cur: dict) -> dict:
 
 async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
     """
-    Проверяем смену квартала. Если сменился:
-      1. Защита last_report_sent от двойной отправки.
-      2. Синхронизируем stats_all (чтобы метаданные завершённых были свежими);
-         на старте пропускаем — polling_loop уже синкнул (resync=False).
-      3. Строим отчёт, сохраняем снапшот quarters/<period>.json.
-      4. Обновляем by_quarter в агрегатах stats_all.
-      5. Отправляем отчёт владельцу.
-      6. Сбрасываем stats_current на новый период.
-    Возвращает (возможно новый) stats_current.
+    Проверяет необходимость смены квартала и выполняет ротацию статистики с доставкой отчёта владельцу.
+    
+    Parameters:
+        bot (Bot): Бот, используемый для доставки отчёта.
+        cur (dict): Текущее состояние статистики квартала.
+        stats_all (dict): Агрегированная статистика.
+        resync (bool): Определяет, нужно ли перед ротацией обновить агрегированную статистику.
+    
+    Returns:
+        dict: Текущее состояние статистики для активного квартала.
     """
     now_period = current_quarter()
     async with restorable_state_transaction():
@@ -658,21 +661,17 @@ async def check_and_notify_favourites(
     bot: Bot, seen: set[str], favourites=_FAV_UNSET,
 ) -> tuple[set[str], bool]:
     """
-    Проверяем избранное:
-    0. favourites: если передан уже скачанный ответ /favourites (цикл тянет его
-       ОДИН раз и делит между уведомлениями и ресинком) — используем его и НЕ
-       ходим в сеть. favourites=_FAV_UNSET (не передан, прямой вызов) — фетчим
-       сами. Явный None («в этом цикле избранное недоступно») — пропускаем цикл,
-       БЕЗ повторного фетча.
-    1. Загружаем текущий список с Shikimori
-    2. Находим новые элементы (которых нет в seen)
-    3. Отправляем уведомления и обновляем seen
-    4. Если что-то новое нашли — пересобираем stats["favourites"] из УЖЕ
-       скачанного списка (без повторного запроса к API), чтобы /favs показывал
-       свежее сразу, не дожидаясь 6-часового ресинка.
-
-    Ключ в seen: "{category}_{id}", например "animes_5114".
-    Возвращает (seen, found_new).
+    Проверяет избранное, уведомляет о новых элементах и обновляет baseline.
+    
+    Параметры:
+    	seen (set[str]): Идентификаторы уже обработанных элементов в формате
+    		``"{category}_{id}"``.
+    	favourites: Предварительно загруженное избранное; значение ``None`` пропускает
+    		проверку без повторного запроса.
+    
+    Возвращает:
+    	tuple[set[str], bool]: Обновлённый набор обработанных идентификаторов и
+    		признак обнаружения новых элементов.
     """
     if favourites is _FAV_UNSET:
         async with aiohttp.ClientSession() as session:
@@ -974,9 +973,17 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
 
 
 def _should_full_sync(last_full_sync: float | None, now: float, interval: float) -> bool:
-    """Пора ли пересинкивать stats_all: ещё ни разу успешно в этой сессии
-    (last_full_sync is None ⇒ ретраим каждый цикл, пока не выйдет) либо с
-    последнего успешного синка прошло больше interval секунд."""
+    """
+    Determine whether a full statistics synchronization is due.
+    
+    Parameters:
+        last_full_sync (float | None): Timestamp of the most recent successful synchronization.
+        now (float): Current timestamp.
+        interval (float): Minimum interval between synchronizations, in seconds.
+    
+    Returns:
+        bool: `True` if no synchronization has succeeded yet or the interval has elapsed, `False` otherwise.
+    """
     return last_full_sync is None or (now - last_full_sync) >= interval
 
 
@@ -984,7 +991,15 @@ async def _notify_profile_privacy_owner(
     bot: Bot,
     last_notify_at: float | None,
 ) -> float | None:
-    """Шлёт owner-only диагностику с общим интервалом фоновых ошибок."""
+    """
+    Send the owner a diagnostic message for profile privacy errors when notification throttling permits.
+    
+    Parameters:
+        last_notify_at (float | None): Monotonic timestamp of the previous notification.
+    
+    Returns:
+        float | None: The current monotonic timestamp when a notification attempt is allowed; otherwise, the previous timestamp.
+    """
     now = time.monotonic()
     if (
         last_notify_at is not None
@@ -1008,12 +1023,12 @@ async def _notify_profile_privacy_owner(
 
 async def polling_loop(bot: Bot) -> None:
     """
-    Бесконечный цикл проверки каждые CHECK_INTERVAL секунд.
-
-    Первый запуск (seen_ids.json не существует):
-      — бот молча запоминает все текущие ID из истории и избранного
-      — сообщения НЕ отправляются (не спамим историей за последние месяцы)
-      — с этого момента бот следит только за НОВЫМИ событиями
+    Выполняет фоновую проверку истории, избранного и статистики с заданным интервалом.
+    
+    При первом запуске без сохранённого baseline текущие записи истории и избранного
+    сохраняются без уведомлений. При ошибке закрытого профиля baseline и статистика
+    не обновляются, а владельцу отправляется уведомление. Ошибки отдельных циклов
+    обрабатываются без остановки фоновой проверки.
     """
     seen_ids  = load_seen_ids()
     seen_favs = load_seen_favourites()
@@ -1625,9 +1640,13 @@ async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> Non
 
 async def cmd_status(message: Message) -> None:
     """
-    /status — показывает что сейчас смотрит/читает пользователь.
-    Переиспользует общий свежий результат для всех чатов, затем собирает
-    ответ с учётом всех комбинаций.
+    Display the owner's current anime and manga activity.
+    
+    Handles private-profile access errors with owner-specific messaging and reports when no activity is available.
+    
+    Parameters:
+    	message (Message): Incoming Telegram message used to determine the requester and deliver the status.
+    
     """
     try:
         rates = await _get_status_rates()

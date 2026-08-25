@@ -121,6 +121,7 @@ async def test_failed_fetch_skips_cycle(monkeypatch):
 @pytest.mark.asyncio
 async def test_private_history_preserves_state_and_never_broadcasts(monkeypatch):
     async def _fetch(session, page=1):
+        """Raise a profile privacy error for a history fetch request."""
         raise shiki_api.ProfilePrivacyError(f"fetch_history(page={page})")
 
     monkeypatch.setattr("handlers.fetch_history", _fetch)

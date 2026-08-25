@@ -12,6 +12,13 @@ import handlers
 
 class DummyMessage:
     def __init__(self, chat_id=1, user_id=None):
+        """
+        Initialize a test message with optional chat and user identifiers.
+        
+        Parameters:
+            chat_id: Identifier of the chat associated with the message.
+            user_id: Identifier of the user who sent the message.
+        """
         self.chat_id = chat_id
         self.from_user = (
             types.SimpleNamespace(id=user_id)
