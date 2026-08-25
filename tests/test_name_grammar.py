@@ -275,7 +275,10 @@ def test_maker_failure_preserves_explicit_gender(
     expected_gender,
     expected_word,
 ):
+    detector_calls = []
+
     def unexpected_detector():
+        detector_calls.append(1)
         raise RuntimeError("явный режим не должен запускать detector")
 
     def broken_maker():
@@ -289,6 +292,7 @@ def test_maker_failure_preserves_explicit_gender(
             maker_factory=broken_maker,
         )
 
+    assert detector_calls == []
     assert context == DisplayNameContext(
         nominative="Костя",
         genitive="Костя",
