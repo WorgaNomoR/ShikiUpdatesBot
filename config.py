@@ -75,7 +75,8 @@ SHIKI_BASE_URL = (os.environ.get("SHIKI_BASE_URL") or "https://shikimori.io").st
 # по умолчанию — ник профиля (SHIKI_USER). Пустая строка/пробелы → фолбэк.
 DISPLAY_NAME = os.environ.get("DISPLAY_NAME", "").strip() or SHIKI_USER
 # Автоопределение пола и склонение поддерживаемых русских имён.
-# male/female — явный пол для неоднозначных имён; none — старое поведение.
+# male/female — явный пол сообщений; поддерживаемые имена склоняются.
+# none — старое поведение без склонения и с мужскими вариантами.
 DISPLAY_NAME_GENDER = (
     os.environ.get("DISPLAY_NAME_GENDER", "auto").strip().lower() or "auto"
 )

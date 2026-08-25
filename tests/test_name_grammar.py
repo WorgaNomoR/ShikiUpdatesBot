@@ -140,6 +140,46 @@ def test_explicit_gender_makes_ambiguous_name_deterministic(
     assert text == f"Саша {expected_word}"
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_gender", "expected_word"),
+    [
+        ("male", "male", "сделал"),
+        ("female", "female", "сделала"),
+    ],
+)
+def test_explicit_gender_preserves_unsupported_name_without_morphology(
+    mode,
+    expected_gender,
+    expected_word,
+):
+    calls = []
+
+    def counting_factory():
+        calls.append(1)
+        raise RuntimeError("морфология не должна запускаться")
+
+    context = build_display_name_context(
+        "Alice",
+        mode,
+        detector_factory=counting_factory,
+        maker_factory=counting_factory,
+    )
+
+    assert calls == []
+    assert context == DisplayNameContext(
+        nominative="Alice",
+        genitive="Alice",
+        dative="Alice",
+        accusative="Alice",
+        instrumental="Alice",
+        gender=expected_gender,
+        inflection_applied=False,
+    )
+    assert format_name_template("{n} {g:сделал|сделала}", context) == (
+        f"Alice {expected_word}"
+    )
+
+
 def test_none_skips_dependency_and_preserves_masculine_fallback():
     calls = []
 
@@ -222,6 +262,50 @@ def test_maker_failure_falls_back(caplog):
     assert "исходное имя" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_gender", "expected_word"),
+    [
+        ("male", "male", "готов"),
+        ("female", "female", "готова"),
+    ],
+)
+def test_maker_failure_preserves_explicit_gender(
+    caplog,
+    mode,
+    expected_gender,
+    expected_word,
+):
+    detector_calls = []
+
+    def unexpected_detector():
+        detector_calls.append(1)
+        raise RuntimeError("явный режим не должен запускать detector")
+
+    def broken_maker():
+        raise RuntimeError("сломанные правила склонения")
+
+    with caplog.at_level(logging.WARNING):
+        context = build_display_name_context(
+            "Костя",
+            mode,
+            detector_factory=unexpected_detector,
+            maker_factory=broken_maker,
+        )
+
+    assert detector_calls == []
+    assert context == DisplayNameContext(
+        nominative="Костя",
+        genitive="Костя",
+        dative="Костя",
+        accusative="Костя",
+        instrumental="Костя",
+        gender=expected_gender,
+        inflection_applied=False,
+    )
+    assert format_name_template("{g:готов|готова}", context) == expected_word
+    assert "исходное имя" in caplog.text
+
+
 def test_non_string_case_result_falls_back():
     class Detector:
         def detect(self, **_kwargs):
@@ -256,14 +340,21 @@ def test_indeclinable_name_keeps_unchanged_forms_and_female_grammar():
     )
 
 
-def test_html_escaping_happens_after_safe_fallback():
-    context = build_display_name_context("<b>Костя&", "auto")
+@pytest.mark.parametrize(
+    ("mode", "expected_word"),
+    [
+        ("auto", "готов"),
+        ("female", "готова"),
+    ],
+)
+def test_html_escaping_happens_after_safe_fallback(mode, expected_word):
+    context = build_display_name_context("<b>Костя&", mode)
     text = format_name_template(
-        "{n}|{n_gen}|{n_dat}|{n_acc}|{n_ins}",
+        "{n}|{n_gen}|{n_dat}|{n_acc}|{n_ins}|{g:готов|готова}",
         context,
     )
 
-    assert text == "|".join(["&lt;b&gt;Костя&amp;"] * 5)
+    assert text == "|".join(["&lt;b&gt;Костя&amp;"] * 5 + [expected_word])
     assert "<b>" not in text
 
 
