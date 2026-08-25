@@ -30,6 +30,7 @@ from messages import (
 )
 from shiki_api import (
     _STAT_STATUSES,
+    ProfilePrivacyError,
     fetch_favourites,
     fetch_list_export,
     fetch_meta_batch,
@@ -399,6 +400,8 @@ async def sync_stats_all(
                      media, len(need_meta), len(new_ids), len(retry_ids))
             try:
                 meta_map = await fetch_meta_batch(media, need_meta, session=session)
+            except ProfilePrivacyError:
+                raise
             except Exception as e:
                 log.error("sync_stats_all(%s): fetch_meta_batch упал: %s", media, e)
 
@@ -508,6 +511,8 @@ async def sync_stats_all(
         after = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
         if before != after:
             changed = True
+    except ProfilePrivacyError:
+        raise
     except Exception as e:
         log.error("sync_stats_all: сбор избранного упал: %s", e)
 

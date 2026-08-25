@@ -63,6 +63,7 @@ from shiki_api import (
     _INDUSTRY_CATEGORIES,
     ANIME_ALLOWED_KINDS,
     HISTORY_PAGE_LIMIT,
+    ProfilePrivacyError,
     fetch_current_rates,
     fetch_favourites,
     fetch_history,
@@ -118,6 +119,27 @@ _STATUS_CACHE_TTL = 60.0
 _status_cache: tuple[list[dict], list[dict]] | None = None
 _status_cache_at = 0.0
 _status_cache_lock: asyncio.Lock | None = None
+
+
+def _profile_privacy_owner_text() -> str:
+    """Полная инструкция владельцу по открытию публичного списка."""
+    settings_url = f"https://shikimori.io/{SHIKI_USER}/edit/profile"
+    return (
+        "⚠️ Профиль Shikimori закрыт.\n\n"
+        "ShikiUpdatesBot использует только публичные данные и не может прочитать "
+        "закрытые историю, выгрузки списков и текущие статусы.\n\n"
+        "Открой настройки профиля и установи:\n"
+        "«Могут видеть мой список» → «Все посетители сайта»\n\n"
+        f"{settings_url}"
+    )
+
+
+def _profile_privacy_public_text() -> str:
+    """Краткое объяснение без настроек и owner-only ссылки."""
+    return (
+        "⚠️ Профиль Shikimori закрыт. "
+        "Владельцу бота нужно открыть доступ к списку в настройках профиля."
+    )
 
 
 def _get_status_cache_lock() -> asyncio.Lock:
@@ -338,6 +360,8 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
     if resync:
         try:
             stats_all, _ = await sync_stats_all()
+        except ProfilePrivacyError:
+            raise
         except Exception as e:
             log.error("rotate_quarter: sync_stats_all упал: %s", e)
 
@@ -728,6 +752,8 @@ async def check_and_notify_favourites(
         try:
             stats = await _collect_favourites(None, stats, fav=favourites)
             save_stats_all(stats)
+        except ProfilePrivacyError:
+            raise
         except Exception as e:
             log.error("check_and_notify_favourites: не удалось обновить stats_all: %s", e)
     else:
@@ -954,6 +980,28 @@ def _should_full_sync(last_full_sync: float | None, now: float, interval: float)
     return last_full_sync is None or (now - last_full_sync) >= interval
 
 
+async def _notify_profile_privacy_owner(
+    bot: Bot,
+    last_notify_at: float | None,
+) -> float | None:
+    """Шлёт owner-only диагностику с общим интервалом фоновых ошибок."""
+    now = time.monotonic()
+    if (
+        last_notify_at is not None
+        and now - last_notify_at < ERROR_NOTIFY_INTERVAL
+    ):
+        return last_notify_at
+
+    try:
+        await bot.send_message(OWNER_ID, _profile_privacy_owner_text())
+    except Exception as notify_error:
+        log.exception(
+            "Не удалось отправить владельцу диагностику приватности: %s",
+            notify_error,
+        )
+    return now
+
+
 async def polling_loop(bot: Bot) -> None:
     """
     Бесконечный цикл проверки каждые CHECK_INTERVAL секунд.
@@ -971,55 +1019,92 @@ async def polling_loop(bot: Bot) -> None:
         DISPLAY_NAME, len(load_subscribers()), len(seen_ids), CHECK_INTERVAL,
     )
 
+    last_error_notify_at: float | None = None
+    privacy_error: ProfilePrivacyError | None = None
+    pending_seen_ids: set[int] | None = None
+    pending_seen_favs: set[str] | None = None
+    stats_all = load_stats_all()
+    synced_ok = False
+
     # boot-throttle: одна общая ClientSession на все стартовые фетчи (анти-429),
     # фиксированные паузы между фазами; избранное тянем ОДИН раз и переиспользуем.
     async with aiohttp.ClientSession() as session:
-        if not seen_ids:
-            log.info("Первый запуск — инициализируем историю без отправки сообщений.")
-            entries = await fetch_history(session)
-            if entries is None:
-                log.warning("Не удалось получить историю при инициализации — пропускаем, повторим на следующем цикле.")
-            else:
-                seen_ids = {e["id"] for e in entries}
-                save_seen_ids(seen_ids)
-                log.info("Инициализировано %d ID истории.", len(seen_ids))
+        try:
+            if not seen_ids:
+                log.info("Первый запуск — инициализируем историю без отправки сообщений.")
+                entries = await fetch_history(session)
+                if entries is None:
+                    log.warning(
+                        "Не удалось получить историю при инициализации — "
+                        "пропускаем, повторим на следующем цикле."
+                    )
+                else:
+                    pending_seen_ids = {e["id"] for e in entries}
             await asyncio.sleep(BOOT_PHASE_DELAY)
 
-        # Избранное фетчим ОДИН раз: и для инициализации seen_favs, и для sync (fav=).
-        favourites = await fetch_favourites(session)
-        if not seen_favs:
-            log.info("Инициализируем избранное без отправки сообщений.")
-            if favourites is None:
-                log.warning("Не удалось получить избранное при инициализации — пропускаем, повторим на следующем цикле.")
-            else:
-                for category in _FAV_CATEGORIES:
-                    for item in (favourites.get(category) or []):
-                        if item.get("id") is not None:
-                            seen_favs.add(f"{category}_{item['id']}")
-                save_seen_favourites(seen_favs)
-                log.info("Инициализировано %d записей избранного.", len(seen_favs))
-        await asyncio.sleep(BOOT_PHASE_DELAY)
+            # Избранное фетчим ОДИН раз: для baseline и sync (fav=).
+            favourites = await fetch_favourites(session)
+            if not seen_favs:
+                log.info("Инициализируем избранное без отправки сообщений.")
+                if favourites is None:
+                    log.warning(
+                        "Не удалось получить избранное при инициализации — "
+                        "пропускаем, повторим на следующем цикле."
+                    )
+                else:
+                    pending_seen_favs = {
+                        f"{category}_{item['id']}"
+                        for category in _FAV_CATEGORIES
+                        for item in (favourites.get(category) or [])
+                        if item.get("id") is not None
+                    }
+            await asyncio.sleep(BOOT_PHASE_DELAY)
 
-        # Актуализируем полную статистику из list_export на той же сессии,
-        # с уже полученным избранным (fav=) — без повторного фетча favourites.
-        log.info("Синхронизируем статистику за всё время (stats_all)...")
-        try:
-            stats_all, synced_ok = await sync_stats_all(session=session, fav=favourites)
-        except Exception as e:
-            log.exception("Не удалось синхронизировать stats_all при старте: %s", e)
-            stats_all = load_stats_all()
-            synced_ok = False
+            # Сохранять baseline можно только после этой последней сетевой фазы:
+            # privacy failure одного endpoint отменяет весь стартовый результат.
+            log.info("Синхронизируем статистику за всё время (stats_all)...")
+            try:
+                stats_all, synced_ok = await sync_stats_all(
+                    session=session,
+                    fav=favourites,
+                )
+            except ProfilePrivacyError:
+                raise
+            except Exception as e:
+                log.exception("Не удалось синхронизировать stats_all при старте: %s", e)
+        except ProfilePrivacyError as error:
+            privacy_error = error
+            log.warning(
+                "На старте обнаружен закрытый профиль (%s); "
+                "baseline и статистика не продвигаются.",
+                error.endpoint,
+            )
+
+    if privacy_error is None:
+        if pending_seen_ids is not None:
+            seen_ids = pending_seen_ids
+            save_seen_ids(seen_ids)
+            log.info("Инициализировано %d ID истории.", len(seen_ids))
+        if pending_seen_favs is not None:
+            seen_favs = pending_seen_favs
+            save_seen_favourites(seen_favs)
+            log.info("Инициализировано %d записей избранного.", len(seen_favs))
+    else:
+        last_error_notify_at = await _notify_profile_privacy_owner(
+            bot,
+            last_error_notify_at,
+        )
+
     # Метка последнего успешного полного синка (monotonic). None ⇒ в этой
     # сессии ещё не синкнулись успешно — цикл будет ретраить каждый раз.
     last_full_sync = time.monotonic() if synced_ok else None
 
     # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
-    try:
-        cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
-    except Exception as e:
-        log.exception("Ошибка ротации квартала при старте: %s", e)
-
-    last_error_notify_at = 0.0
+    if privacy_error is None:
+        try:
+            cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
+        except Exception as e:
+            log.exception("Ошибка ротации квартала при старте: %s", e)
 
     while True:
         try:
@@ -1045,6 +1130,8 @@ async def polling_loop(bot: Bot) -> None:
                         last_full_sync = time.monotonic()
                     else:
                         log.warning("stats_all: ресинк не удался (429?), повторим в следующем цикле.")
+                except ProfilePrivacyError:
+                    raise
                 except Exception as e:
                     log.exception("stats_all: ресинк в цикле упал: %s", e)
 
@@ -1060,11 +1147,25 @@ async def polling_loop(bot: Bot) -> None:
         except asyncio.CancelledError:
             # Штатная отмена задачи — пробрасываем, не глушим
             raise
+        except ProfilePrivacyError as error:
+            log.warning(
+                "Закрытый профиль обнаружен в фоновом цикле (%s); "
+                "состояние сохранено без изменений.",
+                error.endpoint,
+            )
+            last_error_notify_at = await _notify_profile_privacy_owner(
+                bot,
+                last_error_notify_at,
+            )
+            heartbeat()
         except Exception as e:
             log.exception("Непредвиденная ошибка в цикле проверки, продолжаем: %s", e)
 
             now = time.monotonic()
-            if now - last_error_notify_at >= ERROR_NOTIFY_INTERVAL:
+            if (
+                last_error_notify_at is None
+                or now - last_error_notify_at >= ERROR_NOTIFY_INTERVAL
+            ):
                 last_error_notify_at = now
 
                 try:
@@ -1524,7 +1625,18 @@ async def cmd_status(message: Message) -> None:
     Переиспользует общий свежий результат для всех чатов, затем собирает
     ответ с учётом всех комбинаций.
     """
-    rates = await _get_status_rates()
+    try:
+        rates = await _get_status_rates()
+    except ProfilePrivacyError:
+        from_user = getattr(message, "from_user", None)
+        is_owner = from_user is not None and from_user.id == OWNER_ID
+        text = (
+            _profile_privacy_owner_text()
+            if is_owner
+            else _profile_privacy_public_text()
+        )
+        await message.answer(text)
+        return
     if rates is None:
         await message.answer("⚠️ Не удалось получить данные от Shikimori. Попробуй позже.")
         return

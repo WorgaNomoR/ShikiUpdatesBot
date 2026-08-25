@@ -2,7 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 """Стабильные публичные метаданные проекта для всех режимов запуска."""
 
-PROJECT_VERSION = "v0.3.0"
+PROJECT_VERSION = "v0.3.1"
 PROJECT_REPOSITORY = "WorgaNomoR/ShikiUpdatesBot"
 PROJECT_SUMMARY = (
     "Telegram-бот, который следит за историей и избранным пользователя "

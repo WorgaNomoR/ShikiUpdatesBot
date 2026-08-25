@@ -79,6 +79,16 @@ _STAT_STATUSES: frozenset[str] = frozenset({
     "planned", "watching", "rewatching", "completed", "on_hold", "dropped",
 })
 
+_PRIVATE_PROFILE_MESSAGE = "You are not authorized to access this page."
+
+
+class ProfilePrivacyError(RuntimeError):
+    """Shikimori подтвердил, что публичный доступ к профилю закрыт."""
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        super().__init__(f"Профиль Shikimori закрыт ({endpoint})")
+
 _ORIGIN_RU: dict[str, str] = {
     "original":         "Оригинал",
     "manga":            "Манга",
@@ -263,6 +273,24 @@ def _retry_after(headers) -> float:
     return min(secs, _RETRY_AFTER_CAP)
 
 
+async def _is_private_profile_response(resp) -> bool:
+    """Проверяет только точный JSON-маркер закрытого профиля в HTTP 403."""
+    try:
+        payload = await resp.json(content_type=None)
+    except (
+        json.JSONDecodeError,
+        aiohttp.ContentTypeError,
+        AttributeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("error") == _PRIVATE_PROFILE_MESSAGE
+    )
+
+
 async def _fetch(
     session: aiohttp.ClientSession,
     method: str,
@@ -278,8 +306,9 @@ async def _fetch(
     Единый выстрел HTTP через центральный троттл + ретрай на 429.
 
     Перед КАЖДОЙ попыткой await-им _throttle() (min-gap). При 429 читаем
-    Retry-After, спим, ретраим (до _MAX_429_RETRIES). На не-200 → None. На
-    успехе отдаём await parse(resp). parse разбирает тело под конкретный вызов
+    Retry-After, спим, ретраим (до _MAX_429_RETRIES). Точный privacy-ответ
+    поднимаем как ProfilePrivacyError; остальные не-200 дают None. На успехе
+    отдаём await parse(resp). parse разбирает тело под конкретный вызов
     (list / dict / GraphQL); его исключения парсинга ловим здесь → None.
     """
     if headers is None:
@@ -309,6 +338,9 @@ async def _fetch(
                         continue
                     log.warning("%s: 429 rate limit, ретраи исчерпаны", label)
                     return None
+                if resp.status == 403 and await _is_private_profile_response(resp):
+                    log.warning("%s: профиль Shikimori закрыт", label)
+                    raise ProfilePrivacyError(label)
                 if resp.status != 200:
                     log.warning("%s: HTTP %d", label, resp.status)
                     return None

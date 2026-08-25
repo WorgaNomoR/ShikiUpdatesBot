@@ -19,6 +19,7 @@ import pytest
 
 import handlers
 import messages
+import shiki_api
 import stats as smod
 import storage
 import utils
@@ -789,4 +790,28 @@ async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatc
 
     assert ok is False
     assert result_stats is preserved
+    assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_sync_stats_all_private_export_dominates_partial_success(monkeypatch):
+    """Один доступный экспорт не маскирует privacy failure второго."""
+    import stats as stats_mod
+
+    preserved = {"_sentinel": "keep-me"}
+    saved = []
+
+    async def fake_export(session, media):
+        if media == "anime":
+            return []
+        raise shiki_api.ProfilePrivacyError("fetch_list_export(manga)")
+
+    monkeypatch.setattr(stats_mod, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.load_stats_all", lambda use_cache=True: preserved)
+    monkeypatch.setattr("stats.save_stats_all", lambda data: saved.append(data))
+
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await smod.sync_stats_all()
+
+    assert preserved == {"_sentinel": "keep-me"}
     assert saved == []

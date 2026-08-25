@@ -3,6 +3,7 @@
 """Тесты handlers.cmd_status — команда /status (текущие просмотры/чтение)."""
 
 import asyncio
+import types
 
 import pytest
 
@@ -10,8 +11,13 @@ import handlers
 
 
 class DummyMessage:
-    def __init__(self, chat_id=1):
+    def __init__(self, chat_id=1, user_id=None):
         self.chat_id = chat_id
+        self.from_user = (
+            types.SimpleNamespace(id=user_id)
+            if user_id is not None
+            else None
+        )
         self.calls = []
 
     async def answer(self, text, **kwargs):
@@ -227,3 +233,78 @@ async def test_status_full_failure_is_not_cached(monkeypatch):
     await handlers.cmd_status(recovered)
     assert "Ergo Proxy" in recovered.calls[0][0]
     assert len(calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_status_private_profile_non_owner_gets_no_settings_details(monkeypatch):
+    async def _fetch(media, statuses):
+        if media == "anime":
+            raise handlers.ProfilePrivacyError("fetch_current_rates(anime/watching)")
+        return [_manga_item("Berserk")]
+
+    monkeypatch.setattr("handlers.fetch_current_rates", _fetch)
+    message = DummyMessage(user_id=handlers.OWNER_ID + 1)
+
+    await handlers.cmd_status(message)
+
+    text = message.calls[0][0]
+    assert "профиль shikimori закрыт" in text.lower()
+    assert "владельцу бота" in text.lower()
+    assert "Могут видеть мой список" not in text
+    assert "Все посетители сайта" not in text
+    assert "edit/profile" not in text
+    assert "Berserk" not in text
+    assert handlers._status_cache is None
+
+
+@pytest.mark.asyncio
+async def test_status_private_profile_owner_gets_instruction_and_ready_link(monkeypatch):
+    monkeypatch.setattr(handlers, "SHIKI_USER", "ConfiguredUser")
+
+    async def _fetch(media, statuses):
+        if media == "manga":
+            raise handlers.ProfilePrivacyError("fetch_current_rates(manga/watching)")
+        return [_anime_item("Ergo Proxy")]
+
+    monkeypatch.setattr("handlers.fetch_current_rates", _fetch)
+    message = DummyMessage(user_id=handlers.OWNER_ID)
+
+    await handlers.cmd_status(message)
+
+    text = message.calls[0][0]
+    assert "Могут видеть мой список" in text
+    assert "Все посетители сайта" in text
+    assert "https://shikimori.io/ConfiguredUser/edit/profile" in text
+    assert "Ergo Proxy" not in text
+    assert handlers._status_cache is None
+
+
+@pytest.mark.asyncio
+async def test_status_private_profile_is_not_cached_and_recovers(monkeypatch):
+    responses = {
+        "anime": [
+            handlers.ProfilePrivacyError("fetch_current_rates(anime/watching)"),
+            [_anime_item("Ergo Proxy")],
+        ],
+        "manga": [[], []],
+    }
+    calls = []
+
+    async def _fetch(media, statuses):
+        calls.append(media)
+        result = responses[media].pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr("handlers.fetch_current_rates", _fetch)
+
+    failed = DummyMessage(user_id=handlers.OWNER_ID)
+    await handlers.cmd_status(failed)
+    assert handlers._status_cache is None
+
+    recovered = DummyMessage(user_id=handlers.OWNER_ID)
+    await handlers.cmd_status(recovered)
+    assert "Ergo Proxy" in recovered.calls[0][0]
+    assert handlers._status_cache is not None
+    assert calls == ["anime", "manga", "anime", "manga"]
