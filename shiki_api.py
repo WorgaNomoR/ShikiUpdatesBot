@@ -274,7 +274,7 @@ def _retry_after(headers) -> float:
 
 
 async def _is_private_profile_response(resp) -> bool:
-    """Проверяет только точный JSON-маркер закрытого профиля в HTTP 403."""
+    """Проверяет точное JSON-сообщение закрытого профиля в HTTP 403."""
     try:
         payload = await resp.json(content_type=None)
     except (
@@ -287,7 +287,7 @@ async def _is_private_profile_response(resp) -> bool:
         return False
     return (
         isinstance(payload, dict)
-        and payload.get("error") == _PRIVATE_PROFILE_MESSAGE
+        and payload.get("message") == _PRIVATE_PROFILE_MESSAGE
     )
 
 
