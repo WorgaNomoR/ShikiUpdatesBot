@@ -8,6 +8,7 @@ import pytest
 import backup
 import config
 import handlers
+import shiki_api
 import storage
 
 
@@ -436,6 +437,165 @@ async def test_cycle_fetches_favourites_once_and_threads_to_sync(monkeypatch):
     assert cnf_favs == [fav_payload]
     # Ресинку в цикле проброшен fav= (иначе sync_stats_all фетчил бы 2-й раз).
     assert sync_favs[-1] is fav_payload
+
+
+@pytest.mark.asyncio
+async def test_startup_private_list_notifies_owner_without_saving_public_favourites(
+    monkeypatch,
+):
+    """Доступное favourites не маскирует закрытый list export на старте."""
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {777: "subscriber"})
+    monkeypatch.setattr(
+        "handlers.load_stats_current",
+        lambda: {"period": "2026-Q2", "events": []},
+    )
+    preserved_stats = storage._empty_stats_all()
+    monkeypatch.setattr("handlers.load_stats_all", lambda: preserved_stats)
+
+    saved_favourites = []
+    monkeypatch.setattr(
+        "handlers.save_seen_favourites",
+        lambda seen: saved_favourites.append(set(seen)),
+    )
+    monkeypatch.setattr(
+        "handlers.save_stats_all",
+        lambda data: pytest.fail("privacy failure сохранил stats_all"),
+    )
+
+    favourites = {
+        "animes": [{"id": 10}],
+        "mangas": [],
+        "characters": [],
+        "people": [],
+    }
+
+    async def fake_favourites(session):
+        return favourites
+
+    async def fake_sync(session=None, fav=None):
+        assert fav is favourites
+        raise shiki_api.ProfilePrivacyError("fetch_list_export(anime)")
+
+    async def fake_check(bot, seen, cur):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("handlers.fetch_favourites", fake_favourites)
+    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
+    monkeypatch.setattr(
+        "handlers.rotate_quarter_if_needed",
+        AsyncMock(side_effect=AssertionError("privacy failure запустил ротацию")),
+    )
+    monkeypatch.setattr(
+        "handlers.send_to_all_chats",
+        AsyncMock(side_effect=AssertionError("privacy diagnostic ушёл подписчикам")),
+    )
+
+    sent = []
+
+    class DummyBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
+
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(DummyBot())
+
+    assert saved_favourites == []
+    assert len(sent) == 1
+    assert sent[0][0] == config.OWNER_ID
+    assert "Могут видеть мой список" in sent[0][1]
+    assert f"/{config.SHIKI_USER}/edit/profile" in sent[0][1]
+    assert sent[0][2] == {"parse_mode": handlers.ParseMode.HTML}
+
+
+@pytest.mark.asyncio
+async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {777: "subscriber"})
+    monkeypatch.setattr(
+        "handlers.load_stats_current",
+        lambda: {"period": "2026-Q2", "events": []},
+    )
+    monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
+    monkeypatch.setattr("handlers.ERROR_NOTIFY_INTERVAL", 3600)
+    monkeypatch.setattr("handlers._should_full_sync", lambda *args: False)
+
+    favourites = {
+        "animes": [{"id": 10}],
+        "mangas": [],
+        "characters": [],
+        "people": [],
+    }
+
+    async def fake_favourites(session):
+        return favourites
+
+    async def fake_sync(session=None, fav=None):
+        return storage._empty_stats_all(), True
+
+    async def fake_rotate(bot, cur, stats_all, resync=True):
+        return cur
+
+    async def fake_weekly(bot, cur):
+        return cur
+
+    check_calls = 0
+
+    async def fake_check(bot, seen, cur):
+        nonlocal check_calls
+        check_calls += 1
+        if check_calls <= 2:
+            raise shiki_api.ProfilePrivacyError("fetch_history(page=1)")
+        if check_calls == 3:
+            return seen, cur
+        raise asyncio.CancelledError
+
+    recovered_favourites_checks = []
+
+    async def fake_check_favourites(bot, seen, favourites=None):
+        recovered_favourites_checks.append(favourites)
+        return seen, False
+
+    async def fake_sleep(delay):
+        return None
+
+    heartbeat_calls = []
+    monkeypatch.setattr("handlers.fetch_favourites", fake_favourites)
+    monkeypatch.setattr("handlers.sync_stats_all", fake_sync)
+    monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
+    monkeypatch.setattr("handlers._weekly_backup_if_due", fake_weekly)
+    monkeypatch.setattr("handlers.check_and_notify", fake_check)
+    monkeypatch.setattr(
+        "handlers.check_and_notify_favourites",
+        fake_check_favourites,
+    )
+    monkeypatch.setattr("handlers.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "handlers.heartbeat",
+        lambda: heartbeat_calls.append(True),
+    )
+    broadcast = AsyncMock()
+    monkeypatch.setattr("handlers.send_to_all_chats", broadcast)
+
+    sent = []
+
+    class DummyBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
+
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(DummyBot())
+
+    assert check_calls == 4
+    assert len(sent) == 1
+    assert sent[0][0] == config.OWNER_ID
+    assert sent[0][2] == {"parse_mode": handlers.ParseMode.HTML}
+    assert recovered_favourites_checks == [favourites]
+    assert len(heartbeat_calls) == 3
+    broadcast.assert_not_awaited()
 
 
 # ═══════════════════════════════════════════════════════════════════

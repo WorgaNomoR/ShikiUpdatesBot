@@ -28,7 +28,7 @@ class _FakeResponse:
         self._json_value = json_value
         self._json_exc = json_exc
 
-    async def json(self):
+    async def json(self, *args, **kwargs):
         if self._json_exc is not None:
             raise self._json_exc
         return self._json_value
@@ -235,6 +235,79 @@ class _SeqSession:
         return self._responses.pop(0)
 
 
+# ── Точный privacy-сигнал: только 403 + точное поле error ──
+
+@pytest.mark.asyncio
+async def test_fetch_classifies_exact_private_profile_response():
+    response = _SeqResponse(
+        403,
+        json_value={"error": shiki_api._PRIVATE_PROFILE_MESSAGE},
+    )
+
+    with pytest.raises(shiki_api.ProfilePrivacyError) as exc_info:
+        await fetch_history(_SeqSession([response]))
+
+    assert exc_info.value.endpoint == "fetch_history(page=1)"
+
+
+@pytest.mark.asyncio
+async def test_list_export_propagates_private_profile_response():
+    response = _SeqResponse(
+        403,
+        json_value={"error": shiki_api._PRIVATE_PROFILE_MESSAGE},
+    )
+
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await shiki_api.fetch_list_export(_SeqSession([response]), "anime")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": "You are not authorized to access this page"},
+        {"error": "You are not authorized to access this page. "},
+        {"error": "you are not authorized to access this page."},
+        {"message": "You are not authorized to access this page."},
+        "You are not authorized to access this page.",
+        None,
+    ],
+    ids=[
+        "missing-period",
+        "trailing-space",
+        "different-case",
+        "different-field",
+        "plain-string",
+        "null",
+    ],
+)
+async def test_fetch_does_not_classify_near_private_profile_responses(payload):
+    response = _SeqResponse(403, json_value=payload)
+
+    assert await fetch_history(_SeqSession([response])) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_classify_malformed_403_body():
+    response = _FakeResponse(
+        403,
+        json_exc=json.JSONDecodeError("bad", "", 0),
+    )
+
+    assert await fetch_history(_FakeSession(response=response)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 404, 500])
+async def test_fetch_does_not_classify_private_message_on_other_status(status):
+    response = _SeqResponse(
+        status,
+        json_value={"error": shiki_api._PRIVATE_PROFILE_MESSAGE},
+    )
+
+    assert await fetch_history(_SeqSession([response])) is None
+
+
 # ── _throttle: держит min-gap (мутация: без sleep всплеск не тормозится) ──
 
 @pytest.mark.asyncio
@@ -311,6 +384,28 @@ async def test_fetch_returns_none_when_429_exhausted(monkeypatch):
     )
     assert await fetch_history(session) is None
     assert session.calls == attempts   # 1 исходный + _MAX_429_RETRIES ретраев
+
+
+@pytest.mark.asyncio
+async def test_429_private_message_remains_rate_limit_failure(monkeypatch):
+    async def fake_sleep(delay):
+        return None
+
+    monkeypatch.setattr(shiki_api.asyncio, "sleep", fake_sleep)
+    attempts = shiki_api._MAX_429_RETRIES + 1
+    responses = [
+        _SeqResponse(
+            429,
+            json_value={"error": shiki_api._PRIVATE_PROFILE_MESSAGE},
+            headers={"Retry-After": "0"},
+        )
+        for _ in range(attempts)
+    ]
+
+    session = _SeqSession(responses)
+
+    assert await fetch_history(session) is None
+    assert session.calls == attempts
 
 
 # ── _retry_after: парсинг Retry-After с фолбэками и клампом ──
@@ -428,6 +523,29 @@ async def test_fetch_current_rates_none_only_when_all_statuses_fail(monkeypatch)
         lambda *a, **k: _FakeSessionCM(session),
     )
     assert await shiki_api.fetch_current_rates("anime", ["watching", "rewatching"]) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_current_rates_private_failure_dominates_partial_success(monkeypatch):
+    watching = [{"id": 1, "anime": {"kind": "tv"}}]
+    session = _SeqSession([
+        _SeqResponse(200, json_value=watching),
+        _SeqResponse(
+            403,
+            json_value={"error": shiki_api._PRIVATE_PROFILE_MESSAGE},
+        ),
+    ])
+    monkeypatch.setattr(
+        shiki_api.aiohttp,
+        "ClientSession",
+        lambda *args, **kwargs: _FakeSessionCM(session),
+    )
+
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await shiki_api.fetch_current_rates(
+            "anime",
+            ["watching", "rewatching"],
+        )
 
 
 # ════════════════════════════════════════════════════════════════

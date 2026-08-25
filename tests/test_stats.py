@@ -13,12 +13,14 @@
 """
 
 import copy
+import json
 import re
 
 import pytest
 
 import handlers
 import messages
+import shiki_api
 import stats as smod
 import storage
 import utils
@@ -790,3 +792,101 @@ async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatc
     assert ok is False
     assert result_stats is preserved
     assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_sync_stats_all_private_export_dominates_partial_success(monkeypatch):
+    """Один доступный экспорт не маскирует privacy failure второго."""
+    import stats as stats_mod
+
+    preserved = {"_sentinel": "keep-me"}
+    saved = []
+
+    async def fake_export(session, media):
+        if media == "anime":
+            return []
+        raise shiki_api.ProfilePrivacyError("fetch_list_export(manga)")
+
+    monkeypatch.setattr(stats_mod, "fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.load_stats_all", lambda use_cache=True: preserved)
+    monkeypatch.setattr("stats.save_stats_all", lambda data: saved.append(data))
+
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await smod.sync_stats_all()
+
+    assert preserved == {"_sentinel": "keep-me"}
+    assert saved == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("privacy_stage", ["metadata", "favourites"])
+async def test_sync_stats_all_late_privacy_failure_preserves_process_cache(
+    monkeypatch,
+    tmp_path,
+    privacy_stage,
+):
+    """Поздний privacy failure не публикует частичный sync через process cache."""
+    initial = storage._empty_stats_all()
+    stats_file = tmp_path / "stats_all.json"
+    stats_file.write_text(
+        json.dumps(initial, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(storage, "STATS_ALL_FILE", stats_file)
+    monkeypatch.setattr(storage, "_stats_all_cache", None)
+    monkeypatch.setattr(storage, "_stats_all_cache_ts", 0.0)
+
+    exports = {
+        "anime": [
+            {
+                "target_id": 1,
+                "target_type": "Anime",
+                "target_title": "Ergo Proxy",
+                "target_title_ru": "Эрго Прокси",
+                "score": 8,
+                "status": "completed",
+                "rewatches": 0,
+                "episodes": 23,
+            },
+        ],
+        "manga": [
+            {
+                "target_id": 2,
+                "target_type": "Manga",
+                "target_title": "Berserk",
+                "target_title_ru": "Берсерк",
+                "score": 9,
+                "status": "completed",
+                "rewatches": 0,
+                "chapters": 10,
+                "volumes": 2,
+            },
+        ],
+    }
+
+    async def fake_export(session, media):
+        return exports[media]
+
+    async def fake_meta(media, ids, session=None):
+        if privacy_stage == "metadata" and media == "manga":
+            raise shiki_api.ProfilePrivacyError("fetch_meta_batch(manga)")
+        kind = "tv" if media == "anime" else "manga"
+        return {tid: {"kind": kind} for tid in ids}
+
+    async def fake_collect(session, stats, fav=None):
+        if privacy_stage == "favourites":
+            raise shiki_api.ProfilePrivacyError("fetch_favourites")
+        return stats
+
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr(
+        "stats.save_stats_all",
+        lambda data: pytest.fail("privacy failure сохранил частичный stats_all"),
+    )
+
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await smod.sync_stats_all(session=object())
+
+    assert storage.load_stats_all() == initial

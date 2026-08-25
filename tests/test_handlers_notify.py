@@ -9,6 +9,7 @@ import zipfile
 import pytest
 
 import backup
+import shiki_api
 import storage
 from handlers import check_and_notify
 
@@ -115,6 +116,26 @@ async def test_failed_fetch_skips_cycle(monkeypatch):
     assert result == {5}     # seen_ids не тронут
     assert saved == []       # ничего не сохранили
     assert sent == []        # ничего не слали
+
+
+@pytest.mark.asyncio
+async def test_private_history_preserves_state_and_never_broadcasts(monkeypatch):
+    async def _fetch(session, page=1):
+        raise shiki_api.ProfilePrivacyError(f"fetch_history(page={page})")
+
+    monkeypatch.setattr("handlers.fetch_history", _fetch)
+    saved = _capture_saves(monkeypatch)
+    sent = _capture_sends(monkeypatch)
+    original_seen = {5}
+    original_cur = _empty_cur()
+
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await check_and_notify(DummyBot(), original_seen, original_cur)
+
+    assert original_seen == {5}
+    assert original_cur == _empty_cur()
+    assert saved == []
+    assert sent == []
 
 
 @pytest.mark.asyncio

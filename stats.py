@@ -10,6 +10,7 @@
 """
 
 import json
+from copy import deepcopy
 
 import aiohttp
 
@@ -30,6 +31,7 @@ from messages import (
 )
 from shiki_api import (
     _STAT_STATUSES,
+    ProfilePrivacyError,
     fetch_favourites,
     fetch_list_export,
     fetch_meta_batch,
@@ -359,6 +361,11 @@ async def sync_stats_all(
         log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
         return stats, False
 
+    # load_stats_all обновляет процессный кэш и возвращает тот же объект.
+    # Изолируем рабочие изменения, чтобы поздний privacy failure не опубликовал
+    # частичный результат через кэш до атомарного сохранения.
+    stats = deepcopy(stats)
+
     changed = False
 
     for media, export in (("anime", export_anime), ("manga", export_manga)):
@@ -399,6 +406,8 @@ async def sync_stats_all(
                      media, len(need_meta), len(new_ids), len(retry_ids))
             try:
                 meta_map = await fetch_meta_batch(media, need_meta, session=session)
+            except ProfilePrivacyError:
+                raise
             except Exception as e:
                 log.error("sync_stats_all(%s): fetch_meta_batch упал: %s", media, e)
 
@@ -508,6 +517,8 @@ async def sync_stats_all(
         after = json.dumps(stats.get("favourites"), ensure_ascii=False, sort_keys=True)
         if before != after:
             changed = True
+    except ProfilePrivacyError:
+        raise
     except Exception as e:
         log.error("sync_stats_all: сбор избранного упал: %s", e)
 
