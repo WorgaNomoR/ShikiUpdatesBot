@@ -59,14 +59,17 @@ def is_eligible_first_name(name: str) -> bool:
     return bool(_ELIGIBLE_FIRST_NAME.fullmatch(name))
 
 
-def _fallback_context(name: str) -> DisplayNameContext:
+def _fallback_context(
+    name: str,
+    gender: DisplayGender | None = None,
+) -> DisplayNameContext:
     return DisplayNameContext(
         nominative=name,
         genitive=name,
         dative=name,
         accusative=name,
         instrumental=name,
-        gender=None,
+        gender=gender,
         inflection_applied=False,
     )
 
@@ -104,23 +107,31 @@ def build_display_name_context(
     """
     name = (raw_name or "").strip()
     mode = (gender_mode or "auto").strip().lower()
-    fallback = _fallback_context(name)
+    default_fallback = _fallback_context(name)
 
     if mode not in _GENDER_MODES:
         logger.warning("Неподдерживаемый DISPLAY_NAME_GENDER; грамматика имени отключена")
-        return fallback
+        return default_fallback
     if mode == "none":
-        return fallback
+        return default_fallback
+
+    explicit_gender: DisplayGender | None = None
+    if mode == "male":
+        explicit_gender = "male"
+    elif mode == "female":
+        explicit_gender = "female"
+    fallback = _fallback_context(name, explicit_gender)
+
     if not is_eligible_first_name(name):
         logger.info(
             "DISPLAY_NAME не является поддерживаемым русским именем; "
-            "грамматика имени отключена"
+            "склонение имени отключено"
         )
         return fallback
 
     try:
-        known_gender = mode != "auto"
-        if mode == "auto":
+        known_gender = explicit_gender is not None
+        if explicit_gender is None:
             detected = detector_factory().detect(firstname=name)
             if detected == Gender.MALE:
                 selected_gender: DisplayGender = "male"
@@ -132,12 +143,8 @@ def build_display_name_context(
                 )
                 return fallback
         else:
-            if mode == "male":
-                selected_gender = "male"
-                detected = Gender.MALE
-            else:
-                selected_gender = "female"
-                detected = Gender.FEMALE
+            selected_gender = explicit_gender
+            detected = Gender.FEMALE if explicit_gender == "female" else Gender.MALE
 
         maker = maker_factory()
         case_values = {

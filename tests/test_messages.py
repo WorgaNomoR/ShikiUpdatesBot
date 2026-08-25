@@ -1723,3 +1723,27 @@ def test_female_context_selects_female_surrounding_grammar():
         "И это её право.",
         "Анна дочитала и уставилась в стену.",
     ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_word"),
+    [
+        ("male", "закинул"),
+        ("female", "закинула"),
+    ],
+)
+def test_final_render_uses_explicit_gender_for_latin_name(
+    monkeypatch,
+    mode,
+    expected_word,
+):
+    monkeypatch.setattr(
+        messages,
+        "DISPLAY_NAME_CONTEXT",
+        build_display_name_context("Alice", mode),
+    )
+    monkeypatch.setattr(random, "choice", fixed_choice)
+
+    text = build_message(make_entry("добавлено в список", url=""))
+
+    assert f"Alice {expected_word}" in text
