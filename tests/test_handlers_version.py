@@ -147,6 +147,37 @@ async def test_info_reuses_telegram_file_id_after_first_upload(
     assert handlers._info_preview_file_id == "telegram-info-preview"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached_preview", [None, "expired-file-id"])
+async def test_info_falls_back_to_text_when_photo_is_rejected(
+    monkeypatch,
+    info_preview,
+    cached_preview,
+):
+    monkeypatch.setattr(handlers, "_info_preview_file_id", cached_preview)
+    monkeypatch.setattr(handlers, "load_update_state", lambda: {})
+    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    message = AsyncMock()
+    message.from_user = MagicMock(id=handlers.OWNER_ID + 1)
+    message.answer_photo.side_effect = TelegramBadRequest(
+        method=MagicMock(),
+        message="wrong file identifier",
+    )
+
+    await handlers.cmd_info(message)
+
+    preview = cached_preview or info_preview
+    message.answer_photo.assert_awaited_once()
+    photo_call = message.answer_photo.await_args
+    assert photo_call.args[0] is preview
+    message.answer.assert_awaited_once()
+    text_call = message.answer.await_args
+    assert text_call.args[0] == photo_call.kwargs["caption"]
+    assert text_call.kwargs["parse_mode"] == ParseMode.HTML
+    assert text_call.kwargs["reply_markup"] is photo_call.kwargs["reply_markup"]
+    assert handlers._info_preview_file_id is None
+
+
 @pytest.mark.parametrize("photos", [None, []])
 def test_info_preview_file_id_ignores_missing_or_empty_photo(monkeypatch, photos):
     monkeypatch.setattr(handlers, "_info_preview_file_id", "existing-file-id")

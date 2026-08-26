@@ -106,7 +106,9 @@ async def test_fetch_main_version_requests_raw_project_meta_from_main(release_bu
 
 @pytest.mark.asyncio
 async def test_fetch_main_version_returns_none_for_missing_file(release_build):
-    session = FakeSession(FakeResponse(status=404, text="not found"))
+    session = FakeSession(
+        FakeResponse(status=404, text='PROJECT_VERSION = "v1.4.0"\n'),
+    )
 
     assert await updates.fetch_main_version(session) is None
 

@@ -9,6 +9,7 @@ import yaml
 
 COMPOSE_PATH = Path(__file__).resolve().parents[1] / "docker-compose.yml"
 DOCKERIGNORE_PATH = COMPOSE_PATH.with_name(".dockerignore")
+DOCKERFILE_PATH = COMPOSE_PATH.with_name("Dockerfile")
 REQUIRED_ENV_VARS = {"BOT_TOKEN", "OWNER_ID", "SHIKI_USER"}
 REQUIRED_INTERPOLATION = re.compile(r"^\$\{([A-Z][A-Z0-9_]*):\?[^}]+\}$")
 
@@ -51,3 +52,9 @@ def test_docker_context_keeps_only_runtime_info_asset():
 
     assert relevant == ["assets/*", "!assets/info-preview.png"]
     assert "assets/" not in patterns
+
+
+def test_docker_build_requires_info_preview_in_effective_context():
+    instructions = DOCKERFILE_PATH.read_text(encoding="utf-8").splitlines()
+
+    assert "RUN test -f /app/assets/info-preview.png" in instructions

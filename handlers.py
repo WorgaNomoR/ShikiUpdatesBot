@@ -1762,6 +1762,7 @@ def _remember_info_preview_file_id(message: Message) -> None:
 
 async def cmd_info(message: Message) -> None:
     """Публично показать только сохранённое и process-local состояние."""
+    global _info_preview_file_id
     state = load_update_state()
     is_owner = message.from_user is not None and message.from_user.id == OWNER_ID
     text = _build_info_text(state)
@@ -1777,12 +1778,22 @@ async def cmd_info(message: Message) -> None:
             reply_markup=keyboard,
         )
         return
-    sent = await message.answer_photo(
-        preview,
-        caption=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
-    )
+    try:
+        sent = await message.answer_photo(
+            preview,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except TelegramBadRequest as e:
+        _info_preview_file_id = None
+        log.warning("Не удалось отправить иллюстрацию /info: %s", e)
+        await message.answer(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
     if _info_preview_file_id is None:
         _remember_info_preview_file_id(sent)
 
