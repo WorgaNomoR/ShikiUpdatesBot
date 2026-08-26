@@ -179,15 +179,16 @@ def _valid_import_payload(name: str, obj) -> bool:
         return (isinstance(obj, dict) and "period" in obj
                 and isinstance(obj.get("events"), list))
     if name == "update_state.json":
-        keys = {
+        legacy_keys = {
             "last_checked_at",
             "latest_version",
             "release_url",
             "last_notified_version",
         }
+        current_keys = legacy_keys | {"latest_main_version"}
         return (
             isinstance(obj, dict)
-            and set(obj) == keys
+            and set(obj) in (legacy_keys, current_keys)
             and all(
                 value is None or isinstance(value, str)
                 for value in obj.values()

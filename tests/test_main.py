@@ -55,6 +55,22 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         await main.main()
 
     app.bot.set_my_commands.assert_awaited_once()
+    public_commands = [
+        command.command
+        for command in app.bot.set_my_commands.await_args.args[0]
+    ]
+    assert "info" in public_commands
+    assert "version" not in public_commands
+    registered_messages = [
+        call.args[0]
+        for call in app.dispatcher.message.register.call_args_list
+    ]
+    assert main.cmd_info in registered_messages
+    registered_callbacks = [
+        call.args[0]
+        for call in app.dispatcher.callback_query.register.call_args_list
+    ]
+    assert main.version_refresh_cb in registered_callbacks
     app.dispatcher.shutdown.register.assert_not_called()
     app.probe.assert_awaited_once_with(app.bot)
     app.start_updates.assert_called_once_with(app.bot)

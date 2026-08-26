@@ -11,17 +11,20 @@ from unittest.mock import (
 import pytest
 
 import handlers
+import runtime_status
 from utils import _utcnow
 
 
 @pytest.fixture(autouse=True)
 def _reset_polling_task():
     handlers._polling_task = None
+    runtime_status.set_polling_active(False)
     yield
     t = handlers._polling_task
     if t is not None and not t.done():
         t.cancel()
     handlers._polling_task = None
+    runtime_status.set_polling_active(False)
 
 
 @pytest.fixture
@@ -62,6 +65,32 @@ async def test_start_polling_loop_is_idempotent(fake_loop):
     assert handlers.start_polling_loop(bot) is True     # запустили
     assert handlers.start_polling_loop(bot) is False    # уже жив — повторно не стартуем
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_polling_runtime_status_becomes_inactive_when_task_stops(fake_loop):
+    assert handlers.start_polling_loop(MagicMock()) is True
+    await asyncio.sleep(0)
+    assert runtime_status.get_runtime_snapshot().polling_active is True
+
+    task = handlers._polling_task
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    assert runtime_status.get_runtime_snapshot().polling_active is False
+
+
+def test_stale_polling_done_callback_does_not_hide_new_active_task(monkeypatch):
+    old_task = MagicMock()
+    old_task.cancelled.return_value = True
+    handlers._polling_task = MagicMock()
+    runtime_status.set_polling_active(True)
+
+    handlers._on_polling_done(old_task)
+
+    assert runtime_status.get_runtime_snapshot().polling_active is True
 
 
 @pytest.mark.asyncio

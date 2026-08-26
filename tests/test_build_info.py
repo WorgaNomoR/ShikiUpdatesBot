@@ -17,3 +17,6 @@ def test_semver_tuple_is_strict():
 def test_source_mode_has_canonical_project_version_and_repository():
     assert build_info.APP_VERSION == project_meta.PROJECT_VERSION
     assert build_info.APP_REPOSITORY == project_meta.PROJECT_REPOSITORY
+    assert build_info.MAIN_VERSION_API.endswith(
+        "/repos/WorgaNomoR/ShikiUpdatesBot/contents/project_meta.py"
+    )

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Идентичность запуска и сборки, встраиваемая PyInstaller spec-файлом.
+"""Идентичность запуска, сборки и GitHub API, встраиваемая PyInstaller.
 
 При запуске из исходников используются общие метаданные проекта; PyInstaller
 подменяет их данными конкретной CI-сборки.
@@ -42,6 +42,11 @@ RELEASES_URL = (
 )
 LATEST_RELEASE_API = (
     f"{APP_API_URL.rstrip('/')}/repos/{APP_REPOSITORY}/releases/latest"
+    if APP_REPOSITORY
+    else ""
+)
+MAIN_VERSION_API = (
+    f"{APP_API_URL.rstrip('/')}/repos/{APP_REPOSITORY}/contents/project_meta.py"
     if APP_REPOSITORY
     else ""
 )

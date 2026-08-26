@@ -38,6 +38,7 @@ from handlers import (
     cmd_broadcast,
     cmd_cancel,
     cmd_favs,
+    cmd_info,
     cmd_start,
     cmd_stats,
     cmd_status,
@@ -46,6 +47,7 @@ from handlers import (
     cmd_version,
     probe_owner_and_start,
     stats_menu_cb,
+    version_refresh_cb,
 )
 from healthcheck import start_health_server
 from runtime import (
@@ -69,6 +71,7 @@ async def main() -> None:
     dp.message.register(cmd_cancel,    Command("cancel"))
     dp.message.register(cmd_stats,     Command("stats"))
     dp.message.register(cmd_favs,      Command("favs"))
+    dp.message.register(cmd_info,      Command("info"))
     dp.message.register(cmd_version,   Command("version"))
 
     # FSM-обработчики для /broadcast
@@ -85,12 +88,16 @@ async def main() -> None:
     # Кнопки меню /stats (callback_data вида "stats:<ключ>")
     dp.callback_query.register(stats_menu_cb, F.data.startswith("stats:"))
 
+    # Кнопка обновления сведений о версиях
+    dp.callback_query.register(version_refresh_cb, F.data == "version:refresh")
+
     # Публичные команды в меню "/" — команды владельца не показываем
     await bot.set_my_commands([
         BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
         BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
         BotCommand(command="stats",  description="Статистика: квартал или всё время 📊"),
         BotCommand(command="favs",   description="Избранное ❤️"),
+        BotCommand(command="info",   description="О боте ℹ️"),
         BotCommand(command="stop",   description="Отписаться 😢"),
     ])
 
