@@ -147,6 +147,16 @@ async def test_info_reuses_telegram_file_id_after_first_upload(
     assert handlers._info_preview_file_id == "telegram-info-preview"
 
 
+@pytest.mark.parametrize("photos", [None, []])
+def test_info_preview_file_id_ignores_missing_or_empty_photo(photos):
+    handlers._info_preview_file_id = "existing-file-id"
+    message = MagicMock(photo=photos)
+
+    handlers._remember_info_preview_file_id(message)
+
+    assert handlers._info_preview_file_id == "existing-file-id"
+
+
 @pytest.mark.asyncio
 async def test_info_degrades_without_exposing_local_error(monkeypatch):
     monkeypatch.setattr(handlers, "load_update_state", lambda: {})

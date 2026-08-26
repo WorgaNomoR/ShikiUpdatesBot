@@ -46,7 +46,7 @@ def test_docker_context_keeps_only_runtime_info_asset():
     relevant = [
         pattern
         for pattern in patterns
-        if pattern in {"assets/*", "!assets/info-preview.png"}
+        if pattern.lstrip("!").startswith("assets/")
     ]
 
     assert relevant == ["assets/*", "!assets/info-preview.png"]
