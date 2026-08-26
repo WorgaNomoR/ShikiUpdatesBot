@@ -111,4 +111,4 @@ SEEN_FAVS_FILE = DATA_DIR / "seen_favourites.json"  # ID виденного из
 STATS_ALL_FILE     = DATA_DIR / "stats_all.json"      # вся история: тайтлы + агрегаты
 STATS_CURRENT_FILE = DATA_DIR / "stats_current.json"  # события текущего квартала
 QUARTERS_DIR       = DATA_DIR / "quarters"            # замороженные снапшоты кварталов
-UPDATE_STATE_FILE  = DATA_DIR / "update_state.json"   # проверка версии standalone exe
+UPDATE_STATE_FILE  = DATA_DIR / "update_state.json"   # кеш версий main и Windows-релиза

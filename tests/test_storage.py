@@ -396,12 +396,29 @@ def test_update_state_roundtrip(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "UPDATE_STATE_FILE", path)
     expected = {
         "last_checked_at": "2026-08-05T12:00:00+00:00",
+        "latest_main_version": "v1.3.0",
         "latest_version": "v1.2.0",
         "release_url": "https://example.test/release",
         "last_notified_version": None,
     }
     storage.save_update_state(expected)
     assert storage.load_update_state() == expected
+
+
+def test_load_update_state_backfills_main_version(monkeypatch, tmp_path):
+    path = tmp_path / "update_state.json"
+    path.write_text(json.dumps({
+        "last_checked_at": "2026-08-05T12:00:00+00:00",
+        "latest_version": "v1.2.0",
+        "release_url": "https://example.test/release",
+        "last_notified_version": "v1.2.0",
+    }), encoding="utf-8")
+    monkeypatch.setattr(storage, "UPDATE_STATE_FILE", path)
+
+    state = storage.load_update_state()
+
+    assert state["latest_main_version"] is None
+    assert state["latest_version"] == "v1.2.0"
 
 
 def test_load_update_state_bad_json_returns_defaults(monkeypatch, tmp_path):

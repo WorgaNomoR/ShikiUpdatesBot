@@ -273,12 +273,13 @@ def save_stats_current(data: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  update_state.json — ПРОВЕРКА ВЕРСИИ STANDALONE-СБОРКИ
+#  update_state.json — КЕШ ВЕРСИЙ MAIN И WINDOWS-РЕЛИЗА
 # ═══════════════════════════════════════════════════════════════════
 
 def _empty_update_state() -> dict:
     return {
         "last_checked_at": None,
+        "latest_main_version": None,
         "latest_version": None,
         "release_url": None,
         "last_notified_version": None,

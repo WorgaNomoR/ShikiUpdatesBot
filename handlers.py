@@ -4,7 +4,7 @@
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
 Верхний слой: команды и FSM (/start, /stop, /subs, /broadcast, /backup,
-/status, /stats, /favs), inline-меню, рассылка, цикл уведомлений (check_and_
+/status, /stats, /favs, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
 notify*, polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
 """
@@ -22,6 +22,7 @@ from aiogram.fsm.state import (
     StatesGroup,
 )
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -59,6 +60,13 @@ from messages import (
     extract_score_change,
     format_rate_entry,
 )
+from runtime import RESOURCE_ROOT
+from runtime_status import (
+    RuntimeSnapshot,
+    get_runtime_snapshot,
+    mark_full_sync_success,
+    set_polling_active,
+)
 from shiki_api import (
     _FAV_CATEGORIES,
     _INDUSTRY_CATEGORIES,
@@ -90,6 +98,7 @@ from storage import (
     load_stats_all,
     load_stats_current,
     load_subscribers,
+    load_update_state,
     restorable_state_transaction,
     save_seen_favourites,
     save_seen_ids,
@@ -117,6 +126,7 @@ from utils import (
 BOOT_PHASE_DELAY = 2.0  # секунд
 _HISTORY_CATCHUP_MAX_PAGES = 5
 _STATUS_CACHE_TTL = 60.0
+INFO_PREVIEW_PATH = RESOURCE_ROOT / "assets" / "info-preview.png"
 _status_cache: tuple[list[dict], list[dict]] | None = None
 _status_cache_at = 0.0
 _status_cache_lock: asyncio.Lock | None = None
@@ -360,7 +370,9 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
     # сессией сразу после первого ловил 429 (boot-burst в день ротации).
     if resync:
         try:
-            stats_all, _ = await sync_stats_all()
+            stats_all, synced_ok = await sync_stats_all()
+            if synced_ok:
+                mark_full_sync_success()
         except ProfilePrivacyError:
             raise
         except Exception as e:
@@ -1103,6 +1115,8 @@ async def polling_loop(bot: Bot) -> None:
     # Метка последнего успешного полного синка (monotonic). None ⇒ в этой
     # сессии ещё не синкнулись успешно — цикл будет ретраить каждый раз.
     last_full_sync = time.monotonic() if synced_ok else None
+    if synced_ok:
+        mark_full_sync_success()
 
     # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
     if privacy_error is None:
@@ -1133,6 +1147,7 @@ async def polling_loop(bot: Bot) -> None:
                     _, synced_ok = await sync_stats_all(fav=cycle_favourites)
                     if synced_ok:
                         last_full_sync = time.monotonic()
+                        mark_full_sync_success()
                     else:
                         log.warning("stats_all: ресинк не удался (429?), повторим в следующем цикле.")
                 except ProfilePrivacyError:
@@ -1202,6 +1217,8 @@ _polling_task: "asyncio.Task | None" = None
 
 def _on_polling_done(task: "asyncio.Task") -> None:
     """Логируем, если polling_loop завершился неожиданно."""
+    if task is _polling_task:
+        set_polling_active(False)
     if task.cancelled():
         log.warning("polling_loop: задача отменена.")
     elif exc := task.exception():
@@ -1215,7 +1232,12 @@ def start_polling_loop(bot: Bot) -> bool:
     global _polling_task
     if _polling_task is not None and not _polling_task.done():
         return False
-    _polling_task = asyncio.create_task(polling_loop(bot))
+    try:
+        _polling_task = asyncio.create_task(polling_loop(bot))
+    except Exception:
+        set_polling_active(False)
+        raise
+    set_polling_active(True)
     _polling_task.add_done_callback(_on_polling_done)
     return True
 
@@ -1684,7 +1706,95 @@ async def cmd_version(message: Message) -> None:
         return
     state = await refresh_update_state(force=True)
     await message.answer(
-        build_version_text(state),
+        _build_info_text(state),
         parse_mode=ParseMode.HTML,
-        reply_markup=build_version_keyboard(state.get("release_url")),
+        reply_markup=build_version_keyboard(
+            state.get("release_url"),
+            include_refresh=True,
+        ),
     )
+
+
+def _build_info_text(state: dict) -> str:
+    """Собрать локальный runtime-снимок без раскрытия ошибок чтения."""
+    try:
+        last_backup_at = load_stats_current().get("last_backup_at")
+    except Exception as e:
+        log.warning("Не удалось прочитать время планового backup для /info: %s", e)
+        last_backup_at = "unknown"
+    try:
+        runtime = get_runtime_snapshot()
+    except Exception as e:
+        log.warning("Не удалось прочитать runtime status для /info: %s", e)
+        runtime = RuntimeSnapshot(None, None, False)
+    return build_version_text(
+        state,
+        runtime=runtime,
+        last_backup_at=last_backup_at,
+    )
+
+
+def _load_info_preview() -> BufferedInputFile | None:
+    """Прочитать локальную иллюстрацию; при проблеме оставить текстовый ответ."""
+    try:
+        content = INFO_PREVIEW_PATH.read_bytes()
+    except OSError as e:
+        log.warning("Не удалось прочитать иллюстрацию /info: %s", e)
+        return None
+    if not content:
+        log.warning("Иллюстрация /info пуста")
+        return None
+    return BufferedInputFile(content, filename=INFO_PREVIEW_PATH.name)
+
+
+async def cmd_info(message: Message) -> None:
+    """Публично показать только сохранённое и process-local состояние."""
+    state = load_update_state()
+    is_owner = message.from_user is not None and message.from_user.id == OWNER_ID
+    text = _build_info_text(state)
+    keyboard = build_version_keyboard(
+        state.get("release_url"),
+        include_refresh=is_owner,
+    )
+    preview = _load_info_preview()
+    if preview is None:
+        await message.answer(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+    await message.answer_photo(
+        preview,
+        caption=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def version_refresh_cb(callback: CallbackQuery) -> None:
+    """Повторно проверить owner guard и вручную обновить GitHub cache."""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("Только для владельца бота.", show_alert=True)
+        return
+
+    await callback.answer("Обновляю сведения…")
+    state = await refresh_update_state(force=True)
+    if callback.message is not None:
+        text = _build_info_text(state)
+        keyboard = build_version_keyboard(
+            state.get("release_url"),
+            include_refresh=True,
+        )
+        if getattr(callback.message, "photo", None):
+            await callback.message.edit_caption(
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        else:
+            await callback.message.edit_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )

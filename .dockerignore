@@ -51,7 +51,8 @@ ruff.toml
 ShikiUpdatesBot.spec
 packaging/windows/
 release_security.py
-assets/
+assets/*
+!assets/info-preview.png
 
 # Документация, не нужная во время выполнения контейнера
 README.md

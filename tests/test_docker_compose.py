@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 COMPOSE_PATH = Path(__file__).resolve().parents[1] / "docker-compose.yml"
+DOCKERIGNORE_PATH = COMPOSE_PATH.with_name(".dockerignore")
 REQUIRED_ENV_VARS = {"BOT_TOKEN", "OWNER_ID", "SHIKI_USER"}
 REQUIRED_INTERPOLATION = re.compile(r"^\$\{([A-Z][A-Z0-9_]*):\?[^}]+\}$")
 
@@ -38,3 +39,11 @@ def test_compose_loads_env_file_but_keeps_data_volume_invariant():
     assert service["env_file"] == [".env"]
     assert service["environment"]["DATA_DIR"] == "/data"
     assert "./data:/data" in service["volumes"]
+
+
+def test_docker_context_keeps_only_runtime_info_asset():
+    patterns = DOCKERIGNORE_PATH.read_text(encoding="utf-8").splitlines()
+
+    assert "assets/*" in patterns
+    assert "!assets/info-preview.png" in patterns
+    assert "assets/" not in patterns

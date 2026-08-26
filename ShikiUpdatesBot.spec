@@ -95,6 +95,7 @@ datas = collect_data_files("pytrovich")
 datas += copy_metadata("aiogram")
 datas += copy_metadata("aiohttp")
 datas += copy_metadata("pytrovich")
+datas.append((str(root / "assets" / "info-preview.png"), "assets"))
 
 a = Analysis(
     [str(root / "launcher.py")],

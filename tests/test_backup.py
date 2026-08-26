@@ -202,7 +202,8 @@ async def test_restore_round_trip(backup_env):
         "subscribers.json": '{"subscribers": {"123": "Alice"}}',
         "stats_current.json": '{"period": "2026-Q2", "events": []}',
         "update_state.json": (
-            '{"last_checked_at": null, "latest_version": "v1.2.0", '
+            '{"last_checked_at": null, "latest_main_version": "v1.3.0", '
+            '"latest_version": "v1.2.0", '
             '"release_url": "https://release", "last_notified_version": "v1.2.0"}'
         ),
         "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
@@ -220,6 +221,7 @@ async def test_restore_round_trip(backup_env):
     # файлы реально записаны
     assert storage.load_subscribers() == {123: "Alice"}
     assert storage.load_update_state()["last_notified_version"] == "v1.2.0"
+    assert storage.load_update_state()["latest_main_version"] == "v1.3.0"
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
     assert not (backup_env / "seen_ids.json").exists()
 
@@ -309,6 +311,7 @@ async def test_restore_skips_unreadable_zip_member(backup_env, monkeypatch, read
 async def test_restore_rejects_inexact_update_state_schema(backup_env, change):
     state = {
         "last_checked_at": None,
+        "latest_main_version": "v1.3.0",
         "latest_version": "v1.2.0",
         "release_url": "https://release",
         "last_notified_version": "v1.2.0",
@@ -329,6 +332,7 @@ async def test_restore_rejects_inexact_update_state_schema(backup_env, change):
     "key",
     [
         "last_checked_at",
+        "latest_main_version",
         "latest_version",
         "release_url",
         "last_notified_version",
@@ -338,6 +342,7 @@ async def test_restore_rejects_inexact_update_state_schema(backup_env, change):
 async def test_restore_rejects_non_string_update_state_value(backup_env, key):
     state = {
         "last_checked_at": None,
+        "latest_main_version": "v1.3.0",
         "latest_version": "v1.2.0",
         "release_url": "https://release",
         "last_notified_version": "v1.2.0",
@@ -348,6 +353,25 @@ async def test_restore_rejects_non_string_update_state_value(backup_env, key):
     with pytest.raises(ValueError, match="нет валидных файлов"):
         await backup.restore_backup_zip(raw)
     assert not (backup_env / "update_state.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_accepts_legacy_update_state_and_backfills_main(backup_env):
+    legacy = {
+        "last_checked_at": None,
+        "latest_version": "v1.2.0",
+        "release_url": "https://release",
+        "last_notified_version": "v1.2.0",
+    }
+
+    result = await backup.restore_backup_zip(
+        _zip_bytes({"update_state.json": json.dumps(legacy)})
+    )
+
+    assert result["restored"] == ["update_state.json"]
+    state = storage.load_update_state()
+    assert state["latest_main_version"] is None
+    assert state["latest_version"] == "v1.2.0"
 
 
 @pytest.mark.asyncio

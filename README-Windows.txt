@@ -40,7 +40,8 @@ Disable-Autostart.cmd (или удалите ShikiUpdatesBot.lnk через shel
 
 - ShikiUpdatesBot.exe --check-config  проверяет настройки без подключения бота.
 - ShikiUpdatesBot.exe --version       показывает установленную версию.
-- /version в Telegram проверяет последнюю опубликованную сборку (только владелец).
+- /info в Telegram показывает сведения о боте, его версии и состоянии.
+- /version обновляет сведения о доступных версиях (только владелец).
 - Для обновления остановите бот и замените только ShikiUpdatesBot.exe.
   Не удаляйте .env, каталог данных (по умолчанию data\) и logs\.
 

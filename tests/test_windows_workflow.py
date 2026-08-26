@@ -23,10 +23,16 @@ SPEC = yaml.safe_load(WORKFLOW)
 POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
 POWERSHELL_TESTS_UNAVAILABLE = sys.platform != "win32" or POWERSHELL is None
 ROOT = Path(__file__).resolve().parents[1]
+PYINSTALLER_SPEC = (ROOT / "ShikiUpdatesBot.spec").read_text(encoding="utf-8")
 
 
 def _step(job: dict, name: str) -> dict:
     return next(step for step in job["steps"] if step.get("name") == name)
+
+
+def test_pyinstaller_bundles_info_preview():
+    assert 'root / "assets" / "info-preview.png"' in PYINSTALLER_SPEC
+    assert '"assets"' in PYINSTALLER_SPEC
 
 
 def _value_paths(value, needle: str, path=()):

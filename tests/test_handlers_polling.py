@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 
@@ -373,6 +376,11 @@ async def test_cycle_fetches_favourites_once_and_threads_to_sync(monkeypatch):
     monkeypatch.setattr("handlers.heartbeat", lambda: None)
     # Форсим ресинк stats_all в цикле, чтобы проверить проброс fav=.
     monkeypatch.setattr("handlers._should_full_sync", lambda *a, **k: True)
+    sync_marks = []
+    monkeypatch.setattr(
+        "handlers.mark_full_sync_success",
+        lambda: sync_marks.append(True),
+    )
 
     fav_payload = {"animes": [{"id": 10}], "mangas": [], "characters": [], "people": []}
     fav_calls = []
@@ -437,6 +445,42 @@ async def test_cycle_fetches_favourites_once_and_threads_to_sync(monkeypatch):
     assert cnf_favs == [fav_payload]
     # Ресинку в цикле проброшен fav= (иначе sync_stats_all фетчил бы 2-й раз).
     assert sync_favs[-1] is fav_payload
+    assert len(sync_marks) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_full_sync_does_not_advance_display_timestamp(monkeypatch):
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
+    monkeypatch.setattr(
+        "handlers.load_stats_current",
+        lambda: {"period": "2026-Q2", "events": []},
+    )
+    monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
+    monkeypatch.setattr(
+        "handlers.fetch_favourites",
+        AsyncMock(return_value={"animes": [], "mangas": []}),
+    )
+    monkeypatch.setattr(
+        "handlers.sync_stats_all",
+        AsyncMock(return_value=(storage._empty_stats_all(), False)),
+    )
+    monkeypatch.setattr(
+        "handlers.rotate_quarter_if_needed",
+        AsyncMock(side_effect=lambda bot, cur, stats_all, resync=False: cur),
+    )
+    monkeypatch.setattr(
+        "handlers.check_and_notify",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+    mark = MagicMock()
+    monkeypatch.setattr("handlers.mark_full_sync_success", mark)
+
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(object())
+
+    mark.assert_not_called()
 
 
 @pytest.mark.asyncio

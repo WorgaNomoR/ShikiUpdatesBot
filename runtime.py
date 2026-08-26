@@ -23,6 +23,9 @@ if os.name == "nt":
     from ctypes import wintypes
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
+RESOURCE_ROOT = Path(
+    getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+).resolve()
 APP_ROOT = (
     Path(sys.executable).resolve().parent
     if IS_FROZEN

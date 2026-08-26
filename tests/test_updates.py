@@ -21,9 +21,10 @@ import updates
 
 
 class FakeResponse:
-    def __init__(self, status=200, payload=None):
+    def __init__(self, status=200, payload=None, text=None):
         self.status = status
         self.payload = payload
+        self.text_payload = text
 
     async def __aenter__(self):
         return self
@@ -33,6 +34,9 @@ class FakeResponse:
 
     async def json(self):
         return self.payload
+
+    async def text(self):
+        return self.text_payload
 
 
 class FakeSession:
@@ -51,6 +55,11 @@ def release_build(monkeypatch):
     monkeypatch.setattr(updates, "HAS_RELEASE_INFO", True)
     monkeypatch.setattr(updates, "APP_VERSION", "v1.2.0")
     monkeypatch.setattr(updates, "LATEST_RELEASE_API", "https://api.github.test/releases/latest")
+    monkeypatch.setattr(
+        updates,
+        "MAIN_VERSION_API",
+        "https://api.github.test/repos/example/project/contents/project_meta.py",
+    )
     monkeypatch.setattr(updates, "RELEASES_URL", "https://github.test/releases/latest")
 
 
@@ -80,6 +89,50 @@ async def test_fetch_latest_release_returns_none_on_network_error(release_build)
 
 
 @pytest.mark.asyncio
+async def test_fetch_main_version_requests_raw_project_meta_from_main(release_build):
+    source = 'PROJECT_VERSION = "v1.4.0"\r\nraise RuntimeError("must not execute")\r\n'
+    session = FakeSession(FakeResponse(text=source))
+
+    assert await updates.fetch_main_version(session) == "v1.4.0"
+    url, kwargs = session.calls[0]
+    assert url.endswith("/contents/project_meta.py")
+    assert kwargs["params"] == {"ref": "main"}
+    assert kwargs["headers"]["Accept"] == "application/vnd.github.raw+json"
+
+
+@pytest.mark.asyncio
+async def test_fetch_main_version_returns_none_for_missing_file(release_build):
+    session = FakeSession(FakeResponse(status=404, text="not found"))
+
+    assert await updates.fetch_main_version(session) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_main_version_returns_none_on_network_error(release_build):
+    session = MagicMock()
+    session.get.side_effect = aiohttp.ClientError("network unavailable")
+
+    assert await updates.fetch_main_version(session) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        'PROJECT_VERSION = "v1.2"',
+        'PROJECT_VERSION = "v01.2.3"',
+        "PROJECT_VERSION = 'v1.2.3'",
+        ' PROJECT_VERSION = "v1.2.3"',
+        'PROJECT_VERSION = "v1.2.3"  ',
+        'PROJECT_VERSION = "v1.2.3"\nPROJECT_VERSION = "v1.2.4"',
+        'PROJECT_VERSION = "v1.2.3"\nPROJECT_VERSION = get_version()',
+    ],
+)
+def test_parse_main_version_rejects_non_strict_or_ambiguous_source(source):
+    assert updates.parse_main_version(source) is None
+
+
+@pytest.mark.asyncio
 async def test_refresh_update_state_persists_success(release_build, monkeypatch):
     state = {
         "last_checked_at": None,
@@ -95,9 +148,15 @@ async def test_refresh_update_state_persists_success(release_build, monkeypatch)
         "fetch_latest_release",
         AsyncMock(return_value=updates.ReleaseInfo("v1.3.0", "https://release")),
     )
+    monkeypatch.setattr(
+        updates,
+        "fetch_main_version",
+        AsyncMock(return_value="v1.4.0"),
+    )
 
     result = await updates.refresh_update_state(force=True)
     assert result["latest_version"] == "v1.3.0"
+    assert result["latest_main_version"] == "v1.4.0"
     assert result["last_checked_at"]
     assert saved[-1]["release_url"] == "https://release"
 
@@ -115,14 +174,17 @@ async def test_refresh_update_state_honors_recent_naive_timestamp(
         "last_notified_version": None,
     }
     fetch = AsyncMock()
+    fetch_main = AsyncMock()
     save = MagicMock()
     monkeypatch.setattr(updates, "_utcnow", lambda: now)
     monkeypatch.setattr(updates, "load_update_state", lambda: state.copy())
     monkeypatch.setattr(updates, "save_update_state", save)
     monkeypatch.setattr(updates, "fetch_latest_release", fetch)
+    monkeypatch.setattr(updates, "fetch_main_version", fetch_main)
 
     assert await updates.refresh_update_state(force=False) == state
     fetch.assert_not_awaited()
+    fetch_main.assert_not_awaited()
     save.assert_not_called()
 
 
@@ -143,7 +205,10 @@ def test_checked_recently_rejects_future_timestamp(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_forced_source_check_uses_release_api(release_build, monkeypatch):
+async def test_scheduled_source_check_uses_both_version_sources(
+    release_build,
+    monkeypatch,
+):
     monkeypatch.setattr(updates, "IS_FROZEN", False)
     state = {
         "last_checked_at": None,
@@ -152,14 +217,114 @@ async def test_forced_source_check_uses_release_api(release_build, monkeypatch):
         "last_notified_version": None,
     }
     fetch = AsyncMock(return_value=updates.ReleaseInfo("v1.3.0", "https://release"))
+    fetch_main = AsyncMock(return_value="v1.4.0")
     monkeypatch.setattr(updates, "load_update_state", lambda: state.copy())
     monkeypatch.setattr(updates, "save_update_state", lambda value: None)
     monkeypatch.setattr(updates, "fetch_latest_release", fetch)
+    monkeypatch.setattr(updates, "fetch_main_version", fetch_main)
+
+    result = await updates.refresh_update_state(force=False)
+
+    fetch.assert_awaited_once()
+    fetch_main.assert_awaited_once()
+    assert result["latest_version"] == "v1.3.0"
+    assert result["latest_main_version"] == "v1.4.0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("main_result", "release_result", "expected_main", "expected_release"),
+    [
+        ("v1.4.0", None, "v1.4.0", "v1.2.5"),
+        (None, updates.ReleaseInfo("v1.3.0", "https://new-release"), "v1.3.5", "v1.3.0"),
+    ],
+)
+async def test_refresh_update_state_merges_independent_results(
+    release_build,
+    monkeypatch,
+    main_result,
+    release_result,
+    expected_main,
+    expected_release,
+):
+    state = {
+        "last_checked_at": None,
+        "latest_main_version": "v1.3.5",
+        "latest_version": "v1.2.5",
+        "release_url": "https://old-release",
+        "last_notified_version": "v1.2.5",
+    }
+    monkeypatch.setattr(updates, "load_update_state", lambda: state.copy())
+    monkeypatch.setattr(updates, "save_update_state", lambda value: state.update(value))
+    monkeypatch.setattr(
+        updates,
+        "fetch_main_version",
+        AsyncMock(return_value=main_result),
+    )
+    monkeypatch.setattr(
+        updates,
+        "fetch_latest_release",
+        AsyncMock(return_value=release_result),
+    )
 
     result = await updates.refresh_update_state(force=True)
 
-    fetch.assert_awaited_once()
-    assert result["latest_version"] == "v1.3.0"
+    assert result["latest_main_version"] == expected_main
+    assert result["latest_version"] == expected_release
+    assert result["last_notified_version"] == "v1.2.5"
+
+
+@pytest.mark.asyncio
+async def test_refresh_update_state_total_failure_preserves_last_valid_cache(
+    release_build,
+    monkeypatch,
+):
+    state = {
+        "last_checked_at": None,
+        "latest_main_version": "v1.3.5",
+        "latest_version": "v1.2.5",
+        "release_url": "https://old-release",
+        "last_notified_version": "v1.2.5",
+    }
+    monkeypatch.setattr(updates, "load_update_state", lambda: state.copy())
+    monkeypatch.setattr(updates, "save_update_state", lambda value: None)
+    monkeypatch.setattr(
+        updates,
+        "fetch_main_version",
+        AsyncMock(side_effect=RuntimeError("main unavailable")),
+    )
+    monkeypatch.setattr(
+        updates,
+        "fetch_latest_release",
+        AsyncMock(side_effect=RuntimeError("release unavailable")),
+    )
+
+    result = await updates.refresh_update_state(force=True)
+
+    assert result["latest_main_version"] == "v1.3.5"
+    assert result["latest_version"] == "v1.2.5"
+    assert result["release_url"] == "https://old-release"
+    assert result["last_notified_version"] == "v1.2.5"
+
+
+@pytest.mark.asyncio
+async def test_refresh_update_state_propagates_fetch_cancellation(
+    release_build,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        updates,
+        "fetch_main_version",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+    monkeypatch.setattr(
+        updates,
+        "fetch_latest_release",
+        AsyncMock(return_value=None),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await updates.refresh_update_state(force=True)
 
 
 @pytest.mark.asyncio
@@ -218,6 +383,7 @@ async def test_stale_update_refresh_preserves_imported_notification_state(
         return updates.ReleaseInfo("v1.3.0", "https://new-release")
 
     monkeypatch.setattr(updates, "fetch_latest_release", paused_fetch)
+    monkeypatch.setattr(updates, "fetch_main_version", AsyncMock(return_value=None))
     writer = asyncio.create_task(updates.refresh_update_state(force=True))
     await started.wait()
 
@@ -274,6 +440,7 @@ async def test_overlapping_update_refresh_keeps_newer_completed_check(
 
     monkeypatch.setattr(updates, "_utcnow", lambda: next(checked_times))
     monkeypatch.setattr(updates, "fetch_latest_release", fetch_release)
+    monkeypatch.setattr(updates, "fetch_main_version", AsyncMock(return_value=None))
     monkeypatch.setattr(updates, "load_update_state", load_state)
     monkeypatch.setattr(updates, "save_update_state", save_state)
 
@@ -293,9 +460,9 @@ async def test_overlapping_update_refresh_keeps_newer_completed_check(
 def test_build_version_text_marks_source_mode(monkeypatch):
     monkeypatch.setattr(updates, "IS_FROZEN", False)
     text = updates.build_version_text({})
-    assert "Python/source" in text
-    assert "вручную через /version" in text
+    assert "Python/source или Docker" in text
     assert "Shikimori" in text
+    assert "GNU General Public License версии 3 или более поздней" in text
 
 
 @pytest.mark.parametrize(
@@ -303,10 +470,10 @@ def test_build_version_text_marks_source_mode(monkeypatch):
     [
         ("2026-08-06T12:12:30.388825", "06.08.2026, 12:12 UTC"),
         ("2026-08-06T15:12:30+03:00", "06.08.2026, 12:12 UTC"),
-        (None, "ещё не проверялась"),
-        ("", "ещё не проверялась"),
-        (123, "ещё не проверялась"),
-        ("not-an-iso-timestamp", "время последней проверки неизвестно"),
+        (None, "ещё не выполнялось"),
+        ("", "ещё не выполнялось"),
+        (123, "ещё не выполнялось"),
+        ("not-an-iso-timestamp", "время неизвестно"),
     ],
 )
 def test_build_version_text_formats_checked_at_safely(monkeypatch, stored, rendered):
@@ -314,8 +481,10 @@ def test_build_version_text_formats_checked_at_safely(monkeypatch, stored, rende
 
     text = updates.build_version_text({"last_checked_at": stored})
 
-    assert "Последняя версия:" in text
-    assert f"Проверено: {rendered}" in text
+    assert "Версия этого бота:" in text
+    assert "Актуальная версия проекта:" in text
+    assert "Последняя версия для Windows:" in text
+    assert f"Последнее обновление сведений: {rendered}" in text
     if isinstance(stored, str) and stored:
         assert stored not in text
 
@@ -332,7 +501,80 @@ def test_version_keyboard_contains_repository_and_release(monkeypatch):
     ]
 
 
-def test_start_update_loop_is_disabled_outside_release_exe(monkeypatch):
+def test_version_renderer_escapes_content_and_rejects_unsafe_links(monkeypatch):
+    monkeypatch.setattr(updates, "PROJECT_SUMMARY", '<script>alert("x")</script>')
+    monkeypatch.setattr(updates, "APP_VERSION", 'v1.2.3<unsafe>')
+    monkeypatch.setattr(updates, "REPOSITORY_URL", "javascript:alert(1)")
+    monkeypatch.setattr(updates, "RELEASES_URL", "https://github.test/releases/latest")
+    runtime = updates.RuntimeSnapshot(3661, 1_750_000_000, True)
+
+    text = updates.build_version_text(
+        {
+            "latest_main_version": '<b>v9.9.9</b>',
+            "latest_version": "v1.2.3&next",
+        },
+        runtime=runtime,
+        last_backup_at=10**1000,
+    )
+    keyboard = updates.build_version_keyboard(
+        "https://user:secret@github.test/release",
+    )
+
+    assert "<script>" not in text
+    assert "&lt;script&gt;" in text
+    assert "v1.2.3&lt;unsafe&gt;" in text
+    assert "Актуальная версия проекта: <code>неизвестна</code>" in text
+    assert "Последняя версия для Windows: <code>неизвестна</code>" in text
+    assert "javascript:" not in text
+    assert "Последняя плановая резервная копия: неизвестно" in text
+    assert keyboard.inline_keyboard[0][0].url == "https://github.test/releases/latest"
+
+    monkeypatch.setattr(
+        updates,
+        "REPOSITORY_URL",
+        'https://github.test/project?quote="x"&page=1',
+    )
+    linked_text = updates.build_version_text({}, runtime=runtime)
+    assert 'quote=&quot;x&quot;&amp;page=1' in linked_text
+
+
+@pytest.mark.asyncio
+async def test_newer_main_without_windows_release_does_not_notify(
+    release_build,
+    monkeypatch,
+):
+    state = {
+        "latest_main_version": "v9.0.0",
+        "latest_version": "v1.2.0",
+        "last_notified_version": None,
+    }
+    monkeypatch.setattr(updates, "refresh_update_state", AsyncMock(return_value=state))
+    bot = AsyncMock()
+
+    await updates.check_and_notify_update(bot)
+
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_source_background_refresh_never_sends_windows_notification(monkeypatch):
+    state = {
+        "latest_main_version": "v1.4.0",
+        "latest_version": "v1.3.0",
+        "last_notified_version": None,
+    }
+    refresh = AsyncMock(return_value=state)
+    monkeypatch.setattr(updates, "IS_FROZEN", False)
+    monkeypatch.setattr(updates, "refresh_update_state", refresh)
+    bot = AsyncMock()
+
+    await updates.check_and_notify_update(bot)
+
+    refresh.assert_awaited_once_with()
+    bot.send_message.assert_not_awaited()
+
+
+def test_start_update_loop_is_disabled_without_release_identity(monkeypatch):
     create_task = MagicMock()
     monkeypatch.setattr(updates, "update_checks_enabled", lambda: False)
     monkeypatch.setattr(updates, "_update_task", None)
