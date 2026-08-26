@@ -9,6 +9,7 @@ from unittest.mock import (
 
 import pytest
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 
 import handlers
 from runtime_status import RuntimeSnapshot
@@ -17,6 +18,7 @@ from runtime_status import RuntimeSnapshot
 @pytest.fixture(autouse=True)
 def info_preview(monkeypatch):
     preview = MagicMock(name="info_preview")
+    monkeypatch.setattr(handlers, "_info_preview_file_id", None)
     monkeypatch.setattr(handlers, "_load_info_preview", lambda: preview)
     return preview
 
@@ -120,6 +122,32 @@ async def test_info_is_public_cache_only_and_uses_html(monkeypatch, info_preview
 
 
 @pytest.mark.asyncio
+async def test_info_reuses_telegram_file_id_after_first_upload(
+    monkeypatch,
+    info_preview,
+):
+    load_preview = MagicMock(return_value=info_preview)
+    monkeypatch.setattr(handlers, "_load_info_preview", load_preview)
+    monkeypatch.setattr(handlers, "load_update_state", lambda: {})
+    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    first = AsyncMock()
+    first.from_user = MagicMock(id=handlers.OWNER_ID + 1)
+    first.answer_photo.return_value = MagicMock(
+        photo=[MagicMock(file_id="telegram-info-preview")],
+    )
+    second = AsyncMock()
+    second.from_user = MagicMock(id=handlers.OWNER_ID + 1)
+
+    await handlers.cmd_info(first)
+    await handlers.cmd_info(second)
+
+    assert first.answer_photo.await_args.args[0] is info_preview
+    assert second.answer_photo.await_args.args[0] == "telegram-info-preview"
+    load_preview.assert_called_once_with()
+    assert handlers._info_preview_file_id == "telegram-info-preview"
+
+
+@pytest.mark.asyncio
 async def test_info_degrades_without_exposing_local_error(monkeypatch):
     monkeypatch.setattr(handlers, "load_update_state", lambda: {})
     monkeypatch.setattr(
@@ -209,7 +237,10 @@ async def test_owner_version_refresh_callback_updates_html(monkeypatch):
     await handlers.version_refresh_cb(callback)
 
     refresh.assert_awaited_once_with(force=True)
-    assert callback.message.edit_text.await_args.kwargs["parse_mode"] == ParseMode.HTML
+    kwargs = callback.message.edit_text.await_args.kwargs
+    assert kwargs["parse_mode"] == ParseMode.HTML
+    text = callback.message.edit_text.await_args.args[0]
+    assert "Актуальная версия проекта: <code>v1.3.0</code>" in text
     callback.answer.assert_awaited_once_with("Обновляю сведения…")
 
 
@@ -233,3 +264,32 @@ async def test_owner_refresh_edits_photo_caption_with_html(monkeypatch):
     kwargs = callback.message.edit_caption.await_args.kwargs
     assert kwargs["parse_mode"] == ParseMode.HTML
     assert "Актуальная версия проекта: <code>v1.3.0</code>" in kwargs["caption"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_photo", [False, True])
+async def test_owner_refresh_handles_non_editable_message(monkeypatch, has_photo):
+    monkeypatch.setattr(
+        handlers,
+        "refresh_update_state",
+        AsyncMock(return_value={"latest_main_version": "v1.3.0"}),
+    )
+    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    callback = AsyncMock()
+    callback.from_user = MagicMock(id=handlers.OWNER_ID)
+    callback.message = AsyncMock()
+    callback.message.photo = [MagicMock()] if has_photo else None
+    edit = (
+        callback.message.edit_caption
+        if has_photo
+        else callback.message.edit_text
+    )
+    edit.side_effect = TelegramBadRequest(
+        method=MagicMock(),
+        message="message is not modified",
+    )
+
+    await handlers.version_refresh_cb(callback)
+
+    edit.assert_awaited_once()
+    callback.answer.assert_awaited_once_with("Обновляю сведения…")

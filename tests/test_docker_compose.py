@@ -43,7 +43,11 @@ def test_compose_loads_env_file_but_keeps_data_volume_invariant():
 
 def test_docker_context_keeps_only_runtime_info_asset():
     patterns = DOCKERIGNORE_PATH.read_text(encoding="utf-8").splitlines()
+    relevant = [
+        pattern
+        for pattern in patterns
+        if pattern in {"assets/*", "!assets/info-preview.png"}
+    ]
 
-    assert "assets/*" in patterns
-    assert "!assets/info-preview.png" in patterns
+    assert relevant == ["assets/*", "!assets/info-preview.png"]
     assert "assets/" not in patterns

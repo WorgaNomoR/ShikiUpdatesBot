@@ -7,6 +7,7 @@ import io
 import json
 import zipfile
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import (
     AsyncMock,
     MagicMock,
@@ -16,8 +17,11 @@ import aiohttp
 import pytest
 
 import backup
+import project_meta
 import storage
 import updates
+
+PROJECT_META_PATH = Path(__file__).resolve().parents[1] / "project_meta.py"
 
 
 class FakeResponse:
@@ -130,6 +134,12 @@ async def test_fetch_main_version_returns_none_on_network_error(release_build):
 )
 def test_parse_main_version_rejects_non_strict_or_ambiguous_source(source):
     assert updates.parse_main_version(source) is None
+
+
+def test_parse_main_version_accepts_current_project_meta_contract():
+    source = PROJECT_META_PATH.read_text(encoding="utf-8")
+
+    assert updates.parse_main_version(source) == project_meta.PROJECT_VERSION
 
 
 @pytest.mark.asyncio
@@ -545,7 +555,7 @@ async def test_newer_main_without_windows_release_does_not_notify(
 ):
     state = {
         "latest_main_version": "v9.0.0",
-        "latest_version": "v1.2.0",
+        "latest_version": None,
         "last_notified_version": None,
     }
     monkeypatch.setattr(updates, "refresh_update_state", AsyncMock(return_value=state))

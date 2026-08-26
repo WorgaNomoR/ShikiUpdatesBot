@@ -31,8 +31,10 @@ def _step(job: dict, name: str) -> dict:
 
 
 def test_pyinstaller_bundles_info_preview():
-    assert 'root / "assets" / "info-preview.png"' in PYINSTALLER_SPEC
-    assert '"assets"' in PYINSTALLER_SPEC
+    assert (
+        'datas.append((str(root / "assets" / "info-preview.png"), "assets"))'
+        in PYINSTALLER_SPEC
+    )
 
 
 def _value_paths(value, needle: str, path=()):

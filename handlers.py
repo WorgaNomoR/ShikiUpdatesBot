@@ -16,6 +16,7 @@ import time
 import aiohttp
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import (
     State,
@@ -127,6 +128,7 @@ BOOT_PHASE_DELAY = 2.0  # секунд
 _HISTORY_CATCHUP_MAX_PAGES = 5
 _STATUS_CACHE_TTL = 60.0
 INFO_PREVIEW_PATH = RESOURCE_ROOT / "assets" / "info-preview.png"
+_info_preview_file_id: str | None = None
 _status_cache: tuple[list[dict], list[dict]] | None = None
 _status_cache_at = 0.0
 _status_cache_lock: asyncio.Lock | None = None
@@ -1747,6 +1749,17 @@ def _load_info_preview() -> BufferedInputFile | None:
     return BufferedInputFile(content, filename=INFO_PREVIEW_PATH.name)
 
 
+def _remember_info_preview_file_id(message: Message) -> None:
+    """Запомнить Telegram file_id после первой локальной загрузки иллюстрации."""
+    global _info_preview_file_id
+    photos = getattr(message, "photo", None)
+    if not isinstance(photos, (list, tuple)) or not photos:
+        return
+    file_id = getattr(photos[-1], "file_id", None)
+    if isinstance(file_id, str) and file_id:
+        _info_preview_file_id = file_id
+
+
 async def cmd_info(message: Message) -> None:
     """Публично показать только сохранённое и process-local состояние."""
     state = load_update_state()
@@ -1756,7 +1769,7 @@ async def cmd_info(message: Message) -> None:
         state.get("release_url"),
         include_refresh=is_owner,
     )
-    preview = _load_info_preview()
+    preview = _info_preview_file_id or _load_info_preview()
     if preview is None:
         await message.answer(
             text,
@@ -1764,12 +1777,14 @@ async def cmd_info(message: Message) -> None:
             reply_markup=keyboard,
         )
         return
-    await message.answer_photo(
+    sent = await message.answer_photo(
         preview,
         caption=text,
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
+    if _info_preview_file_id is None:
+        _remember_info_preview_file_id(sent)
 
 
 async def version_refresh_cb(callback: CallbackQuery) -> None:
@@ -1786,15 +1801,18 @@ async def version_refresh_cb(callback: CallbackQuery) -> None:
             state.get("release_url"),
             include_refresh=True,
         )
-        if getattr(callback.message, "photo", None):
-            await callback.message.edit_caption(
-                caption=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-            )
-        else:
-            await callback.message.edit_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-            )
+        try:
+            if getattr(callback.message, "photo", None):
+                await callback.message.edit_caption(
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            else:
+                await callback.message.edit_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+        except TelegramBadRequest as e:
+            log.warning("Не удалось обновить сообщение /info: %s", e)
