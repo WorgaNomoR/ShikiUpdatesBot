@@ -148,8 +148,8 @@ async def test_info_reuses_telegram_file_id_after_first_upload(
 
 
 @pytest.mark.parametrize("photos", [None, []])
-def test_info_preview_file_id_ignores_missing_or_empty_photo(photos):
-    handlers._info_preview_file_id = "existing-file-id"
+def test_info_preview_file_id_ignores_missing_or_empty_photo(monkeypatch, photos):
+    monkeypatch.setattr(handlers, "_info_preview_file_id", "existing-file-id")
     message = MagicMock(photo=photos)
 
     handlers._remember_info_preview_file_id(message)
