@@ -82,6 +82,8 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.cmd_info in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
+    assert main.cmd_blocklist in registered_messages
+    assert "blocklist" not in public_commands
     assert app.registration_order[:2] == ["access-recovery", "middleware"]
     app.reconcile_access.assert_awaited_once_with()
     middleware = app.dispatcher.update.outer_middleware.call_args.args[0]

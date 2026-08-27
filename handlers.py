@@ -3,7 +3,7 @@
 """
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
-Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock,
+Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock, /blocklist,
 /broadcast, /backup, /status, /stats, /favs, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
 notify*, polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
@@ -97,6 +97,7 @@ from storage import (
     BlockedUsersStateError,
     _empty_stats_current,
     add_blocked_user,
+    list_blocked_users,
     load_seen_favourites,
     load_seen_ids,
     load_stats_all,
@@ -132,6 +133,11 @@ from utils import (
 BOOT_PHASE_DELAY = 2.0  # секунд
 _HISTORY_CATCHUP_MAX_PAGES = 5
 _STATUS_CACHE_TTL = 60.0
+_TELEGRAM_MESSAGE_LIMIT = 4096
+_BLOCKLIST_HINT = (
+    "Подсказка: <code>/block 123456789</code> — заблокировать; "
+    "<code>/unblock 123456789</code> — разблокировать."
+)
 INFO_PREVIEW_PATH = RESOURCE_ROOT / "assets" / "info-preview.png"
 _info_preview_file_id: str | None = None
 _status_cache: tuple[list[dict], list[dict]] | None = None
@@ -1629,6 +1635,54 @@ async def cmd_unblock(message: Message) -> None:
         else f"ℹ️ Пользователь {rendered_id} не был заблокирован."
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+def _build_blocklist_messages(blocked_user_ids: set[int]) -> list[str]:
+    """Собрать HTML-сообщения со списком, не разрывая строки ID."""
+    ordered_ids = sorted(blocked_user_ids)
+    if not ordered_ids:
+        return [f"📭 Список блокировок пуст.\n\n{_BLOCKLIST_HINT}"]
+
+    header = f"🚫 <b>Заблокированные пользователи: {len(ordered_ids)}</b>"
+    rows = [f"• <code>{user_id}</code>" for user_id in ordered_ids]
+    messages: list[str] = []
+    current = header
+
+    for row in rows:
+        separator = "\n\n" if current == header else "\n"
+        candidate = f"{current}{separator}{row}"
+        if len(f"{candidate}\n\n{_BLOCKLIST_HINT}") <= _TELEGRAM_MESSAGE_LIMIT:
+            current = candidate
+            continue
+        messages.append(current)
+        current = row
+
+    messages.append(f"{current}\n\n{_BLOCKLIST_HINT}")
+    return messages
+
+
+async def cmd_blocklist(message: Message) -> None:
+    """Показать владельцу полный список заблокированных Telegram ID."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer(
+            "🚫 Эта команда только для владельца бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        blocked_user_ids = list_blocked_users()
+    except (BlockedUsersStateError, OSError) as e:
+        log.error("cmd_blocklist: не удалось прочитать список блокировок: %s", e)
+        await message.answer(
+            "❌ Не удалось безопасно прочитать список блокировок. "
+            "Подробности записаны в лог.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    for text in _build_blocklist_messages(blocked_user_ids):
+        await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 async def cmd_broadcast(message: Message, state: FSMContext) -> None:
