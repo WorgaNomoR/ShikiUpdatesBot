@@ -325,8 +325,10 @@ async def test_backup_receive_download_failure(backup_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
-    monkeypatch.setattr(handlers, "restore_backup_zip",
-                        AsyncMock(side_effect=ValueError("битый <b>zip</b>-архив & мусор")))
+    restore = AsyncMock(
+        side_effect=ValueError("битый <b>zip</b>-архив & мусор")
+    )
+    monkeypatch.setattr(handlers, "restore_backup_zip", restore)
     monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
     state = AsyncMock()
     state.get_data = AsyncMock(return_value={"prompt_msg_id": 55})
@@ -335,6 +337,7 @@ async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
 
     await handlers.backup_receive(msg, state)
 
+    restore.assert_awaited_once()
     msg.answer.assert_awaited_once()
     text = msg.answer.call_args.args[0]
     assert text == "❌ Архив не восстановлен. Проверь формат и целостность файла."

@@ -132,15 +132,13 @@ async def test_owner_id_is_rejected_before_storage(
 
 @pytest.mark.asyncio
 async def test_storage_failure_returns_stable_text_without_raw_exception(monkeypatch):
-    monkeypatch.setattr(
-        handlers,
-        "add_blocked_user",
-        AsyncMock(side_effect=BlockedUsersStateError("private storage detail")),
-    )
+    add = AsyncMock(side_effect=BlockedUsersStateError("private storage detail"))
+    monkeypatch.setattr(handlers, "add_blocked_user", add)
     message = _message("/block 77")
 
     await handlers.cmd_block(message)
 
+    add.assert_awaited_once_with(77)
     assert message.answer.await_args.args == (
         "❌ Не удалось безопасно изменить список блокировок. "
         "Подробности записаны в лог.",
