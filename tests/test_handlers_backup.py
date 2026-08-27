@@ -319,8 +319,7 @@ async def test_backup_receive_download_failure(backup_env, monkeypatch):
 
     msg.answer.assert_awaited_once()
     text = msg.answer.call_args.args[0]
-    assert "❌" in text and "скачать" in text
-    assert "boom" not in text and "net" not in text   # raw exception не протёк
+    assert text == "❌ Не удалось скачать архив. Попробуй ещё раз."
     restore.assert_not_awaited()          # битую загрузку в restore не потащили
 
 
@@ -338,8 +337,7 @@ async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
 
     msg.answer.assert_awaited_once()
     text = msg.answer.call_args.args[0]
-    assert "❌" in text and "не восстановлен" in text
-    assert "мусор" not in text and "&lt;b&gt;" not in text  # raw exception не протёк
+    assert text == "❌ Архив не восстановлен. Проверь формат и целостность файла."
 
 
 @pytest.mark.asyncio

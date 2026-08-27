@@ -41,6 +41,9 @@ async def test_access_commands_reject_forged_non_owner_calls(
 
     add.assert_not_awaited()
     remove.assert_not_awaited()
+    assert message.answer.await_args.args == (
+        "🚫 Эта команда только для владельца бота.",
+    )
     assert message.answer.await_args.kwargs["parse_mode"] == ParseMode.HTML
 
 
@@ -138,5 +141,7 @@ async def test_storage_failure_returns_stable_text_without_raw_exception(monkeyp
 
     await handlers.cmd_block(message)
 
-    text = message.answer.await_args.args[0]
-    assert "private storage detail" not in text
+    assert message.answer.await_args.args == (
+        "❌ Не удалось безопасно изменить список блокировок. "
+        "Подробности записаны в лог.",
+    )
