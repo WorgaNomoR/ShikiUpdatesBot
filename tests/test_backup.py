@@ -75,6 +75,10 @@ def _corrupt_stored_member(raw: bytes, name: str) -> bytes:
 
 def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
+    (backup_env / "blocked_users.json").write_text(
+        '{"blocked_user_ids": [7]}',
+        encoding="utf-8",
+    )
     (backup_env / "stats_current.json").write_text('{"period": "2026-Q2"}', encoding="utf-8")
     (backup_env / "subscribers.json.tmp").write_text("garbage", encoding="utf-8")
     restore_stage = backup_env / ".restore-interrupted.tmp" / "new"
@@ -85,6 +89,7 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     names = set(zipfile.ZipFile(io.BytesIO(raw)).namelist())
 
     assert "subscribers.json" in names
+    assert "blocked_users.json" in names
     assert "stats_current.json" in names
     assert "quarters/2026-Q1.json" in names          # вложенность сохранена
     assert "subscribers.json.tmp" not in names       # *.tmp исключён
@@ -96,6 +101,7 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
 # ─────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("name", [
+    "blocked_users.json",
     "subscribers.json",
     "stats_current.json",
     "update_state.json",
@@ -199,6 +205,7 @@ async def test_restore_rejects_oversized_total_before_publication(backup_env):
 @pytest.mark.asyncio
 async def test_restore_round_trip(backup_env):
     raw = _zip_bytes({
+        "blocked_users.json": '{"blocked_user_ids": [456]}',
         "subscribers.json": '{"subscribers": {"123": "Alice"}}',
         "stats_current.json": '{"period": "2026-Q2", "events": []}',
         "update_state.json": (
@@ -212,6 +219,7 @@ async def test_restore_round_trip(backup_env):
     result = await backup.restore_backup_zip(raw)
 
     assert set(result["restored"]) == {
+        "blocked_users.json",
         "subscribers.json",
         "stats_current.json",
         "update_state.json",
@@ -220,6 +228,7 @@ async def test_restore_round_trip(backup_env):
     assert "seen_ids.json" in result["skipped"]
     # файлы реально записаны
     assert storage.load_subscribers() == {123: "Alice"}
+    assert storage.load_blocked_users() == {456}
     assert storage.load_update_state()["last_notified_version"] == "v1.2.0"
     assert storage.load_update_state()["latest_main_version"] == "v1.3.0"
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
@@ -780,6 +789,10 @@ async def test_restore_rejects_quarter_without_period(backup_env):
 
 
 def test_valid_import_payload_accepts_canonical_shapes():
+    assert backup._valid_import_payload(
+        "blocked_users.json",
+        {"blocked_user_ids": [1]},
+    )
     assert backup._valid_import_payload("subscribers.json", {"subscribers": {"1": "A"}})
     assert backup._valid_import_payload("stats_current.json", {"period": "2026-Q2", "events": []})
     assert backup._valid_import_payload("quarters/2026-Q1.json", {"period": "2026-Q1"})
@@ -801,3 +814,126 @@ async def test_restore_creates_missing_quarters_dir(backup_env):
     assert "quarters/2026-Q1.json" in result["restored"]
     # _atomic_write сам создаёт parent — краша на свежем томе нет
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
+
+
+# ─────────────────────────────────────────────────────────────
+#  Список блокировок в полном кандидате восстановления
+# ─────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"blocked_user_ids": [999]}',
+        '{"blocked_user_ids": [7, 7]}',
+        '{"blocked_user_ids": [true]}',
+        '{"blocked_user_ids": [-1]}',
+        '{"blocked_user_ids": "7"}',
+        '{"blocked_user_ids": [], "extra": 1}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_restore_rejects_malformed_or_owner_blocked_users(backup_env, payload):
+    with pytest.raises(ValueError, match="нет валидных файлов"):
+        await backup.restore_backup_zip(_zip_bytes({"blocked_users.json": payload}))
+
+    assert not (backup_env / "blocked_users.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_does_not_publish_subscribers_with_invalid_archive_blocked_users(
+    backup_env,
+):
+    raw = _zip_bytes({
+        "blocked_users.json": '{"blocked_user_ids": [7, 7]}',
+        "subscribers.json": '{"subscribers": {"7": "Must stay blocked"}}',
+    })
+
+    with pytest.raises(ValueError, match="подписчики не восстановлены"):
+        await backup.restore_backup_zip(raw)
+
+    assert not (backup_env / "subscribers.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_filters_subscribers_against_candidate_blocked_users(backup_env):
+    raw = _zip_bytes({
+        "blocked_users.json": '{"blocked_user_ids": [7]}',
+        "subscribers.json": '{"subscribers": {"7": "Blocked", "8": "Allowed"}}',
+    })
+
+    result = await backup.restore_backup_zip(raw)
+
+    assert set(result["restored"]) == {"blocked_users.json", "subscribers.json"}
+    assert storage.load_blocked_users() == {7}
+    assert storage.load_subscribers() == {8: "Allowed"}
+
+
+@pytest.mark.asyncio
+async def test_restore_blocked_users_alone_removes_current_subscriber(backup_env):
+    storage.save_subscribers({7: "Blocked", 8: "Allowed"})
+
+    result = await backup.restore_backup_zip(
+        _zip_bytes({"blocked_users.json": '{"blocked_user_ids": [7]}'})
+    )
+
+    assert set(result["restored"]) == {"blocked_users.json", "subscribers.json"}
+    assert storage.load_subscribers() == {8: "Allowed"}
+
+
+@pytest.mark.asyncio
+async def test_restore_subscribers_alone_respects_current_blocked_users(backup_env):
+    storage.save_blocked_users({7})
+
+    result = await backup.restore_backup_zip(
+        _zip_bytes({
+            "subscribers.json": '{"subscribers": {"7": "Blocked", "8": "Allowed"}}'
+        })
+    )
+
+    assert result["restored"] == ["subscribers.json"]
+    assert storage.load_blocked_users() == {7}
+    assert storage.load_subscribers() == {8: "Allowed"}
+
+
+@pytest.mark.asyncio
+async def test_restore_subscribers_fails_closed_when_current_blocked_users_are_corrupt(
+    backup_env,
+):
+    storage._atomic_write(backup_env / "blocked_users.json", "{broken")
+
+    with pytest.raises(ValueError, match="сначала восстанови blocked_users.json"):
+        await backup.restore_backup_zip(
+            _zip_bytes({"subscribers.json": '{"subscribers": {"8": "Allowed"}}'})
+        )
+
+    assert not (backup_env / "subscribers.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_rolls_back_blocked_users_if_subscriber_publication_fails(
+    backup_env,
+    monkeypatch,
+):
+    storage.save_blocked_users({1})
+    storage.save_subscribers({2: "Old"})
+    raw = _zip_bytes({
+        "blocked_users.json": '{"blocked_user_ids": [7]}',
+        "subscribers.json": '{"subscribers": {"8": "New"}}',
+    })
+    real_publish = backup._publish_staged_file
+    calls = 0
+
+    def fail_second_publish(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("disk failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(backup, "_publish_staged_file", fail_second_publish)
+
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        await backup.restore_backup_zip(raw)
+
+    assert storage.load_blocked_users() == {1}
+    assert storage.load_subscribers() == {2: "Old"}

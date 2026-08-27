@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from config import (
+    BLOCKED_USERS_FILE,
+    OWNER_ID,
     SEEN_FAVS_FILE,
     SEEN_IDS_FILE,
     STATS_ALL_FILE,
@@ -94,6 +96,19 @@ def save_seen_ids(seen_ids: set[int]) -> None:
 #  subscribers — ПОДПИСЧИКИ
 # ═══════════════════════════════════════════════════════════════════
 
+def subscribers_from_payload(payload: object) -> dict[int, str]:
+    """Проверить и разобрать JSON-структуру подписчиков."""
+    if not isinstance(payload, dict):
+        raise ValueError("состояние подписчиков должно быть объектом")
+    raw_subscribers = payload.get("subscribers")
+    if not isinstance(raw_subscribers, dict):
+        raise ValueError("поле subscribers должно быть объектом")
+    try:
+        return {int(key): value for key, value in raw_subscribers.items()}
+    except (TypeError, ValueError) as e:
+        raise ValueError("ключ подписчика должен быть числовым ID") from e
+
+
 def load_subscribers() -> dict[int, str]:
     """
     Загружаем подписчиков из JSON.
@@ -103,11 +118,29 @@ def load_subscribers() -> dict[int, str]:
     path = Path(SUBS_FILE)
     if path.exists():
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return {int(k): v for k, v in data.get("subscribers", {}).items()}
-        except (json.JSONDecodeError, KeyError, ValueError):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return subscribers_from_payload(payload)
+        except (json.JSONDecodeError, OSError, ValueError):
             log.warning("Не удалось прочитать %s, начинаем с пустого списка.", SUBS_FILE)
     return {}
+
+
+def _load_subscribers_for_access_recovery() -> dict[int, str]:
+    """Строго загрузить подписчиков для fail-safe сверки при запуске."""
+    path = Path(SUBS_FILE)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return subscribers_from_payload(payload)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.error(
+            "access-control: подписчики недоступны для сверки при запуске: %s",
+            e,
+        )
+        raise BlockedUsersStateError(
+            "подписчики недоступны для безопасной сверки"
+        ) from e
 
 
 def save_subscribers(subs: dict[int, str]) -> None:
@@ -116,6 +149,213 @@ def save_subscribers(subs: dict[int, str]) -> None:
         SUBS_FILE,
         json.dumps({"subscribers": {str(k): v for k, v in subs.items()}}, ensure_ascii=False, indent=2),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  blocked_users — ГЛОБАЛЬНЫЙ СПИСОК БЛОКИРОВОК TELEGRAM USER ID
+# ═══════════════════════════════════════════════════════════════════
+
+class BlockedUsersStateError(ValueError):
+    """Существующий список блокировок нельзя безопасно прочитать или проверить."""
+
+
+class BlockedUsersMutationError(RuntimeError):
+    """Транзакционное изменение списка блокировок не удалось применить."""
+
+
+def validate_telegram_user_id(user_id: object) -> int:
+    """Проверить положительный Telegram user ID в диапазоне signed int64."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int):
+        raise ValueError("Telegram user ID должен быть целым числом")
+    if user_id <= 0 or user_id > 2**63 - 1:
+        raise ValueError("Telegram user ID вне допустимого диапазона")
+    return user_id
+
+
+def blocked_users_from_payload(payload: object) -> set[int]:
+    """Проверить и разобрать каноническую JSON-структуру списка блокировок."""
+    if not isinstance(payload, dict) or set(payload) != {"blocked_user_ids"}:
+        raise BlockedUsersStateError("неожиданная структура списка блокировок")
+    raw_ids = payload["blocked_user_ids"]
+    if not isinstance(raw_ids, list):
+        raise BlockedUsersStateError("blocked_user_ids должен быть списком")
+    try:
+        blocked = {validate_telegram_user_id(user_id) for user_id in raw_ids}
+    except ValueError as e:
+        raise BlockedUsersStateError(
+            "список блокировок содержит некорректный user ID"
+        ) from e
+    if len(blocked) != len(raw_ids):
+        raise BlockedUsersStateError(
+            "список блокировок содержит повторяющийся user ID"
+        )
+    if OWNER_ID in blocked:
+        raise BlockedUsersStateError(
+            "OWNER_ID не может находиться в списке блокировок"
+        )
+    return blocked
+
+
+def _blocked_users_json(blocked: set[int]) -> str:
+    """Сериализовать проверенный список блокировок в стабильном порядке."""
+    canonical = blocked_users_from_payload({"blocked_user_ids": list(blocked)})
+    return json.dumps(
+        {"blocked_user_ids": sorted(canonical)},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def load_blocked_users() -> set[int]:
+    """Загрузить список блокировок; отсутствие файла означает пустое состояние.
+
+    Существующий повреждённый файл не превращается в пустой список: вызывающий
+    access gate обязан перейти в fail-safe режим и закрыть доступ не-владельцам.
+    """
+    path = Path(BLOCKED_USERS_FILE)
+    if not path.exists():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return blocked_users_from_payload(payload)
+    except (json.JSONDecodeError, OSError, BlockedUsersStateError) as e:
+        log.error(
+            "load_blocked_users: список блокировок недоступен или повреждён: %s",
+            e,
+        )
+        raise BlockedUsersStateError(
+            "список блокировок недоступен или повреждён"
+        ) from e
+
+
+def list_blocked_users() -> set[int]:
+    """Вернуть независимый снимок заблокированных Telegram user ID."""
+    return set(load_blocked_users())
+
+
+def is_user_blocked(user_id: int) -> bool:
+    """Проверить глобальный запрет; владелец всегда остаётся доступен."""
+    user_id = validate_telegram_user_id(user_id)
+    if user_id == OWNER_ID:
+        return False
+    return user_id in load_blocked_users()
+
+
+def save_blocked_users(blocked: set[int]) -> None:
+    """Атомарно сохранить валидный список блокировок без владельца."""
+    _atomic_write(BLOCKED_USERS_FILE, _blocked_users_json(blocked))
+
+
+def _subscribers_json(subscribers: dict[int, str]) -> str:
+    """Сериализовать подписчиков для общей access-control транзакции."""
+    return json.dumps(
+        {"subscribers": {str(k): v for k, v in subscribers.items()}},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _publish_access_state(payloads: dict[Path, str]) -> None:
+    """Опубликовать несколько файлов с откатом уже заменённых состояний."""
+    originals: dict[Path, str | None] = {}
+    published: list[Path] = []
+    try:
+        for path in payloads:
+            originals[path] = path.read_text(encoding="utf-8") if path.is_file() else None
+        for path, payload in payloads.items():
+            _atomic_write(path, payload)
+            published.append(path)
+    except Exception as publish_error:
+        rollback_errors: list[Exception] = []
+        for path in reversed(published):
+            try:
+                original = originals[path]
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write(path, original)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            log.critical(
+                "access-control: публикация и откат завершились ошибкой: %s; %s",
+                publish_error,
+                rollback_errors,
+            )
+            raise BlockedUsersMutationError(
+                "не удалось изменить список блокировок и полностью вернуть исходное состояние"
+            ) from publish_error
+        raise BlockedUsersMutationError(
+            "не удалось изменить список блокировок; исходное состояние восстановлено"
+        ) from publish_error
+    finally:
+        for path in payloads:
+            try:
+                path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def add_blocked_user(user_id: int) -> tuple[bool, bool]:
+    """Добавить ID и в одной транзакции удалить пользователя из подписчиков.
+
+    Возвращает ``(добавлен_в_список, удалён_из_подписчиков)``.
+    """
+    user_id = validate_telegram_user_id(user_id)
+    if user_id == OWNER_ID:
+        raise ValueError("OWNER_ID нельзя заблокировать")
+    async with restorable_state_transaction():
+        blocked = load_blocked_users()
+        subscribers = _load_subscribers_for_access_recovery()
+        added = user_id not in blocked
+        subscriber_removed = user_id in subscribers
+        if not added and not subscriber_removed:
+            return False, False
+        blocked.add(user_id)
+        payloads = {
+            Path(BLOCKED_USERS_FILE): _blocked_users_json(blocked),
+        }
+        if subscriber_removed:
+            subscribers.pop(user_id)
+            payloads[Path(SUBS_FILE)] = _subscribers_json(subscribers)
+        _publish_access_state(payloads)
+        return added, subscriber_removed
+
+
+async def reconcile_blocked_subscribers() -> set[int]:
+    """Удалить из подписчиков ID, уже сохранённые в списке блокировок.
+
+    Восстанавливает инвариант после завершения процесса между двумя атомарными
+    заменами файлов. Повторный запуск безопасен и ничего не меняет.
+    """
+    async with restorable_state_transaction():
+        blocked = load_blocked_users()
+        subscribers = _load_subscribers_for_access_recovery()
+        stale_ids = blocked.intersection(subscribers)
+        if not stale_ids:
+            return set()
+        for user_id in stale_ids:
+            subscribers.pop(user_id)
+        save_subscribers(subscribers)
+        log.warning(
+            "access-control: при запуске удалены подписки заблокированных ID: %s",
+            sorted(stale_ids),
+        )
+        return stale_ids
+
+
+async def remove_blocked_user(user_id: int) -> bool:
+    """Удалить ID из списка блокировок, не восстанавливая прежнюю подписку."""
+    user_id = validate_telegram_user_id(user_id)
+    if user_id == OWNER_ID:
+        raise ValueError("OWNER_ID нельзя изменять через список блокировок")
+    async with restorable_state_transaction():
+        blocked = load_blocked_users()
+        if user_id not in blocked:
+            return False
+        blocked.remove(user_id)
+        save_blocked_users(blocked)
+        return True
 
 
 # ═══════════════════════════════════════════════════════════════════

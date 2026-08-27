@@ -3,8 +3,8 @@
 """
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
-Верхний слой: команды и FSM (/start, /stop, /subs, /broadcast, /backup,
-/status, /stats, /favs, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
+Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock,
+/broadcast, /backup, /status, /stats, /favs, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
 notify*, polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
 """
@@ -93,19 +93,24 @@ from stats import (
     sync_stats_all,
 )
 from storage import (
+    BlockedUsersMutationError,
+    BlockedUsersStateError,
     _empty_stats_current,
+    add_blocked_user,
     load_seen_favourites,
     load_seen_ids,
     load_stats_all,
     load_stats_current,
     load_subscribers,
     load_update_state,
+    remove_blocked_user,
     restorable_state_transaction,
     save_seen_favourites,
     save_seen_ids,
     save_stats_all,
     save_stats_current,
     save_subscribers,
+    validate_telegram_user_id,
 )
 from telegram_delivery import is_blocked_error as _is_blocked_error
 from telegram_delivery import send_with_retry
@@ -1291,7 +1296,8 @@ async def probe_owner_and_start(bot: Bot) -> None:
 # ═══════════════════════════════════════════════════════════════
 #
 #  Экспорт = zip всего DATA_DIR (минус *.tmp-огрызки _atomic_write).
-#  Импорт  = по белому списку (subscribers, stats_current, update_state, quarters/*);
+#  Импорт  = по белому списку (список блокировок, subscribers, stats_current,
+#            update_state, quarters/*);
 #            всё прочее в архиве намеренно отбрасывается — seen_ids,
 #            seen_favourites и stats_all регенерируются сами, тащить их
 #            обратно незачем. Асимметрия экспорт(всё)/импорт(бел.список)
@@ -1334,8 +1340,8 @@ async def cmd_backup(message: Message) -> None:
         "💾 <b>Резервное копирование</b>\n\n"
         "📤 <b>Экспорт</b> — пришлю zip-архив всего состояния "
         "(подписчики, статистика, кварталы).\n"
-        "📥 <b>Импорт</b> — восстановлю из архива подписчиков, текущий квартал, "
-        "состояние проверки обновлений и снапшоты кварталов.",
+        "📥 <b>Импорт</b> — восстановлю из архива список блокировок, подписчиков, "
+        "сведения о доступных обновлениях и данные текущего и завершённых кварталов.",
         reply_markup=_backup_menu_kb(),
         parse_mode=ParseMode.HTML,
     )
@@ -1364,9 +1370,9 @@ async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(BackupStates.waiting_import_file)
     prompt = await callback.message.edit_text(
         "📥 Пришли <b>.zip</b>-архив бэкапа (как файл-документ).\n\n"
-        "Возьму из него только нужное — подписчиков, текущий квартал, состояние "
-        "проверки обновлений и снапшоты кварталов. Лишнее в архиве не помешает, "
-        "спокойно пропущу.\n\n/cancel — отмена",
+        "Возьму из него только нужное — список блокировок, подписчиков, сведения о "
+        "доступных обновлениях и данные текущего и завершённых кварталов. Лишнее в архиве "
+        "не помешает, спокойно пропущу.\n\n/cancel — отмена",
         parse_mode=ParseMode.HTML,
     )
     await state.update_data(prompt_msg_id=prompt.message_id)
@@ -1411,15 +1417,21 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
         await message.bot.download(doc, destination=buf)
         raw = buf.getvalue()
     except Exception as e:
-        await message.answer(f"❌ Не удалось скачать файл: {h(str(e))}",
-                             parse_mode=ParseMode.HTML)
+        log.warning("backup_receive: не удалось скачать архив: %s", e)
+        await message.answer(
+            "❌ Не удалось скачать архив. Попробуй ещё раз.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     try:
         result = await restore_backup_zip(raw)
     except ValueError as e:
-        await message.answer(f"❌ Архив не восстановлен: {h(str(e))}",
-                             parse_mode=ParseMode.HTML)
+        log.warning("backup_receive: архив не восстановлен: %s", e)
+        await message.answer(
+            "❌ Архив не восстановлен. Проверь формат и целостность файла.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     restored, skipped = result["restored"], result["skipped"]
@@ -1428,7 +1440,9 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
     if "subscribers.json" in restored:
         lines.append(f"\n👥 Подписчиков теперь: <b>{len(load_subscribers())}</b>")
     if "update_state.json" in restored:
-        lines.append("\n🔄 Состояние проверки обновлений восстановлено.")
+        lines.append("\n🔄 Сведения о доступных обновлениях восстановлены.")
+    if "blocked_users.json" in restored:
+        lines.append("\n🚫 Список блокировок восстановлен.")
     if skipped:
         lines.append(f"\n⏭️ Пропущено (вне белого списка/битые): {len(skipped)}")
     await _safe_delete(message.bot, message.chat.id, message.message_id)
@@ -1518,6 +1532,103 @@ async def cmd_subs(message: Message) -> None:
         lines.append(f"{i}. {_subscriber_link(cid, uname)}")
     sep = "\n"
     await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
+
+
+def _command_target_user_id(message: Message) -> int | None:
+    """Извлечь единственный ASCII decimal user ID из owner-команды."""
+    text = getattr(message, "text", None)
+    if not isinstance(text, str):
+        return None
+    parts = text.split()
+    if len(parts) != 2 or not parts[1].isascii() or not parts[1].isdecimal():
+        return None
+    try:
+        return validate_telegram_user_id(int(parts[1]))
+    except ValueError:
+        return None
+
+
+async def cmd_block(message: Message) -> None:
+    """Скрытая owner-only команда постоянной блокировки Telegram user ID."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer(
+            "🚫 Эта команда только для владельца бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    user_id = _command_target_user_id(message)
+    if user_id is None:
+        await message.answer(
+            "Использование: <code>/block 123456789</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if user_id == OWNER_ID:
+        await message.answer(
+            "🚫 Владельца бота нельзя заблокировать.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        added, subscriber_removed = await add_blocked_user(user_id)
+    except (BlockedUsersMutationError, BlockedUsersStateError, OSError) as e:
+        log.error("cmd_block: не удалось изменить список блокировок: %s", e)
+        await message.answer(
+            "❌ Не удалось безопасно изменить список блокировок. Подробности записаны в лог.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    rendered_id = f"<code>{user_id}</code>"
+    if added and subscriber_removed:
+        text = f"✅ Пользователь {rendered_id} заблокирован и удалён из подписчиков."
+    elif added:
+        text = f"✅ Пользователь {rendered_id} заблокирован."
+    elif subscriber_removed:
+        text = f"ℹ️ Пользователь {rendered_id} уже был заблокирован; подписка удалена."
+    else:
+        text = f"ℹ️ Пользователь {rendered_id} уже заблокирован."
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_unblock(message: Message) -> None:
+    """Скрытая owner-only команда снятия блокировки без возврата подписки."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer(
+            "🚫 Эта команда только для владельца бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    user_id = _command_target_user_id(message)
+    if user_id is None:
+        await message.answer(
+            "Использование: <code>/unblock 123456789</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if user_id == OWNER_ID:
+        await message.answer(
+            "ℹ️ Владелец бота не находится в списке блокировок.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        removed = await remove_blocked_user(user_id)
+    except (BlockedUsersMutationError, BlockedUsersStateError, OSError) as e:
+        log.error("cmd_unblock: не удалось изменить список блокировок: %s", e)
+        await message.answer(
+            "❌ Не удалось безопасно изменить список блокировок. Подробности записаны в лог.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    rendered_id = f"<code>{user_id}</code>"
+    text = (
+        f"✅ Пользователь {rendered_id} разблокирован. Подписка не восстановлена."
+        if removed
+        else f"ℹ️ Пользователь {rendered_id} не был заблокирован."
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 async def cmd_broadcast(message: Message, state: FSMContext) -> None:

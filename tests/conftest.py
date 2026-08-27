@@ -65,6 +65,7 @@ def backup_env(tmp_path, monkeypatch):
     quarters.mkdir(parents=True)
     monkeypatch.setattr("backup.DATA_DIR", data)
     monkeypatch.setattr(storage, "SUBS_FILE", data / "subscribers.json")
+    monkeypatch.setattr(storage, "BLOCKED_USERS_FILE", data / "blocked_users.json")
     monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
     monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
     monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
@@ -73,4 +74,5 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
     monkeypatch.setattr("handlers.OWNER_ID", 999)
     monkeypatch.setattr("backup.OWNER_ID", 999)
+    monkeypatch.setattr(storage, "OWNER_ID", 999)
     return data
