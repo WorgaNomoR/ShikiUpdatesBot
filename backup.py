@@ -29,11 +29,15 @@ from config import (
     log,
 )
 from storage import (
+    BlockedUsersStateError,
     _atomic_write,
+    blocked_users_from_payload,
+    load_blocked_users,
     load_stats_current,
     load_subscribers,
     restorable_state_transaction,
     save_stats_current,
+    subscribers_from_payload,
 )
 from telegram_delivery import send_with_retry
 from utils import (
@@ -59,7 +63,7 @@ SHUTDOWN_BACKUP_TIMEOUT  = 8    # с: жёсткий потолок отправ
 _last_backup_sent_at: float | None = None   # monotonic-метка последнего успешного бэкапа
 
 _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
-    "subscribers.json", "stats_current.json", "update_state.json",
+    "blocked_users.json", "subscribers.json", "stats_current.json", "update_state.json",
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -144,7 +148,8 @@ async def _shutdown_backup(bot: Bot) -> None:
 
 def _is_allowed_import_member(name: str) -> bool:
     """Разрешено ли имя из архива к восстановлению?
-    Бел.список: subscribers.json, stats_current.json, update_state.json и кварталы.
+    Бел.список: blocked_users.json, subscribers.json, stats_current.json,
+    update_state.json и кварталы.
     Глушим zip-slip: '..'-сегменты, абсолютные пути и бэкслеши отвергаем."""
     if not name or name.endswith("/"):
         return False
@@ -165,14 +170,16 @@ def _valid_import_payload(name: str, obj) -> bool:
     валидный, но мусорный по смыслу JSON не затёр рабочее состояние. Проверяем
     ровно ту форму, которую ждут загрузчики (load_subscribers/load_stats_current
     и чтение снапшотов), не строже — иначе отвергли бы легитимные старые файлы."""
-    if name == "subscribers.json":
-        subs = obj.get("subscribers") if isinstance(obj, dict) else None
-        if not isinstance(subs, dict):
+    if name == "blocked_users.json":
+        try:
+            blocked_users_from_payload(obj)
+        except BlockedUsersStateError:
             return False
-        try:                       # ключи — chat_id, должны приводиться к int
-            for k in subs:
-                int(k)
-        except (TypeError, ValueError):
+        return True
+    if name == "subscribers.json":
+        try:
+            subscribers_from_payload(obj)
+        except ValueError:
             return False
         return True
     if name == "stats_current.json":
@@ -197,6 +204,53 @@ def _valid_import_payload(name: str, obj) -> bool:
     if name.startswith(_IMPORT_ALLOWED_DIR + "/"):
         return isinstance(obj, dict) and "period" in obj
     return False
+
+
+def _subscribers_from_import_payload(payload: str) -> dict[int, str]:
+    """Разобрать уже проверенный candidate subscribers.json."""
+    return subscribers_from_payload(json.loads(payload))
+
+
+def _prepare_access_restore_candidate(pending: dict[str, str]) -> dict[str, str]:
+    """Согласовать список блокировок и подписчиков в полном кандидате восстановления.
+
+    Любой восстановленный список подписчиков фильтруется текущим или новым
+    списком блокировок. Новый список блокировок удаляет совпавших пользователей
+    из текущих подписчиков в той же транзакции восстановления.
+    """
+    access_names = {"blocked_users.json", "subscribers.json"}
+    if not access_names.intersection(pending):
+        return pending
+
+    if "blocked_users.json" in pending:
+        blocked = blocked_users_from_payload(json.loads(pending["blocked_users.json"]))
+    else:
+        try:
+            blocked = load_blocked_users()
+        except BlockedUsersStateError as e:
+            raise ValueError(
+                "текущий список блокировок повреждён; сначала восстанови blocked_users.json"
+            ) from e
+
+    if "subscribers.json" in pending:
+        subscribers = _subscribers_from_import_payload(pending["subscribers.json"])
+        publish_subscribers = True
+    else:
+        subscribers = load_subscribers()
+        publish_subscribers = any(user_id in subscribers for user_id in blocked)
+
+    filtered = {
+        chat_id: name
+        for chat_id, name in subscribers.items()
+        if chat_id not in blocked
+    }
+    if publish_subscribers:
+        pending["subscribers.json"] = json.dumps(
+            {"subscribers": {str(key): value for key, value in filtered.items()}},
+            ensure_ascii=False,
+            indent=2,
+        )
+    return pending
 
 
 def _publish_staged_file(source: Path, target: Path) -> None:
@@ -307,6 +361,7 @@ async def restore_backup_zip(raw: bytes) -> dict:
     restored: list[str] = []
     skipped: list[str] = []
     pending: dict[str, str] = {}
+    invalid_access_members: set[str] = set()
     with zf:
         infos = zf.infolist()
         _validate_import_metadata(infos)
@@ -333,17 +388,29 @@ async def restore_backup_zip(raw: bytes) -> dict:
             ) as e:
                 log.warning("restore_backup_zip: пропускаю битый %s: %s", name, e)
                 skipped.append(name)
+                if name in {"blocked_users.json", "subscribers.json"}:
+                    invalid_access_members.add(name)
                 continue
             if not _valid_import_payload(name, obj):   # и похож на ожидаемую структуру?
                 log.warning("restore_backup_zip: %s не похож на ожидаемый формат — пропускаю.", name)
                 skipped.append(name)
+                if name in {"blocked_users.json", "subscribers.json"}:
+                    invalid_access_members.add(name)
                 continue
             pending[name] = payload
 
     if not pending:
         raise ValueError("в архиве нет валидных файлов из белого списка")
+    if (
+        "blocked_users.json" in invalid_access_members
+        and "subscribers.json" in pending
+    ):
+        raise ValueError(
+            "список блокировок в архиве повреждён; подписчики не восстановлены"
+        )
 
     async with restorable_state_transaction():
+        pending = _prepare_access_restore_candidate(pending)
         restored = _publish_restore_files(pending)
     log.info("restore_backup_zip: восстановлено %d, пропущено %d.",
              len(restored), len(skipped))

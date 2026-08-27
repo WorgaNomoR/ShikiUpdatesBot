@@ -43,7 +43,7 @@ async def test_cmd_backup_owner_shows_menu(backup_env):
     await handlers.cmd_backup(msg)
     kwargs = msg.reply.call_args.kwargs
     assert "reply_markup" in kwargs   # инлайн-меню есть
-    assert "проверки обновлений" in msg.reply.call_args.args[0]
+    assert "доступных обновлениях" in msg.reply.call_args.args[0]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -201,7 +201,7 @@ async def test_backup_import_enters_fsm_and_stores_prompt(backup_env):
     cb.answer.assert_awaited_once()            # тихий ack (без show_alert)
     state.set_state.assert_awaited_once_with(handlers.BackupStates.waiting_import_file)
     cb.message.edit_text.assert_awaited_once()  # промпт-сообщение переписано
-    assert "проверки обновлений" in cb.message.edit_text.call_args.args[0]
+    assert "доступных обновлениях" in cb.message.edit_text.call_args.args[0]
     state.update_data.assert_awaited_once_with(prompt_msg_id=555)  # id промпта сохранён для чистки
 
 
@@ -302,7 +302,7 @@ async def test_backup_receive_accepts_exact_document_size(backup_env, monkeypatc
 
     msg.bot.download.assert_awaited_once()
     restore.assert_awaited_once()
-    assert "проверки обновлений восстановлено" in msg.answer.call_args.args[0]
+    assert "доступных обновлениях восстановлены" in msg.answer.call_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -320,8 +320,7 @@ async def test_backup_receive_download_failure(backup_env, monkeypatch):
     msg.answer.assert_awaited_once()
     text = msg.answer.call_args.args[0]
     assert "❌" in text and "скачать" in text
-    assert "&lt;net&gt;" in text and "&amp;" in text   # h(): текст исключения экранирован
-    assert "<net>" not in text                         # сырой тег не протёк
+    assert "boom" not in text and "net" not in text   # raw exception не протёк
     restore.assert_not_awaited()          # битую загрузку в restore не потащили
 
 
@@ -340,9 +339,7 @@ async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
     msg.answer.assert_awaited_once()
     text = msg.answer.call_args.args[0]
     assert "❌" in text and "не восстановлен" in text
-    assert "zip" in text and "мусор" in text          # причина проброшена пользователю
-    assert "&lt;b&gt;" in text and "&amp;" in text    # h(): спецсимволы экранированы
-    assert "<b>" not in text                          # сырой тег из str(e) не протёк
+    assert "мусор" not in text and "&lt;b&gt;" not in text  # raw exception не протёк
 
 
 @pytest.mark.asyncio

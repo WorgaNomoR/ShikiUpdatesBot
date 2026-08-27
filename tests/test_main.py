@@ -15,8 +15,19 @@ import main
 
 def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     bot = SimpleNamespace(set_my_commands=AsyncMock())
+    registration_order = []
+    reconcile_access = AsyncMock(
+        side_effect=lambda: registration_order.append("access-recovery")
+    )
+    message_register = MagicMock(
+        side_effect=lambda *args, **kwargs: registration_order.append("handler")
+    )
+    outer_middleware = MagicMock(
+        side_effect=lambda *args, **kwargs: registration_order.append("middleware")
+    )
     dispatcher = SimpleNamespace(
-        message=SimpleNamespace(register=MagicMock()),
+        update=SimpleNamespace(outer_middleware=outer_middleware),
+        message=SimpleNamespace(register=message_register),
         callback_query=SimpleNamespace(register=MagicMock()),
         shutdown=SimpleNamespace(register=MagicMock()),
         start_polling=AsyncMock(side_effect=RuntimeError("polling stopped")),
@@ -31,6 +42,7 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     monkeypatch.setattr(main, "Bot", lambda token: bot)
     monkeypatch.setattr(main, "Dispatcher", lambda storage: dispatcher)
     monkeypatch.setattr(main, "MemoryStorage", lambda: object())
+    monkeypatch.setattr(main, "reconcile_blocked_subscribers", reconcile_access)
     monkeypatch.setattr(main, "probe_owner_and_start", probe)
     monkeypatch.setattr(main, "start_health_server", health)
     monkeypatch.setattr(main, "start_update_loop", start_updates)
@@ -44,6 +56,8 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
         start_updates=start_updates,
         guard=guard,
         guard_factory=guard_factory,
+        registration_order=registration_order,
+        reconcile_access=reconcile_access,
     )
 
 
@@ -66,6 +80,12 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         for call in app.dispatcher.message.register.call_args_list
     ]
     assert main.cmd_info in registered_messages
+    assert main.cmd_block in registered_messages
+    assert main.cmd_unblock in registered_messages
+    assert app.registration_order[:2] == ["access-recovery", "middleware"]
+    app.reconcile_access.assert_awaited_once_with()
+    middleware = app.dispatcher.update.outer_middleware.call_args.args[0]
+    assert isinstance(middleware, main.AccessControlMiddleware)
     registered_callbacks = [
         call.args[0]
         for call in app.dispatcher.callback_query.register.call_args_list
@@ -95,3 +115,15 @@ async def test_source_main_keeps_healthcheck_and_shutdown_backup(monkeypatch):
     app.dispatcher.shutdown.register.assert_called_once_with(main._shutdown_backup)
     app.start_updates.assert_called_once_with(app.bot)
     app.guard_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_corrupted_blocked_state_keeps_owner_recovery_path(monkeypatch):
+    app = _patch_app_dependencies(monkeypatch, frozen=True)
+    app.reconcile_access.side_effect = main.BlockedUsersStateError("broken")
+
+    with pytest.raises(RuntimeError, match="polling stopped"):
+        await main.main()
+
+    app.reconcile_access.assert_awaited_once_with()
+    app.dispatcher.start_polling.assert_awaited_once()

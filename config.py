@@ -105,6 +105,7 @@ except OSError as e:
 # Состояние уведомлений (что бот уже видел)
 SEEN_IDS_FILE  = DATA_DIR / "seen_ids.json"         # ID обработанных событий истории
 SUBS_FILE      = DATA_DIR / "subscribers.json"      # список подписчиков
+BLOCKED_USERS_FILE = DATA_DIR / "blocked_users.json"  # список блокировок Telegram user ID
 SEEN_FAVS_FILE = DATA_DIR / "seen_favourites.json"  # ID виденного избранного
 
 # Статистика

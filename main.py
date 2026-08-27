@@ -17,6 +17,7 @@ from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
+from access_control import AccessControlMiddleware
 from backup import _shutdown_backup
 from config import (
     BOT_TOKEN,
@@ -35,6 +36,7 @@ from handlers import (
     broadcast_confirm_cb,
     broadcast_receive,
     cmd_backup,
+    cmd_block,
     cmd_broadcast,
     cmd_cancel,
     cmd_favs,
@@ -44,6 +46,7 @@ from handlers import (
     cmd_status,
     cmd_stop,
     cmd_subs,
+    cmd_unblock,
     cmd_version,
     probe_owner_and_start,
     stats_menu_cb,
@@ -54,12 +57,32 @@ from runtime import (
     IS_FROZEN,
     WindowsConsoleCloseGuard,
 )
+from storage import (
+    BlockedUsersStateError,
+    reconcile_blocked_subscribers,
+)
 from updates import start_update_loop
 
 
 async def main() -> None:
+    # До любых Telegram-обработчиков и фоновых задач восстанавливаем инвариант,
+    # если процесс прервался между публикацией двух access-control файлов.
+    try:
+        await reconcile_blocked_subscribers()
+    except BlockedUsersStateError:
+        # Центральная граница продолжит запрещать доступ всем, кроме владельца;
+        # владелец сможет восстановить корректное состояние через /backup.
+        log.error(
+            "Не удалось проверить подписчиков по списку блокировок; "
+            "доступ обычных пользователей останется закрыт."
+        )
+
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher(storage=MemoryStorage())
+
+    # Глобальная проверка списка блокировок — первый проектный middleware.
+    # Будущую регистрацию пользователей (#97) ставить только после этой строки.
+    dp.update.outer_middleware(AccessControlMiddleware())
 
     # Регистрируем команды
     dp.message.register(cmd_start,     Command("start"))
@@ -73,6 +96,8 @@ async def main() -> None:
     dp.message.register(cmd_favs,      Command("favs"))
     dp.message.register(cmd_info,      Command("info"))
     dp.message.register(cmd_version,   Command("version"))
+    dp.message.register(cmd_block,     Command("block"))
+    dp.message.register(cmd_unblock,   Command("unblock"))
 
     # FSM-обработчики для /broadcast
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)

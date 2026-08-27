@@ -1,16 +1,203 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
+import asyncio
 import json
 
 import pytest
 
 import storage
 from storage import (
+    BlockedUsersMutationError,
+    BlockedUsersStateError,
+    add_blocked_user,
+    load_blocked_users,
     load_seen_ids,
     load_subscribers,
+    reconcile_blocked_subscribers,
+    save_blocked_users,
     save_seen_ids,
     save_subscribers,
+    subscribers_from_payload,
 )
+
+
+@pytest.fixture
+def access_state_env(monkeypatch, tmp_path):
+    """Изолировать список блокировок, subscribers и OWNER_ID."""
+    blocked_path = tmp_path / "blocked_users.json"
+    subscribers_path = tmp_path / "subscribers.json"
+    monkeypatch.setattr(storage, "BLOCKED_USERS_FILE", blocked_path)
+    monkeypatch.setattr(storage, "SUBS_FILE", subscribers_path)
+    monkeypatch.setattr(storage, "OWNER_ID", 999)
+    return blocked_path, subscribers_path
+
+
+def test_load_blocked_users_missing_file_migrates_to_empty(access_state_env):
+    assert load_blocked_users() == set()
+
+
+def test_blocked_users_roundtrip_is_canonical(access_state_env):
+    blocked_path, _subscribers_path = access_state_env
+
+    save_blocked_users({30, 10, 20})
+
+    assert load_blocked_users() == {10, 20, 30}
+    assert json.loads(blocked_path.read_text(encoding="utf-8")) == {
+        "blocked_user_ids": [10, 20, 30]
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{broken",
+        json.dumps([]),
+        json.dumps({"blocked_user_ids": "1"}),
+        json.dumps({"blocked_user_ids": [1, 1]}),
+        json.dumps({"blocked_user_ids": [True]}),
+        json.dumps({"blocked_user_ids": [-1]}),
+        json.dumps({"blocked_user_ids": [999]}),
+        json.dumps({"blocked_user_ids": [], "extra": 1}),
+    ],
+)
+def test_corrupted_blocked_users_state_never_degrades_to_empty(
+    access_state_env,
+    payload,
+):
+    blocked_path, _subscribers_path = access_state_env
+    blocked_path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(BlockedUsersStateError):
+        load_blocked_users()
+
+
+def test_owner_id_is_rejected_by_storage_save_and_check(access_state_env):
+    blocked_path, _subscribers_path = access_state_env
+
+    with pytest.raises(BlockedUsersStateError):
+        save_blocked_users({storage.OWNER_ID})
+
+    blocked_path.write_text("{broken", encoding="utf-8")
+    assert storage.is_user_blocked(storage.OWNER_ID) is False
+
+
+@pytest.mark.asyncio
+async def test_block_atomically_removes_private_subscriber_and_unblock_does_not_restore(
+    access_state_env,
+):
+    storage.save_subscribers({77: "Unknown", 88: "Other"})
+
+    assert await add_blocked_user(77) == (True, True)
+    assert load_blocked_users() == {77}
+    assert storage.load_subscribers() == {88: "Other"}
+
+    assert await add_blocked_user(77) == (False, False)
+    assert await storage.remove_blocked_user(77) is True
+    assert await storage.remove_blocked_user(77) is False
+    assert storage.load_subscribers() == {88: "Other"}
+
+
+@pytest.mark.asyncio
+async def test_block_rejects_owner_before_any_write(access_state_env):
+    blocked_path, subscribers_path = access_state_env
+
+    with pytest.raises(ValueError, match="OWNER_ID"):
+        await add_blocked_user(storage.OWNER_ID)
+    with pytest.raises(ValueError, match="OWNER_ID"):
+        await storage.remove_blocked_user(storage.OWNER_ID)
+
+    assert not blocked_path.exists()
+    assert not subscribers_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_blocked_users_mutations_do_not_lose_ids(access_state_env):
+    await asyncio.gather(*(add_blocked_user(user_id) for user_id in range(1, 51)))
+
+    assert load_blocked_users() == set(range(1, 51))
+
+
+@pytest.mark.asyncio
+async def test_block_rolls_back_blocked_users_when_subscriber_publication_fails(
+    access_state_env,
+    monkeypatch,
+):
+    blocked_path, subscribers_path = access_state_env
+    save_blocked_users({10})
+    storage.save_subscribers({77: "Target", 88: "Other"})
+    original_atomic_write = storage._atomic_write
+
+    def fail_subscribers(path, data):
+        if storage.Path(path) == subscribers_path:
+            raise OSError("disk failure")
+        original_atomic_write(path, data)
+
+    monkeypatch.setattr(storage, "_atomic_write", fail_subscribers)
+
+    with pytest.raises(BlockedUsersMutationError, match="исходное состояние"):
+        await add_blocked_user(77)
+
+    assert load_blocked_users() == {10}
+    assert storage.load_subscribers() == {77: "Target", 88: "Other"}
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_repairs_interrupted_block_publication(
+    access_state_env,
+):
+    save_blocked_users({77, 99})
+    save_subscribers({77: "Target", 88: "Other"})
+
+    assert await reconcile_blocked_subscribers() == {77}
+    assert load_blocked_users() == {77, 99}
+    assert load_subscribers() == {88: "Other"}
+    assert await reconcile_blocked_subscribers() == set()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {},
+        {"subscribers": None},
+        {"subscribers": {"abc": "Name"}},
+    ],
+)
+def test_subscribers_payload_validation_rejects_malformed_state(payload):
+    with pytest.raises(ValueError):
+        subscribers_from_payload(payload)
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_converts_subscriber_read_failure(
+    access_state_env,
+    monkeypatch,
+):
+    _blocked_path, subscribers_path = access_state_env
+    save_blocked_users({77})
+    save_subscribers({77: "Target"})
+    original_read_text = storage.Path.read_text
+
+    def fail_subscriber_read(path, *args, **kwargs):
+        if path == subscribers_path:
+            raise OSError("read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage.Path, "read_text", fail_subscriber_read)
+
+    with pytest.raises(BlockedUsersStateError):
+        await reconcile_blocked_subscribers()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_rejects_null_subscribers(access_state_env):
+    _blocked_path, subscribers_path = access_state_env
+    save_blocked_users({77})
+    subscribers_path.write_text('{"subscribers": null}', encoding="utf-8")
+
+    with pytest.raises(BlockedUsersStateError):
+        await reconcile_blocked_subscribers()
 
 
 def test_load_seen_ids_missing_file(monkeypatch, tmp_path):
@@ -103,6 +290,19 @@ def test_load_subscribers_corrupted_json(monkeypatch, tmp_path):
     file.write_text("{", encoding="utf-8")
 
     monkeypatch.setattr("storage.SUBS_FILE", str(file))
+
+    assert load_subscribers() == {}
+
+
+def test_load_subscribers_read_error_falls_back_to_empty(monkeypatch, tmp_path):
+    file = tmp_path / "subs.json"
+    file.write_text('{"subscribers": {}}', encoding="utf-8")
+    monkeypatch.setattr("storage.SUBS_FILE", str(file))
+
+    def fail_read(*args, **kwargs):
+        raise OSError("read failure")
+
+    monkeypatch.setattr(storage.Path, "read_text", fail_read)
 
     assert load_subscribers() == {}
 
