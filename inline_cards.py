@@ -306,11 +306,13 @@ def _chooser_description(media_type: str, item: dict) -> str:
     return " · ".join(parts)
 
 
-def build_inline_result(
+def _build_inline_result(
     media_type: str,
     item: dict,
+    *,
+    allow_photo: bool,
 ) -> InlineQueryResultPhoto | InlineQueryResultArticle:
-    """Собрать результат с постером или равноправную текстовую карточку."""
+    """Собрать один результат с учётом выбранного режима представления."""
     item_id = _plain(item.get("id"))
     if not item_id.isdigit():
         raise ValueError("карточка Shikimori не содержит корректный id")
@@ -324,7 +326,7 @@ def build_inline_result(
     photo_url = _web_url(poster.get("originalUrl"))
     thumbnail_url = _web_url(poster.get("mainUrl")) or photo_url
 
-    if photo_url:
+    if photo_url and allow_photo:
         return InlineQueryResultPhoto(
             id=result_id,
             photo_url=photo_url,
@@ -340,10 +342,36 @@ def build_inline_result(
         description=description or None,
         url=url,
         hide_url=True,
-        thumbnail_url=thumbnail_url or None,
+        thumbnail_url=(photo_url or thumbnail_url) or None,
         input_message_content=InputTextMessageContent(
             message_text=caption,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         ),
     )
+
+
+def build_inline_result(
+    media_type: str,
+    item: dict,
+) -> InlineQueryResultPhoto | InlineQueryResultArticle:
+    """Собрать результат с постером или равноправную текстовую карточку."""
+    return _build_inline_result(media_type, item, allow_photo=True)
+
+
+def finalize_inline_results(
+    media_type: str,
+    rendered: list[
+        tuple[dict, InlineQueryResultPhoto | InlineQueryResultArticle]
+    ],
+) -> list[InlineQueryResultPhoto | InlineQueryResultArticle]:
+    """Не дать полностью постерной странице превратиться в галерею без названий."""
+    results = [result for _item, result in rendered]
+    if results and all(isinstance(result, InlineQueryResultPhoto) for result in results):
+        last_item, _last_result = rendered[-1]
+        results[-1] = _build_inline_result(
+            media_type,
+            last_item,
+            allow_photo=False,
+        )
+    return results

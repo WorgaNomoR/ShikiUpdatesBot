@@ -88,6 +88,49 @@ def test_missing_or_invalid_poster_falls_back_to_article_with_same_caption():
     assert missing.input_message_content.parse_mode == ParseMode.HTML
 
 
+def test_all_photo_page_uses_last_item_as_article_to_force_vertical_layout():
+    items = [
+        _anime_item(id=str(item_id), russian=f"Fate {item_id}")
+        for item_id in (1, 2, 3)
+    ]
+    rendered = [
+        (item, inline_cards.build_inline_result("anime", item))
+        for item in items
+    ]
+
+    results = inline_cards.finalize_inline_results("anime", rendered)
+
+    assert [type(result) for result in results] == [
+        InlineQueryResultPhoto,
+        InlineQueryResultPhoto,
+        InlineQueryResultArticle,
+    ]
+    assert [result.id for result in results] == ["anime:1", "anime:2", "anime:3"]
+    assert results[-1].thumbnail_url.endswith("poster.jpg")
+    assert results[-1].input_message_content.message_text == rendered[-1][1].caption
+
+
+def test_natural_article_fallback_keeps_other_photo_results_unchanged():
+    items = [
+        _anime_item(id="1"),
+        _anime_item(id="2", poster=None),
+        _anime_item(id="3"),
+    ]
+    rendered = [
+        (item, inline_cards.build_inline_result("anime", item))
+        for item in items
+    ]
+
+    results = inline_cards.finalize_inline_results("anime", rendered)
+
+    assert results == [result for _item, result in rendered]
+    assert [type(result) for result in results] == [
+        InlineQueryResultPhoto,
+        InlineQueryResultArticle,
+        InlineQueryResultPhoto,
+    ]
+
+
 def test_manga_and_ranobe_facts_use_chapters_volumes_and_publishers():
     item = _anime_item(
         kind="light_novel",

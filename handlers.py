@@ -58,7 +58,10 @@ from config import (
     log,
 )
 from healthcheck import heartbeat
-from inline_cards import build_inline_result
+from inline_cards import (
+    build_inline_result,
+    finalize_inline_results,
+)
 from inline_search import (
     SHIKIMORI_PAGE_SIZE,
     InlineActor,
@@ -1590,15 +1593,18 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
             await inline_query.answer([], cache_time=0)
             return
 
-        results = []
+        rendered_results = []
         for item in search_page.items:
             try:
-                results.append(build_inline_result(query.media_type, item))
+                rendered_results.append(
+                    (item, build_inline_result(query.media_type, item))
+                )
             except Exception as e:
                 log.warning(
                     "inline-search: пропущена повреждённая карточка (%s)",
                     type(e).__name__,
                 )
+        results = finalize_inline_results(query.media_type, rendered_results)
         next_offset = ""
         if len(search_page.items) == SHIKIMORI_PAGE_SIZE:
             next_offset = _inline_search_service.issue_continuation(
