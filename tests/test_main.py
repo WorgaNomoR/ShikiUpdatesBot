@@ -82,7 +82,15 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.cmd_info in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
-    assert main.cmd_blocklist in registered_messages
+    blocklist_registrations = [
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.cmd_blocklist
+    ]
+    assert len(blocklist_registrations) == 1
+    blocklist_filter = blocklist_registrations[0].args[1]
+    assert isinstance(blocklist_filter, main.Command)
+    assert blocklist_filter.commands == ("blocklist",)
     assert "blocklist" not in public_commands
     assert app.registration_order[:2] == ["access-recovery", "middleware"]
     app.reconcile_access.assert_awaited_once_with()

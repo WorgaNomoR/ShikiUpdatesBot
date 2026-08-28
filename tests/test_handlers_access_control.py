@@ -14,6 +14,12 @@ from aiogram.enums import ParseMode
 import handlers
 from storage import BlockedUsersStateError
 
+_EXPECTED_BLOCKLIST_HINT = (
+    "Подсказка: <code>/block 123456789</code> — заблокировать; "
+    "<code>/unblock 123456789</code> — разблокировать."
+)
+_EXPECTED_TELEGRAM_MESSAGE_LIMIT = 4096
+
 
 def _message(text, user_id=None):
     message = MagicMock()
@@ -175,7 +181,7 @@ async def test_blocklist_empty_state_has_one_management_hint(monkeypatch):
     assert message.answer.await_count == 1
     text = message.answer.await_args.args[0]
     assert text.startswith("📭 Список блокировок пуст.")
-    assert text.count(handlers._BLOCKLIST_HINT) == 1
+    assert text.count(_EXPECTED_BLOCKLIST_HINT) == 1
     assert message.answer.await_args.kwargs == {"parse_mode": ParseMode.HTML}
 
 
@@ -195,7 +201,7 @@ async def test_blocklist_sorts_and_renders_every_id_without_mutation(monkeypatch
     text = message.answer.await_args.args[0]
     assert text.startswith("🚫 <b>Заблокированные пользователи: 3</b>")
     assert re.findall(r"• <code>(\d+)</code>", text) == ["12", "300", "987654321"]
-    assert text.count(handlers._BLOCKLIST_HINT) == 1
+    assert text.count(_EXPECTED_BLOCKLIST_HINT) == 1
     list_blocked.assert_called_once_with()
     add.assert_not_awaited()
     remove.assert_not_awaited()
@@ -216,14 +222,14 @@ async def test_blocklist_splits_at_id_boundaries_and_hints_only_at_end(monkeypat
     calls = message.answer.await_args_list
     assert len(calls) > 1
     texts = [call.args[0] for call in calls]
-    assert all(len(text) <= handlers._TELEGRAM_MESSAGE_LIMIT for text in texts)
+    assert all(len(text) <= _EXPECTED_TELEGRAM_MESSAGE_LIMIT for text in texts)
     assert all(call.kwargs == {"parse_mode": ParseMode.HTML} for call in calls)
     assert texts[0].startswith(
         "🚫 <b>Заблокированные пользователи: 1000</b>"
     )
-    assert sum(text.count(handlers._BLOCKLIST_HINT) for text in texts) == 1
-    assert handlers._BLOCKLIST_HINT not in texts[-2]
-    assert texts[-1].endswith(handlers._BLOCKLIST_HINT)
+    assert sum(text.count(_EXPECTED_BLOCKLIST_HINT) for text in texts) == 1
+    assert _EXPECTED_BLOCKLIST_HINT not in texts[-2]
+    assert texts[-1].endswith(_EXPECTED_BLOCKLIST_HINT)
     rendered_ids = [
         int(user_id)
         for text in texts
