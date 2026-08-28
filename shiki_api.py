@@ -20,6 +20,10 @@ from config import (
     SHIKI_USER,
     log,
 )
+from request_budget import (
+    BudgetSnapshot,
+    RollingBudget,
+)
 from utils import (
     _rel_url,
     _safe_float,
@@ -89,6 +93,15 @@ class ProfilePrivacyError(RuntimeError):
         self.endpoint = endpoint
         super().__init__(f"Профиль Shikimori закрыт ({endpoint})")
 
+
+class ShikimoriBudgetExceeded(RuntimeError):
+    """Защитный лимит не позволил inline-поиску начать HTTP-попытку."""
+
+    def __init__(self, snapshot: BudgetSnapshot):
+        self.snapshot = snapshot
+        super().__init__("Исчерпан минутный бюджет запросов к Shikimori")
+
+
 _ORIGIN_RU: dict[str, str] = {
     "original":         "Оригинал",
     "manga":            "Манга",
@@ -153,6 +166,61 @@ query($ids: String!) {
   }
 }
 """
+
+_GQL_INLINE_ANIME = """
+query($search: String!, $page: PositiveInt!) {
+  animes(search: $search, page: $page, limit: 50, censored: false) {
+    id
+    url
+    name
+    russian
+    japanese
+    kind
+    score
+    status
+    episodes
+    duration
+    airedOn { year }
+    studios { name }
+    genres { russian name kind }
+    poster { originalUrl mainUrl }
+    description
+  }
+}
+"""
+
+_GQL_INLINE_MANGA = """
+query($search: String!, $page: PositiveInt!) {
+  mangas(
+    search: $search,
+    kind: "manga,manhwa,manhua,one_shot,doujin",
+    page: $page,
+    limit: 50,
+    censored: false
+  ) {
+    id
+    url
+    name
+    russian
+    japanese
+    kind
+    score
+    status
+    chapters
+    volumes
+    airedOn { year }
+    publishers { name }
+    genres { russian name kind }
+    poster { originalUrl mainUrl }
+    description
+  }
+}
+"""
+
+_GQL_INLINE_RANOBE = _GQL_INLINE_MANGA.replace(
+    'kind: "manga,manhwa,manhua,one_shot,doujin"',
+    'kind: "light_novel,novel"',
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -232,9 +300,16 @@ _MIN_GAP: float = 0.25              # сек между выстрелами →
 _MAX_429_RETRIES: int = 2           # доп. попыток после первого 429
 _RETRY_AFTER_DEFAULT: float = 1.0   # если сервер не прислал корректный Retry-After
 _RETRY_AFTER_CAP: float = 10.0      # потолок ожидания, чтобы не подвесить цикл
+_REQUEST_ATTEMPT_LIMIT = 80
+_REQUEST_ATTEMPT_PERIOD = 60.0
+_INLINE_ATTEMPT_RESERVE = 20
 
 _last_request_at: float = 0.0       # монотонная метка последнего выстрела
 _throttle_lock: "asyncio.Lock | None" = None
+_request_attempt_budget = RollingBudget(
+    _REQUEST_ATTEMPT_LIMIT,
+    _REQUEST_ATTEMPT_PERIOD,
+)
 
 
 def _get_throttle_lock() -> asyncio.Lock:
@@ -301,6 +376,8 @@ async def _fetch(
     timeout: float,
     headers: dict | None = None,
     json_body: dict | None = None,
+    traffic_class: str = "general",
+    actor_user_id: int | None = None,
 ):
     """
     Единый выстрел HTTP через центральный троттл + ретрай на 429.
@@ -313,8 +390,25 @@ async def _fetch(
     """
     if headers is None:
         headers = dict(HEADERS)   # копия дефолта: даже будущая in-place мутация не тронет модульный HEADERS
+    reserve = _INLINE_ATTEMPT_RESERVE if traffic_class == "inline" else 0
     for attempt in range(_MAX_429_RETRIES + 1):
         await _throttle()
+        if not _request_attempt_budget.try_acquire(
+            reserve=reserve,
+            actor=actor_user_id,
+        ):
+            snapshot = _request_attempt_budget.snapshot(reserve=reserve)
+            if traffic_class == "inline":
+                raise ShikimoriBudgetExceeded(snapshot)
+            log.warning(
+                "%s: исчерпан общий минутный бюджет Shikimori; "
+                "использовано %d/%d HTTP-попыток; до освобождения %.1f с",
+                label,
+                snapshot.used,
+                snapshot.capacity,
+                snapshot.retry_after,
+            )
+            return None
         try:
             if method == "POST":
                 cm = session.post(
@@ -331,12 +425,13 @@ async def _fetch(
                     delay = _retry_after(getattr(resp, "headers", None))
                     if attempt < _MAX_429_RETRIES:
                         log.warning(
-                            "%s: 429 rate limit, ретрай через %.2f с (попытка %d/%d)",
+                            "%s: получен HTTP 429; повтор через %.2f с "
+                            "(попытка %d/%d)",
                             label, delay, attempt + 1, _MAX_429_RETRIES,
                         )
                         await asyncio.sleep(delay)
                         continue
-                    log.warning("%s: 429 rate limit, ретраи исчерпаны", label)
+                    log.warning("%s: HTTP 429; повторы исчерпаны", label)
                     return None
                 if resp.status == 403 and await _is_private_profile_response(resp):
                     log.warning("%s: профиль Shikimori закрыт", label)
@@ -361,24 +456,77 @@ async def _fetch(
 
 
 async def _gql_request(
-    session: aiohttp.ClientSession, query: str, variables: dict,
+    session: aiohttp.ClientSession,
+    query: str,
+    variables: dict,
+    *,
+    traffic_class: str = "general",
+    allow_partial: bool = True,
+    actor_user_id: int | None = None,
 ) -> dict | None:
     """
     Один GraphQL-запрос через центральный троттл/ретрай. Возвращает поле data
-    или None при ошибке. Частичные данные (data + errors) возвращаются — пусть
-    caller решает.
+    или None при ошибке. Частичные данные (data + errors) по умолчанию
+    возвращаются вызывающему коду; строгий inline-поиск отклоняет их целиком.
     """
     async def _parse(resp):
         payload = await resp.json(content_type=None)
         if "errors" in payload:
             log.warning("_gql_request: GraphQL errors: %s", payload["errors"])
+            if not allow_partial:
+                return None
         return payload.get("data")
 
     return await _fetch(
         session, "POST", GRAPHQL_URL, parse=_parse, label="_gql_request",
         headers={**HEADERS, "Content-Type": "application/json"}, timeout=20,
         json_body={"query": query, "variables": variables},
+        traffic_class=traffic_class,
+        actor_user_id=actor_user_id,
     )
+
+
+async def fetch_inline_search(
+    media_type: str,
+    title: str,
+    page: int,
+    *,
+    session: "aiohttp.ClientSession | None" = None,
+    actor_user_id: int | None = None,
+) -> list[dict] | None:
+    """Получить одну inline-страницу без дополнительных запросов деталей."""
+    if media_type not in {"anime", "manga", "ranobe"} or page <= 0:
+        return None
+    if session is None:
+        async with aiohttp.ClientSession() as own:
+            return await fetch_inline_search(
+                media_type,
+                title,
+                page,
+                session=own,
+                actor_user_id=actor_user_id,
+            )
+
+    query = {
+        "anime": _GQL_INLINE_ANIME,
+        "manga": _GQL_INLINE_MANGA,
+        "ranobe": _GQL_INLINE_RANOBE,
+    }[media_type]
+    data = await _gql_request(
+        session,
+        query,
+        {"search": title, "page": page},
+        traffic_class="inline",
+        allow_partial=False,
+        actor_user_id=actor_user_id,
+    )
+    if not isinstance(data, dict):
+        return None
+    field = "animes" if media_type == "anime" else "mangas"
+    items = data.get(field)
+    if not isinstance(items, list):
+        return None
+    return [item for item in items if isinstance(item, dict)]
 
 
 async def fetch_list_export(session: aiohttp.ClientSession, media: str) -> list[dict] | None:

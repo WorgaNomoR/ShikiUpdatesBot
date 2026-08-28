@@ -42,6 +42,7 @@ from handlers import (
     cmd_cancel,
     cmd_favs,
     cmd_info,
+    cmd_inline_search,
     cmd_start,
     cmd_stats,
     cmd_status,
@@ -100,6 +101,7 @@ async def main() -> None:
     dp.message.register(cmd_block,     Command("block"))
     dp.message.register(cmd_unblock,   Command("unblock"))
     dp.message.register(cmd_blocklist, Command("blocklist"))
+    dp.inline_query.register(cmd_inline_search)
 
     # FSM-обработчики для /broadcast
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
@@ -153,7 +155,10 @@ async def main() -> None:
             log.warning("Не удалось установить обработчик закрытия консоли: %s", e)
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query", "inline_query"],
+        )
     finally:
         if close_guard is not None:
             close_guard.complete()

@@ -11,12 +11,14 @@ main.py лишь регистрирует эти функции в Dispatcher.
 
 import asyncio
 import io
+import math
 import time
 
 import aiohttp
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import (
     State,
@@ -27,9 +29,16 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultsButton,
     Message,
 )
 
+from access_control import (
+    INLINE_ACCESS_ALLOWED,
+    INLINE_ACCESS_BLOCKED,
+    inline_access_status,
+)
 from backup import (
     BACKUP_TAG,
     IMPORT_DOCUMENT_MAX_BYTES,
@@ -49,6 +58,14 @@ from config import (
     log,
 )
 from healthcheck import heartbeat
+from inline_cards import build_inline_result
+from inline_search import (
+    SHIKIMORI_PAGE_SIZE,
+    InlineActor,
+    InlineSearchLimitExceeded,
+    InlineSearchService,
+    parse_inline_query,
+)
 from messages import (
     BROADCAST_HEADER,
     DISPLAY_NAME_CONTEXT,
@@ -143,6 +160,7 @@ _info_preview_file_id: str | None = None
 _status_cache: tuple[list[dict], list[dict]] | None = None
 _status_cache_at = 0.0
 _status_cache_lock: asyncio.Lock | None = None
+_inline_search_service = InlineSearchService()
 
 
 def _profile_privacy_owner_text() -> str:
@@ -1459,14 +1477,182 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
 #  КОМАНДЫ БОТА
 # ═══════════════════════════════════════════════════════════════
 
-async def cmd_start(message: Message) -> None:
+def _return_to_inline_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка ручного возврата к выбору чата без автоматического поиска."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="Вернуться к поиску",
+            switch_inline_query="",
+        )
+    ]])
+
+
+def _inline_limit_text() -> str:
+    """Объяснение после перехода из кнопки исчерпанного inline-лимита."""
+    return (
+        "⏳ <b>Shikimori попросил сделать паузу</b>\n\n"
+        "Минутный лимит запросов к Shikimori временно исчерпан. "
+        "Бот приостановил новые поисковые запросы, чтобы сохранить запас для "
+        "уведомлений, /status и остальных функций.\n\n"
+        "Обычно поиск возобновляется меньше чем через минуту. Вернитесь к поиску и "
+        "повторите запрос чуть позже."
+    )
+
+
+async def _answer_inline_access(inline_query: InlineQuery, status: str) -> bool:
+    """Ответить на отклонённый inline-запрос; вернуть признак завершения."""
+    if status == INLINE_ACCESS_ALLOWED:
+        return False
+    kwargs = {"cache_time": 0}
+    if status != INLINE_ACCESS_BLOCKED:
+        kwargs["button"] = InlineQueryResultsButton(
+            text="Подписаться для поиска",
+            start_parameter="inline_search",
+        )
+    await inline_query.answer([], **kwargs)
+    return True
+
+
+async def cmd_inline_search(inline_query: InlineQuery) -> None:
+    """Оркестрировать доступный подписчикам inline-поиск без доменной логики."""
+    user_id = inline_query.from_user.id
+    try:
+        status = inline_access_status(user_id)
+        if await _answer_inline_access(inline_query, status):
+            return
+        actor = InlineActor(
+            user_id=user_id,
+            full_name=inline_query.from_user.full_name,
+            username=inline_query.from_user.username,
+        )
+
+        query = parse_inline_query(inline_query.query)
+        offset = inline_query.offset or ""
+        generation: int | None = None
+        if offset:
+            if query is None:
+                await inline_query.answer([], cache_time=0)
+                return
+            page = _inline_search_service.resolve_continuation(query, offset)
+            if page is None:
+                await inline_query.answer([], cache_time=0)
+                return
+        else:
+            if query is None:
+                _inline_search_service.invalidate_debounce(user_id)
+                await inline_query.answer([], cache_time=0)
+                return
+            generation = await _inline_search_service.debounce(user_id)
+            if generation is None:
+                await inline_query.answer([], cache_time=0)
+                return
+            if not _inline_search_service.is_current(user_id, generation):
+                await inline_query.answer([], cache_time=0)
+                return
+            page = 1
+
+        def authorized() -> bool:
+            return inline_access_status(user_id) == INLINE_ACCESS_ALLOWED
+
+        current_status = inline_access_status(user_id)
+        if current_status != INLINE_ACCESS_ALLOWED:
+            await _answer_inline_access(inline_query, current_status)
+            return
+        try:
+            search_page = await _inline_search_service.get_page(
+                query,
+                page,
+                authorized=authorized,
+                actor=actor,
+            )
+        except InlineSearchLimitExceeded as e:
+            current_status = inline_access_status(user_id)
+            if current_status != INLINE_ACCESS_ALLOWED:
+                await _answer_inline_access(inline_query, current_status)
+                return
+            retry_after = max(1, math.ceil(e.retry_after))
+            await inline_query.answer(
+                [],
+                cache_time=0,
+                button=InlineQueryResultsButton(
+                    text=f"⏳ Лимит Shikimori: повторите через {retry_after} с",
+                    start_parameter="inline_search_limit",
+                ),
+            )
+            return
+        if search_page is None:
+            await inline_query.answer([], cache_time=0)
+            return
+        if (
+            generation is not None
+            and not _inline_search_service.is_current(user_id, generation)
+        ):
+            await inline_query.answer([], cache_time=0)
+            return
+
+        results = []
+        for item in search_page.items:
+            try:
+                results.append(build_inline_result(query.media_type, item))
+            except Exception as e:
+                log.warning(
+                    "inline-search: пропущена повреждённая карточка (%s)",
+                    type(e).__name__,
+                )
+        next_offset = ""
+        if len(search_page.items) == SHIKIMORI_PAGE_SIZE:
+            next_offset = _inline_search_service.issue_continuation(
+                query,
+                page=page + 1,
+                preceding_expires_at=search_page.expires_at,
+            )
+        await inline_query.answer(
+            results,
+            cache_time=0,
+            next_offset=next_offset,
+        )
+    except Exception as e:
+        log.warning("inline-search: безопасный пустой ответ (%s)", type(e).__name__)
+        try:
+            await inline_query.answer([], cache_time=0)
+        except Exception:
+            log.debug("inline-search: Telegram не принял пустой ответ")
+
+
+async def cmd_start(
+    message: Message,
+    command: CommandObject | None = None,
+) -> None:
     """Подписаться на уведомления (для владельца — заодно добудить фоновый цикл)."""
+    chat_id = message.chat.id
+    name = message.from_user.full_name if message.from_user else str(chat_id)
+    inline_limit_start = bool(
+        command is not None
+        and command.args == "inline_search_limit"
+        and message.from_user is not None
+        and chat_id == message.from_user.id
+    )
+    if inline_limit_start:
+        await message.answer(
+            _inline_limit_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_return_to_inline_keyboard(),
+        )
+        return
+
     if message.from_user is not None and message.from_user.id == OWNER_ID:
         if start_polling_loop(message.bot):
             log.info("Фоновый цикл добужен владельцем через /start.")
 
-    chat_id = message.chat.id
-    name = message.from_user.full_name if message.from_user else str(chat_id)
+    inline_search_start = bool(
+        command is not None
+        and command.args == "inline_search"
+        and message.from_user is not None
+        and chat_id == message.from_user.id
+    )
+    answer_kwargs = {"parse_mode": ParseMode.HTML}
+    if inline_search_start:
+        answer_kwargs["reply_markup"] = _return_to_inline_keyboard()
 
     async with restorable_state_transaction():
         subs = load_subscribers()
@@ -1479,7 +1665,7 @@ async def cmd_start(message: Message) -> None:
         await message.answer(
             f"☕ Ты уже подписан, {h(name)}! Буду слать новости об активности "
             f"{h(DISPLAY_NAME_CONTEXT.genitive)}.",
-            parse_mode=ParseMode.HTML,
+            **answer_kwargs,
         )
         return
 
@@ -1491,7 +1677,7 @@ async def cmd_start(message: Message) -> None:
         f"{h(DISPLAY_NAME_CONTEXT.genitive)} на Shikimori. \U0001f3cc\n\n"
         "Чтобы отписаться — /stop"
     )
-    await message.answer(reply, parse_mode=ParseMode.HTML)
+    await message.answer(reply, **answer_kwargs)
 
 
 async def cmd_stop(message: Message) -> None:

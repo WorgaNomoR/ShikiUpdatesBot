@@ -9,11 +9,13 @@
 import asyncio
 import json
 import types
+from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
 
 import shiki_api
+from request_budget import BudgetSnapshot
 from shiki_api import (
     fetch_favourites,
     fetch_history,
@@ -623,6 +625,177 @@ async def test_gql_request_returns_partial_data_despite_errors():
     ])
     data = await shiki_api._gql_request(session, "q", {"ids": "1"})
     assert data == {"animes": []}
+
+
+@pytest.mark.parametrize(
+    ("media_type", "field", "kind_filter"),
+    [
+        ("anime", "animes", None),
+        ("manga", "mangas", "manga,manhwa,manhua,one_shot,doujin"),
+        ("ranobe", "mangas", "light_novel,novel"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inline_search_uses_exact_graphql_domain_kind_and_single_page_request(
+    monkeypatch,
+    media_type,
+    field,
+    kind_filter,
+):
+    gql = AsyncMock(return_value={field: [{"id": "1"}]})
+    monkeypatch.setattr(shiki_api, "_gql_request", gql)
+
+    result = await shiki_api.fetch_inline_search(
+        media_type,
+        "Berserk",
+        3,
+        session=object(),
+    )
+
+    assert result == [{"id": "1"}]
+    gql.assert_awaited_once()
+    query, variables = gql.await_args.args[1:]
+    assert f"{field}(" in query
+    assert "limit: 50" in query
+    assert "censored: false" in query
+    assert "poster { originalUrl mainUrl }" in query
+    assert "genres { russian name kind }" in query
+    assert variables == {"search": "Berserk", "page": 3}
+    assert gql.await_args.kwargs == {
+        "traffic_class": "inline",
+        "allow_partial": False,
+        "actor_user_id": None,
+    }
+    if kind_filter is None:
+        assert "kind:" not in query
+    else:
+        assert f'kind: "{kind_filter}"' in query
+
+
+@pytest.mark.asyncio
+async def test_inline_search_rejects_unknown_media_without_network(monkeypatch):
+    gql = AsyncMock()
+    monkeypatch.setattr(shiki_api, "_gql_request", gql)
+
+    assert await shiki_api.fetch_inline_search(
+        "game",
+        "Berserk",
+        1,
+        session=object(),
+    ) is None
+    gql.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inline_search_does_not_cache_shape_from_graphql_error():
+    session = _SeqSession([
+        _gql_response(
+            {"animes": [{"id": "partial"}]},
+            errors=[{"message": "partial failure"}],
+        )
+    ])
+
+    assert await shiki_api.fetch_inline_search(
+        "anime",
+        "Berserk",
+        1,
+        session=session,
+    ) is None
+    assert session.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_global_attempt_budget_counts_429_retry_and_reserves_inline_headroom(
+    monkeypatch,
+):
+    reservations = []
+
+    class Budget:
+        def try_acquire(self, *, reserve=0, actor=None):
+            reservations.append((reserve, actor))
+            return True
+
+    monkeypatch.setattr(shiki_api, "_request_attempt_budget", Budget())
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(shiki_api.asyncio, "sleep", no_sleep)
+    session = _SeqSession([
+        _SeqResponse(429, headers={"Retry-After": "0"}),
+        _gql_response({"animes": []}),
+    ])
+
+    data = await shiki_api._gql_request(
+        session,
+        "query { animes { id } }",
+        {},
+        traffic_class="inline",
+        actor_user_id=777,
+    )
+
+    assert data == {"animes": []}
+    assert session.calls == 2
+    assert reservations == [
+        (shiki_api._INLINE_ATTEMPT_RESERVE, 777),
+        (shiki_api._INLINE_ATTEMPT_RESERVE, 777),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_global_budget_stops_before_http(monkeypatch):
+    class Budget:
+        def try_acquire(self, *, reserve=0, actor=None):
+            return False
+
+        def snapshot(self, *, reserve=0):
+            return BudgetSnapshot(80, 80 - reserve, 12.0, None, ())
+
+    throttle = AsyncMock()
+    monkeypatch.setattr(shiki_api, "_request_attempt_budget", Budget())
+    monkeypatch.setattr(shiki_api, "_throttle", throttle)
+    session = _SeqSession([_SeqResponse(200, json_value=[])])
+
+    assert await fetch_history(session) is None
+    assert session.calls == 0
+    throttle.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_inline_attempt_reserve_raises_attributed_typed_failure(
+    monkeypatch,
+):
+    class Budget:
+        def try_acquire(self, *, reserve=0, actor=None):
+            assert reserve == shiki_api._INLINE_ATTEMPT_RESERVE
+            assert actor == 777
+            return False
+
+        def snapshot(self, *, reserve=0):
+            return BudgetSnapshot(
+                used=60,
+                capacity=60,
+                retry_after=17.5,
+                last_actor=777,
+                actor_counts=((777, 12),),
+            )
+
+    monkeypatch.setattr(shiki_api, "_request_attempt_budget", Budget())
+    monkeypatch.setattr(shiki_api, "_throttle", AsyncMock())
+    session = _SeqSession([_gql_response({"animes": []})])
+
+    with pytest.raises(shiki_api.ShikimoriBudgetExceeded) as exc_info:
+        await shiki_api._gql_request(
+            session,
+            "query { animes { id } }",
+            {},
+            traffic_class="inline",
+            actor_user_id=777,
+        )
+
+    assert exc_info.value.snapshot.retry_after == 17.5
+    assert exc_info.value.snapshot.actor_counts == ((777, 12),)
+    assert session.calls == 0
 
 
 # ════════════════════════════════════════════════════════════════

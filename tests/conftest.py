@@ -48,9 +48,14 @@ def _no_throttle(monkeypatch):
     утекал между функциональными event-loop'ами pytest-asyncio. Выделенные
     тесты троттла сами возвращают _MIN_GAP и гоняют фейковые часы."""
     import shiki_api
+    from request_budget import RollingBudget
     monkeypatch.setattr(shiki_api, "_MIN_GAP", 0)
     shiki_api._throttle_lock = None
     shiki_api._last_request_at = 0.0
+    shiki_api._request_attempt_budget = RollingBudget(
+        shiki_api._REQUEST_ATTEMPT_LIMIT,
+        shiki_api._REQUEST_ATTEMPT_PERIOD,
+    )
 
 
 # Общая фикстура редиректа состояния в tmp_path: используют и

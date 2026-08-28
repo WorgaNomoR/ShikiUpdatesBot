@@ -29,6 +29,7 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
         update=SimpleNamespace(outer_middleware=outer_middleware),
         message=SimpleNamespace(register=message_register),
         callback_query=SimpleNamespace(register=MagicMock()),
+        inline_query=SimpleNamespace(register=MagicMock()),
         shutdown=SimpleNamespace(register=MagicMock()),
         start_polling=AsyncMock(side_effect=RuntimeError("polling stopped")),
         stop_polling=AsyncMock(),
@@ -82,6 +83,9 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.cmd_info in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
+    app.dispatcher.inline_query.register.assert_called_once_with(
+        main.cmd_inline_search
+    )
     blocklist_registrations = [
         call
         for call in app.dispatcher.message.register.call_args_list
@@ -108,7 +112,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     app.guard.install.assert_called_once_with()
     app.dispatcher.start_polling.assert_awaited_once_with(
         app.bot,
-        allowed_updates=["message", "callback_query"],
+        allowed_updates=["message", "callback_query", "inline_query"],
     )
     app.guard.complete.assert_called_once_with()
     app.guard.uninstall.assert_called_once_with()
