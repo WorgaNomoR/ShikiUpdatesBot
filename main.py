@@ -37,6 +37,7 @@ from handlers import (
     broadcast_receive,
     cmd_backup,
     cmd_block,
+    cmd_blocklist,
     cmd_broadcast,
     cmd_cancel,
     cmd_favs,
@@ -98,6 +99,7 @@ async def main() -> None:
     dp.message.register(cmd_version,   Command("version"))
     dp.message.register(cmd_block,     Command("block"))
     dp.message.register(cmd_unblock,   Command("unblock"))
+    dp.message.register(cmd_blocklist, Command("blocklist"))
 
     # FSM-обработчики для /broadcast
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
