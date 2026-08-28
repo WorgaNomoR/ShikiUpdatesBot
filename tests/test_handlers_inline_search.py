@@ -9,6 +9,7 @@ from unittest.mock import (
 )
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
 import handlers
 from inline_search import (
@@ -229,6 +230,35 @@ async def test_api_failure_returns_empty_and_no_continuation(monkeypatch):
 
     service.issue_continuation.assert_not_called()
     inline_query.answer.assert_awaited_once_with([], cache_time=0)
+
+
+@pytest.mark.asyncio
+async def test_telegram_rejection_logs_description_before_safe_empty_answer(
+    monkeypatch,
+    caplog,
+):
+    inline_query = _inline_query()
+    inline_query.answer.side_effect = [
+        TelegramBadRequest(
+            method=MagicMock(),
+            message='Bad Request: can\'t parse entities: Unsupported start tag "br"',
+        ),
+        None,
+    ]
+    service = _service(page=SearchPage(items=(), expires_at=100.0))
+    monkeypatch.setattr(
+        handlers,
+        "inline_access_status",
+        lambda _user_id: handlers.INLINE_ACCESS_ALLOWED,
+    )
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+
+    await handlers.cmd_inline_search(inline_query)
+
+    assert inline_query.answer.await_count == 2
+    inline_query.answer.assert_awaited_with([], cache_time=0)
+    assert "Telegram отклонил результаты" in caplog.text
+    assert 'Unsupported start tag "br"' in caplog.text
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,8 @@ def test_anime_caption_normalizes_url_escapes_api_text_and_groups_taxonomy():
     assert "<i>剣風伝奇&lt;ベルセルク&gt;</i>" in caption
     assert "<b>TV-сериал · 1997</b>" in caption
     assert "⭐ 8.61 · 25 эп. · 23 мин." in caption
+    assert "<blockquote><b>TV-сериал · 1997</b>\n⭐ 8.61" in caption
+    assert "<br>" not in caption
     assert "🎞 OLM &amp; Co" in caption
     assert "👥 <b>Демография:</b> Сэйнэн" in caption
     assert "🎭 <b>Жанры:</b> Экшен" in caption

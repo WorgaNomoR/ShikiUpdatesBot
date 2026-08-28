@@ -1612,7 +1612,14 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
             next_offset=next_offset,
         )
     except Exception as e:
-        log.warning("inline-search: безопасный пустой ответ (%s)", type(e).__name__)
+        if isinstance(e, TelegramBadRequest):
+            log.warning(
+                "inline-search: Telegram отклонил результаты; "
+                "отправляю безопасный пустой ответ: %s",
+                e,
+            )
+        else:
+            log.warning("inline-search: безопасный пустой ответ (%s)", type(e).__name__)
         try:
             await inline_query.answer([], cache_time=0)
         except Exception:

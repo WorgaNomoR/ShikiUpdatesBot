@@ -200,7 +200,7 @@ def _render_caption(
     if japanese_title:
         lines.append(f"<i>{h(japanese_title)}</i>")
     if facts:
-        lines.extend(("", f"<blockquote>{'<br>'.join(facts)}</blockquote>"))
+        lines.extend(("", f"<blockquote>{'\n'.join(facts)}</blockquote>"))
     taxonomy_lines = []
     for emoji, label, items, omitted in taxonomies:
         rendered = [h(value) for value in items]
