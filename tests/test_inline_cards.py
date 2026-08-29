@@ -3,6 +3,7 @@
 """Иерархия, безопасность и Telegram-лимиты inline-карточек."""
 
 import re
+from unittest.mock import MagicMock
 
 import pytest
 from aiogram.enums import ParseMode
@@ -12,6 +13,7 @@ from aiogram.types import (
 )
 
 import inline_cards
+from inline_facts import InlineFact
 
 
 def _anime_item(**overrides):
@@ -142,7 +144,11 @@ def test_first_page_appends_explicit_project_promo_without_replacing_photos():
         for item in items
     ]
 
-    results = inline_cards.finalize_inline_results(rendered, page=1)
+    results = inline_cards.finalize_inline_results(
+        rendered,
+        page=1,
+        fact_seed="seed",
+    )
 
     assert [type(result) for result in results] == [
         InlineQueryResultPhoto,
@@ -173,18 +179,79 @@ def test_first_page_appends_explicit_project_promo_without_replacing_photos():
     )
 
 
-@pytest.mark.parametrize(
-    ("rendered", "page"),
-    [
-        ([], 1),
-        ([inline_cards.build_inline_result("anime", _anime_item())], 2),
-    ],
-)
-def test_empty_or_continuation_page_does_not_append_project_promo(
-    rendered,
-    page,
-):
-    assert inline_cards.finalize_inline_results(rendered, page=page) == rendered
+def test_empty_page_does_not_append_technical_result():
+    assert inline_cards.finalize_inline_results(
+        [],
+        page=2,
+        fact_seed="seed",
+    ) == []
+
+
+def test_all_photo_continuation_appends_explicit_fact(monkeypatch):
+    rendered = [
+        inline_cards.build_inline_result(
+            "anime",
+            _anime_item(id=str(item_id)),
+        )
+        for item_id in (1, 2, 3)
+    ]
+    fact = InlineFact("test-fact", "Япония использует <три> письменности.")
+    selector = MagicMock(return_value=fact)
+    monkeypatch.setattr(inline_cards, "select_inline_fact", selector)
+
+    results = inline_cards.finalize_inline_results(
+        rendered,
+        page=3,
+        fact_seed="777\0anime\0fate",
+    )
+
+    selector.assert_called_once_with("777\0anime\0fate", page=3)
+    assert results[:-1] == rendered
+    assert all(isinstance(result, InlineQueryResultPhoto) for result in results[:-1])
+    technical = results[-1]
+    assert isinstance(technical, InlineQueryResultArticle)
+    assert technical.id == "fact:3:test-fact"
+    assert technical.title == "💡 Отправить интересный факт"
+    assert technical.description == (
+        "При выборе отправит в чат факт об аниме или Японии"
+    )
+    assert "Япония использует &lt;три&gt; письменности." in (
+        technical.input_message_content.message_text
+    )
+
+
+def test_continuation_with_natural_article_does_not_append_fact(monkeypatch):
+    rendered = [
+        inline_cards.build_inline_result("anime", _anime_item(id="1")),
+        inline_cards.build_inline_result(
+            "anime",
+            _anime_item(id="2", poster=None),
+        ),
+    ]
+    selector = MagicMock()
+    monkeypatch.setattr(inline_cards, "select_inline_fact", selector)
+
+    results = inline_cards.finalize_inline_results(
+        rendered,
+        page=2,
+        fact_seed="seed",
+    )
+
+    assert results == rendered
+    selector.assert_not_called()
+
+
+def test_owner_fact_marks_selection_without_hiding_click_effect():
+    result = inline_cards.build_fact_result(
+        InlineFact("owner-test", "Любимый факт.", owner_pick=True),
+        page=4,
+    )
+
+    assert result.id == "fact:4:owner-test"
+    assert result.description.startswith("При выборе отправит в чат")
+    assert "🎁 <i>Выбор владельца ShikiUpdatesBot</i>" in (
+        result.input_message_content.message_text
+    )
 
 
 def test_natural_article_fallback_keeps_other_photo_results_before_promo():
@@ -195,7 +262,11 @@ def test_natural_article_fallback_keeps_other_photo_results_before_promo():
     ]
     rendered = [inline_cards.build_inline_result("anime", item) for item in items]
 
-    results = inline_cards.finalize_inline_results(rendered, page=1)
+    results = inline_cards.finalize_inline_results(
+        rendered,
+        page=1,
+        fact_seed="seed",
+    )
 
     assert results[:-1] == rendered
     assert [type(result) for result in results] == [

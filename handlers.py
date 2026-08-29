@@ -1618,7 +1618,14 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
                     "inline-search: пропущена повреждённая карточка (%s)",
                     type(e).__name__,
                 )
-        results = finalize_inline_results(rendered_results, page=page)
+        fact_seed = (
+            f"{user_id}\0{query.media_type}\0{query.title.casefold()}"
+        )
+        results = finalize_inline_results(
+            rendered_results,
+            page=page,
+            fact_seed=fact_seed,
+        )
         next_offset = ""
         if len(search_page.items) == SHIKIMORI_PAGE_SIZE:
             next_offset = _inline_search_service.issue_continuation(

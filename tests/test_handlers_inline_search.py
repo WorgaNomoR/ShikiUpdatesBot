@@ -111,11 +111,13 @@ async def test_valid_offset_skips_debounce_and_fetches_issued_page(monkeypatch):
     )
     monkeypatch.setattr(handlers, "_inline_search_service", service)
     builder = MagicMock(side_effect=lambda media, item, **_kwargs: item)
+    finalizer = MagicMock(side_effect=lambda rendered, **_kwargs: rendered)
     monkeypatch.setattr(
         handlers,
         "build_inline_result",
         builder,
     )
+    monkeypatch.setattr(handlers, "finalize_inline_results", finalizer)
 
     await handlers.cmd_inline_search(inline_query)
 
@@ -127,6 +129,11 @@ async def test_valid_offset_skips_debounce_and_fetches_issued_page(monkeypatch):
         "anime",
         {"id": "1"},
         bot_username="WorgaTestBot",
+    )
+    finalizer.assert_called_once_with(
+        [{"id": "1"}],
+        page=2,
+        fact_seed="777\0anime\0berserk",
     )
     inline_query.answer.assert_awaited_once_with(
         [{"id": "1"}],

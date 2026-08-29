@@ -16,6 +16,10 @@ from aiogram.types import (
 )
 
 from config import SHIKI_BASE_URL
+from inline_facts import (
+    InlineFact,
+    select_inline_fact,
+)
 from project_meta import PROJECT_REPOSITORY
 from utils import (
     _rel_url,
@@ -447,13 +451,41 @@ def build_project_promo_result() -> InlineQueryResultArticle:
     )
 
 
+def build_fact_result(fact: InlineFact, *, page: int) -> InlineQueryResultArticle:
+    """Собрать явно подписанный результат, отправляющий факт в чат."""
+    owner_note = ""
+    if fact.owner_pick:
+        owner_note = "\n\n🎁 <i>Выбор владельца ShikiUpdatesBot</i>"
+    return InlineQueryResultArticle(
+        id=f"fact:{page}:{fact.id}",
+        title="💡 Отправить интересный факт",
+        description=(
+            "При выборе отправит в чат факт об аниме или Японии"
+        ),
+        input_message_content=InputTextMessageContent(
+            message_text=(
+                "💡 <b>Интересный факт</b>\n\n"
+                f"{h(fact.text)}{owner_note}"
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        ),
+    )
+
+
 def finalize_inline_results(
     rendered: list[InlineQueryResultPhoto | InlineQueryResultArticle],
     *,
     page: int,
+    fact_seed: str,
 ) -> list[InlineQueryResultPhoto | InlineQueryResultArticle]:
-    """Добавить к первой непустой странице явную промокарточку проекта."""
+    """Сохранить смешанный список без замены карточек с постерами."""
     results = list(rendered)
-    if page == 1 and results:
+    if not results:
+        return results
+    if page == 1:
         results.append(build_project_promo_result())
+    elif all(isinstance(result, InlineQueryResultPhoto) for result in results):
+        fact = select_inline_fact(fact_seed, page=page)
+        results.append(build_fact_result(fact, page=page))
     return results
