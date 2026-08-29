@@ -3,7 +3,6 @@
 """Иерархия, безопасность и Telegram-лимиты inline-карточек."""
 
 import re
-from unittest.mock import MagicMock
 
 import pytest
 from aiogram.enums import ParseMode
@@ -187,7 +186,7 @@ def test_empty_page_does_not_append_technical_result():
     ) == []
 
 
-def test_all_photo_continuation_appends_explicit_fact(monkeypatch):
+def test_all_photo_continuation_appends_explicit_fact():
     rendered = [
         inline_cards.build_inline_result(
             "anime",
@@ -195,32 +194,41 @@ def test_all_photo_continuation_appends_explicit_fact(monkeypatch):
         )
         for item_id in (1, 2, 3)
     ]
-    fact = InlineFact("test-fact", "Япония использует <три> письменности.")
-    selector = MagicMock(return_value=fact)
-    monkeypatch.setattr(inline_cards, "select_inline_fact", selector)
-
     results = inline_cards.finalize_inline_results(
         rendered,
         page=3,
         fact_seed="777\0anime\0fate",
     )
 
-    selector.assert_called_once_with("777\0anime\0fate", page=3)
     assert results[:-1] == rendered
     assert all(isinstance(result, InlineQueryResultPhoto) for result in results[:-1])
     technical = results[-1]
     assert isinstance(technical, InlineQueryResultArticle)
-    assert technical.id == "fact:3:test-fact"
+    assert technical.id == "fact:3:demographics-seinen-josei"
     assert technical.title == "💡 Отправить интересный факт"
     assert technical.description == (
         "При выборе отправит в чат факт об аниме или Японии"
     )
-    assert "Япония использует &lt;три&gt; письменности." in (
+    assert (
+        "Сэйнэн и дзёсэй — демографические категории манги для взрослой "
+        "мужской и женской аудитории соответственно."
+    ) in (
         technical.input_message_content.message_text
     )
 
 
-def test_continuation_with_natural_article_does_not_append_fact(monkeypatch):
+def test_fact_result_escapes_text():
+    result = inline_cards.build_fact_result(
+        InlineFact("test-fact", "Япония использует <три> письменности."),
+        page=3,
+    )
+
+    assert "Япония использует &lt;три&gt; письменности." in (
+        result.input_message_content.message_text
+    )
+
+
+def test_continuation_with_natural_article_does_not_append_fact():
     rendered = [
         inline_cards.build_inline_result("anime", _anime_item(id="1")),
         inline_cards.build_inline_result(
@@ -228,9 +236,6 @@ def test_continuation_with_natural_article_does_not_append_fact(monkeypatch):
             _anime_item(id="2", poster=None),
         ),
     ]
-    selector = MagicMock()
-    monkeypatch.setattr(inline_cards, "select_inline_fact", selector)
-
     results = inline_cards.finalize_inline_results(
         rendered,
         page=2,
@@ -238,7 +243,6 @@ def test_continuation_with_natural_article_does_not_append_fact(monkeypatch):
     )
 
     assert results == rendered
-    selector.assert_not_called()
 
 
 def test_owner_fact_marks_selection_without_hiding_click_effect():

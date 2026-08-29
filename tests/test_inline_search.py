@@ -122,6 +122,24 @@ async def test_invalidation_cancels_timer_without_starting_another_one():
 
 
 @pytest.mark.asyncio
+async def test_external_cancellation_propagates_from_debounce():
+    started = asyncio.Event()
+
+    async def sleeping(_delay):
+        started.set()
+        await asyncio.Future()
+
+    service = InlineSearchService(sleep=sleeping)
+    pending = asyncio.create_task(service.debounce(9))
+    await started.wait()
+
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+
+@pytest.mark.asyncio
 async def test_cache_normalizes_case_obeys_ttl_and_caches_empty_success():
     clock = {"now": 100.0}
     calls = []

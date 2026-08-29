@@ -243,6 +243,9 @@ class InlineSearchService:
         try:
             await timer
         except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise
             return None
         finally:
             if self._pending.get(user_id) == (generation, timer):

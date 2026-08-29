@@ -698,8 +698,10 @@ async def test_inline_search_uses_exact_graphql_domain_kind_and_single_page_requ
     assert "poster { originalUrl mainUrl }" in query
     assert "genres { russian name kind }" in query
     if media_type == "anime":
-        assert "rating" in query
-        assert "origin" in query
+        fields = {line.strip() for line in query.splitlines()}
+        assert "rating" in fields
+        assert "origin" in fields
+        assert "episodes" in fields
     assert variables == {"search": "Berserk", "page": 3}
     assert gql.await_args.kwargs == {
         "traffic_class": "inline",
