@@ -59,7 +59,7 @@ def test_anime_caption_normalizes_url_escapes_api_text_and_groups_taxonomy():
     assert "🔖 Возрастной рейтинг: R-17" in caption
     assert "🟢 Онгоинг" in caption
     assert "<br>" not in caption
-    assert "🎞 OLM &amp; Co" in caption
+    assert "🎞 Студия: OLM &amp; Co" in caption
     assert "👥 <b>Демография:</b> Сэйнэн" in caption
     assert "🎭 <b>Жанры:</b> Экшен" in caption
     assert "🏷 <b>Темы:</b> Gore" in caption
@@ -128,58 +128,81 @@ def test_missing_or_invalid_poster_falls_back_to_article_with_same_caption():
     assert missing.input_message_content.parse_mode == ParseMode.HTML
 
 
-def test_all_photo_page_uses_last_item_as_article_to_force_vertical_layout():
+def test_first_page_appends_explicit_project_promo_without_replacing_photos():
     items = [
         _anime_item(id=str(item_id), russian=f"Fate {item_id}")
         for item_id in (1, 2, 3)
     ]
     rendered = [
-        (
+        inline_cards.build_inline_result(
+            "anime",
             item,
-            inline_cards.build_inline_result(
-                "anime",
-                item,
-                bot_username="WorgaTestBot",
-            ),
+            bot_username="WorgaTestBot",
         )
         for item in items
     ]
 
-    results = inline_cards.finalize_inline_results(
-        "anime",
-        rendered,
-        bot_username="WorgaTestBot",
-    )
+    results = inline_cards.finalize_inline_results(rendered, page=1)
 
     assert [type(result) for result in results] == [
         InlineQueryResultPhoto,
         InlineQueryResultPhoto,
+        InlineQueryResultPhoto,
         InlineQueryResultArticle,
     ]
-    assert [result.id for result in results] == ["anime:1", "anime:2", "anime:3"]
-    assert results[-1].thumbnail_url.endswith("poster.jpg")
-    assert results[-1].input_message_content.message_text == rendered[-1][1].caption
-    assert results[-1].reply_markup.inline_keyboard[0][2].url.endswith("?start=info")
+    assert [result.id for result in results] == [
+        "anime:1",
+        "anime:2",
+        "anime:3",
+        "project:share",
+    ]
+    promo = results[-1]
+    assert promo.title == "📣 Поделиться ShikiUpdatesBot"
+    assert promo.description == (
+        "Отправит в чат сообщение о боте и ссылку на GitHub"
+    )
+    assert "ShikiUpdatesBot: активность и поиск на Shikimori" in (
+        promo.input_message_content.message_text
+    )
+    assert promo.input_message_content.message_text.count(
+        "https://github.com/WorgaNomoR/ShikiUpdatesBot"
+    ) == 2
+    assert promo.reply_markup.inline_keyboard[0][0].text == "GitHub и установка"
+    assert promo.reply_markup.inline_keyboard[0][0].url == (
+        "https://github.com/WorgaNomoR/ShikiUpdatesBot"
+    )
 
 
-def test_natural_article_fallback_keeps_other_photo_results_unchanged():
+@pytest.mark.parametrize(
+    ("rendered", "page"),
+    [
+        ([], 1),
+        ([inline_cards.build_inline_result("anime", _anime_item())], 2),
+    ],
+)
+def test_empty_or_continuation_page_does_not_append_project_promo(
+    rendered,
+    page,
+):
+    assert inline_cards.finalize_inline_results(rendered, page=page) == rendered
+
+
+def test_natural_article_fallback_keeps_other_photo_results_before_promo():
     items = [
         _anime_item(id="1"),
         _anime_item(id="2", poster=None),
         _anime_item(id="3"),
     ]
-    rendered = [
-        (item, inline_cards.build_inline_result("anime", item))
-        for item in items
-    ]
+    rendered = [inline_cards.build_inline_result("anime", item) for item in items]
 
-    results = inline_cards.finalize_inline_results("anime", rendered)
+    results = inline_cards.finalize_inline_results(rendered, page=1)
 
-    assert results == [result for _item, result in rendered]
+    assert results[:-1] == rendered
     assert [type(result) for result in results] == [
         InlineQueryResultPhoto,
         InlineQueryResultArticle,
         InlineQueryResultPhoto,
+        InlineQueryResultArticle,
     ]
 
 
@@ -199,8 +222,25 @@ def test_manga_and_ranobe_facts_use_chapters_volumes_and_publishers():
     assert caption.startswith("📖 ")
     assert "<b>Ранобэ · 1997</b>" in caption
     assert "42 гл. · 7 т." in caption
-    assert "🏢 Kadokawa" in caption
+    assert "🏢 Издатель: Kadokawa" in caption
     assert "эп." not in caption and "мин." not in caption
+
+
+def test_studio_and_publisher_labels_become_plural_for_multiple_names():
+    anime_caption = inline_cards.build_card_caption(
+        "anime",
+        _anime_item(studios=[{"name": "OLM"}, {"name": "Sunrise"}]),
+    )
+    manga_caption = inline_cards.build_card_caption(
+        "manga",
+        _anime_item(
+            studios=None,
+            publishers=[{"name": "Kadokawa"}, {"name": "Shueisha"}],
+        ),
+    )
+
+    assert "🎞 Студии: OLM · Sunrise" in anime_caption
+    assert "🏢 Издатели: Kadokawa · Shueisha" in manga_caption
 
 
 def test_missing_optional_fields_remove_whole_sections_without_placeholders():

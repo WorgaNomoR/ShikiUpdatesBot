@@ -1607,13 +1607,10 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
         for item in search_page.items:
             try:
                 rendered_results.append(
-                    (
+                    build_inline_result(
+                        query.media_type,
                         item,
-                        build_inline_result(
-                            query.media_type,
-                            item,
-                            bot_username=bot_username,
-                        ),
+                        bot_username=bot_username,
                     )
                 )
             except Exception as e:
@@ -1621,11 +1618,7 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
                     "inline-search: пропущена повреждённая карточка (%s)",
                     type(e).__name__,
                 )
-        results = finalize_inline_results(
-            query.media_type,
-            rendered_results,
-            bot_username=bot_username,
-        )
+        results = finalize_inline_results(rendered_results, page=page)
         next_offset = ""
         if len(search_page.items) == SHIKIMORI_PAGE_SIZE:
             next_offset = _inline_search_service.issue_continuation(

@@ -184,9 +184,9 @@ async def test_offset_with_invalid_query_does_not_even_read_or_invalidate_state(
 
 
 @pytest.mark.asyncio
-async def test_full_page_issues_next_offset_but_short_page_does_not(monkeypatch):
+async def test_full_49_item_page_adds_promo_and_issues_next_offset(monkeypatch):
     inline_query = _inline_query()
-    items = tuple({"id": str(index)} for index in range(50))
+    items = tuple({"id": str(index)} for index in range(49))
     service = _service(page=SearchPage(items=items, expires_at=500.0))
     monkeypatch.setattr(
         handlers,
@@ -212,6 +212,38 @@ async def test_full_page_issues_next_offset_but_short_page_does_not(monkeypatch)
         "next_offset": "next-token",
     }
     assert len(inline_query.answer.await_args.args[0]) == 50
+
+
+@pytest.mark.asyncio
+async def test_short_first_page_adds_promo_without_next_offset(monkeypatch):
+    inline_query = _inline_query()
+    items = tuple({"id": str(index)} for index in range(48))
+    service = _service(page=SearchPage(items=items, expires_at=500.0))
+    monkeypatch.setattr(
+        handlers,
+        "inline_access_status",
+        lambda _user_id: handlers.INLINE_ACCESS_ALLOWED,
+    )
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+    monkeypatch.setattr(
+        handlers,
+        "build_inline_result",
+        lambda media, item, **_kwargs: item,
+    )
+
+    await handlers.cmd_inline_search(inline_query)
+
+    service.issue_continuation.assert_not_called()
+    results = inline_query.answer.await_args.args[0]
+    assert len(results) == 49
+    assert [result["id"] for result in results[:-1]] == [
+        str(index) for index in range(48)
+    ]
+    assert results[-1].id == "project:share"
+    assert inline_query.answer.await_args.kwargs == {
+        "cache_time": 0,
+        "next_offset": "",
+    }
 
 
 @pytest.mark.asyncio

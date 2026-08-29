@@ -656,7 +656,7 @@ async def test_inline_search_uses_exact_graphql_domain_kind_and_single_page_requ
     gql.assert_awaited_once()
     query, variables = gql.await_args.args[1:]
     assert f"{field}(" in query
-    assert "limit: 50" in query
+    assert "limit: 49" in query
     assert "censored: false" in query
     assert "poster { originalUrl mainUrl }" in query
     assert "genres { russian name kind }" in query

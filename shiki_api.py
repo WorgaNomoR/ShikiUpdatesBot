@@ -173,7 +173,7 @@ query($search: String!, $page: PositiveInt!) {
     search: $search,
     kind: "tv,movie,ova,ona,special,tv_special",
     page: $page,
-    limit: 50,
+    limit: 49,
     censored: false
   ) {
     id
@@ -203,7 +203,7 @@ query($search: String!, $page: PositiveInt!) {
     search: $search,
     kind: "manga,manhwa,manhua,one_shot,doujin",
     page: $page,
-    limit: 50,
+    limit: 49,
     censored: false
   ) {
     id

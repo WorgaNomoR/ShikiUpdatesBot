@@ -16,12 +16,14 @@ from aiogram.types import (
 )
 
 from config import SHIKI_BASE_URL
+from project_meta import PROJECT_REPOSITORY
 from utils import (
     _rel_url,
     h,
 )
 
 PHOTO_CAPTION_LIMIT = 1024
+PROJECT_URL = f"https://github.com/{PROJECT_REPOSITORY}"
 
 _HTML_TAG_RE = re.compile(r"<[^>]*>")
 _HTML_BREAK_RE = re.compile(r"<\s*(?:br\s*/?|/p|/div)\s*>", re.IGNORECASE)
@@ -171,6 +173,7 @@ def _facts(media_type: str, item: dict) -> list[str]:
             lines.append(f"🔖 Возрастной рейтинг: {h(rating)}")
         people = _people_names(item, "studios")
         people_icon = "🎞"
+        people_label = "Студия" if len(people) == 1 else "Студии"
     else:
         metrics = []
         chapters = _format_number(item.get("chapters"))
@@ -183,11 +186,12 @@ def _facts(media_type: str, item: dict) -> list[str]:
             lines.append(f"📄 {h(' · '.join(metrics))}")
         people = _people_names(item, "publishers")
         people_icon = "🏢"
+        people_label = "Издатель" if len(people) == 1 else "Издатели"
 
     if _plain(item.get("status")) == "ongoing":
         lines.append("🟢 Онгоинг")
     if people:
-        lines.append(f"{people_icon} {h(' · '.join(people))}")
+        lines.append(f"{people_icon} {people_label}: {h(' · '.join(people))}")
     return lines
 
 
@@ -412,22 +416,44 @@ def build_inline_result(
     )
 
 
+def build_project_promo_result() -> InlineQueryResultArticle:
+    """Собрать честно обозначенную карточку для распространения проекта."""
+    title = "ShikiUpdatesBot: активность и поиск на Shikimori"
+    message = (
+        f'🎌 <b><a href="{h(PROJECT_URL)}">{h(title)}</a></b>\n\n'
+        "Telegram-бот для уведомлений об активности на Shikimori, просмотра "
+        "статистики и поиска карточек аниме, манги и ранобэ прямо из любого "
+        "чата.\n\n"
+        "Исходный код и инструкция по запуску собственного бота доступны "
+        f'на <a href="{h(PROJECT_URL)}">GitHub</a>.'
+    )
+    return InlineQueryResultArticle(
+        id="project:share",
+        title="📣 Поделиться ShikiUpdatesBot",
+        description="Отправит в чат сообщение о боте и ссылку на GitHub",
+        url=PROJECT_URL,
+        hide_url=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="GitHub и установка",
+                url=PROJECT_URL,
+            ),
+        ]]),
+        input_message_content=InputTextMessageContent(
+            message_text=message,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        ),
+    )
+
+
 def finalize_inline_results(
-    media_type: str,
-    rendered: list[
-        tuple[dict, InlineQueryResultPhoto | InlineQueryResultArticle]
-    ],
+    rendered: list[InlineQueryResultPhoto | InlineQueryResultArticle],
     *,
-    bot_username: str | None = None,
+    page: int,
 ) -> list[InlineQueryResultPhoto | InlineQueryResultArticle]:
-    """Не дать полностью постерной странице превратиться в галерею без названий."""
-    results = [result for _item, result in rendered]
-    if results and all(isinstance(result, InlineQueryResultPhoto) for result in results):
-        last_item, _last_result = rendered[-1]
-        results[-1] = _build_inline_result(
-            media_type,
-            last_item,
-            allow_photo=False,
-            bot_username=bot_username,
-        )
+    """Добавить к первой непустой странице явную промокарточку проекта."""
+    results = list(rendered)
+    if page == 1 and results:
+        results.append(build_project_promo_result())
     return results
