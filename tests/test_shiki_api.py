@@ -354,13 +354,50 @@ async def test_throttle_enforces_min_gap_on_burst(monkeypatch):
 async def test_fetch_goes_through_throttle(monkeypatch):
     calls = []
 
-    async def fake_throttle():
-        calls.append(1)
+    async def fake_throttle(*, reserve, actor_user_id):
+        calls.append((reserve, actor_user_id))
+        return True
 
     monkeypatch.setattr(shiki_api, "_throttle", fake_throttle)
     session = _SeqSession([_SeqResponse(200, json_value=[])])
     await fetch_history(session)
-    assert calls == [1]
+    assert calls == [(0, None)]
+
+
+@pytest.mark.asyncio
+async def test_denied_budget_does_not_consume_an_extra_throttle_slot(
+    monkeypatch,
+):
+    monkeypatch.setattr(shiki_api, "_MIN_GAP", 0.25)
+    shiki_api._throttle_lock = None
+    shiki_api._last_request_at = 1000.0
+    clock = {"t": 1000.0}
+    slept = []
+    reservations = []
+    decisions = iter([False, True])
+
+    class Budget:
+        def try_acquire(self, *, reserve=0, actor=None):
+            reservations.append((reserve, actor, clock["t"]))
+            return next(decisions)
+
+    async def fake_sleep(delay):
+        slept.append(delay)
+        clock["t"] += delay
+
+    monkeypatch.setattr(shiki_api, "_request_attempt_budget", Budget())
+    monkeypatch.setattr(shiki_api.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(shiki_api.asyncio, "sleep", fake_sleep)
+
+    assert await shiki_api._throttle(reserve=20, actor_user_id=777) is False
+    assert shiki_api._last_request_at == 1000.0
+    assert await shiki_api._throttle(reserve=0, actor_user_id=None) is True
+    assert slept == [pytest.approx(0.25)]
+    assert reservations == [
+        (20, 777, pytest.approx(1000.25)),
+        (0, None, pytest.approx(1000.25)),
+    ]
+    assert shiki_api._last_request_at == pytest.approx(1000.25)
 
 
 # ── 429 → Retry-After → ретрай восстанавливается И возвращает данные ──
@@ -776,14 +813,12 @@ async def test_exhausted_global_budget_stops_before_http(monkeypatch):
         def snapshot(self, *, reserve=0):
             return BudgetSnapshot(80, 80 - reserve, 12.0, None, ())
 
-    throttle = AsyncMock()
     monkeypatch.setattr(shiki_api, "_request_attempt_budget", Budget())
-    monkeypatch.setattr(shiki_api, "_throttle", throttle)
     session = _SeqSession([_SeqResponse(200, json_value=[])])
 
     assert await fetch_history(session) is None
     assert session.calls == 0
-    throttle.assert_awaited_once_with()
+    assert shiki_api._last_request_at == 0.0
 
 
 @pytest.mark.asyncio
@@ -806,7 +841,6 @@ async def test_exhausted_inline_attempt_reserve_raises_attributed_typed_failure(
             )
 
     monkeypatch.setattr(shiki_api, "_request_attempt_budget", Budget())
-    monkeypatch.setattr(shiki_api, "_throttle", AsyncMock())
     session = _SeqSession([_gql_response({"animes": []})])
 
     with pytest.raises(shiki_api.ShikimoriBudgetExceeded) as exc_info:

@@ -218,7 +218,9 @@ async def test_full_49_item_page_adds_promo_and_issues_next_offset(monkeypatch):
         "cache_time": 0,
         "next_offset": "next-token",
     }
-    assert len(inline_query.answer.await_args.args[0]) == 50
+    results = inline_query.answer.await_args.args[0]
+    assert len(results) == 50
+    assert results[-1].id == "project:share"
 
 
 @pytest.mark.asyncio

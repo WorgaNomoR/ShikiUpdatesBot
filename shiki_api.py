@@ -197,15 +197,17 @@ query($search: String!, $page: PositiveInt!) {
 }
 """
 
-_GQL_INLINE_MANGA = """
-query($search: String!, $page: PositiveInt!) {
+def _build_inline_manga_query(kind_filter: str) -> str:
+    """Собрать независимый manga GraphQL-запрос с явным набором kind."""
+    return f"""
+query($search: String!, $page: PositiveInt!) {{
   mangas(
     search: $search,
-    kind: "manga,manhwa,manhua,one_shot,doujin",
+    kind: "{kind_filter}",
     page: $page,
     limit: 49,
     censored: false
-  ) {
+  ) {{
     id
     url
     name
@@ -216,18 +218,21 @@ query($search: String!, $page: PositiveInt!) {
     status
     chapters
     volumes
-    airedOn { year }
-    publishers { name }
-    genres { russian name kind }
-    poster { originalUrl mainUrl }
+    airedOn {{ year }}
+    publishers {{ name }}
+    genres {{ russian name kind }}
+    poster {{ originalUrl mainUrl }}
     description
-  }
-}
+  }}
+}}
 """
 
-_GQL_INLINE_RANOBE = _GQL_INLINE_MANGA.replace(
-    'kind: "manga,manhwa,manhua,one_shot,doujin"',
-    'kind: "light_novel,novel"',
+
+_GQL_INLINE_MANGA = _build_inline_manga_query(
+    "manga,manhwa,manhua,one_shot,doujin"
+)
+_GQL_INLINE_RANOBE = _build_inline_manga_query(
+    "light_novel,novel"
 )
 
 
@@ -329,15 +334,24 @@ def _get_throttle_lock() -> asyncio.Lock:
     return _throttle_lock
 
 
-async def _throttle() -> None:
-    """Держит фиксированный min-gap перед выстрелом. Сериализован локом: все
-    call-sites проходят через одну точку, всплеск размазывается в ровный ритм."""
+async def _throttle(
+    *,
+    reserve: int | None = None,
+    actor_user_id: int | None = None,
+) -> bool:
+    """Выдержать min-gap и зарезервировать бюджет фактической HTTP-попытки."""
     global _last_request_at
     async with _get_throttle_lock():
         gap = _MIN_GAP - (time.monotonic() - _last_request_at)
         if gap > 0:
             await asyncio.sleep(gap)
+        if reserve is not None and not _request_attempt_budget.try_acquire(
+            reserve=reserve,
+            actor=actor_user_id,
+        ):
+            return False
         _last_request_at = time.monotonic()
+        return True
 
 
 def _retry_after(headers) -> float:
@@ -390,20 +404,20 @@ async def _fetch(
     """
     Единый выстрел HTTP через центральный троттл + ретрай на 429.
 
-    Перед КАЖДОЙ попыткой await-им _throttle() (min-gap). При 429 читаем
-    Retry-After, спим, ретраим (до _MAX_429_RETRIES). Точный privacy-ответ
-    поднимаем как ProfilePrivacyError; остальные не-200 дают None. На успехе
-    отдаём await parse(resp). parse разбирает тело под конкретный вызов
+    Перед КАЖДОЙ попыткой _throttle() выдерживает min-gap и атомарно резервирует
+    бюджет фактической HTTP-попытки. При 429 читаем Retry-After, спим, ретраим
+    (до _MAX_429_RETRIES). Точный privacy-ответ поднимаем как
+    ProfilePrivacyError; остальные не-200 дают None. На успехе отдаём
+    await parse(resp). parse разбирает тело под конкретный вызов
     (list / dict / GraphQL); его исключения парсинга ловим здесь → None.
     """
     if headers is None:
         headers = dict(HEADERS)   # копия дефолта: даже будущая in-place мутация не тронет модульный HEADERS
     reserve = _INLINE_ATTEMPT_RESERVE if traffic_class == "inline" else 0
     for attempt in range(_MAX_429_RETRIES + 1):
-        await _throttle()
-        if not _request_attempt_budget.try_acquire(
+        if not await _throttle(
             reserve=reserve,
-            actor=actor_user_id,
+            actor_user_id=actor_user_id,
         ):
             snapshot = _request_attempt_budget.snapshot(reserve=reserve)
             if traffic_class == "inline":

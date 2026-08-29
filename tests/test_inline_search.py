@@ -3,10 +3,13 @@
 """Разбор, задержка ввода, кеш, схлопывание, бюджет и продолжения."""
 
 import asyncio
+import gc
 import logging
+import weakref
 
 import pytest
 
+import inline_search
 from inline_search import (
     CACHE_TTL_SECONDS,
     DEBOUNCE_SECONDS,
@@ -215,6 +218,76 @@ async def test_concurrent_identical_misses_coalesce_into_one_fetch():
     page1, page2 = await asyncio.gather(first, second)
     assert page1 is page2
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_consume_task_exception_reads_real_task_failure():
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    contexts = []
+    completed = asyncio.Event()
+    expected = InlineSearchLimitExceeded(5.0)
+
+    def capture_unhandled(_loop, context):
+        contexts.append(context)
+
+    async def fail():
+        raise expected
+
+    loop.set_exception_handler(capture_unhandled)
+    try:
+        task = asyncio.create_task(fail())
+        task.add_done_callback(lambda _task: completed.set())
+        await asyncio.wait_for(completed.wait(), timeout=0.5)
+
+        inline_search._consume_task_exception(task)
+        task_ref = weakref.ref(task)
+        del task
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+
+        assert task_ref() is None
+        assert [
+            context
+            for context in contexts
+            if context.get("message") == "Task exception was never retrieved"
+        ] == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_only_waiter_consumes_background_limit_error():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetcher(_media_type, _title, _page, _actor):
+        started.set()
+        await release.wait()
+        raise InlineSearchLimitExceeded(5.0)
+
+    service = InlineSearchService(fetcher=fetcher)
+    query = parse_inline_query("anime Berserk")
+    assert query is not None
+    waiter = asyncio.create_task(
+        service.get_page(query, 1, authorized=lambda: True, actor=_ACTOR)
+    )
+    await started.wait()
+    background = next(iter(service._inflight.values()))
+    assert background.remove_done_callback(
+        inline_search._consume_task_exception
+    ) == 1
+    background.add_done_callback(inline_search._consume_task_exception)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+
+    with pytest.raises(InlineSearchLimitExceeded) as exc_info:
+        await asyncio.wait_for(asyncio.shield(background), timeout=0.5)
+    assert exc_info.value.retry_after == 5.0
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,13 @@ Sleep = Callable[[float], Awaitable[None]]
 AuthorizationCheck = Callable[[], bool]
 
 
+def _consume_task_exception(task: asyncio.Task[object]) -> None:
+    """Прочитать исключение фоновой задачи, если все ожидающие отменены."""
+    if task.cancelled():
+        return
+    task.exception()
+
+
 @dataclass(frozen=True)
 class ParsedInlineQuery:
     """Проверенная поисковая пара и канонический ключ заголовка."""
@@ -323,6 +330,7 @@ class InlineSearchService:
                     actor=actor,
                 )
             )
+            task.add_done_callback(_consume_task_exception)
             self._inflight[key] = task
         result = await asyncio.shield(task)
         if not authorized():
