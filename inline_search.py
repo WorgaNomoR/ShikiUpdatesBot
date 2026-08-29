@@ -28,10 +28,16 @@ INLINE_PAGE_PERIOD = 60.0
 SHIKIMORI_PAGE_SIZE = 50
 
 _PREFIXES = {
+    "a": "anime",
+    "а": "anime",
     "anime": "anime",
     "аниме": "anime",
+    "m": "manga",
+    "м": "manga",
     "manga": "manga",
     "манга": "manga",
+    "r": "ranobe",
+    "р": "ranobe",
     "ranobe": "ranobe",
     "ранобэ": "ranobe",
 }

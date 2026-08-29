@@ -474,6 +474,7 @@ def test_build_version_text_marks_source_mode(monkeypatch):
     text = updates.build_version_text({})
     assert "Python/source или Docker" in text
     assert "Shikimori" in text
+    assert "искать и отправлять карточки аниме, манги и ранобэ" in text
     assert "GNU General Public License версии 3 или более поздней" in text
 
 

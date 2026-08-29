@@ -1593,18 +1593,39 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
             await inline_query.answer([], cache_time=0)
             return
 
+        bot_username = None
+        try:
+            bot_user = await inline_query.bot.me()
+            bot_username = bot_user.username
+        except Exception as e:
+            log.warning(
+                "inline-search: не удалось определить username бота (%s)",
+                type(e).__name__,
+            )
+
         rendered_results = []
         for item in search_page.items:
             try:
                 rendered_results.append(
-                    (item, build_inline_result(query.media_type, item))
+                    (
+                        item,
+                        build_inline_result(
+                            query.media_type,
+                            item,
+                            bot_username=bot_username,
+                        ),
+                    )
                 )
             except Exception as e:
                 log.warning(
                     "inline-search: пропущена повреждённая карточка (%s)",
                     type(e).__name__,
                 )
-        results = finalize_inline_results(query.media_type, rendered_results)
+        results = finalize_inline_results(
+            query.media_type,
+            rendered_results,
+            bot_username=bot_username,
+        )
         next_offset = ""
         if len(search_page.items) == SHIKIMORI_PAGE_SIZE:
             next_offset = _inline_search_service.issue_continuation(
@@ -1639,6 +1660,16 @@ async def cmd_start(
     """Подписаться на уведомления (для владельца — заодно добудить фоновый цикл)."""
     chat_id = message.chat.id
     name = message.from_user.full_name if message.from_user else str(chat_id)
+    info_start = bool(
+        command is not None
+        and command.args == "info"
+        and message.from_user is not None
+        and chat_id == message.from_user.id
+    )
+    if info_start:
+        await _send_info(message)
+        return
+
     inline_limit_start = bool(
         command is not None
         and command.args == "inline_search_limit"
@@ -2124,8 +2155,8 @@ def _remember_info_preview_file_id(message: Message) -> None:
         _info_preview_file_id = file_id
 
 
-async def cmd_info(message: Message) -> None:
-    """Публично показать только сохранённое и process-local состояние."""
+async def _send_info(message: Message) -> None:
+    """Отправить публичную карточку только из локального состояния."""
     global _info_preview_file_id
     state = load_update_state()
     is_owner = message.from_user is not None and message.from_user.id == OWNER_ID
@@ -2160,6 +2191,11 @@ async def cmd_info(message: Message) -> None:
         return
     if _info_preview_file_id is None:
         _remember_info_preview_file_id(sent)
+
+
+async def cmd_info(message: Message) -> None:
+    """Публично показать только сохранённое и process-local состояние."""
+    await _send_info(message)
 
 
 async def version_refresh_cb(callback: CallbackQuery) -> None:

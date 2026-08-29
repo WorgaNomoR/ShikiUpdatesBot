@@ -27,6 +27,9 @@ def _inline_query(*, user_id=777, query="anime Berserk", offset=""):
         ),
         query=query,
         offset=offset,
+        bot=SimpleNamespace(
+            me=AsyncMock(return_value=SimpleNamespace(username="WorgaTestBot")),
+        ),
         answer=AsyncMock(),
     )
 
@@ -65,6 +68,7 @@ async def test_rejected_users_stop_before_parser_debounce_cache_and_network(
     await handlers.cmd_inline_search(inline_query)
 
     parser.assert_not_called()
+    inline_query.bot.me.assert_not_awaited()
     service.debounce.assert_not_awaited()
     service.get_page.assert_not_awaited()
     kwargs = inline_query.answer.await_args.kwargs
@@ -106,13 +110,24 @@ async def test_valid_offset_skips_debounce_and_fetches_issued_page(monkeypatch):
         lambda _user_id: handlers.INLINE_ACCESS_ALLOWED,
     )
     monkeypatch.setattr(handlers, "_inline_search_service", service)
-    monkeypatch.setattr(handlers, "build_inline_result", lambda media, item: item)
+    builder = MagicMock(side_effect=lambda media, item, **_kwargs: item)
+    monkeypatch.setattr(
+        handlers,
+        "build_inline_result",
+        builder,
+    )
 
     await handlers.cmd_inline_search(inline_query)
 
     service.resolve_continuation.assert_called_once()
     service.debounce.assert_not_awaited()
     assert service.get_page.await_args.args[1] == 2
+    inline_query.bot.me.assert_awaited_once_with()
+    builder.assert_called_once_with(
+        "anime",
+        {"id": "1"},
+        bot_username="WorgaTestBot",
+    )
     inline_query.answer.assert_awaited_once_with(
         [{"id": "1"}],
         cache_time=0,
@@ -179,7 +194,11 @@ async def test_full_page_issues_next_offset_but_short_page_does_not(monkeypatch)
         lambda _user_id: handlers.INLINE_ACCESS_ALLOWED,
     )
     monkeypatch.setattr(handlers, "_inline_search_service", service)
-    monkeypatch.setattr(handlers, "build_inline_result", lambda media, item: item)
+    monkeypatch.setattr(
+        handlers,
+        "build_inline_result",
+        lambda media, item, **_kwargs: item,
+    )
 
     await handlers.cmd_inline_search(inline_query)
 

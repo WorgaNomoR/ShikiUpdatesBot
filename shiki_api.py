@@ -169,7 +169,13 @@ query($ids: String!) {
 
 _GQL_INLINE_ANIME = """
 query($search: String!, $page: PositiveInt!) {
-  animes(search: $search, page: $page, limit: 50, censored: false) {
+  animes(
+    search: $search,
+    kind: "tv,movie,ova,ona,special,tv_special",
+    page: $page,
+    limit: 50,
+    censored: false
+  ) {
     id
     url
     name
@@ -178,6 +184,8 @@ query($search: String!, $page: PositiveInt!) {
     kind
     score
     status
+    rating
+    origin
     episodes
     duration
     airedOn { year }
@@ -526,7 +534,20 @@ async def fetch_inline_search(
     items = data.get(field)
     if not isinstance(items, list):
         return None
-    return [item for item in items if isinstance(item, dict)]
+    result = [item.copy() for item in items if isinstance(item, dict)]
+    if media_type == "anime":
+        for item in result:
+            origin = str(item.get("origin") or "").strip()
+            rating = str(item.get("rating") or "").strip()
+            if origin and origin != "unknown":
+                item["origin"] = _ORIGIN_RU.get(origin, origin)
+            else:
+                item.pop("origin", None)
+            if rating and rating != "none":
+                item["rating"] = _RATING_RU.get(rating, rating)
+            else:
+                item.pop("rating", None)
+    return result
 
 
 async def fetch_list_export(session: aiohttp.ClientSession, media: str) -> list[dict] | None:

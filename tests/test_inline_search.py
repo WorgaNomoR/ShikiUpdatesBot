@@ -30,10 +30,16 @@ _ACTOR = InlineActor(user_id=101, full_name="Alice", username="alice")
     [
         (" anime   Steins;Gate ", ("anime", "Steins;Gate", "steins;gate")),
         ("АНИМЕ Берсерк", ("anime", "Берсерк", "берсерк")),
+        ("a Steins;Gate", ("anime", "Steins;Gate", "steins;gate")),
+        ("А   Берсерк", ("anime", "Берсерк", "берсерк")),
         ("manga  Higurashi no Naku Koro ni", ("manga", "Higurashi no Naku Koro ni", "higurashi no naku koro ni")),
         ("МАНГА   Когда плачут цикады", ("manga", "Когда плачут цикады", "когда плачут цикады")),
+        ("M Higurashi", ("manga", "Higurashi", "higurashi")),
+        ("м Higurashi", ("manga", "Higurashi", "higurashi")),
         ("ranobe Re:Zero", ("ranobe", "Re:Zero", "re:zero")),
         ("РАНОБЭ  Меланхолия Харухи", ("ranobe", "Меланхолия Харухи", "меланхолия харухи")),
+        ("r Re:Zero", ("ranobe", "Re:Zero", "re:zero")),
+        ("Р Re:Zero", ("ranobe", "Re:Zero", "re:zero")),
     ],
 )
 def test_parser_normalizes_prefix_case_and_whitespace(raw, expected):
@@ -45,7 +51,22 @@ def test_parser_normalizes_prefix_case_and_whitespace(raw, expected):
 
 @pytest.mark.parametrize(
     "raw",
-    [None, "", "anime", "anime   ", "anime a", "манга я", "game Berserk", "Berserk"],
+    [
+        None,
+        "",
+        "anime",
+        "anime   ",
+        "anime a",
+        "a x",
+        "а я",
+        "m x",
+        "м x",
+        "r x",
+        "р я",
+        "манга я",
+        "game Berserk",
+        "Berserk",
+    ],
 )
 def test_parser_rejects_missing_prefix_title_and_one_character(raw):
     assert parse_inline_query(raw) is None

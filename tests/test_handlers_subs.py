@@ -308,3 +308,33 @@ async def test_inline_limit_deep_link_explains_and_changes_no_subscription_state
     backup.assert_not_awaited()
     polling.assert_not_called()
     assert search_service.method_calls == []
+
+
+@pytest.mark.asyncio
+async def test_info_deep_link_is_private_read_only_and_does_not_subscribe(
+    monkeypatch,
+):
+    send_info = AsyncMock()
+    load = MagicMock()
+    save = MagicMock()
+    backup = AsyncMock()
+    polling = MagicMock()
+    search_service = MagicMock()
+    monkeypatch.setattr(handlers, "_send_info", send_info)
+    monkeypatch.setattr(handlers, "load_subscribers", load)
+    monkeypatch.setattr(handlers, "save_subscribers", save)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    monkeypatch.setattr(handlers, "start_polling_loop", polling)
+    monkeypatch.setattr(handlers, "_inline_search_service", search_service)
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+
+    await handlers.cmd_start(msg, MagicMock(args="info"))
+
+    send_info.assert_awaited_once_with(msg)
+    load.assert_not_called()
+    save.assert_not_called()
+    backup.assert_not_awaited()
+    polling.assert_not_called()
+    assert search_service.method_calls == []

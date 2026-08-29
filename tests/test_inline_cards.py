@@ -23,6 +23,9 @@ def _anime_item(**overrides):
         "japanese": "剣風伝奇<ベルセルク>",
         "kind": "tv",
         "score": 8.61,
+        "status": "ongoing",
+        "origin": "Манга",
+        "rating": "R-17",
         "episodes": 25,
         "duration": 23,
         "airedOn": {"year": 1997},
@@ -50,8 +53,11 @@ def test_anime_caption_normalizes_url_escapes_api_text_and_groups_taxonomy():
     assert "Берсерк &amp; &lt;Гатс&gt;" in caption
     assert "<i>剣風伝奇&lt;ベルセルク&gt;</i>" in caption
     assert "<b>TV-сериал · 1997</b>" in caption
-    assert "⭐ 8.61 · 25 эп. · 23 мин." in caption
-    assert "<blockquote><b>TV-сериал · 1997</b>\n⭐ 8.61" in caption
+    assert "<blockquote><b>TV-сериал · 1997</b>\n⭐ Оценка: 8.61" in caption
+    assert "⏱ 25 эп. · 23 мин." in caption
+    assert "📖 Первоисточник: Манга" in caption
+    assert "🔖 Возрастной рейтинг: R-17" in caption
+    assert "🟢 Онгоинг" in caption
     assert "<br>" not in caption
     assert "🎞 OLM &amp; Co" in caption
     assert "👥 <b>Демография:</b> Сэйнэн" in caption
@@ -74,6 +80,40 @@ def test_photo_result_uses_poster_and_stable_domain_specific_id():
     assert anime.parse_mode == ParseMode.HTML
 
 
+def test_result_keyboard_opens_current_inline_shikimori_and_read_only_info():
+    result = inline_cards.build_inline_result(
+        "anime",
+        _anime_item(),
+        bot_username="@WorgaTestBot",
+    )
+
+    buttons = result.reply_markup.inline_keyboard[0]
+    assert [button.text for button in buttons] == [
+        "🔎 Новый поиск",
+        "На Shikimori",
+        "ℹ️ О боте",
+    ]
+    assert buttons[0].switch_inline_query_current_chat == ""
+    assert buttons[1].url == (
+        "https://shikimori.io/animes/33-kenpuu-denki-berserk"
+    )
+    assert buttons[2].url == "https://t.me/WorgaTestBot?start=info"
+
+
+def test_invalid_bot_username_omits_only_info_button():
+    result = inline_cards.build_inline_result(
+        "anime",
+        _anime_item(),
+        bot_username="bad username",
+    )
+
+    buttons = result.reply_markup.inline_keyboard[0]
+    assert [button.text for button in buttons] == [
+        "🔎 Новый поиск",
+        "На Shikimori",
+    ]
+
+
 def test_missing_or_invalid_poster_falls_back_to_article_with_same_caption():
     missing = inline_cards.build_inline_result("manga", _anime_item(poster=None))
     invalid = inline_cards.build_inline_result(
@@ -94,11 +134,22 @@ def test_all_photo_page_uses_last_item_as_article_to_force_vertical_layout():
         for item_id in (1, 2, 3)
     ]
     rendered = [
-        (item, inline_cards.build_inline_result("anime", item))
+        (
+            item,
+            inline_cards.build_inline_result(
+                "anime",
+                item,
+                bot_username="WorgaTestBot",
+            ),
+        )
         for item in items
     ]
 
-    results = inline_cards.finalize_inline_results("anime", rendered)
+    results = inline_cards.finalize_inline_results(
+        "anime",
+        rendered,
+        bot_username="WorgaTestBot",
+    )
 
     assert [type(result) for result in results] == [
         InlineQueryResultPhoto,
@@ -108,6 +159,7 @@ def test_all_photo_page_uses_last_item_as_article_to_force_vertical_layout():
     assert [result.id for result in results] == ["anime:1", "anime:2", "anime:3"]
     assert results[-1].thumbnail_url.endswith("poster.jpg")
     assert results[-1].input_message_content.message_text == rendered[-1][1].caption
+    assert results[-1].reply_markup.inline_keyboard[0][2].url.endswith("?start=info")
 
 
 def test_natural_article_fallback_keeps_other_photo_results_unchanged():
@@ -193,6 +245,10 @@ def test_dense_caption_truncates_description_then_whole_taxonomy_items():
     assert caption.count("<tg-spoiler>") == caption.count("</tg-spoiler>")
     assert "&amp;" in caption
     assert re.search(r"&amp(?!;)", caption) is None
+
+
+def test_parsed_caption_length_uses_telegram_utf16_units():
+    assert inline_cards.parsed_caption_length("A&amp;B 🎬") == 6
 
 
 def test_cleaner_removes_known_markup_but_keeps_plain_bracketed_names():

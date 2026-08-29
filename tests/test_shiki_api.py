@@ -630,7 +630,7 @@ async def test_gql_request_returns_partial_data_despite_errors():
 @pytest.mark.parametrize(
     ("media_type", "field", "kind_filter"),
     [
-        ("anime", "animes", None),
+        ("anime", "animes", "tv,movie,ova,ona,special,tv_special"),
         ("manga", "mangas", "manga,manhwa,manhua,one_shot,doujin"),
         ("ranobe", "mangas", "light_novel,novel"),
     ],
@@ -660,16 +660,41 @@ async def test_inline_search_uses_exact_graphql_domain_kind_and_single_page_requ
     assert "censored: false" in query
     assert "poster { originalUrl mainUrl }" in query
     assert "genres { russian name kind }" in query
+    if media_type == "anime":
+        assert "rating" in query
+        assert "origin" in query
     assert variables == {"search": "Berserk", "page": 3}
     assert gql.await_args.kwargs == {
         "traffic_class": "inline",
         "allow_partial": False,
         "actor_user_id": None,
     }
-    if kind_filter is None:
-        assert "kind:" not in query
-    else:
-        assert f'kind: "{kind_filter}"' in query
+    assert f'kind: "{kind_filter}"' in query
+
+
+@pytest.mark.asyncio
+async def test_inline_anime_translates_origin_rating_and_omits_unknown_values(
+    monkeypatch,
+):
+    gql = AsyncMock(return_value={
+        "animes": [
+            {"id": "1", "origin": "visual_novel", "rating": "r_plus"},
+            {"id": "2", "origin": "unknown", "rating": "none"},
+        ]
+    })
+    monkeypatch.setattr(shiki_api, "_gql_request", gql)
+
+    result = await shiki_api.fetch_inline_search(
+        "anime",
+        "Fate",
+        1,
+        session=object(),
+    )
+
+    assert result == [
+        {"id": "1", "origin": "Визуальная новелла", "rating": "R+"},
+        {"id": "2"},
+    ]
 
 
 @pytest.mark.asyncio

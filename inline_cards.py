@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 from aiogram.enums import ParseMode
 from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
     InputTextMessageContent,
@@ -23,6 +25,7 @@ PHOTO_CAPTION_LIMIT = 1024
 
 _HTML_TAG_RE = re.compile(r"<[^>]*>")
 _HTML_BREAK_RE = re.compile(r"<\s*(?:br\s*/?|/p|/div)\s*>", re.IGNORECASE)
+_BOT_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 _SHIKI_BBCODE_RE = re.compile(
     r"\[/?(?:b|i|u|s|spoiler|quote|code|center|left|right|color|size|font|"
     r"url|img|character|person|anime|manga)(?:=[^\]]*)?\]",
@@ -66,8 +69,9 @@ def clean_shikimori_description(value: object) -> str:
 
 
 def parsed_caption_length(caption: str) -> int:
-    """Посчитать видимые символы после разбора HTML-сущностей и тегов."""
-    return len(html.unescape(_HTML_TAG_RE.sub("", caption)))
+    """Посчитать видимый текст в используемых Telegram единицах UTF-16."""
+    visible = html.unescape(_HTML_TAG_RE.sub("", caption))
+    return len(visible.encode("utf-16-le")) // 2
 
 
 def _plain(value: object) -> str:
@@ -142,34 +146,46 @@ def _facts(media_type: str, item: dict) -> list[str]:
     year = _plain(aired_on.get("year")) if isinstance(aired_on, dict) else ""
     heading = " · ".join(part for part in (kind_label, year) if part)
 
-    metrics: list[str] = []
+    lines: list[str] = []
+    if heading:
+        lines.append(f"<b>{h(heading)}</b>")
+
     score = _format_number(item.get("score"))
     if score:
-        metrics.append(f"⭐ {score}")
+        lines.append(f"⭐ Оценка: {h(score)}")
     if media_type == "anime":
+        metrics: list[str] = []
         episodes = _format_number(item.get("episodes"))
         duration = _format_number(item.get("duration"))
         if episodes:
             metrics.append(f"{episodes} эп.")
         if duration:
             metrics.append(f"{duration} мин.")
+        if metrics:
+            lines.append(f"⏱ {h(' · '.join(metrics))}")
+        origin = _plain(item.get("origin"))
+        rating = _plain(item.get("rating"))
+        if origin:
+            lines.append(f"📖 Первоисточник: {h(origin)}")
+        if rating:
+            lines.append(f"🔖 Возрастной рейтинг: {h(rating)}")
         people = _people_names(item, "studios")
         people_icon = "🎞"
     else:
+        metrics = []
         chapters = _format_number(item.get("chapters"))
         volumes = _format_number(item.get("volumes"))
         if chapters:
             metrics.append(f"{chapters} гл.")
         if volumes:
             metrics.append(f"{volumes} т.")
+        if metrics:
+            lines.append(f"📄 {h(' · '.join(metrics))}")
         people = _people_names(item, "publishers")
         people_icon = "🏢"
 
-    lines: list[str] = []
-    if heading:
-        lines.append(f"<b>{h(heading)}</b>")
-    if metrics:
-        lines.append(h(" · ".join(metrics)))
+    if _plain(item.get("status")) == "ongoing":
+        lines.append("🟢 Онгоинг")
     if people:
         lines.append(f"{people_icon} {h(' · '.join(people))}")
     return lines
@@ -306,11 +322,38 @@ def _chooser_description(media_type: str, item: dict) -> str:
     return " · ".join(parts)
 
 
+def _card_keyboard(
+    bot_username: str | None,
+    shikimori_url: str,
+) -> InlineKeyboardMarkup:
+    """Добавить полезные действия без расходования лимита подписи."""
+    buttons = [
+        InlineKeyboardButton(
+            text="🔎 Новый поиск",
+            switch_inline_query_current_chat="",
+        ),
+        InlineKeyboardButton(
+            text="На Shikimori",
+            url=shikimori_url,
+        ),
+    ]
+    username = _plain(bot_username).removeprefix("@")
+    if _BOT_USERNAME_RE.fullmatch(username):
+        buttons.append(
+            InlineKeyboardButton(
+                text="ℹ️ О боте",
+                url=f"https://t.me/{username}?start=info",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
 def _build_inline_result(
     media_type: str,
     item: dict,
     *,
     allow_photo: bool,
+    bot_username: str | None,
 ) -> InlineQueryResultPhoto | InlineQueryResultArticle:
     """Собрать один результат с учётом выбранного режима представления."""
     item_id = _plain(item.get("id"))
@@ -321,6 +364,7 @@ def _build_inline_result(
     caption = build_card_caption(media_type, item)
     description = _chooser_description(media_type, item)
     url = _shikimori_url(media_type, item)
+    keyboard = _card_keyboard(bot_username, url)
     poster = item.get("poster")
     poster = poster if isinstance(poster, dict) else {}
     photo_url = _web_url(poster.get("originalUrl"))
@@ -335,6 +379,7 @@ def _build_inline_result(
             description=description or None,
             caption=caption,
             parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
         )
     return InlineQueryResultArticle(
         id=result_id,
@@ -343,6 +388,7 @@ def _build_inline_result(
         url=url,
         hide_url=True,
         thumbnail_url=(photo_url or thumbnail_url) or None,
+        reply_markup=keyboard,
         input_message_content=InputTextMessageContent(
             message_text=caption,
             parse_mode=ParseMode.HTML,
@@ -354,9 +400,16 @@ def _build_inline_result(
 def build_inline_result(
     media_type: str,
     item: dict,
+    *,
+    bot_username: str | None = None,
 ) -> InlineQueryResultPhoto | InlineQueryResultArticle:
     """Собрать результат с постером или равноправную текстовую карточку."""
-    return _build_inline_result(media_type, item, allow_photo=True)
+    return _build_inline_result(
+        media_type,
+        item,
+        allow_photo=True,
+        bot_username=bot_username,
+    )
 
 
 def finalize_inline_results(
@@ -364,6 +417,8 @@ def finalize_inline_results(
     rendered: list[
         tuple[dict, InlineQueryResultPhoto | InlineQueryResultArticle]
     ],
+    *,
+    bot_username: str | None = None,
 ) -> list[InlineQueryResultPhoto | InlineQueryResultArticle]:
     """Не дать полностью постерной странице превратиться в галерею без названий."""
     results = [result for _item, result in rendered]
@@ -373,5 +428,6 @@ def finalize_inline_results(
             media_type,
             last_item,
             allow_photo=False,
+            bot_username=bot_username,
         )
     return results
