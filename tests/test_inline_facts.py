@@ -11,7 +11,9 @@ from inline_facts import (
     GENERAL_INLINE_FACTS,
     INLINE_FACTS,
     OWNER_INLINE_FACTS,
+    build_fact_share_query,
     classify_fact_query,
+    fact_from_share_query,
     select_fact,
     select_inline_fact,
     select_next_fact,
@@ -85,6 +87,24 @@ def test_public_fact_query_accepts_only_exact_casefolded_whitespace_forms(query)
 )
 def test_fact_like_suffixes_malformed_spellings_and_near_misses_are_rejected(query):
     assert classify_fact_query(query) == FACT_QUERY_REJECT
+
+
+def test_generated_share_query_resolves_exact_fact_and_is_classified_as_match():
+    fact = INLINE_FACTS[7]
+    query = build_fact_share_query(fact.id)
+
+    assert query == f"fact:{fact.id}"
+    assert classify_fact_query(query) == FACT_QUERY_MATCH
+    assert fact_from_share_query(query) == fact
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["fact:forged", "fact:", "fact:anime-word!", "факт:anime-word"],
+)
+def test_unknown_or_malformed_share_queries_are_rejected(query):
+    assert classify_fact_query(query) == FACT_QUERY_REJECT
+    assert fact_from_share_query(query) is None
 
 
 @pytest.mark.parametrize(

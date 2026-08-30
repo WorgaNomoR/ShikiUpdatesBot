@@ -61,7 +61,7 @@ async def test_fact_is_public_for_non_subscriber_and_owner_without_entitlement(
     assert kwargs["parse_mode"] == ParseMode.HTML
     buttons = kwargs["reply_markup"].inline_keyboard[0]
     assert buttons[0].callback_data == "fact:next:safe-html"
-    assert buttons[1].switch_inline_query == "fact"
+    assert buttons[1].switch_inline_query == "fact:safe-html"
 
 
 @pytest.mark.asyncio
@@ -81,7 +81,7 @@ async def test_next_fact_edits_one_message_in_place_and_acknowledges_callback():
     assert kwargs["parse_mode"] == ParseMode.HTML
     buttons = kwargs["reply_markup"].inline_keyboard[0]
     assert buttons[0].callback_data == f"fact:next:{expected.id}"
-    assert buttons[1].switch_inline_query == "fact"
+    assert buttons[1].switch_inline_query == f"fact:{expected.id}"
 
 
 @pytest.mark.asyncio

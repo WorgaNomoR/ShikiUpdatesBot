@@ -242,6 +242,7 @@ def test_personal_fact_rendering_escapes_owner_pick_and_builds_both_buttons():
     text = inline_cards.build_fact_text(fact)
     keyboard = inline_cards.build_fact_keyboard(
         next_callback_data="fact:next:owner-html",
+        share_query="fact:owner-html",
     )
 
     assert text == (
@@ -252,7 +253,7 @@ def test_personal_fact_rendering_escapes_owner_pick_and_builds_both_buttons():
     buttons = keyboard.inline_keyboard[0]
     assert [button.text for button in buttons] == ["Ещё факт", "Поделиться"]
     assert buttons[0].callback_data == "fact:next:owner-html"
-    assert buttons[1].switch_inline_query == "fact"
+    assert buttons[1].switch_inline_query == "fact:owner-html"
 
 
 def test_continuation_with_natural_article_does_not_append_fact():

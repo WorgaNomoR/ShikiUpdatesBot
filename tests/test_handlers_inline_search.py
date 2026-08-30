@@ -91,6 +91,7 @@ async def test_public_fact_query_is_stable_uncached_and_bypasses_media_flow(
         "facts",
         "fact anime",
         "fact!",
+        "fact:forged",
         "f a c t",
         "факты",
         "факт аниме",
@@ -120,6 +121,40 @@ async def test_fact_like_rejections_do_not_fall_through_to_entitlement_or_search
     service.resolve_continuation.assert_not_called()
     service.get_page.assert_not_awaited()
     service.issue_continuation.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", [777, handlers.OWNER_ID])
+async def test_share_query_sends_exact_displayed_fact_without_random_selection(
+    monkeypatch,
+    user_id,
+):
+    expected = handlers.select_next_fact("anime-word")
+    inline_query = _inline_query(
+        user_id=user_id,
+        query=f"fact:{expected.id}",
+    )
+    random_selection = MagicMock(side_effect=AssertionError("выбран другой факт"))
+    entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
+    parser = MagicMock(side_effect=AssertionError("запущен media parser"))
+    service = _service()
+    monkeypatch.setattr(handlers, "select_fact", random_selection)
+    monkeypatch.setattr(handlers, "inline_access_status", entitlement)
+    monkeypatch.setattr(handlers, "parse_inline_query", parser)
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+
+    await handlers.cmd_inline_search(inline_query)
+
+    inline_query.answer.assert_awaited_once()
+    results = inline_query.answer.await_args.args[0]
+    assert len(results) == 1
+    assert expected.text in results[0].input_message_content.message_text
+    assert inline_query.answer.await_args.kwargs == {"cache_time": 0}
+    random_selection.assert_not_called()
+    entitlement.assert_not_called()
+    parser.assert_not_called()
+    service.debounce.assert_not_awaited()
+    service.get_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio

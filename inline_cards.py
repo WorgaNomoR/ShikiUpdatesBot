@@ -462,7 +462,11 @@ def build_fact_text(fact: InlineFact) -> str:
     )
 
 
-def build_fact_keyboard(*, next_callback_data: str) -> InlineKeyboardMarkup:
+def build_fact_keyboard(
+    *,
+    next_callback_data: str,
+    share_query: str,
+) -> InlineKeyboardMarkup:
     """Собрать личные кнопки обновления факта и ручного перехода к отправке."""
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -471,7 +475,7 @@ def build_fact_keyboard(*, next_callback_data: str) -> InlineKeyboardMarkup:
         ),
         InlineKeyboardButton(
             text="Поделиться",
-            switch_inline_query="fact",
+            switch_inline_query=share_query,
         ),
     ]])
 

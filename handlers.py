@@ -68,7 +68,9 @@ from inline_cards import (
 from inline_facts import (
     FACT_QUERY_MATCH,
     FACT_QUERY_REJECT,
+    build_fact_share_query,
     classify_fact_query,
+    fact_from_share_query,
     select_fact,
     select_next_fact,
 )
@@ -1495,6 +1497,7 @@ def _fact_keyboard(fact_id: str) -> InlineKeyboardMarkup:
     """Привязать кнопку обновления к факту, показанному в сообщении."""
     return build_fact_keyboard(
         next_callback_data=f"{_FACT_NEXT_CALLBACK_PREFIX}{fact_id}",
+        share_query=build_fact_share_query(fact_id),
     )
 
 
@@ -1584,7 +1587,9 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
             if inline_query.offset:
                 await inline_query.answer([], cache_time=0)
                 return
-            fact = select_fact(f"{user_id}\0{inline_query.id}")
+            fact = fact_from_share_query(inline_query.query)
+            if fact is None:
+                fact = select_fact(f"{user_id}\0{inline_query.id}")
             await inline_query.answer(
                 [build_fact_result(fact, page=1)],
                 cache_time=0,
