@@ -4,7 +4,7 @@
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
 Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock, /blocklist,
-/broadcast, /backup, /status, /stats, /favs, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
+/broadcast, /backup, /status, /stats, /favs, /fact, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
 notify*, polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
 """
@@ -59,8 +59,20 @@ from config import (
 )
 from healthcheck import heartbeat
 from inline_cards import (
+    build_fact_keyboard,
+    build_fact_result,
+    build_fact_text,
     build_inline_result,
     finalize_inline_results,
+)
+from inline_facts import (
+    FACT_QUERY_MATCH,
+    FACT_QUERY_REJECT,
+    build_fact_share_query,
+    classify_fact_query,
+    fact_from_share_query,
+    select_fact,
+    select_next_fact,
 )
 from inline_search import (
     SHIKIMORI_PAGE_SIZE,
@@ -158,6 +170,7 @@ _BLOCKLIST_HINT = (
     "Подсказка: <code>/block 123456789</code> — заблокировать; "
     "<code>/unblock 123456789</code> — разблокировать."
 )
+_FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
 INFO_PREVIEW_PATH = RESOURCE_ROOT / "assets" / "info-preview.png"
 _info_preview_file_id: str | None = None
 _status_cache: tuple[list[dict], list[dict]] | None = None
@@ -1480,6 +1493,89 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
 #  КОМАНДЫ БОТА
 # ═══════════════════════════════════════════════════════════════
 
+def _fact_keyboard(fact_id: str, *, initiator_id: int) -> InlineKeyboardMarkup:
+    """Привязать обновление к показанному факту и инициатору команды."""
+    return build_fact_keyboard(
+        next_callback_data=(
+            f"{_FACT_NEXT_CALLBACK_PREFIX}{initiator_id}:{fact_id}"
+        ),
+        share_query=build_fact_share_query(fact_id),
+    )
+
+
+def _parse_fact_next_callback(data: str) -> tuple[int, str] | None:
+    """Разобрать callback обновления и отклонить старый или поддельный формат."""
+    if not data.startswith(_FACT_NEXT_CALLBACK_PREFIX):
+        return None
+    initiator_raw, separator, fact_id = data.removeprefix(
+        _FACT_NEXT_CALLBACK_PREFIX
+    ).partition(":")
+    if not separator or not fact_id:
+        return None
+    try:
+        initiator_id = int(initiator_raw)
+    except ValueError:
+        return None
+    if initiator_id <= 0:
+        return None
+    return initiator_id, fact_id
+
+
+async def cmd_fact(message: Message) -> None:
+    """Показать публичный локальный факт без подписки и сетевых обращений."""
+    if message.from_user is None:
+        return
+    initiator_id = message.from_user.id
+    fact = select_fact(f"{initiator_id}\0{message.message_id}")
+    await message.answer(
+        build_fact_text(fact),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_fact_keyboard(fact.id, initiator_id=initiator_id),
+    )
+
+
+async def fact_next_cb(callback: CallbackQuery) -> None:
+    """Заменить показанный факт следующим и всегда подтвердить callback."""
+    parsed = _parse_fact_next_callback(callback.data or "")
+    if parsed is None:
+        await callback.answer(
+            "Этот факт устарел. Отправь /fact ещё раз.",
+            show_alert=True,
+        )
+        return
+    initiator_id, current_id = parsed
+    sender_id = getattr(getattr(callback, "from_user", None), "id", None)
+    if sender_id != initiator_id:
+        await callback.answer(
+            "Обновить этот факт может только тот, кто его запросил.",
+            show_alert=True,
+        )
+        return
+    try:
+        fact = select_next_fact(current_id)
+    except ValueError:
+        await callback.answer(
+            "Этот факт устарел. Отправь /fact ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+    if callback.message is None:
+        return
+    try:
+        await callback.message.edit_text(
+            build_fact_text(fact),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_fact_keyboard(fact.id, initiator_id=initiator_id),
+        )
+    except TelegramBadRequest as e:
+        log.warning(
+            "fact: Telegram не позволил заменить сообщение (%s)",
+            e,
+        )
+
+
 def _return_to_inline_keyboard() -> InlineKeyboardMarkup:
     """Кнопка ручного возврата к выбору чата без автоматического поиска."""
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -1517,9 +1613,26 @@ async def _answer_inline_access(inline_query: InlineQuery, status: str) -> bool:
 
 
 async def cmd_inline_search(inline_query: InlineQuery) -> None:
-    """Оркестрировать доступный подписчикам inline-поиск без доменной логики."""
+    """Развести публичные факты и доступный подписчикам поиск тайтлов."""
     user_id = inline_query.from_user.id
     try:
+        fact_query = classify_fact_query(inline_query.query)
+        if fact_query == FACT_QUERY_MATCH:
+            if inline_query.offset:
+                await inline_query.answer([], cache_time=0)
+                return
+            fact = fact_from_share_query(inline_query.query)
+            if fact is None:
+                fact = select_fact(f"{user_id}\0{inline_query.id}")
+            await inline_query.answer(
+                [build_fact_result(fact, page=1)],
+                cache_time=0,
+            )
+            return
+        if fact_query == FACT_QUERY_REJECT:
+            await inline_query.answer([], cache_time=0)
+            return
+
         status = inline_access_status(user_id)
         if await _answer_inline_access(inline_query, status):
             return

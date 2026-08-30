@@ -128,6 +128,36 @@ async def test_blocked_update_cannot_trigger_fsm_transition_or_side_effect(monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_kind", ["message", "callback", "inline"])
+@pytest.mark.parametrize("state_kind", ["blocked", "malformed"])
+async def test_fact_events_stop_before_selection_for_blocked_or_malformed_state(
+    monkeypatch,
+    event_kind,
+    state_kind,
+):
+    if state_kind == "blocked":
+        check = MagicMock(return_value=True)
+    else:
+        check = MagicMock(side_effect=BlockedUsersStateError("broken"))
+    monkeypatch.setattr(access_control, "is_user_blocked", check)
+    if event_kind == "message":
+        update, event = _message_update()
+    elif event_kind == "callback":
+        update, event = _callback_update(data="fact:next:777:anime-word")
+    else:
+        update, event = _inline_update()
+    selector = MagicMock()
+
+    async def handler(_event, _data):
+        selector()
+
+    await access_control.AccessControlMiddleware()(handler, update, {})
+
+    selector.assert_not_called()
+    event.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("user_id", [777, access_control.OWNER_ID])
 async def test_ordinary_user_and_owner_reach_handler(monkeypatch, user_id):
     check = MagicMock(return_value=False)

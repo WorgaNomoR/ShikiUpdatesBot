@@ -5,10 +5,18 @@
 import pytest
 
 from inline_facts import (
+    FACT_QUERY_MATCH,
+    FACT_QUERY_REJECT,
+    FACT_QUERY_UNRELATED,
     GENERAL_INLINE_FACTS,
     INLINE_FACTS,
     OWNER_INLINE_FACTS,
+    build_fact_share_query,
+    classify_fact_query,
+    fact_from_share_query,
+    select_fact,
     select_inline_fact,
+    select_next_fact,
 )
 
 
@@ -44,3 +52,76 @@ def test_selection_is_stable_and_avoids_repeats_for_a_full_bank_cycle():
 def test_selection_rejects_first_page():
     with pytest.raises(ValueError, match="продолжения"):
         select_inline_fact("seed", page=1)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "fact",
+        "FACT",
+        "  FaCt  ",
+        "\tfact\n",
+        "факт",
+        "ФАКТ",
+        "  ФаКт  ",
+    ],
+)
+def test_public_fact_query_accepts_only_exact_casefolded_whitespace_forms(query):
+    assert classify_fact_query(query) == FACT_QUERY_MATCH
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "facts",
+        "fact anime",
+        "fact!",
+        "f a c t",
+        "factoid",
+        "факты",
+        "факт аниме",
+        "факт?",
+        "ф а к т",
+        "фактология",
+    ],
+)
+def test_fact_like_suffixes_malformed_spellings_and_near_misses_are_rejected(query):
+    assert classify_fact_query(query) == FACT_QUERY_REJECT
+
+
+def test_generated_share_query_resolves_exact_fact_and_is_classified_as_match():
+    fact = INLINE_FACTS[7]
+    query = build_fact_share_query(fact.id)
+
+    assert query == f"fact:{fact.id}"
+    assert classify_fact_query(query) == FACT_QUERY_MATCH
+    assert fact_from_share_query(query) == fact
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["fact:forged", "fact:", "fact:anime-word!", "факт:anime-word"],
+)
+def test_unknown_or_malformed_share_queries_are_rejected(query):
+    assert classify_fact_query(query) == FACT_QUERY_REJECT
+    assert fact_from_share_query(query) is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [None, "", "anime fact", "аниме факт", "interesting", "фак"],
+)
+def test_unrelated_queries_remain_available_to_media_routing(query):
+    assert classify_fact_query(query) == FACT_QUERY_UNRELATED
+
+
+def test_public_selection_is_stable_and_next_rotation_never_repeats_current():
+    current = select_fact("telegram-inline-query-id")
+
+    assert select_fact("telegram-inline-query-id") == current
+    assert select_next_fact(current.id) != current
+
+
+def test_next_rotation_rejects_unknown_fact_id():
+    with pytest.raises(ValueError, match="идентификатор"):
+        select_next_fact("forged")

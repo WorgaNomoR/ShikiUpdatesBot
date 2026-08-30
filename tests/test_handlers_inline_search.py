@@ -18,8 +18,15 @@ from inline_search import (
 )
 
 
-def _inline_query(*, user_id=777, query="anime Berserk", offset=""):
+def _inline_query(
+    *,
+    user_id=777,
+    query="anime Berserk",
+    offset="",
+    query_id="inline-query-1",
+):
     return SimpleNamespace(
+        id=query_id,
         from_user=SimpleNamespace(
             id=user_id,
             full_name="Morpheus",
@@ -32,6 +39,126 @@ def _inline_query(*, user_id=777, query="anime Berserk", offset=""):
         ),
         answer=AsyncMock(),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", ["fact", " FACT ", "факт", "\nФАКТ\t"])
+@pytest.mark.parametrize("user_id", [777, handlers.OWNER_ID])
+async def test_public_fact_query_is_stable_uncached_and_bypasses_media_flow(
+    monkeypatch,
+    query,
+    user_id,
+):
+    first = _inline_query(user_id=user_id, query=query, query_id="retry-id")
+    retry = _inline_query(user_id=user_id, query=query, query_id="retry-id")
+    entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
+    service = _service()
+    monkeypatch.setattr(handlers, "inline_access_status", entitlement)
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+
+    await handlers.cmd_inline_search(first)
+    await handlers.cmd_inline_search(retry)
+
+    entitlement.assert_not_called()
+    first.bot.me.assert_not_awaited()
+    retry.bot.me.assert_not_awaited()
+    service.invalidate_debounce.assert_not_called()
+    service.debounce.assert_not_awaited()
+    service.resolve_continuation.assert_not_called()
+    service.get_page.assert_not_awaited()
+    service.issue_continuation.assert_not_called()
+    first_call = first.answer.await_args
+    retry_call = retry.answer.await_args
+    assert first_call.kwargs == {"cache_time": 0}
+    assert retry_call.kwargs == {"cache_time": 0}
+    first_result = first_call.args[0][0]
+    retry_result = retry_call.args[0][0]
+    assert first_result == retry_result
+    assert first_result.title == "💡 Отправить интересный факт"
+    assert first_result.description == (
+        "При выборе отправит в чат факт об аниме или Японии"
+    )
+    assert first_result.reply_markup is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "facts",
+        "fact anime",
+        "fact!",
+        "fact:forged",
+        "f a c t",
+        "факты",
+        "факт аниме",
+        "факт?",
+        "ф а к т",
+    ],
+)
+async def test_fact_like_rejections_do_not_fall_through_to_entitlement_or_search(
+    monkeypatch,
+    query,
+):
+    inline_query = _inline_query(query=query)
+    entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
+    service = _service()
+    monkeypatch.setattr(handlers, "inline_access_status", entitlement)
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+
+    await handlers.cmd_inline_search(inline_query)
+
+    inline_query.answer.assert_awaited_once_with([], cache_time=0)
+    entitlement.assert_not_called()
+    service.invalidate_debounce.assert_not_called()
+    service.debounce.assert_not_awaited()
+    service.resolve_continuation.assert_not_called()
+    service.get_page.assert_not_awaited()
+    service.issue_continuation.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", [777, handlers.OWNER_ID])
+async def test_share_query_sends_exact_displayed_fact_without_random_selection(
+    monkeypatch,
+    user_id,
+):
+    expected = handlers.select_next_fact("anime-word")
+    inline_query = _inline_query(
+        user_id=user_id,
+        query=f"fact:{expected.id}",
+    )
+    entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
+    service = _service()
+    monkeypatch.setattr(handlers, "inline_access_status", entitlement)
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+
+    await handlers.cmd_inline_search(inline_query)
+
+    inline_query.answer.assert_awaited_once()
+    results = inline_query.answer.await_args.args[0]
+    assert len(results) == 1
+    assert results[0].id == f"fact:1:{expected.id}"
+    assert expected.text in results[0].input_message_content.message_text
+    assert inline_query.answer.await_args.kwargs == {"cache_time": 0}
+    entitlement.assert_not_called()
+    service.debounce.assert_not_awaited()
+    service.get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fact_query_with_offset_is_rejected_before_selection_or_media_state(
+    monkeypatch,
+):
+    inline_query = _inline_query(query="fact", offset="forged")
+    service = _service()
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+
+    await handlers.cmd_inline_search(inline_query)
+
+    inline_query.answer.assert_awaited_once_with([], cache_time=0)
+    service.resolve_continuation.assert_not_called()
+    service.get_page.assert_not_awaited()
 
 
 def _service(*, page=None, continuation_page=2):
@@ -53,21 +180,18 @@ def _service(*, page=None, continuation_page=2):
         ("unsubscribed", True),
     ],
 )
-async def test_rejected_users_stop_before_parser_debounce_cache_and_network(
+async def test_rejected_users_stop_before_debounce_cache_and_network(
     monkeypatch,
     status,
     has_button,
 ):
     inline_query = _inline_query()
     service = _service()
-    parser = MagicMock()
     monkeypatch.setattr(handlers, "inline_access_status", lambda _user_id: status)
-    monkeypatch.setattr(handlers, "parse_inline_query", parser)
     monkeypatch.setattr(handlers, "_inline_search_service", service)
 
     await handlers.cmd_inline_search(inline_query)
 
-    parser.assert_not_called()
     inline_query.bot.me.assert_not_awaited()
     service.debounce.assert_not_awaited()
     service.get_page.assert_not_awaited()

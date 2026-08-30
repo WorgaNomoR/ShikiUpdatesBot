@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Короткие проверяемые факты для технических inline-результатов."""
+"""Короткие проверяемые факты и чистые правила их выбора."""
 
 from __future__ import annotations
 
@@ -112,13 +112,15 @@ GENERAL_INLINE_FACTS = (
     ),
     InlineFact(
         "toei-animation",
-        "Студия, сегодня известная как Toei Animation, начала работу под "
-        "названием Toei Doga в 1956 году.",
+        "«Легенда о Белой Змее» 1958 года стала первым японским цветным "
+        "полнометражным анимационным фильмом. Спустя 61 год её "
+        "4K-реставрацию показали в секции Cannes Classics Каннского фестиваля.",
     ),
     InlineFact(
         "ghibli-founded",
-        "Studio Ghibli основали в 1985 году после успеха фильма «Навсикая из "
-        "Долины ветров».",
+        "В первые годы Studio Ghibli не держала постоянный штат: примерно "
+        "70 человек собирали под конкретный фильм и распускали после завершения. "
+        "Одна неудача тогда могла завершить историю студии.",
     ),
     InlineFact(
         "ghibli-name",
@@ -127,8 +129,9 @@ GENERAL_INLINE_FACTS = (
     ),
     InlineFact(
         "comiket",
-        "Первый Comic Market, более известный как Комикет, прошёл в Токио в "
-        "декабре 1975 года.",
+        "На первом Комикете было всего 32 кружка и около 700 посетителей. "
+        "Официальная хроника отмечает, что примерно 90% публики составляли "
+        "поклонницы сёдзё-манги — школьницы средних и старших классов.",
     ),
     InlineFact(
         "hokusai-manga",
@@ -137,7 +140,9 @@ GENERAL_INLINE_FACTS = (
     ),
     InlineFact(
         "shonen-jump",
-        "Журнал Weekly Shonen Jump начал выходить в 1968 году.",
+        "Рекордный объединённый выпуск Weekly Shonen Jump за 1995 год напечатали "
+        "тиражом 6,53 миллиона экземпляров. Издательство Shueisha до сих пор "
+        "называет этот результат историческим максимумом журнала.",
     ),
     InlineFact(
         "manga-taisho",
@@ -196,27 +201,33 @@ GENERAL_INLINE_FACTS = (
     ),
     InlineFact(
         "main-islands",
-        "Четыре крупнейших острова Японии — Хонсю, Хоккайдо, Кюсю и Сикоку.",
+        "В 2023 году Географическое управление Японии пересчитало острова и "
+        "получило 14 125 вместо прежних 6 852. Страна не выросла вдвое: разницу "
+        "дала возросшая детализация цифровых карт.",
     ),
     InlineFact(
         "tokyo-wards",
-        "В восточной части Токио находятся 23 специальных района: каждый имеет "
-        "собственного мэра и собрание.",
+        "Административного города Токио не существует с 1943 года: город и "
+        "префектуру объединили в столичный округ. Нынешние 23 специальных района "
+        "появились в 1947-м, когда 35 районов укрупнили до 22 и затем отделили Нэриму.",
     ),
     InlineFact(
         "japan-time",
-        "Вся Япония живёт по одному часовому поясу UTC+9 и не переводит часы "
-        "на летнее время.",
+        "Сейчас Япония не переводит часы, но с 1948 по 1951 год в стране "
+        "действовало летнее время. При осеннем возврате стрелок у японцев раз в "
+        "год официально получался день продолжительностью 25 часов.",
     ),
     InlineFact(
         "shinkansen",
-        "Первая линия синкансэна открылась между Токио и Осакой в 1964 году, "
-        "накануне летней Олимпиады в Токио.",
+        "У путей синкансэна нет ни одного железнодорожного переезда: трассы "
+        "полностью отделены от дорог и обычных поездов. Скорость дополнительно "
+        "контролирует автоматика ATC, не полагаясь только на сигналы машинисту.",
     ),
     InlineFact(
         "mount-fuji",
-        "Высота горы Фудзи составляет 3776 метров — это высочайшая вершина "
-        "Японии.",
+        "Территория святилища Фудзисан Хонгу Сэнгэн Тайся включает почти четыре "
+        "квадратных километра земли выше восьмой станции Фудзи. Поэтому вершина "
+        "горы одновременно считается частью храмовой территории.",
     ),
     InlineFact(
         "writing-systems",
@@ -240,18 +251,21 @@ GENERAL_INLINE_FACTS = (
     ),
     InlineFact(
         "emoji",
-        "Первый широко известный набор мобильных эмодзи создал Сигэтака Курита "
-        "для японской системы i-mode в 1999 году.",
+        "Первый набор Сигэтаки Куриты состоял из 176 эмодзи размером всего "
+        "12×12 пикселей, причём лиц среди них было только пять. Сегодня эти "
+        "крошечные изображения входят в коллекцию нью-йоркского MoMA.",
     ),
     InlineFact(
         "qr-code",
-        "QR-код разработала японская компания Denso Wave в 1994 году для "
-        "управления производством автомобильных деталей.",
+        "Для угловых меток QR-кода команда Denso изучала узоры в журналах, "
+        "листовках и на коробках. Пропорцию 1:1:3:1:1 выбрали потому, что она "
+        "реже всего встречалась в печати и легко распознавалась под любым углом.",
     ),
     InlineFact(
         "instant-ramen",
-        "Момофуку Андо представил лапшу быстрого приготовления Chicken Ramen "
-        "в Японии в 1958 году.",
+        "В 91 год изобретатель лапши быстрого приготовления Момофуку Андо начал "
+        "создавать рамен для космоса. Бульон загустили, а лапшу сделали порциями "
+        "на один укус; в 2005 году Space Ram отправился на МКС.",
     ),
     InlineFact(
         "nintendo",
@@ -274,8 +288,9 @@ GENERAL_INLINE_FACTS = (
 OWNER_INLINE_FACTS = (
     InlineFact(
         "owner-evangelion-tv",
-        "Телесериал «Евангелион» начал выходить в октябре 1995 года и состоит "
-        "из 26 серий.",
+        "Токио-3 из «Евангелиона» связан с реальным Хаконэ: официальный "
+        "туристический «план восполнения» отметил 19 мест из аниме. В 2020 году "
+        "станция Тогэндай даже получила подзаголовок «Станция Токио-3».",
         owner_pick=True,
     ),
     InlineFact(
@@ -286,8 +301,9 @@ OWNER_INLINE_FACTS = (
     ),
     InlineFact(
         "owner-frieren-authors",
-        "Мангу «Провожающая в последний путь Фрирен» пишет Канэхито Ямада, "
-        "рисует Цукаса Абэ, а её публикация началась в 2020 году.",
+        "Первые четыре серии «Провожающей в последний путь Фрирен» показали "
+        "вместе как двухчасовой выпуск кинопрограммы Friday Road Show. Затем "
+        "сериал открыл новый пятничный аниме-слот Nippon TV.",
         owner_pick=True,
     ),
     InlineFact(
@@ -313,11 +329,69 @@ OWNER_INLINE_FACTS = (
 
 INLINE_FACTS = GENERAL_INLINE_FACTS + OWNER_INLINE_FACTS
 
+FACT_QUERY_MATCH = "match"
+FACT_QUERY_REJECT = "reject"
+FACT_QUERY_UNRELATED = "unrelated"
+_FACT_QUERY_PREFIXES = ("fact", "факт")
+_FACT_SHARE_PREFIX = "fact:"
+
+
+def _fact_by_id(fact_id: str) -> InlineFact | None:
+    """Найти факт по устойчивому идентификатору без отдельного индекса состояния."""
+    return next((fact for fact in INLINE_FACTS if fact.id == fact_id), None)
+
+
+def build_fact_share_query(fact_id: str) -> str:
+    """Собрать inline-запрос, однозначно привязанный к показанному факту."""
+    return f"{_FACT_SHARE_PREFIX}{fact_id}"
+
+
+def fact_from_share_query(value: object) -> InlineFact | None:
+    """Вернуть факт только для точного сгенерированного запроса «Поделиться»."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    if not normalized.startswith(_FACT_SHARE_PREFIX):
+        return None
+    return _fact_by_id(normalized.removeprefix(_FACT_SHARE_PREFIX))
+
+
+def classify_fact_query(value: object) -> str:
+    """Отделить точный публичный запрос факта от похожих и иных запросов."""
+    if not isinstance(value, str):
+        return FACT_QUERY_UNRELATED
+    normalized = " ".join(value.split()).casefold()
+    if normalized in _FACT_QUERY_PREFIXES or fact_from_share_query(normalized):
+        return FACT_QUERY_MATCH
+    compact = "".join(normalized.split())
+    if any(
+        normalized.startswith(prefix) or compact.startswith(prefix)
+        for prefix in _FACT_QUERY_PREFIXES
+    ):
+        return FACT_QUERY_REJECT
+    return FACT_QUERY_UNRELATED
+
+
+def _seed_start(seed: str) -> int:
+    digest = hashlib.blake2s(seed.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % len(INLINE_FACTS)
+
+
+def select_fact(seed: str) -> InlineFact:
+    """Устойчиво выбрать один факт по непрозрачному источнику энтропии."""
+    return INLINE_FACTS[_seed_start(seed)]
+
+
+def select_next_fact(current_id: str) -> InlineFact:
+    """Вернуть следующий факт банка, гарантированно отличный от текущего."""
+    for index, fact in enumerate(INLINE_FACTS):
+        if fact.id == current_id:
+            return INLINE_FACTS[(index + 1) % len(INLINE_FACTS)]
+    raise ValueError("Неизвестный идентификатор факта")
+
 
 def select_inline_fact(seed: str, *, page: int) -> InlineFact:
     """Устойчиво выбрать факт и не повторять его на соседних страницах."""
     if page < 2:
         raise ValueError("Факты предназначены только для продолжения выдачи")
-    digest = hashlib.blake2s(seed.encode("utf-8"), digest_size=8).digest()
-    start = int.from_bytes(digest, "big") % len(INLINE_FACTS)
-    return INLINE_FACTS[(start + page - 2) % len(INLINE_FACTS)]
+    return INLINE_FACTS[(_seed_start(seed) + page - 2) % len(INLINE_FACTS)]

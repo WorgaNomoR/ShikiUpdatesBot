@@ -451,11 +451,37 @@ def build_project_promo_result() -> InlineQueryResultArticle:
     )
 
 
-def build_fact_result(fact: InlineFact, *, page: int) -> InlineQueryResultArticle:
-    """Собрать явно подписанный результат, отправляющий факт в чат."""
+def build_fact_text(fact: InlineFact) -> str:
+    """Собрать единый безопасный HTML факта для команды и inline-отправки."""
     owner_note = ""
     if fact.owner_pick:
         owner_note = "\n\n🎁 <i>Выбор владельца ShikiUpdatesBot</i>"
+    return (
+        "💡 <b>Интересный факт</b>\n\n"
+        f"{h(fact.text)}{owner_note}"
+    )
+
+
+def build_fact_keyboard(
+    *,
+    next_callback_data: str,
+    share_query: str,
+) -> InlineKeyboardMarkup:
+    """Собрать личные кнопки обновления факта и ручного перехода к отправке."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="Ещё факт",
+            callback_data=next_callback_data,
+        ),
+        InlineKeyboardButton(
+            text="Поделиться",
+            switch_inline_query=share_query,
+        ),
+    ]])
+
+
+def build_fact_result(fact: InlineFact, *, page: int) -> InlineQueryResultArticle:
+    """Собрать явно подписанный результат, отправляющий факт в чат."""
     return InlineQueryResultArticle(
         id=f"fact:{page}:{fact.id}",
         title="💡 Отправить интересный факт",
@@ -463,10 +489,7 @@ def build_fact_result(fact: InlineFact, *, page: int) -> InlineQueryResultArticl
             "При выборе отправит в чат факт об аниме или Японии"
         ),
         input_message_content=InputTextMessageContent(
-            message_text=(
-                "💡 <b>Интересный факт</b>\n\n"
-                f"{h(fact.text)}{owner_note}"
-            ),
+            message_text=build_fact_text(fact),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         ),
