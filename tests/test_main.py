@@ -119,7 +119,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         if call.args[0] is main.fact_next_cb
     )
     fact_filter = fact_registration.args[1]
-    assert fact_filter.resolve(SimpleNamespace(data="fact:next:anime-word")) is True
+    assert fact_filter.resolve(SimpleNamespace(data="fact:next:777:anime-word")) is True
     assert fact_filter.resolve(SimpleNamespace(data="stats:all")) is False
     app.dispatcher.shutdown.register.assert_not_called()
     app.probe.assert_awaited_once_with(app.bot)

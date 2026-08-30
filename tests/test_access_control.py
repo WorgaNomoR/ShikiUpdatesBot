@@ -143,7 +143,7 @@ async def test_fact_events_stop_before_selection_for_blocked_or_malformed_state(
     if event_kind == "message":
         update, event = _message_update()
     elif event_kind == "callback":
-        update, event = _callback_update(data="fact:next:anime-word")
+        update, event = _callback_update(data="fact:next:777:anime-word")
     else:
         update, event = _inline_update()
     selector = MagicMock()

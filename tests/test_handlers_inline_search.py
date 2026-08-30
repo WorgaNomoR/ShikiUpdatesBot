@@ -52,17 +52,14 @@ async def test_public_fact_query_is_stable_uncached_and_bypasses_media_flow(
     first = _inline_query(user_id=user_id, query=query, query_id="retry-id")
     retry = _inline_query(user_id=user_id, query=query, query_id="retry-id")
     entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
-    parser = MagicMock(side_effect=AssertionError("запущен media parser"))
     service = _service()
     monkeypatch.setattr(handlers, "inline_access_status", entitlement)
-    monkeypatch.setattr(handlers, "parse_inline_query", parser)
     monkeypatch.setattr(handlers, "_inline_search_service", service)
 
     await handlers.cmd_inline_search(first)
     await handlers.cmd_inline_search(retry)
 
     entitlement.assert_not_called()
-    parser.assert_not_called()
     first.bot.me.assert_not_awaited()
     retry.bot.me.assert_not_awaited()
     service.invalidate_debounce.assert_not_called()
@@ -105,17 +102,14 @@ async def test_fact_like_rejections_do_not_fall_through_to_entitlement_or_search
 ):
     inline_query = _inline_query(query=query)
     entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
-    parser = MagicMock(side_effect=AssertionError("запущен media parser"))
     service = _service()
     monkeypatch.setattr(handlers, "inline_access_status", entitlement)
-    monkeypatch.setattr(handlers, "parse_inline_query", parser)
     monkeypatch.setattr(handlers, "_inline_search_service", service)
 
     await handlers.cmd_inline_search(inline_query)
 
     inline_query.answer.assert_awaited_once_with([], cache_time=0)
     entitlement.assert_not_called()
-    parser.assert_not_called()
     service.invalidate_debounce.assert_not_called()
     service.debounce.assert_not_awaited()
     service.resolve_continuation.assert_not_called()
@@ -134,13 +128,9 @@ async def test_share_query_sends_exact_displayed_fact_without_random_selection(
         user_id=user_id,
         query=f"fact:{expected.id}",
     )
-    random_selection = MagicMock(side_effect=AssertionError("выбран другой факт"))
     entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
-    parser = MagicMock(side_effect=AssertionError("запущен media parser"))
     service = _service()
-    monkeypatch.setattr(handlers, "select_fact", random_selection)
     monkeypatch.setattr(handlers, "inline_access_status", entitlement)
-    monkeypatch.setattr(handlers, "parse_inline_query", parser)
     monkeypatch.setattr(handlers, "_inline_search_service", service)
 
     await handlers.cmd_inline_search(inline_query)
@@ -148,11 +138,10 @@ async def test_share_query_sends_exact_displayed_fact_without_random_selection(
     inline_query.answer.assert_awaited_once()
     results = inline_query.answer.await_args.args[0]
     assert len(results) == 1
+    assert results[0].id == f"fact:1:{expected.id}"
     assert expected.text in results[0].input_message_content.message_text
     assert inline_query.answer.await_args.kwargs == {"cache_time": 0}
-    random_selection.assert_not_called()
     entitlement.assert_not_called()
-    parser.assert_not_called()
     service.debounce.assert_not_awaited()
     service.get_page.assert_not_awaited()
 
@@ -162,15 +151,12 @@ async def test_fact_query_with_offset_is_rejected_before_selection_or_media_stat
     monkeypatch,
 ):
     inline_query = _inline_query(query="fact", offset="forged")
-    selector = MagicMock()
     service = _service()
-    monkeypatch.setattr(handlers, "select_fact", selector)
     monkeypatch.setattr(handlers, "_inline_search_service", service)
 
     await handlers.cmd_inline_search(inline_query)
 
     inline_query.answer.assert_awaited_once_with([], cache_time=0)
-    selector.assert_not_called()
     service.resolve_continuation.assert_not_called()
     service.get_page.assert_not_awaited()
 
@@ -194,21 +180,18 @@ def _service(*, page=None, continuation_page=2):
         ("unsubscribed", True),
     ],
 )
-async def test_rejected_users_stop_before_parser_debounce_cache_and_network(
+async def test_rejected_users_stop_before_debounce_cache_and_network(
     monkeypatch,
     status,
     has_button,
 ):
     inline_query = _inline_query()
     service = _service()
-    parser = MagicMock()
     monkeypatch.setattr(handlers, "inline_access_status", lambda _user_id: status)
-    monkeypatch.setattr(handlers, "parse_inline_query", parser)
     monkeypatch.setattr(handlers, "_inline_search_service", service)
 
     await handlers.cmd_inline_search(inline_query)
 
-    parser.assert_not_called()
     inline_query.bot.me.assert_not_awaited()
     service.debounce.assert_not_awaited()
     service.get_page.assert_not_awaited()

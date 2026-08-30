@@ -1493,30 +1493,64 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
 #  КОМАНДЫ БОТА
 # ═══════════════════════════════════════════════════════════════
 
-def _fact_keyboard(fact_id: str) -> InlineKeyboardMarkup:
-    """Привязать кнопку обновления к факту, показанному в сообщении."""
+def _fact_keyboard(fact_id: str, *, initiator_id: int) -> InlineKeyboardMarkup:
+    """Привязать обновление к показанному факту и инициатору команды."""
     return build_fact_keyboard(
-        next_callback_data=f"{_FACT_NEXT_CALLBACK_PREFIX}{fact_id}",
+        next_callback_data=(
+            f"{_FACT_NEXT_CALLBACK_PREFIX}{initiator_id}:{fact_id}"
+        ),
         share_query=build_fact_share_query(fact_id),
     )
+
+
+def _parse_fact_next_callback(data: str) -> tuple[int, str] | None:
+    """Разобрать callback обновления и отклонить старый или поддельный формат."""
+    if not data.startswith(_FACT_NEXT_CALLBACK_PREFIX):
+        return None
+    initiator_raw, separator, fact_id = data.removeprefix(
+        _FACT_NEXT_CALLBACK_PREFIX
+    ).partition(":")
+    if not separator or not fact_id:
+        return None
+    try:
+        initiator_id = int(initiator_raw)
+    except ValueError:
+        return None
+    if initiator_id <= 0:
+        return None
+    return initiator_id, fact_id
 
 
 async def cmd_fact(message: Message) -> None:
     """Показать публичный локальный факт без подписки и сетевых обращений."""
     if message.from_user is None:
         return
-    fact = select_fact(f"{message.from_user.id}\0{message.message_id}")
+    initiator_id = message.from_user.id
+    fact = select_fact(f"{initiator_id}\0{message.message_id}")
     await message.answer(
         build_fact_text(fact),
         parse_mode=ParseMode.HTML,
-        reply_markup=_fact_keyboard(fact.id),
+        reply_markup=_fact_keyboard(fact.id, initiator_id=initiator_id),
     )
 
 
 async def fact_next_cb(callback: CallbackQuery) -> None:
     """Заменить показанный факт следующим и всегда подтвердить callback."""
-    data = callback.data or ""
-    current_id = data.removeprefix(_FACT_NEXT_CALLBACK_PREFIX)
+    parsed = _parse_fact_next_callback(callback.data or "")
+    if parsed is None:
+        await callback.answer(
+            "Этот факт устарел. Отправь /fact ещё раз.",
+            show_alert=True,
+        )
+        return
+    initiator_id, current_id = parsed
+    sender_id = getattr(getattr(callback, "from_user", None), "id", None)
+    if sender_id != initiator_id:
+        await callback.answer(
+            "Обновить этот факт может только тот, кто его запросил.",
+            show_alert=True,
+        )
+        return
     try:
         fact = select_next_fact(current_id)
     except ValueError:
@@ -1533,7 +1567,7 @@ async def fact_next_cb(callback: CallbackQuery) -> None:
         await callback.message.edit_text(
             build_fact_text(fact),
             parse_mode=ParseMode.HTML,
-            reply_markup=_fact_keyboard(fact.id),
+            reply_markup=_fact_keyboard(fact.id, initiator_id=initiator_id),
         )
     except TelegramBadRequest as e:
         log.warning(
