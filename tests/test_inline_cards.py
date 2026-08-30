@@ -219,11 +219,14 @@ def test_all_photo_continuation_appends_explicit_fact():
 
 def test_fact_result_escapes_text():
     result = inline_cards.build_fact_result(
-        InlineFact("test-fact", "Япония использует <три> письменности."),
+        InlineFact(
+            "test-fact",
+            "Япония использует <три> письменности и A & B.",
+        ),
         page=3,
     )
 
-    assert "Япония использует &lt;три&gt; письменности." in (
+    assert "Япония использует &lt;три&gt; письменности и A &amp; B." in (
         result.input_message_content.message_text
     )
 
