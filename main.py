@@ -40,6 +40,7 @@ from handlers import (
     cmd_blocklist,
     cmd_broadcast,
     cmd_cancel,
+    cmd_fact,
     cmd_favs,
     cmd_info,
     cmd_inline_search,
@@ -50,6 +51,7 @@ from handlers import (
     cmd_subs,
     cmd_unblock,
     cmd_version,
+    fact_next_cb,
     probe_owner_and_start,
     stats_menu_cb,
     version_refresh_cb,
@@ -96,6 +98,7 @@ async def main() -> None:
     dp.message.register(cmd_cancel,    Command("cancel"))
     dp.message.register(cmd_stats,     Command("stats"))
     dp.message.register(cmd_favs,      Command("favs"))
+    dp.message.register(cmd_fact,      Command("fact"))
     dp.message.register(cmd_info,      Command("info"))
     dp.message.register(cmd_version,   Command("version"))
     dp.message.register(cmd_block,     Command("block"))
@@ -120,12 +123,16 @@ async def main() -> None:
     # Кнопка обновления сведений о версиях
     dp.callback_query.register(version_refresh_cb, F.data == "version:refresh")
 
+    # Локальная ротация публичных фактов
+    dp.callback_query.register(fact_next_cb, F.data.startswith("fact:next:"))
+
     # Публичные команды в меню "/" — команды владельца не показываем
     await bot.set_my_commands([
         BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
         BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
         BotCommand(command="stats",  description="Статистика: квартал или всё время 📊"),
         BotCommand(command="favs",   description="Избранное ❤️"),
+        BotCommand(command="fact",   description="Интересный факт 💡"),
         BotCommand(command="info",   description="О боте ℹ️"),
         BotCommand(command="stop",   description="Отписаться 😢"),
     ])

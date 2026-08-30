@@ -74,13 +74,20 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         command.command
         for command in app.bot.set_my_commands.await_args.args[0]
     ]
+    public_descriptions = {
+        command.command: command.description
+        for command in app.bot.set_my_commands.await_args.args[0]
+    }
     assert "info" in public_commands
+    assert "fact" in public_commands
+    assert public_descriptions["fact"] == "Интересный факт 💡"
     assert "version" not in public_commands
     registered_messages = [
         call.args[0]
         for call in app.dispatcher.message.register.call_args_list
     ]
     assert main.cmd_info in registered_messages
+    assert main.cmd_fact in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
     app.dispatcher.inline_query.register.assert_called_once_with(
@@ -105,6 +112,15 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         for call in app.dispatcher.callback_query.register.call_args_list
     ]
     assert main.version_refresh_cb in registered_callbacks
+    assert main.fact_next_cb in registered_callbacks
+    fact_registration = next(
+        call
+        for call in app.dispatcher.callback_query.register.call_args_list
+        if call.args[0] is main.fact_next_cb
+    )
+    fact_filter = fact_registration.args[1]
+    assert fact_filter.resolve(SimpleNamespace(data="fact:next:anime-word")) is True
+    assert fact_filter.resolve(SimpleNamespace(data="stats:all")) is False
     app.dispatcher.shutdown.register.assert_not_called()
     app.probe.assert_awaited_once_with(app.bot)
     app.start_updates.assert_called_once_with(app.bot)

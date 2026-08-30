@@ -229,6 +229,30 @@ def test_fact_result_escapes_text():
     assert "Япония использует &lt;три&gt; письменности и A &amp; B." in (
         result.input_message_content.message_text
     )
+    assert result.reply_markup is None
+
+
+def test_personal_fact_rendering_escapes_owner_pick_and_builds_both_buttons():
+    fact = InlineFact(
+        "owner-html",
+        "Любимый <факт> владельца & бота.",
+        owner_pick=True,
+    )
+
+    text = inline_cards.build_fact_text(fact)
+    keyboard = inline_cards.build_fact_keyboard(
+        next_callback_data="fact:next:owner-html",
+    )
+
+    assert text == (
+        "💡 <b>Интересный факт</b>\n\n"
+        "Любимый &lt;факт&gt; владельца &amp; бота.\n\n"
+        "🎁 <i>Выбор владельца ShikiUpdatesBot</i>"
+    )
+    buttons = keyboard.inline_keyboard[0]
+    assert [button.text for button in buttons] == ["Ещё факт", "Поделиться"]
+    assert buttons[0].callback_data == "fact:next:owner-html"
+    assert buttons[1].switch_inline_query == "fact"
 
 
 def test_continuation_with_natural_article_does_not_append_fact():

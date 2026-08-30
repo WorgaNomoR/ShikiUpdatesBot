@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Короткие проверяемые факты для технических inline-результатов."""
+"""Короткие проверяемые факты и чистые правила их выбора."""
 
 from __future__ import annotations
 
@@ -313,11 +313,48 @@ OWNER_INLINE_FACTS = (
 
 INLINE_FACTS = GENERAL_INLINE_FACTS + OWNER_INLINE_FACTS
 
+FACT_QUERY_MATCH = "match"
+FACT_QUERY_REJECT = "reject"
+FACT_QUERY_UNRELATED = "unrelated"
+_FACT_QUERY_PREFIXES = ("fact", "факт")
+
+
+def classify_fact_query(value: object) -> str:
+    """Отделить точный публичный запрос факта от похожих и иных запросов."""
+    if not isinstance(value, str):
+        return FACT_QUERY_UNRELATED
+    normalized = " ".join(value.split()).casefold()
+    if normalized in _FACT_QUERY_PREFIXES:
+        return FACT_QUERY_MATCH
+    compact = "".join(normalized.split())
+    if any(
+        normalized.startswith(prefix) or compact.startswith(prefix)
+        for prefix in _FACT_QUERY_PREFIXES
+    ):
+        return FACT_QUERY_REJECT
+    return FACT_QUERY_UNRELATED
+
+
+def _seed_start(seed: str) -> int:
+    digest = hashlib.blake2s(seed.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % len(INLINE_FACTS)
+
+
+def select_fact(seed: str) -> InlineFact:
+    """Устойчиво выбрать один факт по непрозрачному источнику энтропии."""
+    return INLINE_FACTS[_seed_start(seed)]
+
+
+def select_next_fact(current_id: str) -> InlineFact:
+    """Вернуть следующий факт банка, гарантированно отличный от текущего."""
+    for index, fact in enumerate(INLINE_FACTS):
+        if fact.id == current_id:
+            return INLINE_FACTS[(index + 1) % len(INLINE_FACTS)]
+    raise ValueError("Неизвестный идентификатор факта")
+
 
 def select_inline_fact(seed: str, *, page: int) -> InlineFact:
     """Устойчиво выбрать факт и не повторять его на соседних страницах."""
     if page < 2:
         raise ValueError("Факты предназначены только для продолжения выдачи")
-    digest = hashlib.blake2s(seed.encode("utf-8"), digest_size=8).digest()
-    start = int.from_bytes(digest, "big") % len(INLINE_FACTS)
-    return INLINE_FACTS[(start + page - 2) % len(INLINE_FACTS)]
+    return INLINE_FACTS[(_seed_start(seed) + page - 2) % len(INLINE_FACTS)]
