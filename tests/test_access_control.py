@@ -12,6 +12,7 @@ import pytest
 from aiogram.enums import ParseMode
 from aiogram.types import (
     CallbackQuery,
+    InlineQuery,
     Message,
 )
 
@@ -33,6 +34,17 @@ def _callback_update(user_id=777, *, data="stats:all", with_message=True):
     callback.message = MagicMock() if with_message else None
     callback.answer = AsyncMock()
     return SimpleNamespace(message=None, callback_query=callback), callback
+
+
+def _inline_update(user_id=777):
+    inline_query = MagicMock(spec=InlineQuery)
+    inline_query.from_user = SimpleNamespace(id=user_id) if user_id is not None else None
+    inline_query.answer = AsyncMock()
+    return SimpleNamespace(
+        message=None,
+        callback_query=None,
+        inline_query=inline_query,
+    ), inline_query
 
 
 @pytest.mark.asyncio
@@ -84,6 +96,18 @@ async def test_blocked_callback_without_message_is_still_denied(monkeypatch):
         access_control.ACCESS_DENIED_TEXT,
         show_alert=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_blocked_inline_query_gets_immediate_empty_uncached_answer(monkeypatch):
+    monkeypatch.setattr(access_control, "is_user_blocked", lambda user_id: True)
+    update, inline_query = _inline_update()
+    handler = AsyncMock()
+
+    await access_control.AccessControlMiddleware()(handler, update, {})
+
+    handler.assert_not_awaited()
+    inline_query.answer.assert_awaited_once_with([], cache_time=0)
 
 
 @pytest.mark.asyncio
@@ -152,3 +176,45 @@ async def test_missing_sender_or_supported_event_does_not_crash(monkeypatch):
         == "passed"
     )
     check.assert_not_called()
+
+
+def test_inline_entitlement_uses_owner_or_matching_personal_subscription(monkeypatch):
+    blocked = MagicMock(return_value=False)
+    monkeypatch.setattr(access_control, "is_user_blocked", blocked)
+    monkeypatch.setattr(
+        access_control,
+        "load_subscribers",
+        lambda: {777: "Private", -100777: "Group"},
+    )
+
+    assert access_control.inline_access_status(access_control.OWNER_ID) == (
+        access_control.INLINE_ACCESS_ALLOWED
+    )
+    assert access_control.inline_access_status(777) == access_control.INLINE_ACCESS_ALLOWED
+    assert access_control.inline_access_status(100777) == (
+        access_control.INLINE_ACCESS_UNSUBSCRIBED
+    )
+
+
+def test_inline_entitlement_reflects_unsubscribe_on_next_check(monkeypatch):
+    subscribers = {777: "Private"}
+    monkeypatch.setattr(access_control, "is_user_blocked", lambda _user_id: False)
+    monkeypatch.setattr(access_control, "load_subscribers", lambda: subscribers.copy())
+
+    assert access_control.inline_access_status(777) == access_control.INLINE_ACCESS_ALLOWED
+    subscribers.clear()
+    assert access_control.inline_access_status(777) == (
+        access_control.INLINE_ACCESS_UNSUBSCRIBED
+    )
+
+
+def test_inline_entitlement_fails_closed_on_malformed_blacklist(monkeypatch):
+    def broken(_user_id):
+        raise BlockedUsersStateError("broken")
+
+    load = MagicMock(return_value={777: "Private"})
+    monkeypatch.setattr(access_control, "is_user_blocked", broken)
+    monkeypatch.setattr(access_control, "load_subscribers", load)
+
+    assert access_control.inline_access_status(777) == access_control.INLINE_ACCESS_BLOCKED
+    load.assert_not_called()

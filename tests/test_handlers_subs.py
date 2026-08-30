@@ -228,3 +228,113 @@ async def test_cmd_start_escapes_html_names_in_both_branches(
     else:
         assert saved == [{555: subscriber_name}]
         backup.assert_awaited_once_with(msg.bot, 555, subscriber_name, subscribed=True)
+
+
+@pytest.mark.parametrize("already_subscribed", [True, False])
+@pytest.mark.asyncio
+async def test_inline_search_deep_link_adds_only_manual_return_button(
+    monkeypatch,
+    already_subscribed,
+):
+    initial = {555: "Morpheus"} if already_subscribed else {}
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: initial.copy())
+    monkeypatch.setattr(handlers, "save_subscribers", MagicMock())
+    monkeypatch.setattr(handlers, "_backup_after_subscription", AsyncMock())
+    search_service = MagicMock()
+    monkeypatch.setattr(handlers, "_inline_search_service", search_service)
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+    msg.bot = MagicMock()
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_start(msg, MagicMock(args="inline_search"))
+
+    keyboard = msg.answer.await_args.kwargs["reply_markup"]
+    button = keyboard.inline_keyboard[0][0]
+    assert button.text == "Вернуться к поиску"
+    assert button.switch_inline_query == ""
+    assert button.switch_inline_query_current_chat is None
+    assert search_service.method_calls == []
+
+
+@pytest.mark.asyncio
+async def test_inline_search_parameter_in_group_keeps_ordinary_start_response(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {-100: "Group"})
+    save = MagicMock()
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "save_subscribers", save)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    msg = MagicMock()
+    msg.chat.id = -100
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_start(msg, MagicMock(args="inline_search"))
+
+    assert msg.answer.await_args.kwargs == {"parse_mode": ParseMode.HTML}
+    save.assert_not_called()
+    backup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inline_limit_deep_link_explains_and_changes_no_subscription_state(
+    monkeypatch,
+):
+    load = MagicMock()
+    save = MagicMock()
+    backup = AsyncMock()
+    polling = MagicMock()
+    search_service = MagicMock()
+    monkeypatch.setattr(handlers, "load_subscribers", load)
+    monkeypatch.setattr(handlers, "save_subscribers", save)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    monkeypatch.setattr(handlers, "start_polling_loop", polling)
+    monkeypatch.setattr(handlers, "_inline_search_service", search_service)
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_start(msg, MagicMock(args="inline_search_limit"))
+
+    text = msg.answer.await_args.args[0]
+    assert "Shikimori попросил сделать паузу" in text
+    assert "меньше чем через минуту" in text
+    keyboard = msg.answer.await_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].switch_inline_query == ""
+    load.assert_not_called()
+    save.assert_not_called()
+    backup.assert_not_awaited()
+    polling.assert_not_called()
+    assert search_service.method_calls == []
+
+
+@pytest.mark.asyncio
+async def test_info_deep_link_is_private_read_only_and_does_not_subscribe(
+    monkeypatch,
+):
+    send_info = AsyncMock()
+    load = MagicMock()
+    save = MagicMock()
+    backup = AsyncMock()
+    polling = MagicMock()
+    search_service = MagicMock()
+    monkeypatch.setattr(handlers, "_send_info", send_info)
+    monkeypatch.setattr(handlers, "load_subscribers", load)
+    monkeypatch.setattr(handlers, "save_subscribers", save)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    monkeypatch.setattr(handlers, "start_polling_loop", polling)
+    monkeypatch.setattr(handlers, "_inline_search_service", search_service)
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Morpheus", id=555)
+
+    await handlers.cmd_start(msg, MagicMock(args="info"))
+
+    send_info.assert_awaited_once_with(msg)
+    load.assert_not_called()
+    save.assert_not_called()
+    backup.assert_not_awaited()
+    polling.assert_not_called()
+    assert search_service.method_calls == []
