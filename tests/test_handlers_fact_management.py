@@ -75,6 +75,11 @@ def _callback(data, *, owner=True):
     )
 
 
+def _menu_callback_data(message) -> list[str]:
+    keyboard = message.reply.await_args.kwargs["reply_markup"]
+    return [row[0].callback_data for row in keyboard.inline_keyboard]
+
+
 async def _publish(raw: bytes):
     document = fact_bank.parse_fact_bank_bytes(raw)
     return await fact_bank.publish_fact_bank(
@@ -128,6 +133,11 @@ async def test_facts_status_reports_missing_valid_empty_and_invalid_file(fact_ba
     await handlers.cmd_facts(message, state)
     assert "файл ещё не создан" in message.reply.await_args.args[0]
     assert f"Встроенных: <b>{len(INLINE_FACTS)}</b>" in message.reply.await_args.args[0]
+    assert _menu_callback_data(message) == [
+        "facts:upload",
+        "facts:example",
+        "facts:close",
+    ]
 
     fact_bank_env.write_text(
         fact_bank.serialize_fact_bank(fact_bank.empty_fact_bank_document()),
@@ -136,10 +146,29 @@ async def test_facts_status_reports_missing_valid_empty_and_invalid_file(fact_ba
     await handlers.cmd_facts(message, state)
     assert "файл корректен" in message.reply.await_args.args[0]
     assert "Дополнительных: <b>0</b>" in message.reply.await_args.args[0]
+    assert _menu_callback_data(message) == [
+        "facts:upload",
+        "facts:example",
+        "facts:close",
+    ]
 
     fact_bank_env.write_bytes(b"{broken")
     await handlers.cmd_facts(message, state)
     assert "повреждён" in message.reply.await_args.args[0]
+    assert _menu_callback_data(message) == [
+        "facts:upload",
+        "facts:example",
+        "facts:close",
+    ]
+
+    snapshot = await _publish(_payload([_fact("active")]))
+    await handlers.cmd_facts(message, state)
+    assert _menu_callback_data(message) == [
+        "facts:upload",
+        "facts:download",
+        f"facts:ask-clear:{snapshot.revision}",
+        "facts:close",
+    ]
 
 
 @pytest.mark.asyncio
@@ -336,6 +365,42 @@ async def test_download_returns_populated_and_empty_canonical_documents(fact_ban
 
 
 @pytest.mark.asyncio
+async def test_example_button_sends_valid_bundled_five_fact_document(fact_bank_env):
+    callback = _callback("facts:example")
+
+    await handlers.facts_example_cb(callback)
+
+    sent = callback.message.answer_document.await_args.args[0]
+    document = fact_bank.parse_fact_bank_bytes(sent.data)
+    assert sent.filename == "facts.json"
+    assert document.bank_version == "example-1"
+    assert len(document.facts) == 5
+    callback.answer.assert_awaited_once_with("Готовлю пример facts.json...")
+
+
+@pytest.mark.asyncio
+async def test_missing_bundled_example_degrades_to_owner_alert(
+    fact_bank_env,
+    monkeypatch,
+    tmp_path,
+):
+    callback = _callback("facts:example")
+    monkeypatch.setattr(
+        handlers,
+        "FACT_BANK_EXAMPLE_PATH",
+        tmp_path / "missing-facts.json",
+    )
+
+    await handlers.facts_example_cb(callback)
+
+    callback.message.answer_document.assert_not_awaited()
+    callback.answer.assert_awaited_once_with(
+        "Пример facts.json недоступен в этой сборке.",
+        show_alert=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_clear_is_exactly_menu_press_then_one_dynamic_confirmation(
     fact_bank_env,
     monkeypatch,
@@ -458,7 +523,7 @@ async def test_close_clears_fsm_and_removes_owner_menu(fact_bank_env):
 
 
 @pytest.mark.asyncio
-async def test_non_owner_cannot_download_or_clear_fact_bank(fact_bank_env):
+async def test_non_owner_cannot_download_example_or_clear_fact_bank(fact_bank_env):
     snapshot = await _publish(_payload([_fact("protected")]))
     download = _callback("facts:download", owner=False)
     clear = _callback(
@@ -466,8 +531,10 @@ async def test_non_owner_cannot_download_or_clear_fact_bank(fact_bank_env):
         owner=False,
     )
     clear_state = AsyncMock()
+    example = _callback("facts:example", owner=False)
 
     await handlers.facts_download_cb(download)
+    await handlers.facts_example_cb(example)
     await handlers.facts_confirm_clear_cb(clear, clear_state)
 
     download.message.answer_document.assert_not_awaited()
@@ -478,6 +545,11 @@ async def test_non_owner_cannot_download_or_clear_fact_bank(fact_bank_env):
     )
     clear_state.clear.assert_not_awaited()
     clear.answer.assert_awaited_once_with(
+        "🚫 Только для владельца.",
+        show_alert=True,
+    )
+    example.message.answer_document.assert_not_awaited()
+    example.answer.assert_awaited_once_with(
         "🚫 Только для владельца.",
         show_alert=True,
     )

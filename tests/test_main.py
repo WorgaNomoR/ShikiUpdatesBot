@@ -149,6 +149,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.facts_ask_clear_cb in registered_callbacks
     assert main.facts_confirm_clear_cb in registered_callbacks
     assert main.facts_download_cb in registered_callbacks
+    assert main.facts_example_cb in registered_callbacks
     assert main.facts_upload_cb in registered_callbacks
     assert main.facts_cancel_cb in registered_callbacks
     assert main.facts_close_cb in registered_callbacks

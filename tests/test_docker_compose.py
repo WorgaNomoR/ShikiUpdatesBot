@@ -52,9 +52,11 @@ def test_docker_context_keeps_only_runtime_info_asset():
 
     assert relevant == ["assets/*", "!assets/info-preview.png"]
     assert "assets/" not in patterns
+    assert "examples/" not in patterns
 
 
 def test_docker_build_requires_info_preview_in_effective_context():
     instructions = DOCKERFILE_PATH.read_text(encoding="utf-8").splitlines()
 
     assert "RUN test -f /app/assets/info-preview.png" in instructions
+    assert "RUN test -f /app/examples/facts.json" in instructions

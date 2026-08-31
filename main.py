@@ -67,6 +67,7 @@ from handlers import (
     facts_close_cb,
     facts_confirm_clear_cb,
     facts_download_cb,
+    facts_example_cb,
     facts_receive,
     facts_upload_cb,
     probe_owner_and_start,
@@ -149,6 +150,7 @@ async def main() -> None:
     )
     dp.callback_query.register(facts_upload_cb, F.data == "facts:upload")
     dp.callback_query.register(facts_download_cb, F.data == "facts:download")
+    dp.callback_query.register(facts_example_cb, F.data == "facts:example")
     dp.callback_query.register(facts_cancel_cb, F.data == "facts:cancel")
     dp.callback_query.register(facts_close_cb, F.data == "facts:close")
     dp.callback_query.register(

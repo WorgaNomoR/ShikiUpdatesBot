@@ -190,6 +190,7 @@ _FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
 FACTS_APPLY_CALLBACK_PREFIX = "facts:apply:"
 FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
 FACTS_CONFIRM_CLEAR_CALLBACK_PREFIX = "facts:confirm-clear:"
+FACT_BANK_EXAMPLE_PATH = RESOURCE_ROOT / "examples" / "facts.json"
 INFO_PREVIEW_PATH = RESOURCE_ROOT / "assets" / "info-preview.png"
 _info_preview_file_id: str | None = None
 _status_cache: tuple[list[dict], list[dict]] | None = None
@@ -1547,22 +1548,25 @@ def _facts_status_text(
 
 def _facts_menu_keyboard(snapshot: FactBankSnapshot) -> InlineKeyboardMarkup:
     """Собрать скрытое owner-only меню без кнопки очистки пустого банка."""
-    rows = [
-        [InlineKeyboardButton(
-            text="📤 Загрузить дополнительные",
-            callback_data="facts:upload",
-        )],
-        [InlineKeyboardButton(
+    rows = [[InlineKeyboardButton(
+        text="📤 Загрузить дополнительные",
+        callback_data="facts:upload",
+    )]]
+    if snapshot.additional_facts:
+        rows.append([InlineKeyboardButton(
             text="📥 Скачать дополнительные",
             callback_data="facts:download",
-        )],
-    ]
-    if snapshot.additional_facts:
+        )])
         rows.append([InlineKeyboardButton(
             text="🗑 Очистить дополнительные",
             callback_data=(
                 f"{FACTS_ASK_CLEAR_CALLBACK_PREFIX}{snapshot.revision}"
             ),
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
+            text="📄 Скачать пример facts.json",
+            callback_data="facts:example",
         )])
     rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="facts:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1836,6 +1840,35 @@ async def facts_download_cb(callback: CallbackQuery) -> None:
     await callback.message.answer_document(
         BufferedInputFile(payload, filename="facts.json"),
         caption="💡 Канонический дополнительный банк фактов.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def facts_example_cb(callback: CallbackQuery) -> None:
+    """Отправить владельцу встроенный валидный пример дополнительного банка."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("Меню устарело. Отправь /facts ещё раз.", show_alert=True)
+        return
+    try:
+        example = parse_fact_bank_bytes(FACT_BANK_EXAMPLE_PATH.read_bytes())
+        payload = serialize_fact_bank(example).encode("utf-8")
+    except (FactBankValidationError, OSError) as e:
+        log.error("facts: встроенный пример недоступен: %s", e)
+        await callback.answer(
+            "Пример facts.json недоступен в этой сборке.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Готовлю пример facts.json...")
+    await callback.message.answer_document(
+        BufferedInputFile(payload, filename="facts.json"),
+        caption=(
+            "💡 Готовый пример из пяти фактов. Его можно отредактировать и "
+            "загрузить через /facts."
+        ),
         parse_mode=ParseMode.HTML,
     )
 

@@ -96,6 +96,7 @@ datas += copy_metadata("aiogram")
 datas += copy_metadata("aiohttp")
 datas += copy_metadata("pytrovich")
 datas.append((str(root / "assets" / "info-preview.png"), "assets"))
+datas.append((str(root / "examples" / "facts.json"), "examples"))
 
 a = Analysis(
     [str(root / "launcher.py")],
