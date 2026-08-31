@@ -34,8 +34,12 @@ def _fact(fact_id="extra-one", text="Дополнительный факт."):
     return {"id": fact_id, "text": text}
 
 
-def _message(*, owner=True, raw=None, file_size=_UNSET):
-    bot = SimpleNamespace(download=AsyncMock())
+def _message(*, owner=True, raw=None, file_size=_UNSET, file_name="facts.json"):
+    bot = SimpleNamespace(
+        delete_message=AsyncMock(),
+        download=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
     if raw is not None:
         async def download(document, destination):
             destination.write(raw)
@@ -44,7 +48,7 @@ def _message(*, owner=True, raw=None, file_size=_UNSET):
     document = None
     if raw is not None or file_size is not _UNSET:
         document = SimpleNamespace(
-            file_name="facts.json",
+            file_name=file_name,
             file_size=len(raw) if file_size is _UNSET else file_size,
         )
     return SimpleNamespace(
@@ -199,11 +203,16 @@ async def test_invalid_upload_preserves_disk_snapshot_and_waiting_state(
     old_file = fact_bank_env.read_bytes()
     message = _message(raw=b"{broken")
     state = AsyncMock()
-    monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
+    state.get_data.return_value = {"prompt_msg_id": 77}
+    deleted = AsyncMock()
+    monkeypatch.setattr(handlers, "_safe_delete", deleted)
 
     await handlers.facts_receive(message, state)
 
-    assert "не прошёл проверку" in message.answer.await_args.args[0]
+    text = message.bot.edit_message_text.await_args.kwargs["text"]
+    assert "не прошёл проверку" in text
+    message.answer.assert_not_awaited()
+    deleted.assert_awaited_once_with(message.bot, 55, 66)
     assert fact_bank_env.read_bytes() == old_file
     assert fact_bank.get_fact_bank_snapshot() == before
     state.set_state.assert_not_awaited()
@@ -217,11 +226,47 @@ async def test_upload_rejects_unknown_or_oversized_document_before_download(
 ):
     message = _message(raw=b"{}", file_size=file_size)
     state = AsyncMock()
+    state.get_data.return_value = {"prompt_msg_id": 77}
 
     await handlers.facts_receive(message, state)
 
     message.bot.download.assert_not_awaited()
-    assert "512 КиБ" in message.answer.await_args.args[0]
+    assert "512 КиБ" in message.bot.edit_message_text.await_args.kwargs["text"]
+    message.bot.delete_message.assert_awaited_once_with(55, 66)
+    message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_upload_accepts_copy_filename_and_rejects_non_json_without_clutter(
+    fact_bank_env,
+):
+    valid_copy = _message(
+        raw=_payload([_fact("copy-name")]),
+        file_name="facts — копия.JSON",
+    )
+    valid_state = AsyncMock()
+    valid_state.get_data.return_value = {
+        "prompt_msg_id": 77,
+        "command_msg_id": 44,
+    }
+
+    await handlers.facts_receive(valid_copy, valid_state)
+
+    valid_copy.bot.download.assert_awaited_once()
+    assert "Предпросмотр замены" in valid_copy.answer.await_args.args[0]
+
+    wrong_type = _message(raw=b"{}", file_name="facts.txt")
+    wrong_state = AsyncMock()
+    wrong_state.get_data.return_value = {"prompt_msg_id": 91}
+
+    await handlers.facts_receive(wrong_type, wrong_state)
+
+    wrong_type.bot.download.assert_not_awaited()
+    wrong_type.bot.delete_message.assert_awaited_once_with(55, 66)
+    wrong_type.answer.assert_not_awaited()
+    assert "<code>.json</code>" in (
+        wrong_type.bot.edit_message_text.await_args.kwargs["text"]
+    )
 
 
 @pytest.mark.asyncio

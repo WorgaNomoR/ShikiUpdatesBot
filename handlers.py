@@ -1654,7 +1654,8 @@ async def facts_upload_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(FactsStates.waiting_upload_file)
     prompt = await _safe_facts_edit(
         callback.message,
-        "📤 Пришли <b>facts.json</b> как файл-документ.\n\n"
+        "📤 Пришли <b>JSON-файл</b> дополнительных фактов как документ. "
+        "Имя может быть любым, расширение — <code>.json</code>.\n\n"
         "Сначала проверю весь файл и покажу изменения. Диск и активный банк "
         "поменяются только после кнопки «Применить».\n\n/cancel — отмена",
     )
@@ -1674,15 +1675,47 @@ async def facts_upload_cb(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
+async def _reject_facts_upload(
+    message: Message,
+    state: FSMContext,
+    text: str,
+) -> None:
+    """Удалить отклонённую попытку и переиспользовать один upload-промпт."""
+    data = await state.get_data()
+    await _safe_delete(message.bot, message.chat.id, message.message_id)
+    prompt_id = data.get("prompt_msg_id")
+    if isinstance(prompt_id, int) and prompt_id > 0:
+        try:
+            await message.bot.edit_message_text(
+                text=text,
+                chat_id=message.chat.id,
+                message_id=prompt_id,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).casefold():
+                return
+            log.debug("facts: не удалось переиспользовать upload-промпт: %s", e)
+        except Exception as e:
+            log.warning(
+                "facts: не удалось обновить upload-промпт (%s)",
+                type(e).__name__,
+            )
+    fallback = await message.answer(text, parse_mode=ParseMode.HTML)
+    await state.update_data(prompt_msg_id=fallback.message_id)
+
+
 async def facts_receive(message: Message, state: FSMContext) -> None:
     """Проверить загруженный JSON и показать replacement-preview без мутации."""
     if message.from_user is None or message.from_user.id != OWNER_ID:
         return
     document = message.document
-    if not document or (document.file_name or "").casefold() != "facts.json":
-        await message.answer(
-            "📎 Жду файл с точным именем <b>facts.json</b>. Или /cancel.",
-            parse_mode=ParseMode.HTML,
+    if not document or not (document.file_name or "").casefold().endswith(".json"):
+        await _reject_facts_upload(
+            message,
+            state,
+            "📎 Жду файл-документ с расширением <code>.json</code>. Или /cancel.",
         )
         return
     file_size = document.file_size
@@ -1692,10 +1725,11 @@ async def facts_receive(message: Message, state: FSMContext) -> None:
         or file_size < 0
         or file_size > FACT_BANK_MAX_BYTES
     ):
-        await message.answer(
-            "📦 facts.json должен иметь известный размер не больше "
+        await _reject_facts_upload(
+            message,
+            state,
+            "📦 JSON-файл должен иметь известный размер не больше "
             f"<b>{FACT_BANK_MAX_BYTES // 1024} КиБ</b>.",
-            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -1704,17 +1738,19 @@ async def facts_receive(message: Message, state: FSMContext) -> None:
         await message.bot.download(document, destination=buffer)
         candidate = parse_fact_bank_bytes(buffer.getvalue())
     except FactBankValidationError as e:
-        await message.answer(
+        await _reject_facts_upload(
+            message,
+            state,
             "❌ <b>Файл не прошёл проверку</b>\n\n"
             f"{h(str(e))}\n\nИсправь файл и пришли его снова. Или /cancel.",
-            parse_mode=ParseMode.HTML,
         )
         return
     except Exception as e:
         log.warning("facts: не удалось скачать файл-кандидат: %s", e)
-        await message.answer(
-            "❌ Не удалось скачать facts.json. Попробуй ещё раз. Или /cancel.",
-            parse_mode=ParseMode.HTML,
+        await _reject_facts_upload(
+            message,
+            state,
+            "❌ Не удалось скачать JSON-файл. Попробуй ещё раз. Или /cancel.",
         )
         return
 
