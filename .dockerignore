@@ -59,3 +59,6 @@ README.md
 README-Windows.txt
 AGENTS.md
 ideas.md
+
+# Встроенный пример банка должен оставаться в Docker-контексте
+!examples/facts.json
