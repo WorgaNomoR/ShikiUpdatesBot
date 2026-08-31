@@ -61,6 +61,7 @@ def _message(*, owner=True, raw=None, file_size=_UNSET):
 def _callback(data, *, owner=True):
     message = SimpleNamespace(
         message_id=77,
+        delete=AsyncMock(),
         edit_text=AsyncMock(return_value=SimpleNamespace(message_id=77)),
         answer_document=AsyncMock(),
         bot=AsyncMock(),
@@ -349,6 +350,7 @@ async def test_download_returns_populated_and_empty_canonical_documents(fact_ban
 
     await handlers.facts_download_cb(callback)
 
+    callback.message.delete.assert_awaited_once_with()
     sent = callback.message.answer_document.await_args.args[0]
     assert sent.filename == "facts.json"
     assert json.loads(sent.data) == {
@@ -358,9 +360,10 @@ async def test_download_returns_populated_and_empty_canonical_documents(fact_ban
     }
 
     fact_bank_env.write_bytes(b"{broken")
-    callback.message.answer_document.reset_mock()
-    await handlers.facts_download_cb(callback)
-    empty = callback.message.answer_document.await_args.args[0]
+    empty_callback = _callback("facts:download")
+    await handlers.facts_download_cb(empty_callback)
+    empty_callback.message.delete.assert_awaited_once_with()
+    empty = empty_callback.message.answer_document.await_args.args[0]
     assert json.loads(empty.data)["facts"] == []
 
 
@@ -370,6 +373,7 @@ async def test_example_button_sends_valid_bundled_five_fact_document(fact_bank_e
 
     await handlers.facts_example_cb(callback)
 
+    callback.message.delete.assert_awaited_once_with()
     sent = callback.message.answer_document.await_args.args[0]
     document = fact_bank.parse_fact_bank_bytes(sent.data)
     assert sent.filename == "facts.json"
@@ -393,11 +397,43 @@ async def test_missing_bundled_example_degrades_to_owner_alert(
 
     await handlers.facts_example_cb(callback)
 
+    callback.message.delete.assert_not_awaited()
     callback.message.answer_document.assert_not_awaited()
     callback.answer.assert_awaited_once_with(
         "Пример facts.json недоступен в этой сборке.",
         show_alert=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_data", ["facts:download", "facts:example"])
+async def test_document_action_consumes_menu_once_and_rejects_replay(
+    fact_bank_env,
+    callback_data,
+):
+    callback = _callback(callback_data)
+    callback.message.delete.side_effect = [
+        None,
+        TelegramBadRequest(
+            method=MagicMock(),
+            message="Bad Request: message to delete not found",
+        ),
+    ]
+
+    handler = (
+        handlers.facts_download_cb
+        if callback_data == "facts:download"
+        else handlers.facts_example_cb
+    )
+    await handler(callback)
+    await handler(callback)
+
+    assert callback.message.delete.await_count == 2
+    callback.message.answer_document.assert_awaited_once()
+    assert callback.answer.await_args_list[-1].args == (
+        "Это меню уже обработано. Отправь /facts ещё раз.",
+    )
+    assert callback.answer.await_args_list[-1].kwargs == {"show_alert": True}
 
 
 @pytest.mark.asyncio
@@ -549,6 +585,8 @@ async def test_non_owner_cannot_download_example_or_clear_fact_bank(fact_bank_en
         show_alert=True,
     )
     example.message.answer_document.assert_not_awaited()
+    download.message.delete.assert_not_awaited()
+    example.message.delete.assert_not_awaited()
     example.answer.assert_awaited_once_with(
         "🚫 Только для владельца.",
         show_alert=True,

@@ -663,6 +663,16 @@ async def _cleanup_inline_menu(message: Message | None) -> None:
             log.debug("_cleanup_inline_menu: не удалось удалить команду: %s", e)
 
 
+async def _claim_inline_menu(message: Message) -> bool:
+    """Одноразово забрать меню для действия, которое нельзя повторять."""
+    try:
+        await message.delete()
+    except Exception as e:
+        log.debug("_claim_inline_menu: меню уже обработано или недоступно: %s", e)
+        return False
+    return True
+
+
 async def stats_menu_cb(callback: CallbackQuery) -> None:
     """
     Обработчик нажатия кнопки в меню /stats.
@@ -1836,6 +1846,12 @@ async def facts_download_cb(callback: CallbackQuery) -> None:
         return
     reload_fact_bank()
     payload = canonical_active_fact_bank().encode("utf-8")
+    if not await _claim_inline_menu(callback.message):
+        await callback.answer(
+            "Это меню уже обработано. Отправь /facts ещё раз.",
+            show_alert=True,
+        )
+        return
     await callback.answer("Готовлю facts.json...")
     await callback.message.answer_document(
         BufferedInputFile(payload, filename="facts.json"),
@@ -1859,6 +1875,12 @@ async def facts_example_cb(callback: CallbackQuery) -> None:
         log.error("facts: встроенный пример недоступен: %s", e)
         await callback.answer(
             "Пример facts.json недоступен в этой сборке.",
+            show_alert=True,
+        )
+        return
+    if not await _claim_inline_menu(callback.message):
+        await callback.answer(
+            "Это меню уже обработано. Отправь /facts ещё раз.",
             show_alert=True,
         )
         return
