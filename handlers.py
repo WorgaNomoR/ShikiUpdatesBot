@@ -1896,7 +1896,14 @@ async def facts_download_cb(callback: CallbackQuery) -> None:
     if callback.message is None:
         await callback.answer("Меню устарело. Отправь /facts ещё раз.", show_alert=True)
         return
-    reload_fact_bank()
+    snapshot = reload_fact_bank()
+    if not snapshot.additional_facts:
+        await callback.answer(
+            "Дополнительных фактов больше нет. Проверь состояние файла.",
+            show_alert=True,
+        )
+        await _facts_edit_status(callback.message)
+        return
     payload = canonical_active_fact_bank().encode("utf-8")
     if not await _claim_inline_menu(callback.message):
         await callback.answer(

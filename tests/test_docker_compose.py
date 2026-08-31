@@ -52,7 +52,12 @@ def test_docker_context_keeps_only_runtime_info_asset():
 
     assert relevant == ["assets/*", "!assets/info-preview.png"]
     assert "assets/" not in patterns
-    assert "examples/" not in patterns
+    examples_patterns = [
+        pattern
+        for pattern in patterns
+        if "examples" in pattern.lstrip("!").strip("/").split("/")
+    ]
+    assert examples_patterns == []
 
 
 def test_docker_build_requires_info_preview_in_effective_context():

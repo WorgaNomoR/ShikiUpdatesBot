@@ -400,7 +400,7 @@ async def test_cancel_and_global_cancel_preserve_candidate_and_active_bank(
 
 
 @pytest.mark.asyncio
-async def test_download_returns_populated_and_empty_canonical_documents(fact_bank_env):
+async def test_download_returns_populated_canonical_document(fact_bank_env):
     await _publish(_payload([_fact("downloaded")], version="download-v1"))
     callback = _callback("facts:download")
 
@@ -415,12 +415,49 @@ async def test_download_returns_populated_and_empty_canonical_documents(fact_ban
         "facts": [{"id": "downloaded", "text": "Дополнительный факт."}],
     }
 
-    fact_bank_env.write_bytes(b"{broken")
-    empty_callback = _callback("facts:download")
-    await handlers.facts_download_cb(empty_callback)
-    empty_callback.message.delete.assert_awaited_once_with()
-    empty = empty_callback.message.answer_document.await_args.args[0]
-    assert json.loads(empty.data)["facts"] == []
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed_file", "status_fragment"),
+    [
+        ("missing", "файл ещё не создан"),
+        ("invalid", "файл не читается или повреждён"),
+        ("empty", "файл корректен"),
+    ],
+)
+async def test_download_rechecks_bank_before_sending_stale_menu_document(
+    fact_bank_env,
+    changed_file,
+    status_fragment,
+):
+    await _publish(_payload([_fact("downloaded")], version="download-v1"))
+    if changed_file == "missing":
+        fact_bank_env.unlink()
+    elif changed_file == "invalid":
+        fact_bank_env.write_bytes(b"{broken")
+    else:
+        fact_bank_env.write_text(
+            fact_bank.serialize_fact_bank(fact_bank.empty_fact_bank_document()),
+            encoding="utf-8",
+        )
+    callback = _callback("facts:download")
+
+    await handlers.facts_download_cb(callback)
+
+    callback.message.delete.assert_not_awaited()
+    callback.message.answer_document.assert_not_awaited()
+    callback.answer.assert_awaited_once_with(
+        "Дополнительных фактов больше нет. Проверь состояние файла.",
+        show_alert=True,
+    )
+    status = callback.message.edit_text.await_args.args[0]
+    assert status_fragment in status
+    keyboard = callback.message.edit_text.await_args.kwargs["reply_markup"]
+    assert [row[0].callback_data for row in keyboard.inline_keyboard] == [
+        "facts:upload",
+        "facts:example",
+        "facts:close",
+    ]
 
 
 @pytest.mark.asyncio
@@ -467,6 +504,8 @@ async def test_document_action_consumes_menu_once_and_rejects_replay(
     fact_bank_env,
     callback_data,
 ):
+    if callback_data == "facts:download":
+        await _publish(_payload([_fact("downloaded")], version="download-v1"))
     callback = _callback(callback_data)
     callback.message.delete.side_effect = [
         None,
