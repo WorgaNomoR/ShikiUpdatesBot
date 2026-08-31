@@ -32,6 +32,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultsButton,
     Message,
+    ReplyParameters,
 )
 
 from access_control import (
@@ -1665,7 +1666,12 @@ async def facts_upload_cb(callback: CallbackQuery, state: FSMContext) -> None:
         )
         return
     await callback.answer()
-    await state.update_data(prompt_msg_id=prompt.message_id)
+    command = callback.message.reply_to_message
+    command_msg_id = command.message_id if command is not None else None
+    await state.update_data(
+        prompt_msg_id=prompt.message_id,
+        command_msg_id=command_msg_id,
+    )
 
 
 async def facts_receive(message: Message, state: FSMContext) -> None:
@@ -1717,6 +1723,7 @@ async def facts_receive(message: Message, state: FSMContext) -> None:
     canonical = serialize_fact_bank(candidate)
     candidate_revision = fact_bank_candidate_revision(candidate)
     fsm = await state.get_data()
+    command_msg_id = fsm.get("command_msg_id")
     prompt_id = fsm.get("prompt_msg_id")
     if prompt_id is not None:
         await _safe_delete(message.bot, message.chat.id, prompt_id)
@@ -1725,6 +1732,14 @@ async def facts_receive(message: Message, state: FSMContext) -> None:
         await _safe_delete(message.bot, message.chat.id, control_id)
     await _safe_delete(message.bot, message.chat.id, message.message_id)
     await state.set_state(FactsStates.waiting_apply_confirmation)
+    reply_parameters = (
+        ReplyParameters(
+            message_id=command_msg_id,
+            allow_sending_without_reply=True,
+        )
+        if isinstance(command_msg_id, int) and command_msg_id > 0
+        else None
+    )
     preview = await message.answer(
         "🔎 <b>Предпросмотр замены</b>\n\n"
         f"Версия: <code>{h(candidate.bank_version or '—')}</code>\n"
@@ -1744,6 +1759,7 @@ async def facts_receive(message: Message, state: FSMContext) -> None:
             ),
             InlineKeyboardButton(text="❌ Отмена", callback_data="facts:cancel"),
         ]]),
+        reply_parameters=reply_parameters,
     )
     await state.update_data(
         prompt_msg_id=prompt_id,

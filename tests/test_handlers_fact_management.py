@@ -176,6 +176,7 @@ async def test_facts_status_reports_missing_valid_empty_and_invalid_file(fact_ba
 async def test_upload_callback_enters_fsm_and_promises_preview(fact_bank_env):
     state = AsyncMock()
     callback = _callback("facts:upload")
+    callback.message.reply_to_message = SimpleNamespace(message_id=44)
 
     await handlers.facts_upload_cb(callback, state)
 
@@ -183,7 +184,10 @@ async def test_upload_callback_enters_fsm_and_promises_preview(fact_bank_env):
     text = callback.message.edit_text.await_args.args[0]
     assert "Применить" in text
     assert "/cancel" in text
-    state.update_data.assert_awaited_once_with(prompt_msg_id=77)
+    state.update_data.assert_awaited_once_with(
+        prompt_msg_id=77,
+        command_msg_id=44,
+    )
 
 
 @pytest.mark.asyncio
@@ -235,7 +239,11 @@ async def test_upload_preview_has_independent_delta_and_does_not_mutate(
     ], version="preview-v2")
     message = _message(raw=candidate)
     state = AsyncMock()
-    state.get_data.return_value = {"prompt_msg_id": 77, "control_msg_id": 88}
+    state.get_data.return_value = {
+        "prompt_msg_id": 77,
+        "control_msg_id": 88,
+        "command_msg_id": 44,
+    }
     deleted = AsyncMock()
     monkeypatch.setattr(handlers, "_safe_delete", deleted)
 
@@ -260,6 +268,9 @@ async def test_upload_preview_has_independent_delta_and_does_not_mutate(
         f"{handlers.FACTS_APPLY_CALLBACK_PREFIX}{before.revision}:"
         f"{saved['candidate_revision']}"
     )
+    reply_parameters = message.answer.await_args.kwargs["reply_parameters"]
+    assert reply_parameters.message_id == 44
+    assert reply_parameters.allow_sending_without_reply is True
     deleted.assert_any_await(message.bot, 55, 77)
     deleted.assert_any_await(message.bot, 55, 88)
     deleted.assert_any_await(message.bot, 55, 66)
