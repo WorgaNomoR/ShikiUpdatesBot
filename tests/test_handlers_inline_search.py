@@ -11,6 +11,7 @@ from unittest.mock import (
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 
+import fact_bank
 import handlers
 from inline_search import (
     InlineSearchLimitExceeded,
@@ -39,6 +40,32 @@ def _inline_query(
         ),
         answer=AsyncMock(),
     )
+
+
+@pytest.mark.asyncio
+async def test_exact_share_query_resolves_additional_fact_without_media_side_effects(
+    fact_bank_env,
+    monkeypatch,
+):
+    document = fact_bank.parse_fact_bank_bytes(
+        b'{"schema_version":1,"bank_version":"combined","facts":['
+        b'{"id":"external-share","text":"Additional shared fact."}]}'
+    )
+    fact_bank.activate_restored_fact_bank(document)
+    inline_query = _inline_query(query="fact:external-share")
+    entitlement = MagicMock(side_effect=AssertionError("прочитана подписка"))
+    service = _service()
+    monkeypatch.setattr(handlers, "inline_access_status", entitlement)
+    monkeypatch.setattr(handlers, "_inline_search_service", service)
+
+    await handlers.cmd_inline_search(inline_query)
+
+    result = inline_query.answer.await_args.args[0][0]
+    assert result.id == "fact:1:external-share"
+    assert "Additional shared fact." in result.input_message_content.message_text
+    entitlement.assert_not_called()
+    service.debounce.assert_not_awaited()
+    service.get_page.assert_not_awaited()
 
 
 @pytest.mark.asyncio

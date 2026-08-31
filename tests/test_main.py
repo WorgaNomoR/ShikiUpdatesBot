@@ -19,6 +19,9 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     reconcile_access = AsyncMock(
         side_effect=lambda: registration_order.append("access-recovery")
     )
+    reload_facts = MagicMock(
+        side_effect=lambda: registration_order.append("facts-reload")
+    )
     message_register = MagicMock(
         side_effect=lambda *args, **kwargs: registration_order.append("handler")
     )
@@ -44,6 +47,7 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     monkeypatch.setattr(main, "Dispatcher", lambda storage: dispatcher)
     monkeypatch.setattr(main, "MemoryStorage", lambda: object())
     monkeypatch.setattr(main, "reconcile_blocked_subscribers", reconcile_access)
+    monkeypatch.setattr(main, "reload_fact_bank", reload_facts)
     monkeypatch.setattr(main, "probe_owner_and_start", probe)
     monkeypatch.setattr(main, "start_health_server", health)
     monkeypatch.setattr(main, "start_update_loop", start_updates)
@@ -59,6 +63,7 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
         guard_factory=guard_factory,
         registration_order=registration_order,
         reconcile_access=reconcile_access,
+        reload_facts=reload_facts,
     )
 
 
@@ -88,6 +93,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     ]
     assert main.cmd_info in registered_messages
     assert main.cmd_fact in registered_messages
+    assert main.cmd_facts in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
     app.dispatcher.inline_query.register.assert_called_once_with(
@@ -103,7 +109,33 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert isinstance(blocklist_filter, main.Command)
     assert blocklist_filter.commands == ("blocklist",)
     assert "blocklist" not in public_commands
-    assert app.registration_order[:2] == ["access-recovery", "middleware"]
+    assert "facts" not in public_commands
+    facts_registrations = [
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.cmd_facts
+    ]
+    assert len(facts_registrations) == 1
+    facts_filter = facts_registrations[0].args[1]
+    assert isinstance(facts_filter, main.Command)
+    assert facts_filter.commands == ("facts",)
+    facts_receive_registration = next(
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.facts_receive
+    )
+    facts_state_filter = facts_receive_registration.args[1]
+    assert isinstance(facts_state_filter, main.StateFilter)
+    assert facts_state_filter.states == (
+        main.FactsStates.waiting_upload_file,
+        main.FactsStates.waiting_apply_confirmation,
+    )
+    assert app.registration_order[:3] == [
+        "facts-reload",
+        "access-recovery",
+        "middleware",
+    ]
+    app.reload_facts.assert_called_once_with()
     app.reconcile_access.assert_awaited_once_with()
     middleware = app.dispatcher.update.outer_middleware.call_args.args[0]
     assert isinstance(middleware, main.AccessControlMiddleware)
@@ -113,6 +145,24 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     ]
     assert main.version_refresh_cb in registered_callbacks
     assert main.fact_next_cb in registered_callbacks
+    assert main.facts_apply_cb in registered_callbacks
+    assert main.facts_ask_clear_cb in registered_callbacks
+    assert main.facts_confirm_clear_cb in registered_callbacks
+    assert main.facts_download_cb in registered_callbacks
+    assert main.facts_upload_cb in registered_callbacks
+    assert main.facts_cancel_cb in registered_callbacks
+    assert main.facts_close_cb in registered_callbacks
+    facts_apply_registration = next(
+        call
+        for call in app.dispatcher.callback_query.register.call_args_list
+        if call.args[0] is main.facts_apply_cb
+    )
+    assert facts_apply_registration.args[1].resolve(
+        SimpleNamespace(data="facts:apply:0123456789abcdef:fedcba9876543210")
+    ) is True
+    assert facts_apply_registration.args[1].resolve(
+        SimpleNamespace(data="facts:download")
+    ) is False
     fact_registration = next(
         call
         for call in app.dispatcher.callback_query.register.call_args_list

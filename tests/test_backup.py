@@ -23,6 +23,7 @@ import aiohttp
 import pytest
 
 import backup
+import fact_bank
 import handlers
 import storage
 
@@ -937,3 +938,137 @@ async def test_restore_rolls_back_blocked_users_if_subscriber_publication_fails(
 
     assert storage.load_blocked_users() == {1}
     assert storage.load_subscribers() == {2: "Old"}
+
+
+def _facts_payload(fact_id: str | None, *, version="backup-test") -> str:
+    facts = [] if fact_id is None else [{"id": fact_id, "text": "Факт из архива."}]
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "bank_version": version if facts else None,
+            "facts": facts,
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_backup_export_includes_facts_json(backup_env):
+    (backup_env / "facts.json").write_text(
+        _facts_payload("exported-fact"),
+        encoding="utf-8",
+    )
+
+    names = set(zipfile.ZipFile(io.BytesIO(backup._build_backup_zip())).namelist())
+
+    assert "facts.json" in names
+    assert backup._is_allowed_import_member("facts.json") is True
+
+
+@pytest.mark.asyncio
+async def test_valid_fact_restore_is_canonical_and_immediately_active(backup_env):
+    result = await backup.restore_backup_zip(
+        _zip_bytes({"facts.json": _facts_payload("restored-fact")})
+    )
+
+    assert result == {"restored": ["facts.json"], "skipped": []}
+    snapshot = fact_bank.get_fact_bank_snapshot()
+    assert [fact.id for fact in snapshot.additional_facts] == ["restored-fact"]
+    assert (backup_env / "facts.json").read_text(encoding="utf-8") == (
+        fact_bank.canonical_active_fact_bank()
+    )
+
+
+@pytest.mark.asyncio
+async def test_valid_empty_fact_restore_activates_base_only_state(backup_env):
+    current = fact_bank.parse_fact_bank_bytes(
+        _facts_payload("current-fact").encode("utf-8")
+    )
+    fact_bank.activate_restored_fact_bank(current)
+
+    await backup.restore_backup_zip(
+        _zip_bytes({"facts.json": _facts_payload(None)})
+    )
+
+    snapshot = fact_bank.get_fact_bank_snapshot()
+    assert snapshot.additional_facts == ()
+    assert snapshot.file_state == fact_bank.FACT_FILE_VALID
+
+
+@pytest.mark.asyncio
+async def test_invalid_fact_restore_rejects_entire_candidate_without_changes(backup_env):
+    storage.save_stats_current({"period": "2026-Q1", "events": []})
+    current = fact_bank.parse_fact_bank_bytes(
+        _facts_payload("current-fact").encode("utf-8")
+    )
+    fact_bank._atomic_write(backup_env / "facts.json", fact_bank.serialize_fact_bank(current))
+    before = fact_bank.reload_fact_bank()
+
+    raw = _zip_bytes({
+        "stats_current.json": '{"period": "2026-Q2", "events": []}',
+        "facts.json": '{"schema_version": 99, "bank_version": null, "facts": []}',
+    })
+    with pytest.raises(ValueError, match="facts.json"):
+        await backup.restore_backup_zip(raw)
+
+    assert storage.load_stats_current()["period"] == "2026-Q1"
+    assert fact_bank.get_fact_bank_snapshot() == before
+    assert "current-fact" in (backup_env / "facts.json").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_fact_restore_propagates_configuration_failure(backup_env, monkeypatch):
+    with monkeypatch.context() as fact_config:
+        fact_config.setattr(fact_bank, "_base_facts", ())
+        with pytest.raises(RuntimeError, match="ещё не настроена"):
+            await backup.restore_backup_zip(
+                _zip_bytes({"facts.json": _facts_payload("candidate-fact")})
+            )
+
+
+@pytest.mark.asyncio
+async def test_legacy_archive_without_facts_leaves_current_bank_unchanged(backup_env):
+    current = fact_bank.parse_fact_bank_bytes(
+        _facts_payload("current-fact").encode("utf-8")
+    )
+    fact_bank._atomic_write(backup_env / "facts.json", fact_bank.serialize_fact_bank(current))
+    before = fact_bank.reload_fact_bank()
+
+    result = await backup.restore_backup_zip(
+        _zip_bytes({"stats_current.json": '{"period": "2026-Q2", "events": []}'})
+    )
+
+    assert result["restored"] == ["stats_current.json"]
+    assert fact_bank.get_fact_bank_snapshot() == before
+
+
+@pytest.mark.asyncio
+async def test_fact_snapshot_is_unchanged_when_restore_publication_rolls_back(
+    backup_env,
+    monkeypatch,
+):
+    current = fact_bank.parse_fact_bank_bytes(
+        _facts_payload("current-fact").encode("utf-8")
+    )
+    fact_bank._atomic_write(backup_env / "facts.json", fact_bank.serialize_fact_bank(current))
+    before = fact_bank.reload_fact_bank()
+    raw = _zip_bytes({
+        "facts.json": _facts_payload("candidate-fact"),
+        "stats_current.json": '{"period": "2026-Q2", "events": []}',
+    })
+    real_publish = backup._publish_staged_file
+    calls = 0
+
+    def fail_second_publish(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("disk failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(backup, "_publish_staged_file", fail_second_publish)
+
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        await backup.restore_backup_zip(raw)
+
+    assert fact_bank.get_fact_bank_snapshot() == before
+    assert "current-fact" in (backup_env / "facts.json").read_text(encoding="utf-8")

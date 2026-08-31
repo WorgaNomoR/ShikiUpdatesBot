@@ -4,6 +4,7 @@
 
 import pytest
 
+import fact_bank
 from inline_facts import (
     FACT_QUERY_MATCH,
     FACT_QUERY_REJECT,
@@ -125,3 +126,22 @@ def test_public_selection_is_stable_and_next_rotation_never_repeats_current():
 def test_next_rotation_rejects_unknown_fact_id():
     with pytest.raises(ValueError, match="идентификатор"):
         select_next_fact("forged")
+
+
+def test_combined_snapshot_drives_share_selection_next_and_full_cycle(fact_bank_env):
+    document = fact_bank.parse_fact_bank_bytes(
+        b'{"schema_version":1,"bank_version":"combined","facts":['
+        b'{"id":"external-fact","text":"External fact."}]}'
+    )
+    fact_bank.activate_restored_fact_bank(document)
+    combined = fact_bank.get_fact_bank_snapshot().facts
+
+    expected_size = len(INLINE_FACTS) + len(document.facts)
+    assert len(combined) == expected_size
+    assert fact_from_share_query("fact:external-fact") == document.facts[0]
+    assert select_next_fact(INLINE_FACTS[-1].id) == document.facts[0]
+    cycle = [
+        select_inline_fact("combined-seed", page=page)
+        for page in range(2, 2 + len(combined))
+    ]
+    assert len({fact.id for fact in cycle}) == expected_size
