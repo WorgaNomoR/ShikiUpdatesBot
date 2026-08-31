@@ -11,6 +11,7 @@ from unittest.mock import (
 import pytest
 from aiogram.enums import ParseMode
 
+import fact_bank
 import handlers
 from inline_facts import INLINE_FACTS
 
@@ -54,7 +55,9 @@ async def test_fact_is_public_for_non_subscriber_and_owner_without_entitlement(
         MagicMock(side_effect=AssertionError("fact прочитал подписчиков")),
     )
     message = _message(user_id=user_id)
-    expected = handlers.select_fact(f"{user_id}\0{message.message_id}")
+    expected = handlers.select_fact(
+        handlers._fact_message_seed(user_id, message.message_id)
+    )
 
     await handlers.cmd_fact(message)
 
@@ -117,3 +120,29 @@ async def test_forged_next_fact_callback_is_acknowledged_without_editing():
         show_alert=True,
     )
     callback.message.edit_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_command_and_next_button_use_combined_runtime_snapshot(fact_bank_env):
+    document = fact_bank.parse_fact_bank_bytes(
+        b'{"schema_version":1,"bank_version":"combined","facts":['
+        b'{"id":"external-command","text":"Additional command fact."}]}'
+    )
+    fact_bank.activate_restored_fact_bank(document)
+    message_id = None
+    for candidate in range(1, 10_000):
+        seed = handlers._fact_message_seed(777, candidate)
+        if handlers.select_fact(seed).id == "external-command":
+            message_id = candidate
+            break
+    if message_id is None:
+        pytest.fail("не найдено зерно /fact для дополнительного факта")
+    message = _message(message_id=message_id)
+
+    await handlers.cmd_fact(message)
+
+    assert "Additional command fact." in message.answer.await_args.args[0]
+
+    callback = _callback(INLINE_FACTS[-1].id)
+    await handlers.fact_next_cb(callback)
+    assert "Additional command fact." in callback.message.edit_text.await_args.args[0]

@@ -63,12 +63,15 @@ def _no_throttle(monkeypatch):
 @pytest.fixture
 def backup_env(tmp_path, monkeypatch):
     """Редиректим пути состояния в tmp_path, чтобы тесты не трогали /data."""
+    import fact_bank
     import stats
     import storage
     data = tmp_path / "data"
     quarters = data / "quarters"
     quarters.mkdir(parents=True)
     monkeypatch.setattr("backup.DATA_DIR", data)
+    original_facts_file = fact_bank.FACTS_FILE
+    monkeypatch.setattr(fact_bank, "FACTS_FILE", data / "facts.json")
     monkeypatch.setattr(storage, "SUBS_FILE", data / "subscribers.json")
     monkeypatch.setattr(storage, "BLOCKED_USERS_FILE", data / "blocked_users.json")
     monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
@@ -80,4 +83,21 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr("handlers.OWNER_ID", 999)
     monkeypatch.setattr("backup.OWNER_ID", 999)
     monkeypatch.setattr(storage, "OWNER_ID", 999)
-    return data
+    fact_bank.reload_fact_bank()
+    yield data
+    monkeypatch.setattr(fact_bank, "FACTS_FILE", original_facts_file)
+    fact_bank.reload_fact_bank()
+
+
+@pytest.fixture
+def fact_bank_env(tmp_path, monkeypatch):
+    """Изолировать facts.json и process-local snapshot для focused-тестов."""
+    import fact_bank
+
+    original_facts_file = fact_bank.FACTS_FILE
+    facts_file = tmp_path / "facts.json"
+    monkeypatch.setattr(fact_bank, "FACTS_FILE", facts_file)
+    fact_bank.reload_fact_bank()
+    yield facts_file
+    monkeypatch.setattr(fact_bank, "FACTS_FILE", original_facts_file)
+    fact_bank.reload_fact_bank()

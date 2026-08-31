@@ -225,6 +225,7 @@ seen_favourites.json
 stats_all.json
 stats_current.json
 update_state.json
+/facts.json
 quarters/
 
 # Локальные данные при монтировании ./data (Docker / DATA_DIR)

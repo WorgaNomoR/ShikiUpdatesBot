@@ -13,7 +13,10 @@ from aiogram import (
     Dispatcher,
     F,
 )
-from aiogram.filters import Command
+from aiogram.filters import (
+    Command,
+    StateFilter,
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
@@ -25,9 +28,14 @@ from config import (
     DISPLAY_NAME,
     log,
 )
+from fact_bank import reload_fact_bank
 from handlers import (
+    FACTS_APPLY_CALLBACK_PREFIX,
+    FACTS_ASK_CLEAR_CALLBACK_PREFIX,
+    FACTS_CONFIRM_CLEAR_CALLBACK_PREFIX,
     BackupStates,
     BroadcastStates,
+    FactsStates,
     backup_close_cb,
     backup_export_cb,
     backup_import_cb,
@@ -41,6 +49,7 @@ from handlers import (
     cmd_broadcast,
     cmd_cancel,
     cmd_fact,
+    cmd_facts,
     cmd_favs,
     cmd_info,
     cmd_inline_search,
@@ -52,6 +61,15 @@ from handlers import (
     cmd_unblock,
     cmd_version,
     fact_next_cb,
+    facts_apply_cb,
+    facts_ask_clear_cb,
+    facts_cancel_cb,
+    facts_close_cb,
+    facts_confirm_clear_cb,
+    facts_download_cb,
+    facts_example_cb,
+    facts_receive,
+    facts_upload_cb,
     probe_owner_and_start,
     stats_menu_cb,
     version_refresh_cb,
@@ -69,6 +87,10 @@ from updates import start_update_loop
 
 
 async def main() -> None:
+    # Перечитываем дополнительный банк перед запуском обработчиков. Ошибочный
+    # файл уже деградирует к неизменяемой базе внутри fact_bank.
+    reload_fact_bank()
+
     # До любых Telegram-обработчиков и фоновых задач восстанавливаем инвариант,
     # если процесс прервался между публикацией двух access-control файлов.
     try:
@@ -99,6 +121,7 @@ async def main() -> None:
     dp.message.register(cmd_stats,     Command("stats"))
     dp.message.register(cmd_favs,      Command("favs"))
     dp.message.register(cmd_fact,      Command("fact"))
+    dp.message.register(cmd_facts,     Command("facts"))
     dp.message.register(cmd_info,      Command("info"))
     dp.message.register(cmd_version,   Command("version"))
     dp.message.register(cmd_block,     Command("block"))
@@ -116,6 +139,32 @@ async def main() -> None:
     dp.callback_query.register(backup_export_cb, F.data == "backup:export")
     dp.callback_query.register(backup_import_cb, F.data == "backup:import")
     dp.callback_query.register(backup_close_cb,  F.data == "backup:close")
+
+    # FSM и кнопки скрытого owner-only управления дополнительными фактами
+    dp.message.register(
+        facts_receive,
+        StateFilter(
+            FactsStates.waiting_upload_file,
+            FactsStates.waiting_apply_confirmation,
+        ),
+    )
+    dp.callback_query.register(facts_upload_cb, F.data == "facts:upload")
+    dp.callback_query.register(facts_download_cb, F.data == "facts:download")
+    dp.callback_query.register(facts_example_cb, F.data == "facts:example")
+    dp.callback_query.register(facts_cancel_cb, F.data == "facts:cancel")
+    dp.callback_query.register(facts_close_cb, F.data == "facts:close")
+    dp.callback_query.register(
+        facts_apply_cb,
+        F.data.startswith(FACTS_APPLY_CALLBACK_PREFIX),
+    )
+    dp.callback_query.register(
+        facts_ask_clear_cb,
+        F.data.startswith(FACTS_ASK_CLEAR_CALLBACK_PREFIX),
+    )
+    dp.callback_query.register(
+        facts_confirm_clear_cb,
+        F.data.startswith(FACTS_CONFIRM_CLEAR_CALLBACK_PREFIX),
+    )
 
     # Кнопки меню /stats (callback_data вида "stats:<ключ>")
     dp.callback_query.register(stats_menu_cb, F.data.startswith("stats:"))

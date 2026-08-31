@@ -28,6 +28,13 @@ from config import (
     WEEKLY_BACKUP_INTERVAL,
     log,
 )
+from fact_bank import (
+    FactBankDocument,
+    FactBankValidationError,
+    activate_restored_fact_bank,
+    parse_fact_bank_bytes,
+    serialize_fact_bank,
+)
 from storage import (
     BlockedUsersStateError,
     _atomic_write,
@@ -63,7 +70,8 @@ SHUTDOWN_BACKUP_TIMEOUT  = 8    # с: жёсткий потолок отправ
 _last_backup_sent_at: float | None = None   # monotonic-метка последнего успешного бэкапа
 
 _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
-    "blocked_users.json", "subscribers.json", "stats_current.json", "update_state.json",
+    "blocked_users.json", "facts.json", "subscribers.json", "stats_current.json",
+    "update_state.json",
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -148,8 +156,8 @@ async def _shutdown_backup(bot: Bot) -> None:
 
 def _is_allowed_import_member(name: str) -> bool:
     """Разрешено ли имя из архива к восстановлению?
-    Бел.список: blocked_users.json, subscribers.json, stats_current.json,
-    update_state.json и кварталы.
+    Бел.список: blocked_users.json, facts.json, subscribers.json,
+    stats_current.json, update_state.json и кварталы.
     Глушим zip-slip: '..'-сегменты, абсолютные пути и бэкслеши отвергаем."""
     if not name or name.endswith("/"):
         return False
@@ -362,6 +370,7 @@ async def restore_backup_zip(raw: bytes) -> dict:
     skipped: list[str] = []
     pending: dict[str, str] = {}
     invalid_access_members: set[str] = set()
+    restored_fact_document: FactBankDocument | None = None
     with zf:
         infos = zf.infolist()
         _validate_import_metadata(infos)
@@ -371,6 +380,29 @@ async def restore_backup_zip(raw: bytes) -> dict:
                 continue
             if not _is_allowed_import_member(name):
                 skipped.append(name)
+                continue
+            if name == "facts.json":
+                try:
+                    fact_raw = zf.read(info)
+                except (
+                    zipfile.BadZipFile,
+                    RuntimeError,
+                    NotImplementedError,
+                    OSError,
+                    EOFError,
+                    zlib.error,
+                    lzma.LZMAError,
+                ) as e:
+                    raise ValueError(
+                        "facts.json в архиве повреждён; восстановление отменено"
+                    ) from e
+                try:
+                    restored_fact_document = parse_fact_bank_bytes(fact_raw)
+                except FactBankValidationError as e:
+                    raise ValueError(
+                        "facts.json в архиве повреждён; восстановление отменено"
+                    ) from e
+                pending[name] = serialize_fact_bank(restored_fact_document)
                 continue
             try:
                 payload = zf.read(info).decode("utf-8")
@@ -412,6 +444,8 @@ async def restore_backup_zip(raw: bytes) -> dict:
     async with restorable_state_transaction():
         pending = _prepare_access_restore_candidate(pending)
         restored = _publish_restore_files(pending)
+        if restored_fact_document is not None:
+            activate_restored_fact_bank(restored_fact_document)
     log.info("restore_backup_zip: восстановлено %d, пропущено %d.",
              len(restored), len(skipped))
     return {"restored": restored, "skipped": skipped}

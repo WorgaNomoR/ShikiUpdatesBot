@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 RUN test -f /app/assets/info-preview.png
+RUN test -f /app/examples/facts.json
 
 # Порт healthcheck-сервера (healthcheck.py). Платформы, читающие Dockerfile,
 # по EXPOSE понимают, на какой порт направлять пробу /health. Если хостинг

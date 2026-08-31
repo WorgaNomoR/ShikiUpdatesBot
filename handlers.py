@@ -4,7 +4,7 @@
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
 Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock, /blocklist,
-/broadcast, /backup, /status, /stats, /favs, /fact, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
+/broadcast, /backup, /facts, /status, /stats, /favs, /fact, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
 notify*, polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
 """
@@ -32,6 +32,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultsButton,
     Message,
+    ReplyParameters,
 )
 
 from access_control import (
@@ -56,6 +57,22 @@ from config import (
     SHIKI_BASE_URL,
     SHIKI_USER,
     log,
+)
+from fact_bank import (
+    FACT_BANK_MAX_BYTES,
+    FACT_FILE_INVALID,
+    FACT_FILE_MISSING,
+    FactBankSnapshot,
+    FactBankValidationError,
+    StaleFactBankError,
+    canonical_active_fact_bank,
+    clear_fact_bank,
+    fact_bank_candidate_revision,
+    fact_bank_delta,
+    parse_fact_bank_bytes,
+    publish_fact_bank,
+    reload_fact_bank,
+    serialize_fact_bank,
 )
 from healthcheck import heartbeat
 from inline_cards import (
@@ -171,6 +188,10 @@ _BLOCKLIST_HINT = (
     "<code>/unblock 123456789</code> — разблокировать."
 )
 _FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
+FACTS_APPLY_CALLBACK_PREFIX = "facts:apply:"
+FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
+FACTS_CONFIRM_CLEAR_CALLBACK_PREFIX = "facts:confirm-clear:"
+FACT_BANK_EXAMPLE_PATH = RESOURCE_ROOT / "examples" / "facts.json"
 INFO_PREVIEW_PATH = RESOURCE_ROOT / "assets" / "info-preview.png"
 _info_preview_file_id: str | None = None
 _status_cache: tuple[list[dict], list[dict]] | None = None
@@ -641,6 +662,16 @@ async def _cleanup_inline_menu(message: Message | None) -> None:
             await command.delete()
         except Exception as e:
             log.debug("_cleanup_inline_menu: не удалось удалить команду: %s", e)
+
+
+async def _claim_inline_menu(message: Message) -> bool:
+    """Одноразово забрать меню для действия, которое нельзя повторять."""
+    try:
+        await message.delete()
+    except Exception as e:
+        log.debug("_claim_inline_menu: меню уже обработано или недоступно: %s", e)
+        return False
+    return True
 
 
 async def stats_menu_cb(callback: CallbackQuery) -> None:
@@ -1358,6 +1389,11 @@ class BackupStates(StatesGroup):
     waiting_import_file = State()   # ждём .zip-архив от владельца
 
 
+class FactsStates(StatesGroup):
+    waiting_upload_file = State()   # ждём facts.json от владельца
+    waiting_apply_confirmation = State()  # preview уже показан
+
+
 def _backup_menu_kb() -> InlineKeyboardMarkup:
     """Инлайн-меню /backup: экспорт и импорт."""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1379,9 +1415,10 @@ async def cmd_backup(message: Message) -> None:
     await message.reply(
         "💾 <b>Резервное копирование</b>\n\n"
         "📤 <b>Экспорт</b> — пришлю zip-архив всего состояния "
-        "(подписчики, статистика, кварталы).\n"
+        "(подписчики, дополнительные факты, статистика, кварталы).\n"
         "📥 <b>Импорт</b> — восстановлю из архива список блокировок, подписчиков, "
-        "сведения о доступных обновлениях и данные текущего и завершённых кварталов.",
+        "дополнительные факты, сведения о доступных обновлениях и данные "
+        "текущего и завершённых кварталов.",
         reply_markup=_backup_menu_kb(),
         parse_mode=ParseMode.HTML,
     )
@@ -1410,9 +1447,9 @@ async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(BackupStates.waiting_import_file)
     prompt = await callback.message.edit_text(
         "📥 Пришли <b>.zip</b>-архив бэкапа (как файл-документ).\n\n"
-        "Возьму из него только нужное — список блокировок, подписчиков, сведения о "
-        "доступных обновлениях и данные текущего и завершённых кварталов. Лишнее в архиве "
-        "не помешает, спокойно пропущу.\n\n/cancel — отмена",
+        "Возьму из него только нужное — список блокировок, подписчиков, дополнительные "
+        "факты, сведения о доступных обновлениях и данные текущего и завершённых "
+        "кварталов. Лишнее в архиве не помешает, спокойно пропущу.\n\n/cancel — отмена",
         parse_mode=ParseMode.HTML,
     )
     await state.update_data(prompt_msg_id=prompt.message_id)
@@ -1483,10 +1520,537 @@ async def backup_receive(message: Message, state: FSMContext) -> None:
         lines.append("\n🔄 Сведения о доступных обновлениях восстановлены.")
     if "blocked_users.json" in restored:
         lines.append("\n🚫 Список блокировок восстановлен.")
+    if "facts.json" in restored:
+        lines.append("\n💡 Дополнительный банк фактов восстановлен и активирован.")
     if skipped:
         lines.append(f"\n⏭️ Пропущено (вне белого списка/битые): {len(skipped)}")
     await _safe_delete(message.bot, message.chat.id, message.message_id)
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  УПРАВЛЕНИЕ ДОПОЛНИТЕЛЬНЫМ БАНКОМ ФАКТОВ
+# ═══════════════════════════════════════════════════════════════
+
+
+def _facts_status_text(
+    snapshot: FactBankSnapshot,
+    *,
+    notice: str | None = None,
+) -> str:
+    """Показать владельцу активный состав и состояние внешнего файла."""
+    if snapshot.file_state == FACT_FILE_MISSING:
+        file_state = "⚪ файл ещё не создан; работает базовый банк"
+    elif snapshot.file_state == FACT_FILE_INVALID:
+        file_state = "🔴 файл не читается или повреждён; работает базовый банк"
+    else:
+        file_state = "🟢 файл корректен"
+    version = h(snapshot.bank_version) if snapshot.bank_version else "—"
+    prefix = f"{notice}\n\n" if notice else ""
+    return (
+        f"{prefix}💡 <b>Банк фактов</b>\n\n"
+        f"Встроенных: <b>{len(snapshot.base_facts)}</b>\n"
+        f"Дополнительных: <b>{len(snapshot.additional_facts)}</b>\n"
+        f"Всего активно: <b>{len(snapshot.facts)}</b>\n"
+        f"Версия дополнения: <code>{version}</code>\n\n"
+        f"{file_state}"
+    )
+
+
+def _facts_menu_keyboard(snapshot: FactBankSnapshot) -> InlineKeyboardMarkup:
+    """Собрать скрытое owner-only меню без кнопки очистки пустого банка."""
+    rows = [[InlineKeyboardButton(
+        text="📤 Загрузить дополнительные",
+        callback_data="facts:upload",
+    )]]
+    if snapshot.additional_facts:
+        rows.append([InlineKeyboardButton(
+            text="📥 Скачать дополнительные",
+            callback_data="facts:download",
+        )])
+        rows.append([InlineKeyboardButton(
+            text="🗑 Очистить дополнительные",
+            callback_data=(
+                f"{FACTS_ASK_CLEAR_CALLBACK_PREFIX}{snapshot.revision}"
+            ),
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
+            text="📄 Скачать пример facts.json",
+            callback_data="facts:example",
+        )])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="facts:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _safe_facts_edit(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Message | None:
+    """Обновить owner-menu, не превращая Telegram-сбой в сбой мутации."""
+    try:
+        return await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    except TelegramBadRequest as e:
+        detail = str(e).casefold()
+        if (
+            "message is not modified" in detail
+            or "message to edit not found" in detail
+        ):
+            log.debug("facts: служебное сообщение уже не требует обновления: %s", e)
+        else:
+            log.warning("facts: Telegram не позволил обновить owner-menu: %s", e)
+    except Exception as e:
+        log.warning(
+            "facts: не удалось обновить owner-menu (%s)",
+            type(e).__name__,
+        )
+    return None
+
+
+async def _facts_edit_status(
+    message: Message | None,
+    *,
+    notice: str | None = None,
+) -> FactBankSnapshot:
+    """Перечитать файл и заменить текущее owner-menu актуальным статусом."""
+    snapshot = reload_fact_bank()
+    if message is not None:
+        await _safe_facts_edit(
+            message,
+            _facts_status_text(snapshot, notice=notice),
+            reply_markup=_facts_menu_keyboard(snapshot),
+        )
+    return snapshot
+
+
+async def cmd_facts(message: Message, state: FSMContext) -> None:
+    """Открыть скрытое меню управления дополнительными фактами."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+    await state.clear()
+    snapshot = reload_fact_bank()
+    await message.reply(
+        _facts_status_text(snapshot),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_facts_menu_keyboard(snapshot),
+    )
+
+
+async def facts_upload_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Перевести owner-flow в ожидание полного JSON-кандидата."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("Меню устарело. Отправь /facts ещё раз.", show_alert=True)
+        return
+    await state.set_state(FactsStates.waiting_upload_file)
+    prompt = await _safe_facts_edit(
+        callback.message,
+        "📤 Пришли <b>JSON-файл</b> дополнительных фактов как документ. "
+        "Имя может быть любым, расширение — <code>.json</code>.\n\n"
+        "Сначала проверю весь файл и покажу изменения. Диск и активный банк "
+        "поменяются только после кнопки «Применить».\n\n/cancel — отмена",
+    )
+    if prompt is None:
+        await state.clear()
+        await callback.answer(
+            "Не удалось открыть меню. Отправь /facts ещё раз.",
+            show_alert=True,
+        )
+        return
+    await callback.answer()
+    command = callback.message.reply_to_message
+    command_msg_id = command.message_id if command is not None else None
+    await state.update_data(
+        prompt_msg_id=prompt.message_id,
+        command_msg_id=command_msg_id,
+    )
+
+
+async def _reject_facts_upload(
+    message: Message,
+    state: FSMContext,
+    text: str,
+) -> None:
+    """Удалить отклонённую попытку и переиспользовать один upload-промпт."""
+    data = await state.get_data()
+    await _safe_delete(message.bot, message.chat.id, message.message_id)
+    prompt_id = data.get("prompt_msg_id")
+    if isinstance(prompt_id, int) and prompt_id > 0:
+        try:
+            await message.bot.edit_message_text(
+                text=text,
+                chat_id=message.chat.id,
+                message_id=prompt_id,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).casefold():
+                return
+            log.debug("facts: не удалось переиспользовать upload-промпт: %s", e)
+        except Exception as e:
+            log.warning(
+                "facts: не удалось обновить upload-промпт (%s)",
+                type(e).__name__,
+            )
+    fallback = await message.answer(text, parse_mode=ParseMode.HTML)
+    await state.update_data(prompt_msg_id=fallback.message_id)
+
+
+async def facts_receive(message: Message, state: FSMContext) -> None:
+    """Проверить загруженный JSON и показать replacement-preview без мутации."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        return
+    document = message.document
+    if not document or not (document.file_name or "").casefold().endswith(".json"):
+        await _reject_facts_upload(
+            message,
+            state,
+            "📎 Жду файл-документ с расширением <code>.json</code>. Или /cancel.",
+        )
+        return
+    file_size = document.file_size
+    if (
+        isinstance(file_size, bool)
+        or not isinstance(file_size, int)
+        or file_size < 0
+        or file_size > FACT_BANK_MAX_BYTES
+    ):
+        await _reject_facts_upload(
+            message,
+            state,
+            "📦 JSON-файл должен иметь известный размер не больше "
+            f"<b>{FACT_BANK_MAX_BYTES // 1024} КиБ</b>.",
+        )
+        return
+
+    try:
+        buffer = io.BytesIO()
+        await message.bot.download(document, destination=buffer)
+        candidate = parse_fact_bank_bytes(buffer.getvalue())
+    except FactBankValidationError as e:
+        await _reject_facts_upload(
+            message,
+            state,
+            "❌ <b>Файл не прошёл проверку</b>\n\n"
+            f"{h(str(e))}\n\nИсправь файл и пришли его снова. Или /cancel.",
+        )
+        return
+    except Exception as e:
+        log.warning("facts: не удалось скачать файл-кандидат: %s", e)
+        await _reject_facts_upload(
+            message,
+            state,
+            "❌ Не удалось скачать JSON-файл. Попробуй ещё раз. Или /cancel.",
+        )
+        return
+
+    snapshot = reload_fact_bank()
+    added, changed, removed = fact_bank_delta(candidate, snapshot)
+    canonical = serialize_fact_bank(candidate)
+    candidate_revision = fact_bank_candidate_revision(candidate)
+    fsm = await state.get_data()
+    command_msg_id = fsm.get("command_msg_id")
+    prompt_id = fsm.get("prompt_msg_id")
+    if prompt_id is not None:
+        await _safe_delete(message.bot, message.chat.id, prompt_id)
+    control_id = fsm.get("control_msg_id")
+    if control_id is not None:
+        await _safe_delete(message.bot, message.chat.id, control_id)
+    await _safe_delete(message.bot, message.chat.id, message.message_id)
+    await state.set_state(FactsStates.waiting_apply_confirmation)
+    reply_parameters = (
+        ReplyParameters(
+            message_id=command_msg_id,
+            allow_sending_without_reply=True,
+        )
+        if isinstance(command_msg_id, int) and command_msg_id > 0
+        else None
+    )
+    preview = await message.answer(
+        "🔎 <b>Предпросмотр замены</b>\n\n"
+        f"Версия: <code>{h(candidate.bank_version or '—')}</code>\n"
+        f"Фактов в кандидате: <b>{len(candidate.facts)}</b>\n\n"
+        f"Добавится: <b>{added}</b>\n"
+        f"Изменится: <b>{changed}</b>\n"
+        f"Удалится: <b>{removed}</b>\n\n"
+        "Применение полностью заменит текущий дополнительный банк.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Применить",
+                callback_data=(
+                    f"{FACTS_APPLY_CALLBACK_PREFIX}{snapshot.revision}:"
+                    f"{candidate_revision}"
+                ),
+            ),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="facts:cancel"),
+        ]]),
+        reply_parameters=reply_parameters,
+    )
+    await state.update_data(
+        prompt_msg_id=prompt_id,
+        control_msg_id=preview.message_id,
+        candidate_json=canonical,
+        candidate_revision=candidate_revision,
+        expected_revision=snapshot.revision,
+    )
+
+
+def _parse_facts_apply_callback(data: str) -> tuple[str, str] | None:
+    """Разобрать hash-привязку preview к исходному и новому банкам."""
+    if not data.startswith(FACTS_APPLY_CALLBACK_PREFIX):
+        return None
+    expected, separator, candidate = data.removeprefix(
+        FACTS_APPLY_CALLBACK_PREFIX
+    ).partition(":")
+    if not separator or len(expected) != 16 or len(candidate) != 16:
+        return None
+    return expected, candidate
+
+
+async def facts_apply_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Применить только всё ещё актуальный preview-кандидат."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    parsed = _parse_facts_apply_callback(callback.data or "")
+    data = await state.get_data()
+    if parsed is None or not data.get("candidate_json"):
+        await callback.answer(
+            "Это подтверждение уже недействительно. Отправь /facts ещё раз.",
+            show_alert=True,
+        )
+        return
+    expected_revision, candidate_revision = parsed
+    if (
+        data.get("expected_revision") != expected_revision
+        or data.get("candidate_revision") != candidate_revision
+    ):
+        await callback.answer(
+            "Это подтверждение устарело. Отправь /facts ещё раз.",
+            show_alert=True,
+        )
+        return
+    try:
+        candidate = parse_fact_bank_bytes(data["candidate_json"].encode("utf-8"))
+        if fact_bank_candidate_revision(candidate) != candidate_revision:
+            raise FactBankValidationError("preview-кандидат изменился")
+        snapshot = await publish_fact_bank(
+            candidate,
+            expected_revision=expected_revision,
+        )
+    except StaleFactBankError:
+        await state.clear()
+        await callback.answer(
+            "Банк уже изменился. Открой /facts и проверь новое состояние.",
+            show_alert=True,
+        )
+        await _facts_edit_status(
+            callback.message,
+            notice="⚠️ Подтверждение устарело; изменения не применены.",
+        )
+        return
+    except (FactBankValidationError, OSError) as e:
+        log.warning("facts: кандидат не опубликован: %s", e)
+        await callback.answer(
+            "Не удалось безопасно применить банк; прежний банк сохранён.",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await callback.answer("Дополнительный банк применён.")
+    if callback.message is not None:
+        await _safe_facts_edit(
+            callback.message,
+            _facts_status_text(snapshot, notice="✅ Дополнительный банк применён."),
+            reply_markup=_facts_menu_keyboard(snapshot),
+        )
+
+
+async def facts_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отменить upload/preview/clear и вернуться к актуальному статусу."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Отменено.")
+    await _facts_edit_status(callback.message, notice="❌ Изменения отменены.")
+
+
+async def facts_download_cb(callback: CallbackQuery) -> None:
+    """Отправить текущий дополнительный банк в канонической форме."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("Меню устарело. Отправь /facts ещё раз.", show_alert=True)
+        return
+    snapshot = reload_fact_bank()
+    if not snapshot.additional_facts:
+        await callback.answer(
+            "Дополнительных фактов больше нет. Проверь состояние файла.",
+            show_alert=True,
+        )
+        await _facts_edit_status(callback.message)
+        return
+    payload = canonical_active_fact_bank().encode("utf-8")
+    if not await _claim_inline_menu(callback.message):
+        await callback.answer(
+            "Это меню уже обработано. Отправь /facts ещё раз.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Готовлю facts.json...")
+    await callback.message.answer_document(
+        BufferedInputFile(payload, filename="facts.json"),
+        caption="💡 Канонический дополнительный банк фактов.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def facts_example_cb(callback: CallbackQuery) -> None:
+    """Отправить владельцу встроенный валидный пример дополнительного банка."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("Меню устарело. Отправь /facts ещё раз.", show_alert=True)
+        return
+    try:
+        example = parse_fact_bank_bytes(FACT_BANK_EXAMPLE_PATH.read_bytes())
+        payload = serialize_fact_bank(example).encode("utf-8")
+    except (FactBankValidationError, OSError) as e:
+        log.error("facts: встроенный пример недоступен: %s", e)
+        await callback.answer(
+            "Пример facts.json недоступен в этой сборке.",
+            show_alert=True,
+        )
+        return
+    if not await _claim_inline_menu(callback.message):
+        await callback.answer(
+            "Это меню уже обработано. Отправь /facts ещё раз.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Готовлю пример facts.json...")
+    await callback.message.answer_document(
+        BufferedInputFile(payload, filename="facts.json"),
+        caption=(
+            "💡 Готовый пример из пяти фактов. Его можно отредактировать и "
+            "загрузить через /facts."
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def _fact_count_word(count: int) -> str:
+    """Выбрать русскую форму слова «факт» для указанного количества."""
+    remainder = count % 100
+    if 11 <= remainder <= 14:
+        return "фактов"
+    last_digit = count % 10
+    if last_digit == 1:
+        return "факт"
+    if 2 <= last_digit <= 4:
+        return "факта"
+    return "фактов"
+
+
+async def facts_ask_clear_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Первое нажатие очистки: показать единственное подтверждение с числом."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    data = callback.data or ""
+    expected_revision = data.removeprefix(FACTS_ASK_CLEAR_CALLBACK_PREFIX)
+    snapshot = reload_fact_bank()
+    if expected_revision != snapshot.revision or not snapshot.additional_facts:
+        await callback.answer(
+            "Банк уже изменился. Открой /facts и проверь новое состояние.",
+            show_alert=True,
+        )
+        await _facts_edit_status(callback.message)
+        return
+    await state.clear()
+    await callback.answer()
+    if callback.message is not None:
+        count = len(snapshot.additional_facts)
+        await _safe_facts_edit(
+            callback.message,
+            "🗑 <b>Очистить дополнительные факты?</b>\n\n"
+            f"Будет удалено: <b>{count}</b>. Встроенные 50+6 останутся.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"Да, удалить {count} {_fact_count_word(count)}",
+                    callback_data=(
+                        f"{FACTS_CONFIRM_CLEAR_CALLBACK_PREFIX}"
+                        f"{snapshot.revision}"
+                    ),
+                )],
+                [InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="facts:cancel",
+                )],
+            ]),
+        )
+
+
+async def facts_confirm_clear_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Вторым и последним нажатием атомарно очистить дополнительный банк."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    expected_revision = (callback.data or "").removeprefix(
+        FACTS_CONFIRM_CLEAR_CALLBACK_PREFIX
+    )
+    if len(expected_revision) != 16:
+        await callback.answer("Подтверждение повреждено.", show_alert=True)
+        return
+    try:
+        snapshot = await clear_fact_bank(expected_revision=expected_revision)
+    except StaleFactBankError:
+        await callback.answer(
+            "Банк уже изменился. Очистка не выполнена.",
+            show_alert=True,
+        )
+        await _facts_edit_status(callback.message)
+        return
+    except OSError as e:
+        log.warning("facts: не удалось очистить дополнительный банк: %s", e)
+        await callback.answer(
+            "Не удалось безопасно очистить банк; прежний банк сохранён.",
+            show_alert=True,
+        )
+        return
+    await state.clear()
+    await callback.answer("Дополнительные факты удалены.")
+    if callback.message is not None:
+        await _safe_facts_edit(
+            callback.message,
+            _facts_status_text(snapshot, notice="✅ Дополнительные факты удалены."),
+            reply_markup=_facts_menu_keyboard(snapshot),
+        )
+
+
+async def facts_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Закрыть owner-menu и защитно сбросить его FSM."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer()
+    await _cleanup_inline_menu(callback.message)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1501,6 +2065,11 @@ def _fact_keyboard(fact_id: str, *, initiator_id: int) -> InlineKeyboardMarkup:
         ),
         share_query=build_fact_share_query(fact_id),
     )
+
+
+def _fact_message_seed(initiator_id: int, message_id: int) -> str:
+    """Собрать стабильное зерно выбора факта для конкретной команды."""
+    return f"{initiator_id}\0{message_id}"
 
 
 def _parse_fact_next_callback(data: str) -> tuple[int, str] | None:
@@ -1526,7 +2095,7 @@ async def cmd_fact(message: Message) -> None:
     if message.from_user is None:
         return
     initiator_id = message.from_user.id
-    fact = select_fact(f"{initiator_id}\0{message.message_id}")
+    fact = select_fact(_fact_message_seed(initiator_id, message.message_id))
     await message.answer(
         build_fact_text(fact),
         parse_mode=ParseMode.HTML,

@@ -37,6 +37,13 @@ def test_pyinstaller_bundles_info_preview():
     )
 
 
+def test_pyinstaller_bundles_fact_bank_example():
+    assert (
+        'datas.append((str(root / "examples" / "facts.json"), "examples"))'
+        in PYINSTALLER_SPEC
+    )
+
+
 def _value_paths(value, needle: str, path=()):
     if isinstance(value, dict):
         for key, child in value.items():

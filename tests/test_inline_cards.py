@@ -11,6 +11,7 @@ from aiogram.types import (
     InlineQueryResultPhoto,
 )
 
+import fact_bank
 import inline_cards
 from inline_facts import InlineFact
 
@@ -283,6 +284,35 @@ def test_owner_fact_marks_selection_without_hiding_click_effect():
     assert result.description.startswith("При выборе отправит в чат")
     assert "🎁 <i>Выбор владельца ShikiUpdatesBot</i>" in (
         result.input_message_content.message_text
+    )
+
+
+def test_continuation_article_uses_additional_fact_from_combined_snapshot(
+    fact_bank_env,
+):
+    document = fact_bank.parse_fact_bank_bytes(
+        b'{"schema_version":1,"bank_version":"combined","facts":['
+        b'{"id":"external-card","text":"Additional continuation fact."}]}'
+    )
+    fact_bank.activate_restored_fact_bank(document)
+    cycle_length = len(fact_bank.get_fact_bank_snapshot().facts)
+    page = next(
+        candidate
+        for candidate in range(2, 2 + cycle_length)
+        if inline_cards.select_inline_fact("combined-card", page=candidate).id
+        == "external-card"
+    )
+    rendered = [inline_cards.build_inline_result("anime", _anime_item(id="1"))]
+
+    results = inline_cards.finalize_inline_results(
+        rendered,
+        page=page,
+        fact_seed="combined-card",
+    )
+
+    assert results[-1].id == f"fact:{page}:external-card"
+    assert "Additional continuation fact." in (
+        results[-1].input_message_content.message_text
     )
 
 

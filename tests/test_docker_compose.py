@@ -42,8 +42,13 @@ def test_compose_loads_env_file_but_keeps_data_volume_invariant():
     assert "./data:/data" in service["volumes"]
 
 
-def test_docker_context_keeps_only_runtime_info_asset():
+def test_docker_context_keeps_required_runtime_files():
     patterns = DOCKERIGNORE_PATH.read_text(encoding="utf-8").splitlines()
+    active_patterns = [
+        pattern.strip()
+        for pattern in patterns
+        if pattern.strip() and not pattern.lstrip().startswith("#")
+    ]
     relevant = [
         pattern
         for pattern in patterns
@@ -52,9 +57,11 @@ def test_docker_context_keeps_only_runtime_info_asset():
 
     assert relevant == ["assets/*", "!assets/info-preview.png"]
     assert "assets/" not in patterns
+    assert active_patterns[-1] == "!examples/facts.json"
 
 
 def test_docker_build_requires_info_preview_in_effective_context():
     instructions = DOCKERFILE_PATH.read_text(encoding="utf-8").splitlines()
 
     assert "RUN test -f /app/assets/info-preview.png" in instructions
+    assert "RUN test -f /app/examples/facts.json" in instructions
