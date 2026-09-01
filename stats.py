@@ -10,7 +10,9 @@
 """
 
 import json
+import random
 from copy import deepcopy
+from dataclasses import dataclass
 
 import aiohttp
 
@@ -31,6 +33,7 @@ from messages import (
 )
 from shiki_api import (
     _STAT_STATUSES,
+    RANOBE_KINDS,
     ProfilePrivacyError,
     fetch_favourites,
     fetch_list_export,
@@ -73,6 +76,244 @@ _KIND_RU_MANGA: dict[str, str] = {
     "novel":       "Новеллы",
     "ranobe":      "Ранобэ",
 }
+
+PICK_CATEGORY_ANIME = "anime"
+PICK_CATEGORY_MANGA = "manga"
+PICK_CATEGORY_RANOBE = "ranobe"
+PICK_CATEGORY_UNKNOWN = "unknown"
+_MANGA_PRESENTATION_KINDS: frozenset[str] = frozenset({
+    "manga",
+    "manhwa",
+    "manhua",
+})
+
+
+@dataclass(frozen=True)
+class PickCandidate:
+    """Нормализованный локальный кандидат для меню /pick."""
+
+    id: str
+    category: str
+    title: str
+    url: str
+    year: int | None
+    genres: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PickCatalog:
+    """Классифицированный planned-срез одного stats_all snapshot."""
+
+    anime: tuple[PickCandidate, ...]
+    manga: tuple[PickCandidate, ...]
+    ranobe: tuple[PickCandidate, ...]
+    unresolved_count: int
+    updated_at: str | None
+
+    def candidates_for(self, category: str) -> tuple[PickCandidate, ...]:
+        """Вернуть неизменяемый пул известной пользовательской категории."""
+        if category == PICK_CATEGORY_ANIME:
+            return self.anime
+        if category == PICK_CATEGORY_MANGA:
+            return self.manga
+        if category == PICK_CATEGORY_RANOBE:
+            return self.ranobe
+        return ()
+
+
+@dataclass(frozen=True)
+class PickSelection:
+    """Результат выбора и новое состояние цикла без повторов."""
+
+    candidate: PickCandidate | None
+    shown_ids: frozenset[str]
+    pool_reset: bool
+
+
+def classify_manga_presentation_kind(kind: object) -> str:
+    """Классифицировать manga-domain kind без догадок и побочных эффектов."""
+    if not isinstance(kind, str):
+        return PICK_CATEGORY_UNKNOWN
+    normalized = kind.strip().lower()
+    if normalized in RANOBE_KINDS:
+        return PICK_CATEGORY_RANOBE
+    if normalized in _MANGA_PRESENTATION_KINDS:
+        return PICK_CATEGORY_MANGA
+    return PICK_CATEGORY_UNKNOWN
+
+
+def _pick_year(value: object) -> int | None:
+    """Оставить только пригодный для десятилетия календарный год."""
+    if type(value) is int and 1 <= value <= 9999:
+        return value
+    return None
+
+
+def _pick_genres(value: object) -> tuple[str, ...]:
+    """Нормализовать жанры, сохранив исходный порядок и регистр."""
+    if not isinstance(value, list):
+        return ()
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_genre in value:
+        if not isinstance(raw_genre, str):
+            continue
+        genre = raw_genre.strip()
+        key = genre.casefold()
+        if not genre or key in seen:
+            continue
+        seen.add(key)
+        result.append(genre)
+    return tuple(result)
+
+
+def _pick_candidate(
+    title_id: object,
+    record: object,
+    category: str,
+) -> PickCandidate | None:
+    """Построить безопасного кандидата из одной title record."""
+    if not isinstance(record, dict) or record.get("status") != "planned":
+        return None
+    candidate_id = str(title_id).strip()
+    if not candidate_id:
+        return None
+    raw_title = record.get("title")
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
+    raw_url = record.get("url")
+    return PickCandidate(
+        id=candidate_id,
+        category=category,
+        title=title or "Без названия",
+        url=raw_url.strip() if isinstance(raw_url, str) else "",
+        year=_pick_year(record.get("year")),
+        genres=_pick_genres(record.get("genres")),
+    )
+
+
+def build_pick_catalog(stats_all: object) -> PickCatalog | None:
+    """Собрать planned-каталог или вернуть None для непригодной структуры."""
+    if not isinstance(stats_all, dict):
+        return None
+    sections: dict[str, dict] = {}
+    for media in (PICK_CATEGORY_ANIME, PICK_CATEGORY_MANGA):
+        section = stats_all.get(media)
+        if not isinstance(section, dict) or not isinstance(section.get("titles"), dict):
+            return None
+        sections[media] = section["titles"]
+
+    anime: list[PickCandidate] = []
+    manga: list[PickCandidate] = []
+    ranobe: list[PickCandidate] = []
+    unresolved_count = 0
+
+    for title_id, record in sections[PICK_CATEGORY_ANIME].items():
+        candidate = _pick_candidate(title_id, record, PICK_CATEGORY_ANIME)
+        if candidate is not None:
+            anime.append(candidate)
+
+    for title_id, record in sections[PICK_CATEGORY_MANGA].items():
+        if not isinstance(record, dict) or record.get("status") != "planned":
+            continue
+        category = classify_manga_presentation_kind(record.get("kind"))
+        if category == PICK_CATEGORY_UNKNOWN:
+            unresolved_count += 1
+            continue
+        candidate = _pick_candidate(title_id, record, category)
+        if candidate is None:
+            continue
+        if category == PICK_CATEGORY_MANGA:
+            manga.append(candidate)
+        else:
+            ranobe.append(candidate)
+
+    updated_at = stats_all.get("updated_at")
+    return PickCatalog(
+        anime=tuple(anime),
+        manga=tuple(manga),
+        ranobe=tuple(ranobe),
+        unresolved_count=unresolved_count,
+        updated_at=updated_at if isinstance(updated_at, str) else None,
+    )
+
+
+def _pick_remaining(
+    candidates: tuple[PickCandidate, ...],
+    shown_ids: frozenset[str],
+) -> tuple[tuple[PickCandidate, ...], frozenset[str], bool]:
+    """Вернуть непоказанный остаток или начать новый цикл."""
+    remaining = tuple(candidate for candidate in candidates if candidate.id not in shown_ids)
+    if remaining:
+        return remaining, shown_ids, False
+    return candidates, frozenset(), bool(candidates)
+
+
+def select_pick_candidate(
+    candidates: tuple[PickCandidate, ...],
+    shown_ids: object = (),
+) -> PickSelection:
+    """Равномерно выбрать непоказанный вариант и безопасно сбросить цикл."""
+    shown = frozenset(str(item) for item in shown_ids) if shown_ids else frozenset()
+    remaining, cycle_shown, pool_reset = _pick_remaining(candidates, shown)
+    if not remaining:
+        return PickSelection(None, shown, False)
+    candidate = random.choice(remaining)
+    return PickSelection(candidate, cycle_shown | {candidate.id}, pool_reset)
+
+
+def _pick_decade(candidate: PickCandidate) -> int | None:
+    """Вернуть начало десятилетия только при известном годе."""
+    if candidate.year is None:
+        return None
+    return candidate.year // 10 * 10
+
+
+def _pick_genre_keys(candidate: PickCandidate) -> frozenset[str]:
+    """Подготовить регистронезависимое множество жанров для сравнения."""
+    return frozenset(genre.casefold() for genre in candidate.genres)
+
+
+def select_contrast_pick_candidate(
+    candidates: tuple[PickCandidate, ...],
+    anchor: PickCandidate,
+    shown_ids: object = (),
+) -> PickSelection:
+    """Выбрать контраст: другое десятилетие, затем минимум общих жанров."""
+    shown = frozenset(str(item) for item in shown_ids) if shown_ids else frozenset()
+    remaining, cycle_shown, pool_reset = _pick_remaining(candidates, shown)
+    if not remaining:
+        return PickSelection(None, shown, False)
+
+    if len(candidates) > 1:
+        without_anchor = tuple(item for item in remaining if item.id != anchor.id)
+        if not without_anchor and pool_reset:
+            without_anchor = tuple(item for item in candidates if item.id != anchor.id)
+        if without_anchor:
+            remaining = without_anchor
+
+    anchor_decade = _pick_decade(anchor)
+    if anchor_decade is not None:
+        different_decade = tuple(
+            item
+            for item in remaining
+            if _pick_decade(item) is not None and _pick_decade(item) != anchor_decade
+        )
+        if different_decade:
+            remaining = different_decade
+
+    anchor_genres = _pick_genre_keys(anchor)
+    if anchor_genres:
+        known_genres = tuple(item for item in remaining if item.genres)
+        if known_genres:
+            overlaps = {
+                item.id: len(anchor_genres & _pick_genre_keys(item))
+                for item in known_genres
+            }
+            minimum = min(overlaps.values())
+            remaining = tuple(item for item in known_genres if overlaps[item.id] == minimum)
+
+    candidate = random.choice(remaining)
+    return PickSelection(candidate, cycle_shown | {candidate.id}, pool_reset)
 
 
 def _merge_title_record(media: str, export_row: dict, meta: dict | None) -> dict:

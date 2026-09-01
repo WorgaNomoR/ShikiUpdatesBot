@@ -2,7 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 """Стабильные публичные метаданные проекта для всех режимов запуска."""
 
-PROJECT_VERSION = "v0.10.0"
+PROJECT_VERSION = "v0.11.0"
 PROJECT_REPOSITORY = "WorgaNomoR/ShikiUpdatesBot"
 PROJECT_SUMMARY = (
     "Помогает следить за активностью пользователя на Shikimori: сообщает "

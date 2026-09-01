@@ -398,9 +398,11 @@ def _reset_stats_all_cache():
     """Сбрасываем модульный кэш stats_all между тестами (изоляция)."""
     storage._stats_all_cache = None
     storage._stats_all_cache_ts = 0.0
+    storage._stats_all_cache_state = storage.STATS_ALL_MISSING
     yield
     storage._stats_all_cache = None
     storage._stats_all_cache_ts = 0.0
+    storage._stats_all_cache_state = storage.STATS_ALL_MISSING
 
 
 def _valid_stats_all() -> dict:
@@ -446,6 +448,34 @@ def test_load_stats_all_corrupted_json_returns_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "STATS_ALL_FILE", f)
 
     assert storage.load_stats_all() == storage._empty_stats_all()
+
+
+def test_load_stats_all_snapshot_distinguishes_missing_invalid_and_valid(
+    monkeypatch,
+    tmp_path,
+):
+    stats_file = tmp_path / "stats_all.json"
+    monkeypatch.setattr(storage, "STATS_ALL_FILE", stats_file)
+
+    missing = storage.load_stats_all_snapshot(use_cache=False)
+    assert missing.state == storage.STATS_ALL_MISSING
+    assert missing.data == storage._empty_stats_all()
+
+    stats_file.write_text("{broken", encoding="utf-8")
+    invalid = storage.load_stats_all_snapshot(use_cache=False)
+    assert invalid.state == storage.STATS_ALL_INVALID
+    assert invalid.data == storage._empty_stats_all()
+
+    payload = _valid_stats_all()
+    stats_file.write_text(json.dumps(payload), encoding="utf-8")
+    valid = storage.load_stats_all_snapshot(use_cache=False)
+    assert valid.state == storage.STATS_ALL_VALID
+    assert valid.data == payload
+
+    stats_file.write_text(json.dumps({"anime": {}}), encoding="utf-8")
+    structural = storage.load_stats_all_snapshot(use_cache=False)
+    assert structural.state == storage.STATS_ALL_INVALID
+    assert structural.data == storage._empty_stats_all()
 
 
 def test_load_stats_all_cache_hit_skips_file_reread(monkeypatch, tmp_path):
@@ -497,6 +527,9 @@ def test_save_stats_all_writes_file_and_updates_cache(monkeypatch, tmp_path):
     assert on_disk["anime"] == data["anime"]
     # кэш обновлён тем же объектом -> следующий load отдаёт его без чтения файла
     assert storage.load_stats_all() is data
+    snapshot = storage.load_stats_all_snapshot()
+    assert snapshot.state == storage.STATS_ALL_VALID
+    assert snapshot.data is data
 
 
 # ═══════════════════════════════════════════════════════════════════

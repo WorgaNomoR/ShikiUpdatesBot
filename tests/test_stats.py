@@ -15,6 +15,7 @@
 import copy
 import json
 import re
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -176,6 +177,183 @@ def test_aggregates_manga_chapters():
     assert agg["total_chapters_read"] == 100
     assert agg["total_volumes_read"] == 10
     assert agg["publishers"].get("Young Ace") == 1
+
+
+# ════════════════════════════════════════════════════════════════
+#  /pick: classifier, planned-каталог и чистые selector-контракты
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("manga", smod.PICK_CATEGORY_MANGA),
+        ("manhwa", smod.PICK_CATEGORY_MANGA),
+        ("manhua", smod.PICK_CATEGORY_MANGA),
+        ("light_novel", smod.PICK_CATEGORY_RANOBE),
+        ("novel", smod.PICK_CATEGORY_RANOBE),
+        ("ranobe", smod.PICK_CATEGORY_RANOBE),
+        (None, smod.PICK_CATEGORY_UNKNOWN),
+        (123, smod.PICK_CATEGORY_UNKNOWN),
+        ("", smod.PICK_CATEGORY_UNKNOWN),
+        ("future_book_kind", smod.PICK_CATEGORY_UNKNOWN),
+    ],
+)
+def test_manga_presentation_classifier_is_tri_state_without_guessing(kind, expected):
+    assert smod.classify_manga_presentation_kind(kind) == expected
+
+
+def _pick_record(title, *, status="planned", kind="tv", year=2011, genres=None):
+    return {
+        "title": title,
+        "status": status,
+        "kind": kind,
+        "url": f"https://shikimori.one/animes/{title}",
+        "year": year,
+        "genres": ["Экшен"] if genres is None else genres,
+    }
+
+
+def _pick_candidate(candidate_id, *, year=2011, genres=("Экшен",)):
+    return smod.PickCandidate(
+        id=candidate_id,
+        category=smod.PICK_CATEGORY_ANIME,
+        title=candidate_id,
+        url=f"/animes/{candidate_id}",
+        year=year,
+        genres=genres,
+    )
+
+
+def test_pick_catalog_contains_only_planned_and_discloses_unknown_manga_records():
+    stats = storage._empty_stats_all()
+    stats["updated_at"] = "2026-09-01T10:00:00+00:00"
+    stats["anime"]["titles"] = {
+        "1": _pick_record("anime", kind="future_anime_kind"),
+        "2": _pick_record("completed", status="completed"),
+        "3": _pick_record("uppercase", status="PLANNED"),
+    }
+    stats["manga"]["titles"] = {
+        "4": _pick_record("manga", kind="manga"),
+        "5": _pick_record("ranobe", kind="light_novel"),
+        "6": _pick_record("unknown", kind="future_book_kind"),
+        "7": _pick_record("missing-kind", kind=None),
+    }
+
+    catalog = smod.build_pick_catalog(stats)
+
+    assert catalog is not None
+    assert [candidate.id for candidate in catalog.anime] == ["1"]
+    assert [candidate.id for candidate in catalog.manga] == ["4"]
+    assert [candidate.id for candidate in catalog.ranobe] == ["5"]
+    assert catalog.unresolved_count == 2
+    assert catalog.updated_at == "2026-09-01T10:00:00+00:00"
+    all_ids = {
+        candidate.id
+        for pool in (catalog.anime, catalog.manga, catalog.ranobe)
+        for candidate in pool
+    }
+    assert all_ids == {"1", "4", "5"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"anime": {}, "manga": {"titles": {}}},
+        {"anime": {"titles": []}, "manga": {"titles": {}}},
+    ],
+)
+def test_pick_catalog_rejects_structurally_unusable_snapshot(payload):
+    assert smod.build_pick_catalog(payload) is None
+
+
+def test_pick_catalog_normalizes_missing_optional_fields_without_crashing():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "1": {"status": "planned", "genres": ["Экшен", None, "экшен", ""]},
+    }
+
+    catalog = smod.build_pick_catalog(stats)
+
+    assert catalog is not None
+    assert catalog.anime == (
+        smod.PickCandidate(
+            id="1",
+            category=smod.PICK_CATEGORY_ANIME,
+            title="Без названия",
+            url="",
+            year=None,
+            genres=("Экшен",),
+        ),
+    )
+
+
+def test_ordinary_pick_is_uniform_over_unseen_pool_and_resets_after_exhaustion(
+    monkeypatch,
+):
+    candidates = tuple(_pick_candidate(str(index)) for index in range(1, 4))
+    offered: list[tuple[str, ...]] = []
+
+    def choose(items):
+        offered.append(tuple(candidate.id for candidate in items))
+        return items[0]
+
+    monkeypatch.setattr(smod.random, "choice", choose)
+    shown = frozenset()
+    selected = []
+    resets = []
+    for _ in range(4):
+        result = smod.select_pick_candidate(candidates, shown)
+        selected.append(result.candidate.id)
+        resets.append(result.pool_reset)
+        shown = result.shown_ids
+
+    assert selected == ["1", "2", "3", "1"]
+    assert offered == [("1", "2", "3"), ("2", "3"), ("3",), ("1", "2", "3")]
+    assert resets == [False, False, False, True]
+    assert shown == frozenset({"1"})
+
+
+def test_contrast_pick_prefers_other_decade_then_minimum_genre_overlap(
+    monkeypatch,
+):
+    anchor = _pick_candidate("anchor", year=2011, genres=("Экшен", "Драма"))
+    candidates = (
+        anchor,
+        _pick_candidate("same-zero", year=2015, genres=("Комедия",)),
+        _pick_candidate("other-two", year=1998, genres=("Экшен", "Драма")),
+        _pick_candidate("other-zero", year=1987, genres=("Комедия",)),
+        _pick_candidate("other-zero-2", year=1977, genres=("Музыка",)),
+        _pick_candidate("other-missing-genres", year=1967, genres=()),
+        _pick_candidate("missing-year", year=None, genres=("Комедия",)),
+    )
+    offered = []
+
+    def choose(items):
+        offered.append(tuple(candidate.id for candidate in items))
+        return items[0]
+
+    monkeypatch.setattr(smod.random, "choice", choose)
+
+    result = smod.select_contrast_pick_candidate(candidates, anchor, {anchor.id})
+
+    assert result.candidate.id == "other-zero"
+    assert offered == [("other-zero", "other-zero-2")]
+
+
+def test_contrast_pick_weakens_missing_metadata_and_handles_one_item(monkeypatch):
+    anchor = _pick_candidate("only", year=None, genres=())
+    chooser = MagicMock(side_effect=lambda items: items[0])
+    monkeypatch.setattr(smod.random, "choice", chooser)
+
+    result = smod.select_contrast_pick_candidate((anchor,), anchor, {anchor.id})
+
+    assert result.candidate == anchor
+    assert result.pool_reset is True
+    assert result.shown_ids == frozenset({anchor.id})
+    assert tuple(chooser.call_args.args[0]) == (anchor,)
 
 
 # ════════════════════════════════════════════════════════════════

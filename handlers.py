@@ -4,8 +4,9 @@
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
 Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock, /blocklist,
-/broadcast, /backup, /facts, /status, /stats, /favs, /fact, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_
-notify*, polling_loop) и ротация квартала. Зависит от всех нижних модулей;
+/broadcast, /backup, /facts, /pick, /status, /stats, /favs, /fact, /info,
+/version), inline-меню, рассылка, цикл уведомлений (check_and_notify*,
+polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
 """
 
@@ -130,18 +131,28 @@ from shiki_api import (
     is_relevant,
 )
 from stats import (
+    PICK_CATEGORY_ANIME,
+    PICK_CATEGORY_MANGA,
+    PICK_CATEGORY_RANOBE,
+    PickCandidate,
     _collect_favourites,
     _load_prev_quarter_summary,
     _save_quarter_snapshot,
     _update_by_quarter,
     build_current_stats_messages,
     build_favourites_messages,
+    build_pick_catalog,
     build_quarterly_report_messages,
     build_stats_all_messages,
     record_current_event,
+    select_contrast_pick_candidate,
+    select_pick_candidate,
     sync_stats_all,
 )
 from storage import (
+    STATS_ALL_INVALID,
+    STATS_ALL_MISSING,
+    STATS_ALL_VALID,
     BlockedUsersMutationError,
     BlockedUsersStateError,
     _empty_stats_current,
@@ -150,6 +161,7 @@ from storage import (
     load_seen_favourites,
     load_seen_ids,
     load_stats_all,
+    load_stats_all_snapshot,
     load_stats_current,
     load_subscribers,
     load_update_state,
@@ -170,6 +182,8 @@ from updates import (
     refresh_update_state,
 )
 from utils import (
+    _parse_iso_utc,
+    _rel_url,
     _subscriber_link,
     current_quarter,
     h,
@@ -187,6 +201,12 @@ _BLOCKLIST_HINT = (
     "Подсказка: <code>/block 123456789</code> — заблокировать; "
     "<code>/unblock 123456789</code> — разблокировать."
 )
+_PICK_CALLBACK_PREFIX = "pick:"
+_PICK_CATEGORIES: frozenset[str] = frozenset({
+    PICK_CATEGORY_ANIME,
+    PICK_CATEGORY_MANGA,
+    PICK_CATEGORY_RANOBE,
+})
 _FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
 FACTS_APPLY_CALLBACK_PREFIX = "facts:apply:"
 FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
@@ -264,6 +284,10 @@ async def _get_status_rates() -> tuple[list[dict], list[dict]] | None:
 class BroadcastStates(StatesGroup):
     waiting_content = State()   # ждём сообщение от владельца
     waiting_confirm = State()   # ждём нажатия кнопки подтверждения
+
+
+class PickStates(StatesGroup):
+    active = State()  # одно текущее owner-menu и его неповторяющийся цикл
 
 
 def _confirm_kb() -> InlineKeyboardMarkup:
@@ -719,6 +743,398 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
         return
 
     await _send_stats_reports(callback.message.bot, callback.message.chat.id, msgs)
+
+
+def _pick_root_keyboard() -> InlineKeyboardMarkup:
+    """Собрать неизменяемый выбор трёх пользовательских категорий."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Аниме", callback_data="pick:anime")],
+        [InlineKeyboardButton(text="📚 Манга", callback_data="pick:manga")],
+        [InlineKeyboardButton(text="📖 Ранобэ", callback_data="pick:ranobe")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="pick:cancel")],
+    ])
+
+
+def _pick_result_keyboard() -> InlineKeyboardMarkup:
+    """Собрать действия над текущим результатом /pick."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Ещё вариант", callback_data="pick:more")],
+        [InlineKeyboardButton(
+            text="🎲 Что-нибудь совсем другое",
+            callback_data="pick:contrast",
+        )],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="pick:close")],
+    ])
+
+
+def _pick_category_label(category: str) -> str:
+    """Вернуть читательское имя категории без раскрытия внутренних ключей."""
+    return {
+        PICK_CATEGORY_ANIME: "Аниме",
+        PICK_CATEGORY_MANGA: "Манга",
+        PICK_CATEGORY_RANOBE: "Ранобэ",
+    }.get(category, "Тайтлы")
+
+
+def _pick_freshness(updated_at: str | None) -> str:
+    """Отформатировать локальную метку синхронизации или безопасный fallback."""
+    parsed = _parse_iso_utc(updated_at)
+    if parsed is None:
+        return "время обновления неизвестно"
+    return f"обновлено {parsed.strftime('%d.%m.%Y %H:%M')} UTC"
+
+
+def _pick_unresolved_notice(count: int) -> str:
+    """Объяснить исключение unknown-записей без угадывания их категории."""
+    if count <= 0:
+        return ""
+    return (
+        "\n\n⚠️ Запланированных тайтлов с пока не определённым типом: "
+        f"<b>{count}</b>. Они временно не входят ни в мангу, ни в ранобэ."
+    )
+
+
+def _pick_root_text(snapshot_state: str, catalog, *, notice: str | None = None) -> str:
+    """Показать состояние локальных данных и оставить выбор управляемым."""
+    prefix = f"{notice}\n\n" if notice else ""
+    if snapshot_state == STATS_ALL_MISSING:
+        body = (
+            "Локальная статистика ещё не готова. Дождись успешной полной "
+            "синхронизации — бот не будет запускать её из этого меню."
+        )
+        freshness = ""
+        unresolved = ""
+    elif snapshot_state == STATS_ALL_INVALID or catalog is None:
+        body = (
+            "Локальные данные статистики сейчас недоступны или повреждены. "
+            "Бот продолжит работать, а следующая успешная полная синхронизация "
+            "попробует восстановить данные."
+        )
+        freshness = ""
+        unresolved = ""
+    else:
+        body = "Выбери, что подобрать из запланированного списка."
+        freshness = f"\n\n🕒 {_pick_freshness(catalog.updated_at)}."
+        unresolved = _pick_unresolved_notice(catalog.unresolved_count)
+    return f"{prefix}🎲 <b>Что выбрать дальше?</b>\n\n{body}{freshness}{unresolved}"
+
+
+def _pick_clip(text: str, limit: int) -> str:
+    """Ограничить повреждённое длинное поле до безопасного размера Telegram."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 1].rstrip()}…"
+
+
+def _pick_escape_clip(text: str, limit: int) -> str:
+    """Экранировать текст и обрезать его, не разрывая HTML entity."""
+    escaped = h(text)
+    if len(escaped) <= limit:
+        return escaped
+
+    raw_parts: list[str] = []
+    escaped_length = 0
+    budget = max(0, limit - 1)
+    for character in text:
+        escaped_character = h(character)
+        if escaped_length + len(escaped_character) > budget:
+            break
+        raw_parts.append(character)
+        escaped_length += len(escaped_character)
+    return f"{h(''.join(raw_parts).rstrip())}…"
+
+
+def _pick_candidate_text(candidate: PickCandidate, catalog) -> str:
+    """Безопасно отрендерить один локальный результат с нормализованной ссылкой."""
+    title = _pick_escape_clip(candidate.title, 700)
+    relative_url = _rel_url(candidate.url)
+    if relative_url:
+        relative_url = f"/{relative_url.lstrip('/')}"
+        url = h(f"{SHIKI_BASE_URL.rstrip('/')}{relative_url}")
+        rendered_title = (
+            f'<a href="{url}">{title}</a>'
+            if len(url) <= 1000
+            else f"<b>{title}</b>"
+        )
+    else:
+        rendered_title = f"<b>{title}</b>"
+
+    details: list[str] = []
+    if candidate.year is not None:
+        details.append(f"🗓️ {candidate.year}")
+    if candidate.genres:
+        genres = ", ".join(_pick_clip(genre, 100) for genre in candidate.genres[:20])
+        if len(candidate.genres) > 20:
+            genres = f"{genres}, …"
+        details.append(f"🎭 {_pick_escape_clip(genres, 1200)}")
+    details_body = "\n".join(details)
+    details_text = f"\n\n{details_body}" if details_body else ""
+    unresolved = (
+        ""
+        if candidate.category == PICK_CATEGORY_ANIME
+        else _pick_unresolved_notice(catalog.unresolved_count)
+    )
+    return (
+        f"🎲 <b>Вариант — {_pick_category_label(candidate.category)}</b>\n\n"
+        f"{rendered_title}{details_text}\n\n"
+        f"🕒 {_pick_freshness(catalog.updated_at)}."
+        f"{unresolved}"
+    )
+
+
+def _pick_candidate_to_state(candidate: PickCandidate) -> dict:
+    """Сериализовать текущий anchor только во внутрипроцессный FSM."""
+    return {
+        "id": candidate.id,
+        "category": candidate.category,
+        "title": candidate.title,
+        "url": candidate.url,
+        "year": candidate.year,
+        "genres": list(candidate.genres),
+    }
+
+
+def _pick_candidate_from_state(value: object) -> PickCandidate | None:
+    """Защитно восстановить anchor из FSM без доверия к его форме."""
+    if not isinstance(value, dict):
+        return None
+    candidate_id = value.get("id")
+    category = value.get("category")
+    title = value.get("title")
+    url = value.get("url")
+    year = value.get("year")
+    genres = value.get("genres")
+    if (
+        not isinstance(candidate_id, str)
+        or category not in _PICK_CATEGORIES
+        or not isinstance(title, str)
+        or not isinstance(url, str)
+        or (year is not None and type(year) is not int)
+        or not isinstance(genres, list)
+        or any(not isinstance(genre, str) for genre in genres)
+    ):
+        return None
+    return PickCandidate(
+        id=candidate_id,
+        category=category,
+        title=title,
+        url=url,
+        year=year,
+        genres=tuple(genres),
+    )
+
+
+def _load_pick_catalog() -> tuple[str, object | None]:
+    """Прочитать только локальный snapshot и проверить picker-структуру."""
+    snapshot = load_stats_all_snapshot()
+    if snapshot.state != STATS_ALL_VALID:
+        return snapshot.state, None
+    catalog = build_pick_catalog(snapshot.data)
+    if catalog is None:
+        return STATS_ALL_INVALID, None
+    return snapshot.state, catalog
+
+
+async def _discard_previous_pick_menu(message: Message, state: FSMContext) -> None:
+    """Инвалидировать прежнюю сессию и по возможности убрать её сообщения."""
+    previous = await state.get_data()
+    await state.clear()
+    if previous.get("pick_menu_chat_id") != message.chat.id:
+        return
+    menu_id = previous.get("pick_menu_message_id")
+    command_id = previous.get("pick_command_message_id")
+    if type(menu_id) is int:
+        await _safe_delete(message.bot, message.chat.id, menu_id)
+    if type(command_id) is int:
+        await _safe_delete(message.bot, message.chat.id, command_id)
+
+
+def _pick_state_is_active(value: object) -> bool:
+    """Учесть объект State и строковое значение реального FSM storage."""
+    return value == PickStates.active or value == PickStates.active.state
+
+
+async def cmd_pick(message: Message, state: FSMContext) -> None:
+    """Открыть скрытый owner-only выбор из локального planned snapshot."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+
+    current_state = await state.get_state()
+    if current_state is not None and not _pick_state_is_active(current_state):
+        await message.answer(
+            "⚠️ Сначала заверши текущую операцию или отправь /cancel."
+        )
+        return
+    if _pick_state_is_active(current_state):
+        await _discard_previous_pick_menu(message, state)
+    else:
+        await state.clear()
+    snapshot_state, catalog = _load_pick_catalog()
+    try:
+        menu = await message.reply(
+            _pick_root_text(snapshot_state, catalog),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pick_root_keyboard(),
+        )
+    except Exception as e:
+        log.warning("cmd_pick: не удалось открыть меню: %s", e)
+        return
+    await state.set_state(PickStates.active)
+    await state.update_data(
+        pick_menu_chat_id=message.chat.id,
+        pick_menu_message_id=menu.message_id,
+        pick_command_message_id=message.message_id,
+        pick_category=None,
+        pick_shown_ids=[],
+        pick_anchor=None,
+    )
+
+
+async def _pick_callback_session(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> dict | None:
+    """Проверить владельца, сообщение и принадлежность текущей FSM-сессии."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return None
+    if callback.message is None:
+        await callback.answer("Меню устарело. Отправь /pick ещё раз.", show_alert=True)
+        return None
+    if await state.get_state() != PickStates.active:
+        await callback.answer("Меню устарело. Отправь /pick ещё раз.", show_alert=True)
+        return None
+    data = await state.get_data()
+    if (
+        data.get("pick_menu_chat_id") != callback.message.chat.id
+        or data.get("pick_menu_message_id") != callback.message.message_id
+    ):
+        await callback.answer("Это меню уже неактивно.", show_alert=True)
+        return None
+    return data
+
+
+async def _pick_edit(
+    callback: CallbackQuery,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> bool:
+    """Изменить control message, не распространяя Telegram-сбой в FSM."""
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return True
+    except Exception as e:
+        log.debug("pick: не удалось обновить меню: %s", e)
+        await callback.answer("Не удалось обновить меню. Попробуй ещё раз.", show_alert=True)
+        return False
+
+
+async def _pick_show_category(
+    callback: CallbackQuery,
+    state: FSMContext,
+    data: dict,
+    category: str,
+    *,
+    contrast: bool = False,
+) -> None:
+    """Выбрать и атомарно отразить следующий результат текущей категории."""
+    snapshot_state, catalog = _load_pick_catalog()
+    if snapshot_state != STATS_ALL_VALID or catalog is None:
+        if await _pick_edit(
+            callback,
+            _pick_root_text(snapshot_state, catalog),
+            _pick_root_keyboard(),
+        ):
+            await state.update_data(
+                pick_category=None,
+                pick_shown_ids=[],
+                pick_anchor=None,
+            )
+            await callback.answer()
+        return
+
+    candidates = catalog.candidates_for(category)
+    if not candidates:
+        notice = (
+            "📭 В последней локальной синхронизации нет запланированных "
+            f"вариантов в категории «{_pick_category_label(category)}»."
+        )
+        if await _pick_edit(
+            callback,
+            _pick_root_text(snapshot_state, catalog, notice=notice),
+            _pick_root_keyboard(),
+        ):
+            await state.update_data(
+                pick_category=None,
+                pick_shown_ids=[],
+                pick_anchor=None,
+            )
+            await callback.answer()
+        return
+
+    shown_ids = data.get("pick_shown_ids")
+    if not isinstance(shown_ids, list):
+        shown_ids = []
+    anchor = _pick_candidate_from_state(data.get("pick_anchor"))
+    if contrast:
+        if anchor is None or anchor.category != category:
+            await callback.answer("Текущий вариант устарел. Выбери категорию заново.", show_alert=True)
+            return
+        selection = select_contrast_pick_candidate(candidates, anchor, shown_ids)
+    else:
+        selection = select_pick_candidate(candidates, shown_ids)
+    if selection.candidate is None:
+        await callback.answer("Подходящих вариантов пока нет.", show_alert=True)
+        return
+
+    if not await _pick_edit(
+        callback,
+        _pick_candidate_text(selection.candidate, catalog),
+        _pick_result_keyboard(),
+    ):
+        return
+    await state.update_data(
+        pick_category=category,
+        pick_shown_ids=sorted(selection.shown_ids),
+        pick_anchor=_pick_candidate_to_state(selection.candidate),
+    )
+    await callback.answer()
+
+
+async def pick_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Оркестрировать все callback пути текущего owner-only меню /pick."""
+    data = await _pick_callback_session(callback, state)
+    if data is None:
+        return
+    raw_data = callback.data or ""
+    action = raw_data.removeprefix(_PICK_CALLBACK_PREFIX)
+    if action in {"cancel", "close"}:
+        await state.clear()
+        await callback.answer()
+        await _cleanup_inline_menu(callback.message)
+        return
+    if action in _PICK_CATEGORIES:
+        await _pick_show_category(callback, state, data, action)
+        return
+    if action in {"more", "contrast"}:
+        category = data.get("pick_category")
+        if category not in _PICK_CATEGORIES:
+            await callback.answer("Сначала выбери категорию.", show_alert=True)
+            return
+        await _pick_show_category(
+            callback,
+            state,
+            data,
+            category,
+            contrast=action == "contrast",
+        )
+        return
+    await callback.answer("Неизвестное действие.", show_alert=True)
 
 
 async def cmd_favs(message: Message) -> None:
@@ -2619,6 +3035,24 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     await state.clear()
+    # /pick хранит только ID текущего локального control message и команды.
+    # Удаляем их тем же best-effort контрактом, что использует Close.
+    if (
+        data.get("pick_menu_chat_id") == message.chat.id
+        and type(data.get("pick_menu_message_id")) is int
+    ):
+        await _safe_delete(
+            message.bot,
+            message.chat.id,
+            data["pick_menu_message_id"],
+        )
+        if type(data.get("pick_command_message_id")) is int:
+            await _safe_delete(
+                message.bot,
+                message.chat.id,
+                data["pick_command_message_id"],
+            )
+        await _safe_delete(message.bot, message.chat.id, message.message_id)
     # broadcast-флоу: подчищаем всё, что флоу мог создать к этому моменту
     if data.get("prompt_msg_id") is not None:
         await _safe_delete(message.bot, message.chat.id, data["prompt_msg_id"])
@@ -2909,3 +3343,4 @@ async def version_refresh_cb(callback: CallbackQuery) -> None:
                 )
         except TelegramBadRequest as e:
             log.warning("Не удалось обновить сообщение /info: %s", e)
+    build_pick_catalog,
