@@ -780,8 +780,8 @@ def _pick_freshness(updated_at: str | None) -> str:
     """Отформатировать локальную метку синхронизации или безопасный fallback."""
     parsed = _parse_iso_utc(updated_at)
     if parsed is None:
-        return "время обновления неизвестно"
-    return f"обновлено {parsed.strftime('%d.%m.%Y %H:%M')} UTC"
+        return "время обновления списка неизвестно"
+    return f"список обновлён {parsed.strftime('%d.%m.%Y %H:%M')} UTC"
 
 
 def _pick_unresolved_notice(count: int) -> str:
@@ -789,8 +789,8 @@ def _pick_unresolved_notice(count: int) -> str:
     if count <= 0:
         return ""
     return (
-        "\n\n⚠️ Запланированных тайтлов с пока не определённым типом: "
-        f"<b>{count}</b>. Они временно не входят ни в мангу, ни в ранобэ."
+        f"\n\n⚠️ Часть запланированных тайтлов (<b>{count}</b>) пока нельзя "
+        "отнести к манге или ранобэ, поэтому я их не предлагаю."
     )
 
 
@@ -799,24 +799,38 @@ def _pick_root_text(snapshot_state: str, catalog, *, notice: str | None = None) 
     prefix = f"{notice}\n\n" if notice else ""
     if snapshot_state == STATS_ALL_MISSING:
         body = (
-            "Локальная статистика ещё не готова. Дождись успешной полной "
-            "синхронизации — бот не будет запускать её из этого меню."
+            "Список «Запланировано» ещё не готов. Попробуй снова после "
+            "следующего обновления данных."
         )
         freshness = ""
         unresolved = ""
     elif snapshot_state == STATS_ALL_INVALID or catalog is None:
         body = (
-            "Локальные данные статистики сейчас недоступны или повреждены. "
-            "Бот продолжит работать, а следующая успешная полная синхронизация "
-            "попробует восстановить данные."
+            "Не получилось прочитать сохранённый список «Запланировано». "
+            "Попробуй снова после следующего обновления данных."
         )
         freshness = ""
         unresolved = ""
     else:
-        body = "Выбери, что подобрать из запланированного списка."
+        body = (
+            "Выбери категорию — давай найдём что-нибудь в списке "
+            "«Запланировано»."
+        )
         freshness = f"\n\n🕒 {_pick_freshness(catalog.updated_at)}."
         unresolved = _pick_unresolved_notice(catalog.unresolved_count)
-    return f"{prefix}🎲 <b>Что выбрать дальше?</b>\n\n{body}{freshness}{unresolved}"
+    return (
+        f"{prefix}🎲 <b>Не можешь решить, что посмотреть или почитать?</b>"
+        f"\n\n{body}{freshness}{unresolved}"
+    )
+
+
+def _pick_suggestion_heading(category: str) -> str:
+    """Предложить тайтл с естественным согласованием категории."""
+    return {
+        PICK_CATEGORY_ANIME: "Как насчёт этого аниме?",
+        PICK_CATEGORY_MANGA: "Как насчёт этой манги?",
+        PICK_CATEGORY_RANOBE: "Как насчёт этого ранобэ?",
+    }.get(category, "Как насчёт этого?")
 
 
 def _pick_clip(text: str, limit: int) -> str:
@@ -875,7 +889,7 @@ def _pick_candidate_text(candidate: PickCandidate, catalog) -> str:
         else _pick_unresolved_notice(catalog.unresolved_count)
     )
     return (
-        f"🎲 <b>Вариант — {_pick_category_label(candidate.category)}</b>\n\n"
+        f"🎲 <b>{_pick_suggestion_heading(candidate.category)}</b>\n\n"
         f"{rendered_title}{details_text}\n\n"
         f"🕒 {_pick_freshness(catalog.updated_at)}."
         f"{unresolved}"
@@ -1061,8 +1075,8 @@ async def _pick_show_category(
     candidates = catalog.candidates_for(category)
     if not candidates:
         notice = (
-            "📭 В последней локальной синхронизации нет запланированных "
-            f"вариантов в категории «{_pick_category_label(category)}»."
+            f"📭 В категории «{_pick_category_label(category)}» пока нечего "
+            "выбирать из списка «Запланировано»."
         )
         if await _pick_edit(
             callback,
@@ -1089,7 +1103,7 @@ async def _pick_show_category(
     else:
         selection = select_pick_candidate(candidates, shown_ids)
     if selection.candidate is None:
-        await callback.answer("Подходящих вариантов пока нет.", show_alert=True)
+        await callback.answer("В этой категории пока нечего предложить.", show_alert=True)
         return
 
     if not await _pick_edit(

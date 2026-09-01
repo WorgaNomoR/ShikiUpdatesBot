@@ -125,6 +125,10 @@ def _callback_data(markup):
     ]
 
 
+def _button_texts(markup):
+    return [button.text for row in markup.inline_keyboard for button in row]
+
+
 @pytest.mark.asyncio
 async def test_owner_command_opens_hidden_three_category_menu(monkeypatch):
     load = _patch_snapshot(monkeypatch, _stats(unresolved=True))
@@ -137,8 +141,9 @@ async def test_owner_command_opens_hidden_three_category_menu(monkeypatch):
     message.reply.assert_awaited_once()
     text = message.reply.await_args.args[0]
     markup = message.reply.await_args.kwargs["reply_markup"]
-    assert "Что выбрать дальше?" in text
-    assert "не определённым типом: <b>1</b>" in text
+    assert "Не можешь решить, что посмотреть или почитать?" in text
+    assert "давай найдём что-нибудь в списке «Запланировано»" in text
+    assert "Часть запланированных тайтлов (<b>1</b>)" in text
     assert "01.09.2026 10:00 UTC" in text
     assert _callback_data(markup) == [
         "pick:anime",
@@ -220,7 +225,13 @@ async def test_category_more_and_contrast_are_repeat_free_and_render_safe_html(
     await handlers.pick_menu_cb(callback, state)
 
     first_text = callback.message.edit_text.await_args.args[0]
+    first_markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
     assert "A &lt; B &amp; C" in first_text
+    assert _button_texts(first_markup) == [
+        "🔄 Ещё вариант",
+        "🎲 Что-нибудь совсем другое",
+        "❌ Закрыть",
+    ]
     assert first_text.count(handlers.SHIKI_BASE_URL.rstrip("/")) == 1
     assert "shikimori.onehttps://" not in first_text
     assert state.data["pick_shown_ids"] == ["1"]
@@ -289,6 +300,14 @@ def test_pick_renderer_bounds_escaped_html_and_drops_anomalously_long_url():
 
 def test_pick_renderer_shows_unresolved_notice_only_for_manga_domain():
     stats = _stats(unresolved=True)
+    stats["manga"]["titles"]["12"] = {
+        "title": "Манга",
+        "status": "planned",
+        "kind": "manga",
+        "url": "/mangas/12",
+        "year": 2021,
+        "genres": [],
+    }
     stats["manga"]["titles"]["11"] = {
         "title": "Ранобэ",
         "status": "planned",
@@ -300,22 +319,30 @@ def test_pick_renderer_shows_unresolved_notice_only_for_manga_domain():
     catalog = smod.build_pick_catalog(stats)
 
     anime_text = handlers._pick_candidate_text(catalog.anime[0], catalog)
+    manga_text = handlers._pick_candidate_text(catalog.manga[0], catalog)
     ranobe_text = handlers._pick_candidate_text(catalog.ranobe[0], catalog)
 
-    assert "не определённым типом" not in anime_text
-    assert "не определённым типом: <b>1</b>" in ranobe_text
+    assert "Как насчёт этого аниме?" in anime_text
+    assert "Как насчёт этой манги?" in manga_text
+    assert "Как насчёт этого ранобэ?" in ranobe_text
+    assert "поэтому я их не предлагаю" not in anime_text
+    assert "Часть запланированных тайтлов (<b>1</b>)" in ranobe_text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("snapshot_state", "payload", "expected"),
     [
-        (storage.STATS_ALL_MISSING, storage._empty_stats_all(), "ещё не готова"),
-        (storage.STATS_ALL_INVALID, storage._empty_stats_all(), "недоступны или повреждены"),
+        (storage.STATS_ALL_MISSING, storage._empty_stats_all(), "ещё не готов"),
+        (
+            storage.STATS_ALL_INVALID,
+            storage._empty_stats_all(),
+            "Не получилось прочитать",
+        ),
         (
             storage.STATS_ALL_VALID,
             {"anime": {}, "manga": {"titles": {}}},
-            "недоступны или повреждены",
+            "Не получилось прочитать",
         ),
     ],
 )
@@ -333,7 +360,7 @@ async def test_missing_malformed_and_structurally_invalid_snapshot_are_distinct_
 
     text = message.reply.await_args.args[0]
     assert expected in text
-    assert "нет запланированной" not in text
+    assert "пока нечего выбирать" not in text
     assert state.state == handlers.PickStates.active.state
 
 
@@ -348,7 +375,7 @@ async def test_valid_empty_category_keeps_root_menu_usable(monkeypatch):
 
     text = callback.message.edit_text.await_args.args[0]
     markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
-    assert "нет запланированных вариантов в категории «Манга»" in text
+    assert "В категории «Манга» пока нечего выбирать" in text
     assert _callback_data(markup) == [
         "pick:anime",
         "pick:manga",
@@ -370,8 +397,8 @@ async def test_category_empty_because_of_unknown_kind_discloses_unresolved_count
     await handlers.pick_menu_cb(callback, state)
 
     text = callback.message.edit_text.await_args.args[0]
-    assert "нет запланированных вариантов в категории «Манга»" in text
-    assert "не определённым типом: <b>1</b>" in text
+    assert "В категории «Манга» пока нечего выбирать" in text
+    assert "Часть запланированных тайтлов (<b>1</b>)" in text
 
 
 @pytest.mark.asyncio
