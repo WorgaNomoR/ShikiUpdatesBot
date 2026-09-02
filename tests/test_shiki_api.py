@@ -917,11 +917,16 @@ async def test_fetch_meta_batch_parses_full_anime_meta():
         "url": "https://shikimori.one/animes/226-elfen-lied",
         "kind": "TV",
         "score": "8.5",
+        "status": "released",
         "rating": "r",
         "origin": "manga",
         "duration": 25,
         "episodes": 13,
         "airedOn": {"year": 2004},
+        "poster": {
+            "originalUrl": "https://shikimori.one/system/animes/original/226.jpg",
+            "mainUrl": "/system/animes/main/226.jpg",
+        },
         "studios": [{"name": "Arms"}, {"noname": 1}],
         "genres": [
             {"russian": "Драма", "name": "Drama", "kind": "genre"},
@@ -935,7 +940,9 @@ async def test_fetch_meta_batch_parses_full_anime_meta():
     assert set(result) == {"226"}
     meta = result["226"]
     assert meta["url"] == shiki_api._rel_url(item["url"])   # нормализован к относительному
+    assert meta["poster_url"] == item["poster"]["originalUrl"]
     assert meta["kind"] == "tv"                              # приведён к нижнему регистру
+    assert meta["release_status"] == "released"
     assert meta["year"] == 2004
     assert meta["shiki_score"] == 8.5
     assert meta["genres"] == ["Драма"]
@@ -946,6 +953,10 @@ async def test_fetch_meta_batch_parses_full_anime_meta():
     assert meta["rating"] == "R-17"                          # RU-маппинг рейтинга
     assert meta["origin"] == "Манга"                         # RU-маппинг origin
     assert meta["studios"] == ["Arms"]                       # студия без name отброшена
+    assert "poster { originalUrl mainUrl }" in session.requests[0]["query"]
+    assert "status" in {
+        line.strip() for line in session.requests[0]["query"].splitlines()
+    }
 
 
 @pytest.mark.asyncio
@@ -955,9 +966,11 @@ async def test_fetch_meta_batch_parses_manga_meta():
         "url": "/mangas/1-berserk",
         "kind": "Manga",
         "score": "9.1",
+        "status": "ongoing",
         "chapters": 100,
         "volumes": 12,
         "airedOn": {"year": 1989},
+        "poster": {"originalUrl": "/system/mangas/original/1.jpg"},
         "publishers": [{"name": "Hakusensha"}, {"nope": 1}],
         "genres": [],
     }
@@ -967,8 +980,44 @@ async def test_fetch_meta_batch_parses_manga_meta():
     assert meta["chapters_total"] == 100
     assert meta["volumes_total"] == 12
     assert meta["publishers"] == ["Hakusensha"]
+    assert meta["release_status"] == "ongoing"
+    assert meta["poster_url"] == (
+        f"{shiki_api.SHIKI_BASE_URL.rstrip('/')}/system/mangas/original/1.jpg"
+    )
+    assert "poster { originalUrl mainUrl }" in session.requests[0]["query"]
+    assert "status" in {
+        line.strip() for line in session.requests[0]["query"].splitlines()
+    }
     # манга-ветка НЕ добавляет аниме-специфичные поля
     assert "rating" not in meta and "origin" not in meta and "studios" not in meta
+
+
+@pytest.mark.parametrize(
+    ("poster", "expected"),
+    [
+        ({"originalUrl": "javascript:alert(1)"}, ""),
+        (
+            {
+                "originalUrl": "javascript:alert(1)",
+                "mainUrl": "https://cdn.example/poster.webp",
+            },
+            "https://cdn.example/poster.webp",
+        ),
+        (
+            {
+                "originalUrl": "javascript:alert(1)",
+                "mainUrl": "/system/animes/main/1.jpg",
+            },
+            f"{shiki_api.SHIKI_BASE_URL.rstrip('/')}/system/animes/main/1.jpg",
+        ),
+        (None, ""),
+    ],
+)
+def test_poster_url_accepts_only_absolute_http_and_uses_safe_fallback(
+    poster,
+    expected,
+):
+    assert shiki_api._poster_url(poster) == expected
 
 
 @pytest.mark.asyncio

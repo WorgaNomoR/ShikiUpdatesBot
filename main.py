@@ -53,6 +53,7 @@ from handlers import (
     cmd_favs,
     cmd_info,
     cmd_inline_search,
+    cmd_pick,
     cmd_start,
     cmd_stats,
     cmd_status,
@@ -70,6 +71,7 @@ from handlers import (
     facts_example_cb,
     facts_receive,
     facts_upload_cb,
+    pick_menu_cb,
     probe_owner_and_start,
     stats_menu_cb,
     version_refresh_cb,
@@ -122,6 +124,7 @@ async def main() -> None:
     dp.message.register(cmd_favs,      Command("favs"))
     dp.message.register(cmd_fact,      Command("fact"))
     dp.message.register(cmd_facts,     Command("facts"))
+    dp.message.register(cmd_pick,      Command("pick"))
     dp.message.register(cmd_info,      Command("info"))
     dp.message.register(cmd_version,   Command("version"))
     dp.message.register(cmd_block,     Command("block"))
@@ -174,6 +177,12 @@ async def main() -> None:
 
     # Локальная ротация публичных фактов
     dp.callback_query.register(fact_next_cb, F.data.startswith("fact:next:"))
+
+    # Скрытый owner-only локальный выбор из planned snapshot
+    dp.callback_query.register(
+        pick_menu_cb,
+        F.data.startswith("pick:"),
+    )
 
     # Публичные команды в меню "/" — команды владельца не показываем
     await bot.set_my_commands([

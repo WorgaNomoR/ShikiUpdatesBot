@@ -179,6 +179,224 @@ def test_aggregates_manga_chapters():
 
 
 # ════════════════════════════════════════════════════════════════
+#  /pick: classifier, planned-каталог и чистые selector-контракты
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("manga", smod.PICK_CATEGORY_MANGA),
+        ("manhwa", smod.PICK_CATEGORY_MANGA),
+        ("manhua", smod.PICK_CATEGORY_MANGA),
+        ("light_novel", smod.PICK_CATEGORY_RANOBE),
+        ("novel", smod.PICK_CATEGORY_RANOBE),
+        ("ranobe", smod.PICK_CATEGORY_RANOBE),
+        (None, smod.PICK_CATEGORY_UNKNOWN),
+        (123, smod.PICK_CATEGORY_UNKNOWN),
+        ("", smod.PICK_CATEGORY_UNKNOWN),
+        ("future_book_kind", smod.PICK_CATEGORY_UNKNOWN),
+    ],
+)
+def test_manga_presentation_classifier_is_tri_state_without_guessing(kind, expected):
+    assert smod.classify_manga_presentation_kind(kind) == expected
+
+
+def _pick_record(
+    title,
+    *,
+    status="planned",
+    release_status=None,
+    kind="tv",
+    year=2011,
+    genres=None,
+):
+    return {
+        "title": title,
+        "status": status,
+        "release_status": release_status,
+        "kind": kind,
+        "url": f"https://shikimori.one/animes/{title}",
+        "year": year,
+        "genres": ["Экшен"] if genres is None else genres,
+    }
+
+
+def _pick_candidate(candidate_id, *, year=2011, genres=("Экшен",)):
+    return smod.PickCandidate(
+        id=candidate_id,
+        category=smod.PICK_CATEGORY_ANIME,
+        title=candidate_id,
+        url=f"/animes/{candidate_id}",
+        year=year,
+        genres=genres,
+    )
+
+
+def test_pick_catalog_contains_only_planned_and_discloses_unknown_manga_records():
+    stats = storage._empty_stats_all()
+    stats["updated_at"] = "2026-09-01T10:00:00+00:00"
+    stats["anime"]["titles"] = {
+        "1": _pick_record("anime", kind="future_anime_kind"),
+        "2": _pick_record("completed", status="completed"),
+        "3": _pick_record("uppercase", status="PLANNED"),
+    }
+    stats["manga"]["titles"] = {
+        "4": _pick_record("manga", kind="manga"),
+        "5": _pick_record("ranobe", kind="light_novel"),
+        "6": _pick_record("unknown", kind="future_book_kind"),
+        "7": _pick_record("missing-kind", kind=None),
+    }
+
+    catalog = smod.build_pick_catalog(stats)
+
+    assert catalog is not None
+    assert [candidate.id for candidate in catalog.anime] == ["1"]
+    assert [candidate.id for candidate in catalog.manga] == ["4"]
+    assert [candidate.id for candidate in catalog.ranobe] == ["5"]
+    assert catalog.unresolved_count == 2
+    assert catalog.updated_at == "2026-09-01T10:00:00+00:00"
+    all_ids = {
+        candidate.id
+        for pool in (catalog.anime, catalog.manga, catalog.ranobe)
+        for candidate in pool
+    }
+    assert all_ids == {"1", "4", "5"}
+
+
+def test_pick_catalog_excludes_only_explicitly_announced_titles():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "1": _pick_record("released", release_status="released"),
+        "2": _pick_record("ongoing", release_status="ongoing"),
+        "3": _pick_record("announced", release_status="anons"),
+        "4": _pick_record("legacy"),
+        "5": _pick_record("future-status", release_status="future_status"),
+    }
+    stats["manga"]["titles"] = {
+        "6": _pick_record("manga-announced", release_status=" ANONS ", kind="manga"),
+        "7": _pick_record(
+            "unknown-announced",
+            release_status="anons",
+            kind="future_book_kind",
+        ),
+    }
+
+    catalog = smod.build_pick_catalog(stats)
+
+    assert catalog is not None
+    assert [candidate.id for candidate in catalog.anime] == ["1", "2", "4", "5"]
+    assert catalog.manga == ()
+    assert catalog.ranobe == ()
+    assert catalog.unresolved_count == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"anime": {}, "manga": {"titles": {}}},
+        {"anime": {"titles": []}, "manga": {"titles": {}}},
+    ],
+)
+def test_pick_catalog_rejects_structurally_unusable_snapshot(payload):
+    assert smod.build_pick_catalog(payload) is None
+
+
+def test_pick_catalog_normalizes_missing_optional_fields_without_crashing():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "1": {"status": "planned", "genres": ["Экшен", None, "экшен", ""]},
+    }
+
+    catalog = smod.build_pick_catalog(stats)
+
+    assert catalog is not None
+    assert catalog.anime == (
+        smod.PickCandidate(
+            id="1",
+            category=smod.PICK_CATEGORY_ANIME,
+            title="Без названия",
+            url="",
+            year=None,
+            genres=("Экшен",),
+        ),
+    )
+
+
+def test_ordinary_pick_is_uniform_over_unseen_pool_and_resets_after_exhaustion(
+    monkeypatch,
+):
+    candidates = tuple(_pick_candidate(str(index)) for index in range(1, 4))
+    offered: list[tuple[str, ...]] = []
+
+    def choose(items):
+        offered.append(tuple(candidate.id for candidate in items))
+        return items[0]
+
+    monkeypatch.setattr(smod.random, "choice", choose)
+    shown = frozenset()
+    selected = []
+    resets = []
+    for _ in range(4):
+        result = smod.select_pick_candidate(candidates, shown)
+        selected.append(result.candidate.id)
+        resets.append(result.pool_reset)
+        shown = result.shown_ids
+
+    assert selected == ["1", "2", "3", "1"]
+    assert offered == [("1", "2", "3"), ("2", "3"), ("3",), ("1", "2", "3")]
+    assert resets == [False, False, False, True]
+    assert shown == frozenset({"1"})
+
+
+def test_contrast_pick_prefers_other_decade_then_minimum_genre_overlap(
+    monkeypatch,
+):
+    anchor = _pick_candidate("anchor", year=2011, genres=("Экшен", "Драма"))
+    candidates = (
+        anchor,
+        _pick_candidate("same-zero", year=2015, genres=("Комедия",)),
+        _pick_candidate("other-two", year=1998, genres=("Экшен", "Драма")),
+        _pick_candidate("other-zero", year=1987, genres=("Комедия",)),
+        _pick_candidate("other-zero-2", year=1977, genres=("Музыка",)),
+        _pick_candidate("other-missing-genres", year=1967, genres=()),
+        _pick_candidate("missing-year", year=None, genres=("Комедия",)),
+    )
+    offered = []
+
+    def choose(items):
+        offered.append(tuple(candidate.id for candidate in items))
+        return items[0]
+
+    monkeypatch.setattr(smod.random, "choice", choose)
+
+    result = smod.select_contrast_pick_candidate(candidates, anchor, {anchor.id})
+
+    assert result.candidate.id == "other-zero"
+    assert offered == [("other-zero", "other-zero-2")]
+
+
+def test_contrast_pick_weakens_missing_metadata_and_handles_one_item(monkeypatch):
+    anchor = _pick_candidate("only", year=None, genres=())
+    offered = []
+
+    def choose(items):
+        offered.append(tuple(items))
+        return items[0]
+
+    monkeypatch.setattr(smod.random, "choice", choose)
+
+    result = smod.select_contrast_pick_candidate((anchor,), anchor, {anchor.id})
+
+    assert result.candidate == anchor
+    assert result.pool_reset is True
+    assert result.shown_ids == frozenset({anchor.id})
+    assert offered == [(anchor,)]
+
+
+# ════════════════════════════════════════════════════════════════
 #  Регрессия: фильтр нерелевантных kind в sync_stats_all
 # ════════════════════════════════════════════════════════════════
 
@@ -200,7 +418,12 @@ async def test_sync_stats_all_filters_special_before_aggregating(monkeypatch):
         for tid in (1, 2, 3)
     ]
     metadata = {
-        "1": {"kind": "tv", "studios": ["Studio Deen"]},
+        "1": {
+            "kind": "tv",
+            "poster_url": "https://cdn.example/1.jpg",
+            "release_status": "released",
+            "studios": ["Studio Deen"],
+        },
         "2": {"kind": "ova", "studios": ["Studio Deen"]},
         "3": {"kind": "special", "studios": ["Studio Deen"]},
     }
@@ -227,6 +450,10 @@ async def test_sync_stats_all_filters_special_before_aggregating(monkeypatch):
 
     assert ok is True
     assert set(result["anime"]["titles"]) == {"1", "2"}
+    assert result["anime"]["titles"]["1"]["poster_url"] == (
+        "https://cdn.example/1.jpg"
+    )
+    assert result["anime"]["titles"]["1"]["release_status"] == "released"
     assert result["anime"]["aggregates"]["studios"] == {"Studio Deen": 2}
     assert saved == [result]
 
@@ -568,9 +795,48 @@ def test_links_single_domain_in_favourites():
 # ════════════════════════════════════════════════════════════════
 #  favourites-fix (unit 2): metadata-retry в sync_stats_all
 #  Битая мета (пустой kind) дозапрашивается, ваншот пересобирается и
-#  вычищается самоочисткой (43→39 в проде). Анонс (мета снова пустая) —
-#  retry пробуется, но это no-op (запись цела, без записи на диск).
+#  вычищается самоочисткой (43→39 в проде). Полностью повторный пустой ответ
+#  остаётся no-op; впервые полученный release_status сохраняется отдельно.
 # ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_sync_leaves_legacy_planned_poster_refresh_to_issue_57(monkeypatch):
+    stats = storage._empty_stats_all()
+    stats["manga"]["titles"] = {
+        "111": _manga_record(
+            "Запланированная манга",
+            "manga",
+            status="planned",
+            chapters_read=0,
+        ),
+    }
+    monkeypatch.setattr(
+        "stats.load_stats_all",
+        lambda *args, **kwargs: copy.deepcopy(stats),
+    )
+
+    async def fake_export(session, media):
+        if media == "manga":
+            return [_export_manga_row("111", status="planned", chapters=0)]
+        return []
+
+    async def forbidden_meta(*args, **kwargs):
+        pytest.fail("#60 запустил eager poster refresh вместо будущего #57")
+
+    async def fake_collect(session, value, fav=None):
+        return value
+
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", forbidden_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+
+    result, ok = await smod.sync_stats_all(session=object())
+
+    assert ok is True
+    assert "poster_url" not in result["manga"]["titles"]["111"]
+
 
 @pytest.mark.asyncio
 async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
@@ -617,7 +883,9 @@ async def test_sync_repairs_empty_kind_and_filters_oneshot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
+async def test_sync_announced_empty_kind_stores_status_and_remains_retryable(
+    monkeypatch,
+):
     stats = storage._empty_stats_all()
     # planned-тайтл с пустым kind (анонс — вид ещё неизвестен)
     stats["manga"]["titles"] = {
@@ -636,9 +904,16 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
 
     async def fake_meta(media, ids, session=None):
         meta_calls.append((media, list(ids)))
-        # анонс: GraphQL вернул элемент, но kind по-прежнему пустой
+        # Анонс: GraphQL вернул статус, но kind по-прежнему пустой.
         if media == "manga" and "999" in ids:
-            return {"999": {"kind": "", "url": "", "year": None}}
+            return {
+                "999": {
+                    "kind": "",
+                    "release_status": "anons",
+                    "url": "",
+                    "year": None,
+                },
+            }
         return {}
     monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
 
@@ -651,9 +926,73 @@ async def test_sync_announced_empty_kind_is_noop_but_retried(monkeypatch):
 
     # retry БЫЛ предпринят для безвидового анонса (это и есть фикс Codacy)
     assert ("manga", ["999"]) in meta_calls
-    # но это no-op: запись цела, kind остался пустым (не выдумали вид)
+    # Запись цела, kind остался пустым (не выдумали вид), а точный статус
+    # сохранён для чистой фильтрации /pick.
     assert "999" in result["manga"]["titles"]
     assert result["manga"]["titles"]["999"]["kind"] == ""
+    assert result["manga"]["titles"]["999"]["release_status"] == "anons"
+    catalog = smod.build_pick_catalog(result)
+    assert catalog is not None
+    assert catalog.manga == ()
+    assert catalog.ranobe == ()
+    assert catalog.unresolved_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_kind_repair_preserves_known_release_status(monkeypatch):
+    stats = storage._empty_stats_all()
+    announced = _manga_record(
+        "Анонс",
+        "",
+        status="planned",
+        chapters_read=0,
+    )
+    announced["release_status"] = "anons"
+    stats["manga"]["titles"] = {"999": announced}
+    monkeypatch.setattr(
+        "stats.load_stats_all",
+        lambda *args, **kwargs: copy.deepcopy(stats),
+    )
+
+    async def fake_export(session, media):
+        if media == "manga":
+            return [_export_manga_row("999", status="planned", chapters=0)]
+        return []
+
+    async def fake_meta(media, ids, session=None):
+        if media == "manga" and "999" in ids:
+            return {
+                "999": {
+                    "kind": "manga",
+                    "url": "/mangas/999",
+                    "year": 2027,
+                },
+            }
+        return {}
+
+    collect_calls = []
+    fav_marker = object()
+
+    async def fake_collect(session, current, fav):
+        collect_calls.append((session, current, fav))
+        return current
+
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda *args, **kwargs: None)
+
+    result, ok = await smod.sync_stats_all(fav=fav_marker)
+
+    assert ok is True
+    repaired = result["manga"]["titles"]["999"]
+    assert repaired["kind"] == "manga"
+    assert repaired["release_status"] == "anons"
+    assert len(collect_calls) == 1
+    assert collect_calls[0][2] is fav_marker
+    catalog = smod.build_pick_catalog(result)
+    assert catalog is not None
+    assert catalog.manga == ()
 
 
 # ════════════════════════════════════════════════════════════════

@@ -13,6 +13,7 @@ import asyncio
 import json
 import weakref
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from config import (
@@ -392,7 +393,20 @@ def save_seen_favourites(seen: set[str]) -> None:
 
 _stats_all_cache: dict | None = None
 _stats_all_cache_ts: float = 0.0
+_stats_all_cache_state: str = "missing"
 _STATS_ALL_CACHE_TTL: int = 300  # секунд
+
+STATS_ALL_VALID = "valid"
+STATS_ALL_MISSING = "missing"
+STATS_ALL_INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class StatsAllSnapshot:
+    """Локальный stats_all вместе с различимым состоянием файла."""
+
+    data: dict
+    state: str
 
 
 def _empty_stats_all() -> dict:
@@ -406,41 +420,54 @@ def _empty_stats_all() -> dict:
     }
 
 
-def load_stats_all(use_cache: bool = True) -> dict:
+def load_stats_all_snapshot(use_cache: bool = True) -> StatsAllSnapshot:
     """
-    Загружаем stats_all.json (с коротким in-memory кэшем).
-    При ошибке — пустая структура, бот не падает.
+    Загружаем stats_all.json и сохраняем причину пустого результата.
+
+    Обычные потребители продолжают использовать load_stats_all(), а локальные
+    интерактивные сценарии могут отличить первый запуск от повреждения файла.
     """
-    global _stats_all_cache, _stats_all_cache_ts
+    global _stats_all_cache, _stats_all_cache_state, _stats_all_cache_ts
 
     if use_cache and _stats_all_cache is not None:
         age = _utcnow().timestamp() - _stats_all_cache_ts
         if age < _STATS_ALL_CACHE_TTL:
-            return _stats_all_cache
+            return StatsAllSnapshot(_stats_all_cache, _stats_all_cache_state)
 
     data = _empty_stats_all()
+    state = STATS_ALL_MISSING
     try:
         if STATS_ALL_FILE.exists():
             raw = json.loads(STATS_ALL_FILE.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and "anime" in raw and "manga" in raw:
                 data = raw
+                state = STATS_ALL_VALID
             else:
+                state = STATS_ALL_INVALID
                 log.warning("load_stats_all: неожиданная структура, сбрасываем.")
     except (json.JSONDecodeError, OSError, ValueError) as e:
+        state = STATS_ALL_INVALID
         log.warning("load_stats_all: не удалось прочитать файл: %s", e)
 
     _stats_all_cache = data
+    _stats_all_cache_state = state
     _stats_all_cache_ts = _utcnow().timestamp()
-    return data
+    return StatsAllSnapshot(data, state)
+
+
+def load_stats_all(use_cache: bool = True) -> dict:
+    """Загружаем stats_all.json, сохраняя прежний dict-контракт."""
+    return load_stats_all_snapshot(use_cache=use_cache).data
 
 
 def save_stats_all(data: dict) -> None:
     """Сохраняем stats_all.json атомарно + обновляем кэш."""
-    global _stats_all_cache, _stats_all_cache_ts
+    global _stats_all_cache, _stats_all_cache_state, _stats_all_cache_ts
     try:
         data["updated_at"] = _utcnow().isoformat()
         _atomic_write(STATS_ALL_FILE, json.dumps(data, ensure_ascii=False, indent=2))
         _stats_all_cache = data
+        _stats_all_cache_state = STATS_ALL_VALID
         _stats_all_cache_ts = _utcnow().timestamp()
     except Exception as e:
         log.error("save_stats_all: не удалось записать файл: %s", e)

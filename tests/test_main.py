@@ -94,6 +94,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.cmd_info in registered_messages
     assert main.cmd_fact in registered_messages
     assert main.cmd_facts in registered_messages
+    assert main.cmd_pick in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
     app.dispatcher.inline_query.register.assert_called_once_with(
@@ -110,6 +111,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert blocklist_filter.commands == ("blocklist",)
     assert "blocklist" not in public_commands
     assert "facts" not in public_commands
+    assert "pick" not in public_commands
     facts_registrations = [
         call
         for call in app.dispatcher.message.register.call_args_list
@@ -119,6 +121,15 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     facts_filter = facts_registrations[0].args[1]
     assert isinstance(facts_filter, main.Command)
     assert facts_filter.commands == ("facts",)
+    pick_registrations = [
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.cmd_pick
+    ]
+    assert len(pick_registrations) == 1
+    pick_filter = pick_registrations[0].args[1]
+    assert isinstance(pick_filter, main.Command)
+    assert pick_filter.commands == ("pick",)
     facts_receive_registration = next(
         call
         for call in app.dispatcher.message.register.call_args_list
@@ -153,6 +164,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.facts_upload_cb in registered_callbacks
     assert main.facts_cancel_cb in registered_callbacks
     assert main.facts_close_cb in registered_callbacks
+    assert main.pick_menu_cb in registered_callbacks
     facts_apply_registration = next(
         call
         for call in app.dispatcher.callback_query.register.call_args_list
@@ -172,6 +184,14 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     fact_filter = fact_registration.args[1]
     assert fact_filter.resolve(SimpleNamespace(data="fact:next:777:anime-word")) is True
     assert fact_filter.resolve(SimpleNamespace(data="stats:all")) is False
+    pick_registration = next(
+        call
+        for call in app.dispatcher.callback_query.register.call_args_list
+        if call.args[0] is main.pick_menu_cb
+    )
+    pick_filter = pick_registration.args[1]
+    assert pick_filter.resolve(SimpleNamespace(data="pick:anime")) is True
+    assert pick_filter.resolve(SimpleNamespace(data="fact:next:777:anime-word")) is False
     app.dispatcher.shutdown.register.assert_not_called()
     app.probe.assert_awaited_once_with(app.bot)
     app.start_updates.assert_called_once_with(app.bot)
