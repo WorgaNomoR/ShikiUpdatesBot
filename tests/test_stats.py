@@ -15,6 +15,7 @@
 import copy
 import json
 import re
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -396,6 +397,59 @@ def test_contrast_pick_weakens_missing_metadata_and_handles_one_item(monkeypatch
     assert offered == [(anchor,)]
 
 
+def test_metadata_refresh_selection_uses_thresholds_age_and_stable_ties():
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    rows = {
+        "10": {"status": "watching"},
+        "2": {"status": "planned"},
+        "3": {"status": "completed"},
+        "4": {"status": "dropped"},
+        "5": {"status": "rewatching"},
+        "6": {"status": "on_hold"},
+        "7": {"status": "planned"},
+        "8": {"status": "completed"},
+    }
+    titles = {
+        "10": {"kind": "tv", "meta_updated_at": (now - timedelta(days=7)).isoformat()},
+        "2": {"kind": "tv", "meta_updated_at": (now - timedelta(days=7)).isoformat()},
+        "3": {"kind": "tv", "meta_updated_at": (now - timedelta(days=30)).isoformat()},
+        "4": {"kind": "tv", "meta_updated_at": (now - timedelta(days=29)).isoformat()},
+        "5": {"kind": "tv", "meta_updated_at": (now - timedelta(days=6)).isoformat()},
+        "6": {"kind": "tv"},
+        "7": {"kind": ""},
+        "8": {"kind": "tv", "meta_updated_at": "повреждено"},
+    }
+
+    selected = smod._select_metadata_refresh_ids(rows, titles, now)
+
+    # Нет/битая метка старее любой валидной; равный возраст разрешается по
+    # числовому ID. Свежие active/terminal и missing-kind сюда не попадают.
+    assert selected == ["6", "8", "3", "2", "10"]
+
+
+def test_metadata_refresh_selection_is_limited_to_fifty_per_domain():
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    rows = {str(title_id): {"status": "planned"} for title_id in range(60, 0, -1)}
+    titles = {title_id: {"kind": "tv"} for title_id in rows}
+
+    selected = smod._select_metadata_refresh_ids(rows, titles, now)
+
+    assert selected == [str(title_id) for title_id in range(1, 51)]
+
+
+def test_metadata_refresh_selection_treats_future_timestamp_as_stale():
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    rows = {"1": {"status": "planned"}}
+    titles = {
+        "1": {
+            "kind": "tv",
+            "meta_updated_at": (now + timedelta(days=365)).isoformat(),
+        },
+    }
+
+    assert smod._select_metadata_refresh_ids(rows, titles, now) == ["1"]
+
+
 # ════════════════════════════════════════════════════════════════
 #  Регрессия: фильтр нерелевантных kind в sync_stats_all
 # ════════════════════════════════════════════════════════════════
@@ -440,7 +494,9 @@ async def test_sync_stats_all_filters_special_before_aggregating(monkeypatch):
         return current
 
     saved = []
+    now = datetime(2026, 9, 2, 12, 0, 0)
     monkeypatch.setattr("stats.load_stats_all", lambda use_cache=False: stats)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
     monkeypatch.setattr("stats.fetch_list_export", fake_export)
     monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
     monkeypatch.setattr("stats._collect_favourites", fake_collect)
@@ -454,6 +510,8 @@ async def test_sync_stats_all_filters_special_before_aggregating(monkeypatch):
         "https://cdn.example/1.jpg"
     )
     assert result["anime"]["titles"]["1"]["release_status"] == "released"
+    assert result["anime"]["titles"]["1"]["meta_updated_at"] == now.isoformat()
+    assert result["anime"]["titles"]["2"]["meta_updated_at"] == now.isoformat()
     assert result["anime"]["aggregates"]["studios"] == {"Studio Deen": 2}
     assert saved == [result]
 
@@ -801,7 +859,7 @@ def test_links_single_domain_in_favourites():
 
 
 @pytest.mark.asyncio
-async def test_sync_leaves_legacy_planned_poster_refresh_to_issue_57(monkeypatch):
+async def test_sync_refreshes_legacy_planned_record_for_pick(monkeypatch):
     stats = storage._empty_stats_all()
     stats["manga"]["titles"] = {
         "111": _manga_record(
@@ -821,21 +879,389 @@ async def test_sync_leaves_legacy_planned_poster_refresh_to_issue_57(monkeypatch
             return [_export_manga_row("111", status="planned", chapters=0)]
         return []
 
-    async def forbidden_meta(*args, **kwargs):
-        pytest.fail("#60 запустил eager poster refresh вместо будущего #57")
+    calls = []
+
+    async def fake_meta(media, ids, session=None):
+        calls.append((media, list(ids)))
+        return {
+            "111": {
+                "url": "/mangas/111",
+                "poster_url": "https://cdn.example/new.jpg",
+                "kind": "manga",
+                "release_status": "released",
+                "year": 2026,
+                "shiki_score": 7.5,
+                "genres": ["Драма"],
+                "themes": [],
+                "demographic": [],
+                "chapters_total": 20,
+                "volumes_total": 3,
+                "publishers": ["Example"],
+            },
+        }
 
     async def fake_collect(session, value, fav=None):
         return value
 
     monkeypatch.setattr("stats.fetch_list_export", fake_export)
-    monkeypatch.setattr("stats.fetch_meta_batch", forbidden_meta)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
     monkeypatch.setattr("stats._collect_favourites", fake_collect)
     monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
 
     result, ok = await smod.sync_stats_all(session=object())
 
     assert ok is True
-    assert "poster_url" not in result["manga"]["titles"]["111"]
+    assert calls == [("manga", ["111"])]
+    refreshed = result["manga"]["titles"]["111"]
+    assert refreshed["meta_updated_at"] == now.isoformat()
+    assert refreshed["poster_url"] == "https://cdn.example/new.jpg"
+    assert refreshed["release_status"] == "released"
+    catalog = smod.build_pick_catalog(result)
+    assert catalog is not None
+    assert [candidate.id for candidate in catalog.manga] == ["111"]
+
+
+@pytest.mark.asyncio
+async def test_sync_keeps_correctness_fetches_outside_maintenance_limit(monkeypatch):
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        str(title_id): _anime_rec(status="planned")
+        for title_id in range(1, 61)
+    }
+    stats["anime"]["titles"]["900"] = _anime_rec(
+        status="planned",
+        kind="",
+    )
+    stats["manga"]["titles"] = {
+        str(title_id): _manga_record(
+            f"Манга {title_id}",
+            "manga",
+            status="planned",
+            chapters_read=0,
+        )
+        for title_id in range(1001, 1052)
+    }
+
+    anime_rows = [
+        {
+            "target_id": title_id,
+            "target_title": f"Anime {title_id}",
+            "target_title_ru": f"Аниме {title_id}",
+            "score": 0,
+            "status": "planned",
+            "rewatches": 0,
+            "episodes": 0,
+        }
+        for title_id in range(1, 61)
+    ]
+    anime_rows.extend([
+        {
+            "target_id": 900,
+            "target_title": "Broken",
+            "target_title_ru": "Битая мета",
+            "score": 0,
+            "status": "planned",
+            "rewatches": 0,
+            "episodes": 0,
+        },
+        {
+            "target_id": 901,
+            "target_title": "New",
+            "target_title_ru": "Новая запись",
+            "score": 0,
+            "status": "planned",
+            "rewatches": 0,
+            "episodes": 0,
+        },
+    ])
+    manga_rows = [
+        _export_manga_row(str(title_id), status="planned", chapters=0)
+        for title_id in range(1001, 1052)
+    ]
+
+    async def fake_export(session, media):
+        return anime_rows if media == "anime" else manga_rows
+
+    calls = []
+
+    async def fake_meta(media, ids, session=None):
+        calls.append((media, list(ids)))
+        kind = "tv" if media == "anime" else "manga"
+        prefix = "animes" if media == "anime" else "mangas"
+        return {
+            title_id: {
+                "kind": kind,
+                "url": f"/{prefix}/{title_id}",
+                "release_status": "released",
+            }
+            for title_id in ids
+        }
+
+    async def fake_collect(session, value, fav=None):
+        return value
+
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: copy.deepcopy(stats))
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+
+    result, ok = await smod.sync_stats_all(session=object())
+
+    assert ok is True
+    assert calls == [
+        ("anime", ["901", "900"]),
+        ("anime", [str(title_id) for title_id in range(1, 51)]),
+        ("manga", [str(title_id) for title_id in range(1001, 1051)]),
+    ]
+    anime_titles = result["anime"]["titles"]
+    manga_titles = result["manga"]["titles"]
+    assert anime_titles["900"]["meta_updated_at"] == now.isoformat()
+    assert anime_titles["901"]["meta_updated_at"] == now.isoformat()
+    assert sum("meta_updated_at" in anime_titles[str(i)] for i in range(1, 61)) == 50
+    assert sum("meta_updated_at" in manga_titles[str(i)] for i in range(1001, 1052)) == 50
+
+
+@pytest.mark.asyncio
+async def test_sync_refreshes_full_metadata_aggregates_and_preserves_user_state(
+    monkeypatch,
+):
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    old_stamp = (now - timedelta(days=31)).isoformat()
+    stats = storage._empty_stats_all()
+    anime = _anime_rec(
+        score=4,
+        rewatches=1,
+        episodes_watched=2,
+        meta_updated_at=old_stamp,
+    )
+    anime.update({
+        "title": "Старое аниме",
+        "title_en": "Old anime",
+        "url": "/animes/1",
+        "poster_url": "https://cdn.example/old-anime.jpg",
+        "release_status": "ongoing",
+    })
+    manga = _manga_record("Старая манга", "manga")
+    manga.update({
+        "score": 3,
+        "rewatches": 1,
+        "volumes_read": 1,
+        "meta_updated_at": old_stamp,
+        "poster_url": "https://cdn.example/old-manga.jpg",
+        "release_status": "ongoing",
+    })
+    stats["anime"]["titles"] = {"1": anime}
+    stats["manga"]["titles"] = {"2": manga}
+
+    exports = {
+        "anime": [{
+            "target_id": 1,
+            "target_title": "Current anime",
+            "target_title_ru": "Актуальное аниме",
+            "score": 9,
+            "status": "completed",
+            "rewatches": 4,
+            "episodes": 11,
+        }],
+        "manga": [{
+            "target_id": 2,
+            "target_title": "Current manga",
+            "target_title_ru": "Актуальная манга",
+            "score": 8,
+            "status": "completed",
+            "rewatches": 3,
+            "chapters": 22,
+            "volumes": 5,
+        }],
+    }
+    metadata = {
+        "anime": {
+            "1": {
+                "url": "/animes/1-current",
+                "poster_url": "https://cdn.example/new-anime.jpg",
+                "kind": "movie",
+                "release_status": "released",
+                "year": 2025,
+                "shiki_score": 8.8,
+                "genres": ["Драма"],
+                "themes": ["Взросление"],
+                "demographic": ["Сэйнэн"],
+                "episodes_total": 1,
+                "duration": 120,
+                "rating": "R-17",
+                "origin": "Оригинал",
+                "studios": ["New Studio"],
+            },
+        },
+        "manga": {
+            "2": {
+                "url": "/mangas/2-current",
+                "poster_url": "https://cdn.example/new-manga.jpg",
+                "kind": "manhwa",
+                "release_status": "released",
+                "year": 2024,
+                "shiki_score": 8.2,
+                "genres": ["Триллер"],
+                "themes": ["Выживание"],
+                "demographic": ["Сэйнэн"],
+                "chapters_total": 50,
+                "volumes_total": 8,
+                "publishers": ["New Publisher"],
+            },
+        },
+    }
+
+    async def fake_export(session, media):
+        return exports[media]
+
+    async def fake_meta(media, ids, session=None):
+        assert ids == (["1"] if media == "anime" else ["2"])
+        return metadata[media]
+
+    async def fake_collect(session, value, fav=None):
+        return value
+
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: copy.deepcopy(stats))
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+
+    result, ok = await smod.sync_stats_all(session=object())
+
+    assert ok is True
+    refreshed_anime = result["anime"]["titles"]["1"]
+    assert (
+        refreshed_anime["score"],
+        refreshed_anime["status"],
+        refreshed_anime["episodes_watched"],
+        refreshed_anime["rewatches"],
+    ) == (9, "completed", 11, 4)
+    assert refreshed_anime["poster_url"] == "https://cdn.example/new-anime.jpg"
+    assert refreshed_anime["release_status"] == "released"
+    assert refreshed_anime["meta_updated_at"] == now.isoformat()
+    anime_aggregates = result["anime"]["aggregates"]
+    assert anime_aggregates["by_year"] == {"2025": 1}
+    assert anime_aggregates["genres"] == {"Драма": 1}
+    assert anime_aggregates["themes"] == {"Взросление": 1}
+    assert anime_aggregates["demographic"] == {"Сэйнэн": 1}
+    assert anime_aggregates["studios"] == {"New Studio": 1}
+
+    refreshed_manga = result["manga"]["titles"]["2"]
+    assert (
+        refreshed_manga["score"],
+        refreshed_manga["status"],
+        refreshed_manga["chapters_read"],
+        refreshed_manga["volumes_read"],
+        refreshed_manga["rewatches"],
+    ) == (8, "completed", 22, 5, 3)
+    assert refreshed_manga["poster_url"] == "https://cdn.example/new-manga.jpg"
+    assert refreshed_manga["release_status"] == "released"
+    assert refreshed_manga["meta_updated_at"] == now.isoformat()
+    manga_aggregates = result["manga"]["aggregates"]
+    assert manga_aggregates["by_year"] == {"2024": 1}
+    assert manga_aggregates["genres"] == {"Триллер": 1}
+    assert manga_aggregates["publishers"] == {"New Publisher": 1}
+
+
+@pytest.mark.asyncio
+async def test_partial_and_failed_maintenance_responses_preserve_retry_state(
+    monkeypatch,
+):
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    old_stamp = (now - timedelta(days=8)).isoformat()
+    state = storage._empty_stats_all()
+    state["anime"]["titles"] = {
+        title_id: {
+            **_anime_rec(
+                status="planned",
+                score=0,
+                rewatches=0,
+                episodes_watched=0,
+            ),
+            "title": f"Аниме {title_id}",
+            "title_en": f"Anime {title_id}",
+            "url": f"/animes/{title_id}",
+            "poster_url": f"https://cdn.example/old-{title_id}.jpg",
+            "release_status": "anons",
+            "meta_updated_at": old_stamp,
+        }
+        for title_id in ("1", "2")
+    }
+    rows = [{
+        "target_id": int(title_id),
+        "target_title": f"Anime {title_id}",
+        "target_title_ru": f"Аниме {title_id}",
+        "score": 0,
+        "status": "planned",
+        "rewatches": 0,
+        "episodes": 0,
+    } for title_id in ("1", "2")]
+
+    async def fake_export(session, media):
+        return rows if media == "anime" else []
+
+    calls = []
+
+    async def fake_meta(media, ids, session=None):
+        calls.append(list(ids))
+        if len(calls) == 1:
+            return {
+                "1": {
+                    "kind": "tv",
+                    "url": "/animes/1",
+                    "poster_url": "https://cdn.example/new-1.jpg",
+                },
+            }
+        if len(calls) == 2:
+            return {}
+        return {
+            "2": {
+                "kind": "tv",
+                "url": "/animes/2",
+                "poster_url": "https://cdn.example/new-2.jpg",
+                "release_status": "released",
+            },
+        }
+
+    async def fake_collect(session, value, fav=None):
+        return value
+
+    saves = []
+
+    def save(value):
+        nonlocal state
+        state = copy.deepcopy(value)
+        saves.append(copy.deepcopy(value))
+
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: copy.deepcopy(state))
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", save)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+
+    first, _ = await smod.sync_stats_all(session=object())
+    assert first["anime"]["titles"]["1"]["meta_updated_at"] == now.isoformat()
+    assert first["anime"]["titles"]["1"]["release_status"] == "anons"
+    assert first["anime"]["titles"]["2"]["meta_updated_at"] == old_stamp
+    assert first["anime"]["titles"]["2"]["poster_url"].endswith("old-2.jpg")
+
+    second, _ = await smod.sync_stats_all(session=object())
+    assert second["anime"]["titles"]["2"]["meta_updated_at"] == old_stamp
+    assert second["anime"]["titles"]["2"]["poster_url"].endswith("old-2.jpg")
+
+    third, _ = await smod.sync_stats_all(session=object())
+    assert third["anime"]["titles"]["2"]["meta_updated_at"] == now.isoformat()
+    assert third["anime"]["titles"]["2"]["poster_url"].endswith("new-2.jpg")
+    assert calls == [["1", "2"], ["2"], ["2"]]
+    assert len(saves) == 2
 
 
 @pytest.mark.asyncio
