@@ -934,6 +934,57 @@ async def test_sync_announced_empty_kind_stores_status_and_remains_retryable(
     assert catalog.unresolved_count == 0
 
 
+@pytest.mark.asyncio
+async def test_sync_kind_repair_preserves_known_release_status(monkeypatch):
+    stats = storage._empty_stats_all()
+    announced = _manga_record(
+        "Анонс",
+        "",
+        status="planned",
+        chapters_read=0,
+    )
+    announced["release_status"] = "anons"
+    stats["manga"]["titles"] = {"999": announced}
+    monkeypatch.setattr(
+        "stats.load_stats_all",
+        lambda *args, **kwargs: copy.deepcopy(stats),
+    )
+
+    async def fake_export(session, media):
+        if media == "manga":
+            return [_export_manga_row("999", status="planned", chapters=0)]
+        return []
+
+    async def fake_meta(media, ids, session=None):
+        if media == "manga" and "999" in ids:
+            return {
+                "999": {
+                    "kind": "manga",
+                    "url": "/mangas/999",
+                    "year": 2027,
+                },
+            }
+        return {}
+
+    async def fake_collect(session, current, favourites=None):
+        return current
+
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda *args, **kwargs: None)
+
+    result, ok = await smod.sync_stats_all()
+
+    assert ok is True
+    repaired = result["manga"]["titles"]["999"]
+    assert repaired["kind"] == "manga"
+    assert repaired["release_status"] == "anons"
+    catalog = smod.build_pick_catalog(result)
+    assert catalog is not None
+    assert catalog.manga == ()
+
+
 # ════════════════════════════════════════════════════════════════
 #  record_current_event + sync_stats_all (перенесено из test_polling)
 # ════════════════════════════════════════════════════════════════

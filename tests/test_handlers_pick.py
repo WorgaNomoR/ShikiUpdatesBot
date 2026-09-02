@@ -694,7 +694,17 @@ async def test_contrast_rejects_stale_anchor_without_fsm_mutation(
     monkeypatch,
     anchor,
 ):
-    _patch_snapshot(monkeypatch, _stats())
+    stats = _stats()
+    stats["manga"]["titles"]["10"] = {
+        "title": "Другой домен",
+        "status": "planned",
+        "release_status": "released",
+        "kind": "manga",
+        "url": "/mangas/10",
+        "year": 2000,
+        "genres": [],
+    }
+    _patch_snapshot(monkeypatch, stats)
     state = _State()
     await handlers.cmd_pick(_message(), state)
     await state.update_data(

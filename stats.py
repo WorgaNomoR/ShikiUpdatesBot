@@ -376,12 +376,19 @@ def select_contrast_pick_candidate(
     return PickSelection(candidate, cycle_shown | {candidate.id}, pool_reset)
 
 
-def _merge_title_record(media: str, export_row: dict, meta: dict | None) -> dict:
+def _merge_title_record(
+    media: str,
+    export_row: dict,
+    meta: dict | None,
+    previous: dict | None = None,
+) -> dict:
     """
     Собираем одну запись titles{} из строки экспорта и метаданных GraphQL.
     meta может быть None — тогда метаданные пустые, но пользовательские данные есть.
+    При ремонте сохраняем уже известный release_status, если свежий ответ пуст.
     """
     meta = meta or {}
+    previous = previous or {}
     record = {
         "title":    export_row.get("target_title_ru") or export_row.get("target_title") or "???",
         "title_en": export_row.get("target_title") or "",
@@ -391,7 +398,7 @@ def _merge_title_record(media: str, export_row: dict, meta: dict | None) -> dict
         "url":       meta.get("url") or "",
         "poster_url": meta.get("poster_url") or "",
         "kind":      meta.get("kind") or "",
-        "release_status": meta.get("release_status") or "",
+        "release_status": meta.get("release_status") or previous.get("release_status") or "",
         "year":      meta.get("year"),
         "shiki_score": meta.get("shiki_score"),
         "genres":      meta.get("genres") or [],
@@ -732,7 +739,7 @@ async def sync_stats_all(
                 # точный release_status; повторный такой ответ остаётся no-op.
                 if not (rec.get("kind") or ""):
                     if fresh and (fresh.get("kind") or ""):
-                        titles[tid] = _merge_title_record(media, row, fresh)
+                        titles[tid] = _merge_title_record(media, row, fresh, previous=rec)
                         repaired += 1
                         changed = True
                         continue
