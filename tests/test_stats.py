@@ -966,7 +966,10 @@ async def test_sync_kind_repair_preserves_known_release_status(monkeypatch):
             }
         return {}
 
-    async def fake_collect(session, current, favourites=None):
+    collect_calls = []
+
+    async def fake_collect(session, current, fav=None):
+        collect_calls.append((session, current, fav))
         return current
 
     monkeypatch.setattr("stats.fetch_list_export", fake_export)
@@ -974,12 +977,14 @@ async def test_sync_kind_repair_preserves_known_release_status(monkeypatch):
     monkeypatch.setattr("stats._collect_favourites", fake_collect)
     monkeypatch.setattr("stats.save_stats_all", lambda *args, **kwargs: None)
 
-    result, ok = await smod.sync_stats_all()
+    result, ok = await smod.sync_stats_all(fav=None)
 
     assert ok is True
     repaired = result["manga"]["titles"]["999"]
     assert repaired["kind"] == "manga"
     assert repaired["release_status"] == "anons"
+    assert len(collect_calls) == 1
+    assert collect_calls[0][2] is None
     catalog = smod.build_pick_catalog(result)
     assert catalog is not None
     assert catalog.manga == ()
