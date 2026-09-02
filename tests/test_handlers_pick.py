@@ -44,17 +44,30 @@ def _stats(*, unresolved=False):
     data["anime"]["titles"] = {
         "1": {
             "title": "A < B & C",
+            "title_en": "A & C",
             "status": "planned",
+            "release_status": "released",
             "kind": "tv",
             "url": "https://shikimori.one/animes/1-a",
+            "poster_url": "https://cdn.example/anime-1.jpg",
             "year": 2011,
+            "shiki_score": 8.5,
             "genres": ["Экшен", "Драма"],
+            "themes": ["Путешествие"],
+            "demographic": ["Сэйнэн"],
+            "episodes_total": 12,
+            "duration": 24,
+            "rating": "R-17",
+            "origin": "Манга",
+            "studios": ["Studio & Co"],
         },
         "2": {
             "title": "Второй вариант",
             "status": "planned",
+            "release_status": "released",
             "kind": "movie",
             "url": "/animes/2",
+            "poster_url": "https://cdn.example/anime-2.jpg",
             "year": 1998,
             "genres": ["Комедия"],
         },
@@ -92,13 +105,24 @@ def _message(*, owner=True, message_id=100):
     )
 
 
-def _callback(data, *, owner=True, message_id=200, with_message=True):
+def _callback(
+    data,
+    *,
+    owner=True,
+    message_id=200,
+    with_message=True,
+    replacement_id=201,
+):
     message = None
     if with_message:
         message = SimpleNamespace(
             message_id=message_id,
             chat=SimpleNamespace(id=55),
             edit_text=AsyncMock(),
+            edit_media=AsyncMock(),
+            answer=AsyncMock(
+                return_value=SimpleNamespace(message_id=replacement_id),
+            ),
             delete=AsyncMock(),
             edit_reply_markup=AsyncMock(),
             reply_to_message=SimpleNamespace(delete=AsyncMock()),
@@ -153,6 +177,7 @@ async def test_owner_command_opens_hidden_three_category_menu(monkeypatch):
     ]
     assert state.state == handlers.PickStates.active.state
     assert state.data["pick_menu_message_id"] == 200
+    assert state.data["pick_menu_kind"] == handlers._PICK_MENU_TEXT
     assert state.data["pick_command_message_id"] == 100
 
 
@@ -224,9 +249,26 @@ async def test_category_more_and_contrast_are_repeat_free_and_render_safe_html(
 
     await handlers.pick_menu_cb(callback, state)
 
-    first_text = callback.message.edit_text.await_args.args[0]
-    first_markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
+    first_media = callback.message.edit_media.await_args.args[0]
+    first_text = first_media.caption
+    first_kwargs = callback.message.edit_media.await_args.kwargs
+    first_markup = first_kwargs["reply_markup"]
     assert "A &lt; B &amp; C" in first_text
+    assert "<i>A &amp; C</i>" in first_text
+    assert "<b>TV-сериал · 2011</b>" in first_text
+    assert "⭐ Оценка Shikimori: 8.5" in first_text
+    assert "⏱ 12 эп. · 24 мин." in first_text
+    assert "📖 Первоисточник: Манга" in first_text
+    assert "🔖 Возрастной рейтинг: R-17" in first_text
+    assert "🎞 Студия: Studio &amp; Co" in first_text
+    assert "👥 <b>Демография:</b> Сэйнэн" in first_text
+    assert "🎭 <b>Жанры:</b> Экшен · Драма" in first_text
+    assert "🏷 <b>Темы:</b> Путешествие" in first_text
+    assert first_media.media == "https://cdn.example/anime-1.jpg"
+    assert first_media.parse_mode == handlers.ParseMode.HTML
+    assert first_media.show_caption_above_media is False
+    assert handlers.parsed_caption_length(first_text) <= handlers.PHOTO_CAPTION_LIMIT
+    assert "link_preview_options" not in first_kwargs
     assert _button_texts(first_markup) == [
         "🔄 Ещё вариант",
         "🎲 Что-нибудь совсем другое",
@@ -236,17 +278,20 @@ async def test_category_more_and_contrast_are_repeat_free_and_render_safe_html(
     assert "shikimori.onehttps://" not in first_text
     assert state.data["pick_shown_ids"] == ["1"]
     assert state.data["pick_anchor"]["id"] == "1"
+    assert state.data["pick_menu_kind"] == handlers._PICK_MENU_PHOTO
 
     callback.data = "pick:more"
-    callback.message.edit_text.reset_mock()
+    callback.message.edit_media.reset_mock()
     callback.answer.reset_mock()
     await handlers.pick_menu_cb(callback, state)
 
-    assert "Второй вариант" in callback.message.edit_text.await_args.args[0]
+    second_media = callback.message.edit_media.await_args.args[0]
+    assert "Второй вариант" in second_media.caption
+    assert second_media.media == "https://cdn.example/anime-2.jpg"
     assert state.data["pick_shown_ids"] == ["1", "2"]
 
     callback.data = "pick:contrast"
-    callback.message.edit_text.reset_mock()
+    callback.message.edit_media.reset_mock()
     callback.answer.reset_mock()
     await handlers.pick_menu_cb(callback, state)
 
@@ -270,7 +315,7 @@ def test_pick_renderer_bounds_long_untrusted_title_and_genres():
 
     text = handlers._pick_candidate_text(catalog.anime[0], catalog)
 
-    assert len(text) < handlers._TELEGRAM_MESSAGE_LIMIT
+    assert handlers.parsed_caption_length(text) < handlers._TELEGRAM_MESSAGE_LIMIT
     assert "&lt;опасно &amp; длинно&gt;" in text
     assert "Жанр &amp; 0" in text
     assert "…" in text
@@ -292,10 +337,48 @@ def test_pick_renderer_bounds_escaped_html_and_drops_anomalously_long_url():
 
     text = handlers._pick_candidate_text(catalog.anime[0], catalog)
 
-    assert len(text) < handlers._TELEGRAM_MESSAGE_LIMIT
+    assert handlers.parsed_caption_length(text) < handlers._TELEGRAM_MESSAGE_LIMIT
     assert '<a href="' not in text
     assert "&amp;…" in text
     assert "&am…" not in text
+
+
+def test_pick_renderer_applies_one_limit_to_long_facts_and_taxonomy():
+    stats = storage._empty_stats_all()
+    stats["manga"]["titles"] = {
+        "1": {
+            "title": "&" * 1000,
+            "title_en": "<" * 1000,
+            "status": "planned",
+            "kind": "manga",
+            "url": "/mangas/1",
+            "year": 2026,
+            "chapters_total": 999,
+            "volumes_total": 99,
+            "publishers": [f"Издатель & {index}" * 20 for index in range(30)],
+            "demographic": [f"Демография & {index}" * 20 for index in range(30)],
+            "genres": [f"Жанр & {index}" * 20 for index in range(30)],
+            "themes": [f"Тема & {index}" * 20 for index in range(30)],
+        },
+        "2": {
+            "title": "Не определено",
+            "status": "planned",
+            "kind": "future_kind",
+            "url": "/mangas/2",
+        },
+    }
+    catalog = smod.build_pick_catalog(stats)
+
+    text = handlers._pick_candidate_text(
+        catalog.manga[0],
+        catalog,
+        limit=handlers.PHOTO_CAPTION_LIMIT,
+    )
+
+    assert handlers.parsed_caption_length(text) <= handlers.PHOTO_CAPTION_LIMIT
+    assert "🏷 <b>Темы:</b>" not in text
+    assert text.count("<blockquote>") == text.count("</blockquote>") == 1
+    assert "Часть запланированных тайтлов (<b>1</b>)" in text
 
 
 def test_pick_renderer_shows_unresolved_notice_only_for_manga_domain():
@@ -408,7 +491,7 @@ async def test_edit_failure_keeps_previous_anchor_and_fsm_state(monkeypatch):
     await handlers.cmd_pick(_message(), state)
     before = deepcopy(state.data)
     callback = _callback("pick:anime")
-    callback.message.edit_text.side_effect = RuntimeError("cannot edit")
+    callback.message.edit_media.side_effect = RuntimeError("cannot edit")
 
     await handlers.pick_menu_cb(callback, state)
 
@@ -417,6 +500,83 @@ async def test_edit_failure_keeps_previous_anchor_and_fsm_state(monkeypatch):
         show_alert=True,
     )
     assert state.data == before
+
+
+@pytest.mark.asyncio
+async def test_rejected_photo_card_retries_as_text_without_web_preview(monkeypatch):
+    stats = _stats()
+    stats["anime"]["titles"].pop("2")
+    _patch_snapshot(monkeypatch, stats)
+    state = _State()
+    await handlers.cmd_pick(_message(), state)
+    callback = _callback("pick:anime")
+    callback.message.edit_media.side_effect = handlers.TelegramBadRequest(
+        method=MagicMock(),
+        message="failed to get HTTP URL content",
+    )
+
+    await handlers.pick_menu_cb(callback, state)
+
+    callback.message.edit_media.assert_awaited_once()
+    callback.message.edit_text.assert_awaited_once()
+    fallback_options = callback.message.edit_text.await_args.kwargs[
+        "link_preview_options"
+    ]
+    assert fallback_options.is_disabled is True
+    assert state.data["pick_anchor"]["id"] == "1"
+    assert state.data["pick_menu_kind"] == handlers._PICK_MENU_TEXT
+    callback.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_missing_first_poster_stays_text_without_web_preview(monkeypatch):
+    stats = _stats()
+    stats["anime"]["titles"].pop("2")
+    stats["anime"]["titles"]["1"].pop("poster_url")
+    _patch_snapshot(monkeypatch, stats)
+    state = _State()
+    await handlers.cmd_pick(_message(), state)
+    callback = _callback("pick:anime")
+
+    await handlers.pick_menu_cb(callback, state)
+
+    callback.message.edit_media.assert_not_awaited()
+    callback.message.edit_text.assert_awaited_once()
+    options = callback.message.edit_text.await_args.kwargs["link_preview_options"]
+    assert options.is_disabled is True
+    assert state.data["pick_menu_message_id"] == 200
+    assert state.data["pick_menu_kind"] == handlers._PICK_MENU_TEXT
+    assert state.data["pick_anchor"]["id"] == "1"
+    callback.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_missing_poster_after_photo_replaces_menu_with_text(monkeypatch):
+    stats = _stats()
+    stats["anime"]["titles"]["2"].pop("poster_url")
+    _patch_snapshot(monkeypatch, stats)
+    monkeypatch.setattr(smod.random, "choice", lambda items: items[0])
+    state = _State()
+    await handlers.cmd_pick(_message(), state)
+    callback = _callback("pick:anime")
+
+    await handlers.pick_menu_cb(callback, state)
+    callback.data = "pick:more"
+    callback.answer.reset_mock()
+    await handlers.pick_menu_cb(callback, state)
+
+    callback.message.answer.assert_awaited_once()
+    text = callback.message.answer.await_args.args[0]
+    options = callback.message.answer.await_args.kwargs["link_preview_options"]
+    reply = callback.message.answer.await_args.kwargs["reply_parameters"]
+    assert "Второй вариант" in text
+    assert options.is_disabled is True
+    assert reply.message_id == 100
+    callback.message.delete.assert_awaited_once_with()
+    assert state.data["pick_menu_message_id"] == 201
+    assert state.data["pick_menu_kind"] == handlers._PICK_MENU_TEXT
+    assert state.data["pick_anchor"]["id"] == "2"
+    callback.answer.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

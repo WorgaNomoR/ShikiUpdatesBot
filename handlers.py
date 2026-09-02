@@ -14,6 +14,7 @@ import asyncio
 import io
 import math
 import time
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiogram import Bot
@@ -32,6 +33,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultsButton,
+    InputMediaPhoto,
+    LinkPreviewOptions,
     Message,
     ReplyParameters,
 )
@@ -77,11 +80,14 @@ from fact_bank import (
 )
 from healthcheck import heartbeat
 from inline_cards import (
+    CARD_KIND_LABELS,
+    PHOTO_CAPTION_LIMIT,
     build_fact_keyboard,
     build_fact_result,
     build_fact_text,
     build_inline_result,
     finalize_inline_results,
+    parsed_caption_length,
 )
 from inline_facts import (
     FACT_QUERY_MATCH,
@@ -207,6 +213,13 @@ _PICK_CATEGORIES: frozenset[str] = frozenset({
     PICK_CATEGORY_MANGA,
     PICK_CATEGORY_RANOBE,
 })
+_PICK_CATEGORY_ICONS = {
+    PICK_CATEGORY_ANIME: "🎬",
+    PICK_CATEGORY_MANGA: "📚",
+    PICK_CATEGORY_RANOBE: "📖",
+}
+_PICK_MENU_TEXT = "text"
+_PICK_MENU_PHOTO = "photo"
 _FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
 FACTS_APPLY_CALLBACK_PREFIX = "facts:apply:"
 FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
@@ -858,9 +871,131 @@ def _pick_escape_clip(text: str, limit: int) -> str:
     return f"{h(''.join(raw_parts).rstrip())}…"
 
 
-def _pick_candidate_text(candidate: PickCandidate, catalog) -> str:
+def _pick_join_values(values: tuple[str, ...], *, item_limit: int = 100) -> str:
+    """Собрать безопасную компактную строку локальных значений."""
+    raw = " · ".join(_pick_clip(value, item_limit) for value in values)
+    return _pick_escape_clip(raw, 1000)
+
+
+def _pick_fact_lines(candidate: PickCandidate) -> list[str]:
+    """Собрать доступные локальные факты в иерархии inline-карточки."""
+    kind_label = CARD_KIND_LABELS.get(
+        candidate.kind,
+        candidate.kind.replace("_", " ").capitalize(),
+    )
+    heading = " · ".join(
+        part for part in (kind_label, str(candidate.year or "")) if part
+    )
+    lines = [f"<b>{_pick_escape_clip(heading, 300)}</b>"] if heading else []
+
+    if candidate.shiki_score is not None:
+        lines.append(f"⭐ Оценка Shikimori: {candidate.shiki_score:g}")
+    if candidate.category == PICK_CATEGORY_ANIME:
+        metrics = []
+        if candidate.episodes_total is not None:
+            metrics.append(f"{candidate.episodes_total} эп.")
+        if candidate.duration is not None:
+            metrics.append(f"{candidate.duration} мин.")
+        if metrics:
+            lines.append(f"⏱ {' · '.join(metrics)}")
+        if candidate.origin:
+            lines.append(
+                f"📖 Первоисточник: {_pick_escape_clip(candidate.origin, 300)}"
+            )
+        if candidate.rating:
+            lines.append(
+                f"🔖 Возрастной рейтинг: {_pick_escape_clip(candidate.rating, 100)}"
+            )
+        if candidate.studios:
+            label = "Студия" if len(candidate.studios) == 1 else "Студии"
+            lines.append(f"🎞 {label}: {_pick_join_values(candidate.studios)}")
+    else:
+        metrics = []
+        if candidate.chapters_total is not None:
+            metrics.append(f"{candidate.chapters_total} гл.")
+        if candidate.volumes_total is not None:
+            metrics.append(f"{candidate.volumes_total} т.")
+        if metrics:
+            lines.append(f"📄 {' · '.join(metrics)}")
+        if candidate.publishers:
+            label = "Издатель" if len(candidate.publishers) == 1 else "Издатели"
+            lines.append(f"🏢 {label}: {_pick_join_values(candidate.publishers)}")
+    return lines
+
+
+def _pick_taxonomy_lines(candidate: PickCandidate) -> list[str]:
+    """Отрендерить только доступные локальные taxonomy-поля."""
+    lines = []
+    for icon, label, values in (
+        ("👥", "Демография", candidate.demographic),
+        ("🎭", "Жанры", candidate.genres),
+        ("🏷", "Темы", candidate.themes),
+    ):
+        if values:
+            lines.append(f"{icon} <b>{label}:</b> {_pick_join_values(values)}")
+    return lines
+
+
+def _pick_poster_url(candidate: PickCandidate) -> str:
+    """Допустить в Telegram photo-card только абсолютную HTTP(S)-обложку."""
+    parsed = urlsplit(candidate.poster_url)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return candidate.poster_url
+    return ""
+
+
+def _pick_compose_candidate_text(
+    *,
+    heading: str,
+    title: str,
+    subtitle: str,
+    facts: list[str],
+    taxonomy: list[str],
+    freshness: str,
+    unresolved: str,
+    limit: int,
+) -> str:
+    """Собрать карточку в общем лимите, убирая только целые хвостовые поля."""
+    remaining_facts = list(facts)
+    remaining_taxonomy = list(taxonomy)
+    remaining_subtitle = subtitle
+
+    def compose() -> str:
+        title_lines = [title]
+        if remaining_subtitle:
+            title_lines.append(remaining_subtitle)
+        sections = [heading, "\n".join(title_lines)]
+        if remaining_facts:
+            sections.append(f"<blockquote>{'\n'.join(remaining_facts)}</blockquote>")
+        if remaining_taxonomy:
+            sections.append("\n".join(remaining_taxonomy))
+        sections.append(freshness)
+        return f"{'\n\n'.join(sections)}{unresolved}"
+
+    text = compose()
+    while parsed_caption_length(text) > limit:
+        if remaining_taxonomy:
+            remaining_taxonomy.pop()
+        elif remaining_facts:
+            remaining_facts.pop()
+        elif remaining_subtitle:
+            remaining_subtitle = ""
+        else:
+            break
+        text = compose()
+    return text
+
+
+def _pick_candidate_text(
+    candidate: PickCandidate,
+    catalog,
+    *,
+    limit: int = _TELEGRAM_MESSAGE_LIMIT,
+) -> str:
     """Безопасно отрендерить один локальный результат с нормализованной ссылкой."""
-    title = _pick_escape_clip(candidate.title, 700)
+    title_limit = 300 if limit <= PHOTO_CAPTION_LIMIT else 700
+    subtitle_limit = 300 if limit <= PHOTO_CAPTION_LIMIT else 500
+    title = _pick_escape_clip(candidate.title, title_limit)
     relative_url = _rel_url(candidate.url)
     if relative_url:
         relative_url = f"/{relative_url.lstrip('/')}"
@@ -873,26 +1008,26 @@ def _pick_candidate_text(candidate: PickCandidate, catalog) -> str:
     else:
         rendered_title = f"<b>{title}</b>"
 
-    details: list[str] = []
-    if candidate.year is not None:
-        details.append(f"🗓️ {candidate.year}")
-    if candidate.genres:
-        genres = ", ".join(_pick_clip(genre, 100) for genre in candidate.genres[:20])
-        if len(candidate.genres) > 20:
-            genres = f"{genres}, …"
-        details.append(f"🎭 {_pick_escape_clip(genres, 1200)}")
-    details_body = "\n".join(details)
-    details_text = f"\n\n{details_body}" if details_body else ""
+    icon = _PICK_CATEGORY_ICONS.get(candidate.category, "🎲")
+    subtitle = ""
+    if candidate.title_en and candidate.title_en.casefold() != candidate.title.casefold():
+        subtitle = f"<i>{_pick_escape_clip(candidate.title_en, subtitle_limit)}</i>"
+    facts = _pick_fact_lines(candidate)
+    taxonomy = _pick_taxonomy_lines(candidate)
     unresolved = (
         ""
         if candidate.category == PICK_CATEGORY_ANIME
         else _pick_unresolved_notice(catalog.unresolved_count)
     )
-    return (
-        f"🎲 <b>{_pick_suggestion_heading(candidate.category)}</b>\n\n"
-        f"{rendered_title}{details_text}\n\n"
-        f"🕒 {_pick_freshness(catalog.updated_at)}."
-        f"{unresolved}"
+    return _pick_compose_candidate_text(
+        heading=f"🎲 <b>{_pick_suggestion_heading(candidate.category)}</b>",
+        title=f"{icon} {rendered_title}",
+        subtitle=subtitle,
+        facts=facts,
+        taxonomy=taxonomy,
+        freshness=f"🕒 {_pick_freshness(catalog.updated_at)}.",
+        unresolved=unresolved,
+        limit=limit,
     )
 
 
@@ -998,6 +1133,7 @@ async def cmd_pick(message: Message, state: FSMContext) -> None:
     await state.update_data(
         pick_menu_chat_id=message.chat.id,
         pick_menu_message_id=menu.message_id,
+        pick_menu_kind=_PICK_MENU_TEXT,
         pick_command_message_id=message.message_id,
         pick_category=None,
         pick_shown_ids=[],
@@ -1033,19 +1169,77 @@ async def _pick_edit(
     callback: CallbackQuery,
     text: str,
     keyboard: InlineKeyboardMarkup,
-) -> bool:
-    """Изменить control message, не распространяя Telegram-сбой в FSM."""
+    *,
+    poster_url: str = "",
+    current_kind: str = _PICK_MENU_TEXT,
+    command_message_id: object = None,
+) -> tuple[int, str] | None:
+    """Показать photo/text-карточку, сохранив управляемый control message."""
+    current_kind = (
+        _PICK_MENU_PHOTO
+        if current_kind == _PICK_MENU_PHOTO
+        else _PICK_MENU_TEXT
+    )
+    if poster_url:
+        try:
+            await callback.message.edit_media(
+                InputMediaPhoto(
+                    media=poster_url,
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    show_caption_above_media=False,
+                ),
+                reply_markup=keyboard,
+            )
+            return callback.message.message_id, _PICK_MENU_PHOTO
+        except TelegramBadRequest as e:
+            log.debug("pick: Telegram отклонил photo-card: %s", e)
+        except Exception as e:
+            log.debug("pick: не удалось обновить photo-card: %s", e)
+            await callback.answer(
+                "Не удалось обновить меню. Попробуй ещё раз.",
+                show_alert=True,
+            )
+            return None
+
     try:
-        await callback.message.edit_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
+        text_options = {
+            "parse_mode": ParseMode.HTML,
+            "link_preview_options": LinkPreviewOptions(is_disabled=True),
+            "reply_markup": keyboard,
+        }
+        if current_kind == _PICK_MENU_TEXT:
+            await callback.message.edit_text(text, **text_options)
+            return callback.message.message_id, _PICK_MENU_TEXT
+
+        reply_parameters = (
+            ReplyParameters(
+                message_id=command_message_id,
+                allow_sending_without_reply=True,
+            )
+            if type(command_message_id) is int and command_message_id > 0
+            else None
         )
-        return True
+        replacement = await callback.message.answer(
+            text,
+            **text_options,
+            reply_parameters=reply_parameters,
+        )
+        replacement_id = getattr(replacement, "message_id", None)
+        if type(replacement_id) is not int:
+            raise RuntimeError("Telegram не вернул id нового /pick menu")
+        try:
+            await callback.message.delete()
+        except Exception as cleanup_error:
+            log.debug(
+                "pick: старую photo-card не удалось удалить: %s",
+                cleanup_error,
+            )
+        return replacement_id, _PICK_MENU_TEXT
     except Exception as e:
-        log.debug("pick: не удалось обновить меню: %s", e)
+        log.debug("pick: не удалось обновить text-card: %s", e)
         await callback.answer("Не удалось обновить меню. Попробуй ещё раз.", show_alert=True)
-        return False
+        return None
 
 
 async def _pick_show_category(
@@ -1059,12 +1253,18 @@ async def _pick_show_category(
     """Выбрать и атомарно отразить следующий результат текущей категории."""
     snapshot_state, catalog = _load_pick_catalog()
     if snapshot_state != STATS_ALL_VALID or catalog is None:
-        if await _pick_edit(
+        rendered = await _pick_edit(
             callback,
             _pick_root_text(snapshot_state, catalog),
             _pick_root_keyboard(),
-        ):
+            current_kind=data.get("pick_menu_kind", _PICK_MENU_TEXT),
+            command_message_id=data.get("pick_command_message_id"),
+        )
+        if rendered is not None:
+            menu_id, menu_kind = rendered
             await state.update_data(
+                pick_menu_message_id=menu_id,
+                pick_menu_kind=menu_kind,
                 pick_category=None,
                 pick_shown_ids=[],
                 pick_anchor=None,
@@ -1078,12 +1278,18 @@ async def _pick_show_category(
             f"📭 В категории «{_pick_category_label(category)}» пока нечего "
             "выбирать из списка «Запланировано»."
         )
-        if await _pick_edit(
+        rendered = await _pick_edit(
             callback,
             _pick_root_text(snapshot_state, catalog, notice=notice),
             _pick_root_keyboard(),
-        ):
+            current_kind=data.get("pick_menu_kind", _PICK_MENU_TEXT),
+            command_message_id=data.get("pick_command_message_id"),
+        )
+        if rendered is not None:
+            menu_id, menu_kind = rendered
             await state.update_data(
+                pick_menu_message_id=menu_id,
+                pick_menu_kind=menu_kind,
                 pick_category=None,
                 pick_shown_ids=[],
                 pick_anchor=None,
@@ -1106,13 +1312,25 @@ async def _pick_show_category(
         await callback.answer("В этой категории пока нечего предложить.", show_alert=True)
         return
 
-    if not await _pick_edit(
+    poster_url = _pick_poster_url(selection.candidate)
+    rendered = await _pick_edit(
         callback,
-        _pick_candidate_text(selection.candidate, catalog),
+        _pick_candidate_text(
+            selection.candidate,
+            catalog,
+            limit=PHOTO_CAPTION_LIMIT if poster_url else _TELEGRAM_MESSAGE_LIMIT,
+        ),
         _pick_result_keyboard(),
-    ):
+        poster_url=poster_url,
+        current_kind=data.get("pick_menu_kind", _PICK_MENU_TEXT),
+        command_message_id=data.get("pick_command_message_id"),
+    )
+    if rendered is None:
         return
+    menu_id, menu_kind = rendered
     await state.update_data(
+        pick_menu_message_id=menu_id,
+        pick_menu_kind=menu_kind,
         pick_category=category,
         pick_shown_ids=sorted(selection.shown_ids),
         pick_anchor=_pick_candidate_to_state(selection.candidate),

@@ -12,6 +12,7 @@ utils; messages/stats/handlers зависят от него, не наоборо
 import asyncio
 import json
 import time
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -140,11 +141,13 @@ query($ids: String!) {
     url
     kind
     score
+    status
     rating
     origin
     duration
     episodes
     airedOn { year }
+    poster { originalUrl mainUrl }
     studios { name }
     genres { russian name kind }
   }
@@ -158,9 +161,11 @@ query($ids: String!) {
     url
     kind
     score
+    status
     chapters
     volumes
     airedOn { year }
+    poster { originalUrl mainUrl }
     publishers { name }
     genres { russian name kind }
   }
@@ -294,6 +299,23 @@ def _parse_genres(genres_raw: list, kind_filter: str) -> list[str]:
             if name:
                 out.append(name)
     return out
+
+
+def _poster_url(value: object) -> str:
+    """Выбрать пригодный абсолютный URL обложки из ответа GraphQL."""
+    if not isinstance(value, dict):
+        return ""
+    for key in ("originalUrl", "mainUrl"):
+        raw = value.get(key)
+        if not isinstance(raw, str):
+            continue
+        candidate = raw.strip()
+        if candidate.startswith("/"):
+            candidate = f"{SHIKI_BASE_URL.rstrip('/')}{candidate}"
+        parsed = urlsplit(candidate)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return candidate
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -621,7 +643,9 @@ async def fetch_meta_batch(media: str, ids: list[str],
                 genres_raw = item.get("genres") or []
                 meta = {
                     "url":         _rel_url(item.get("url")),
+                    "poster_url":  _poster_url(item.get("poster")),
                     "kind":        (item.get("kind") or "").lower(),
+                    "release_status": (item.get("status") or "").lower(),
                     "year":        (item.get("airedOn") or {}).get("year"),
                     "shiki_score": _safe_float(item.get("score")),
                     "genres":      _parse_genres(genres_raw, "genre"),

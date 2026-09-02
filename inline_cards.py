@@ -41,7 +41,7 @@ _SHIKI_BBCODE_RE = re.compile(
 _ICONS = {"anime": "🎬", "manga": "📚", "ranobe": "📖"}
 # Карточка называет один тайтл; множественные подписи для счётчиков статистики
 # остаются отдельным контрактом представления в stats.py.
-_CARD_KIND_LABELS = {
+CARD_KIND_LABELS = {
     "tv": "TV-сериал",
     "movie": "Фильм",
     "ova": "OVA",
@@ -147,7 +147,7 @@ def _people_names(item: dict, field: str) -> list[str]:
 
 def _facts(media_type: str, item: dict) -> list[str]:
     kind = _plain(item.get("kind"))
-    kind_label = _CARD_KIND_LABELS.get(kind, kind.replace("_", " ").capitalize())
+    kind_label = CARD_KIND_LABELS.get(kind, kind.replace("_", " ").capitalize())
     aired_on = item.get("airedOn")
     year = _plain(aired_on.get("year")) if isinstance(aired_on, dict) else ""
     heading = " · ".join(part for part in (kind_label, year) if part)
@@ -320,7 +320,7 @@ def build_card_caption(media_type: str, item: dict) -> str:
 
 def _chooser_description(media_type: str, item: dict) -> str:
     kind = _plain(item.get("kind"))
-    kind_label = _CARD_KIND_LABELS.get(kind, kind.replace("_", " ").capitalize())
+    kind_label = CARD_KIND_LABELS.get(kind, kind.replace("_", " ").capitalize())
     aired_on = item.get("airedOn")
     year = _plain(aired_on.get("year")) if isinstance(aired_on, dict) else ""
     score = _format_number(item.get("score"))
