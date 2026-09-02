@@ -317,7 +317,7 @@ def select_pick_candidate(
     remaining, cycle_shown, pool_reset = _pick_remaining(candidates, shown)
     if not remaining:
         return PickSelection(None, shown, False)
-    candidate = random.choice(remaining)
+    candidate = random.choice(remaining)  # nosec B311  (выбор рекомендации — не крипта)
     return PickSelection(candidate, cycle_shown | {candidate.id}, pool_reset)
 
 
@@ -372,7 +372,7 @@ def select_contrast_pick_candidate(
             minimum = min(overlaps.values())
             remaining = tuple(item for item in known_genres if overlaps[item.id] == minimum)
 
-    candidate = random.choice(remaining)
+    candidate = random.choice(remaining)  # nosec B311  (выбор рекомендации — не крипта)
     return PickSelection(candidate, cycle_shown | {candidate.id}, pool_reset)
 
 
@@ -694,8 +694,8 @@ async def sync_stats_all(
         # первом заносе (GraphQL не вернул элемент → ВСЕ мета-поля пусты разом).
         # Они навсегда оставались в titles{} (new_ids их не видит, самоочистка
         # пропускает пустой kind) и, если completed, врали в счётчике.
-        # Дозапрашиваем их повторно. Анонсы (вид ещё неизвестен) вернут снова
-        # пустой kind — это обрабатывается как no-op ниже, без записи на диск.
+        # Дозапрашиваем их повторно. При новом точном release_status обновляем
+        # запись даже с пустым kind; полностью повторный ответ остаётся no-op.
         retry_ids = [
             tid for tid in valid_rows
             if tid in titles and not (titles[tid].get("kind") or "")

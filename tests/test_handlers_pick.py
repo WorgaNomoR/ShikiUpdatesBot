@@ -650,6 +650,75 @@ async def test_cancel_clears_pick_fsm_and_tolerates_cleanup_failures(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["more", "contrast"])
+async def test_repeat_actions_reject_invalid_fsm_category_without_mutation(
+    monkeypatch,
+    action,
+):
+    _patch_snapshot(monkeypatch, _stats())
+    state = _State()
+    await handlers.cmd_pick(_message(), state)
+    await state.update_data(pick_category="unknown")
+    before_state = state.state
+    before = deepcopy(state.data)
+    callback = _callback(f"pick:{action}")
+
+    await handlers.pick_menu_cb(callback, state)
+
+    callback.answer.assert_awaited_once_with(
+        "Сначала выбери категорию.",
+        show_alert=True,
+    )
+    callback.message.edit_text.assert_not_awaited()
+    callback.message.edit_media.assert_not_awaited()
+    assert state.state == before_state
+    assert state.data == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "anchor",
+    [
+        {"id": "broken"},
+        {
+            "id": "10",
+            "category": "manga",
+            "title": "Другой домен",
+            "url": "/mangas/10",
+            "year": 2000,
+            "genres": [],
+        },
+    ],
+)
+async def test_contrast_rejects_stale_anchor_without_fsm_mutation(
+    monkeypatch,
+    anchor,
+):
+    _patch_snapshot(monkeypatch, _stats())
+    state = _State()
+    await handlers.cmd_pick(_message(), state)
+    await state.update_data(
+        pick_category="anime",
+        pick_shown_ids=["1"],
+        pick_anchor=anchor,
+    )
+    before_state = state.state
+    before = deepcopy(state.data)
+    callback = _callback("pick:contrast")
+
+    await handlers.pick_menu_cb(callback, state)
+
+    callback.answer.assert_awaited_once_with(
+        "Текущий вариант устарел. Выбери категорию заново.",
+        show_alert=True,
+    )
+    callback.message.edit_text.assert_not_awaited()
+    callback.message.edit_media.assert_not_awaited()
+    assert state.state == before_state
+    assert state.data == before
+
+
+@pytest.mark.asyncio
 async def test_every_pick_path_is_isolated_from_network_entitlement_and_inline_state(
     monkeypatch,
 ):

@@ -476,6 +476,9 @@ def test_load_stats_all_snapshot_distinguishes_missing_invalid_and_valid(
     structural = storage.load_stats_all_snapshot(use_cache=False)
     assert structural.state == storage.STATS_ALL_INVALID
     assert structural.data == storage._empty_stats_all()
+    cached = storage.load_stats_all_snapshot()
+    assert cached.state == storage.STATS_ALL_INVALID
+    assert cached.data is structural.data
 
 
 def test_load_stats_all_cache_hit_skips_file_reread(monkeypatch, tmp_path):

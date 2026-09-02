@@ -3575,4 +3575,3 @@ async def version_refresh_cb(callback: CallbackQuery) -> None:
                 )
         except TelegramBadRequest as e:
             log.warning("Не удалось обновить сообщение /info: %s", e)
-    build_pick_catalog,
