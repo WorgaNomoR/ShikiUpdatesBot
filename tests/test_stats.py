@@ -15,7 +15,6 @@
 import copy
 import json
 import re
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -381,15 +380,20 @@ def test_contrast_pick_prefers_other_decade_then_minimum_genre_overlap(
 
 def test_contrast_pick_weakens_missing_metadata_and_handles_one_item(monkeypatch):
     anchor = _pick_candidate("only", year=None, genres=())
-    chooser = MagicMock(side_effect=lambda items: items[0])
-    monkeypatch.setattr(smod.random, "choice", chooser)
+    offered = []
+
+    def choose(items):
+        offered.append(tuple(items))
+        return items[0]
+
+    monkeypatch.setattr(smod.random, "choice", choose)
 
     result = smod.select_contrast_pick_candidate((anchor,), anchor, {anchor.id})
 
     assert result.candidate == anchor
     assert result.pool_reset is True
     assert result.shown_ids == frozenset({anchor.id})
-    assert tuple(chooser.call_args.args[0]) == (anchor,)
+    assert offered == [(anchor,)]
 
 
 # ════════════════════════════════════════════════════════════════
