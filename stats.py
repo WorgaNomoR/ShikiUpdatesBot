@@ -13,6 +13,7 @@ import json
 import random
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import aiohttp
 
@@ -86,6 +87,20 @@ _MANGA_PRESENTATION_KINDS: frozenset[str] = frozenset({
     "manhwa",
     "manhua",
 })
+
+_META_ACTIVE_STATUSES: frozenset[str] = frozenset({
+    "planned",
+    "watching",
+    "rewatching",
+    "on_hold",
+})
+_META_TERMINAL_STATUSES: frozenset[str] = frozenset({
+    "completed",
+    "dropped",
+})
+_META_ACTIVE_MAX_AGE = timedelta(days=7)
+_META_TERMINAL_MAX_AGE = timedelta(days=30)
+_META_MAINTENANCE_LIMIT = 50
 
 
 @dataclass(frozen=True)
@@ -381,6 +396,7 @@ def _merge_title_record(
     export_row: dict,
     meta: dict | None,
     previous: dict | None = None,
+    meta_updated_at: str | None = None,
 ) -> dict:
     """
     Собираем одну запись titles{} из строки экспорта и метаданных GraphQL.
@@ -422,7 +438,56 @@ def _merge_title_record(
             "volumes_total":  meta.get("volumes_total"),
             "publishers":     meta.get("publishers") or [],
         })
+    if meta_updated_at is not None:
+        record["meta_updated_at"] = meta_updated_at
     return record
+
+
+def _metadata_id_sort_key(title_id: str) -> tuple[int, int, str]:
+    """Устойчивый порядок числовых ID с защитным строковым фолбэком."""
+    try:
+        return 0, int(title_id), title_id
+    except ValueError:
+        return 1, 0, title_id
+
+
+def _select_metadata_refresh_ids(
+    valid_rows: dict[str, dict],
+    titles: dict[str, dict],
+    now: datetime,
+) -> list[str]:
+    """Выбрать oldest-first кандидатов одного media-домена в фиксированный бюджет."""
+    candidates: list[tuple[datetime, tuple[int, int, str], str]] = []
+    for title_id, row in valid_rows.items():
+        record = titles.get(title_id)
+        if not isinstance(record, dict) or not (record.get("kind") or ""):
+            continue
+
+        status = (row.get("status") or "").lower()
+        if status in _META_ACTIVE_STATUSES:
+            max_age = _META_ACTIVE_MAX_AGE
+        elif status in _META_TERMINAL_STATUSES:
+            max_age = _META_TERMINAL_MAX_AGE
+        else:
+            continue
+
+        updated_at = _parse_iso_utc(record.get("meta_updated_at"))
+        if updated_at is not None and updated_at > now:
+            updated_at = None
+        if updated_at is not None and now - updated_at < max_age:
+            continue
+
+        candidates.append((
+            updated_at or datetime.min,
+            _metadata_id_sort_key(title_id),
+            title_id,
+        ))
+
+    candidates.sort()
+    return [
+        title_id
+        for _, _, title_id in candidates[:_META_MAINTENANCE_LIMIT]
+    ]
 
 
 def _bump(counter: dict, key, n: int = 1) -> None:
@@ -649,8 +714,9 @@ async def sync_stats_all(
        (новый id, либо изменился score/status/episodes/chapters).
     3. Для записей, у которых ещё нет метаданных (новый id) — батч GraphQL.
        Для существ, у которых поменялся только пользовательский стейт —
-       обновляем поля из экспорта, метаданные не перезапрашиваем.
-    4. Пересчитываем агрегаты, сохраняем.
+       обновляем поля из экспорта.
+    4. Отдельно обновляем до 50 самых старых метаданных каждого media-домена.
+    5. Пересчитываем агрегаты, сохраняем.
 
     Вызывается при старте бота и периодически из цикла. Уведомлений не шлёт.
     Возвращает (stats_all, ok): ok=False, если ни один экспорт не скачался
@@ -675,6 +741,8 @@ async def sync_stats_all(
     # Изолируем рабочие изменения, чтобы поздний privacy failure не опубликовал
     # частичный результат через кэш до атомарного сохранения.
     stats = deepcopy(stats)
+    sync_time = _utcnow()
+    meta_updated_at = sync_time.isoformat()
 
     changed = False
 
@@ -708,8 +776,8 @@ async def sync_stats_all(
             if tid in titles and not (titles[tid].get("kind") or "")
         ]
 
-        # Подтягиваем метаданные только для новых записей и ремонта битых.
-        # Плановое обновление устаревших полей принадлежит issue #57.
+        # Новые записи и ремонт битой меты — correctness-работа: она всегда
+        # идёт отдельно и не расходует фиксированный maintenance-батч.
         need_meta = new_ids + retry_ids
         meta_map: dict[str, dict] = {}
         if need_meta:
@@ -721,6 +789,33 @@ async def sync_stats_all(
                 raise
             except Exception as e:
                 log.error("sync_stats_all(%s): fetch_meta_batch упал: %s", media, e)
+
+        maintenance_ids = _select_metadata_refresh_ids(
+            valid_rows,
+            titles,
+            sync_time,
+        )
+        maintenance_meta: dict[str, dict] = {}
+        if maintenance_ids:
+            log.info(
+                "sync_stats_all(%s): планово обновляем метаданные: %d",
+                media,
+                len(maintenance_ids),
+            )
+            try:
+                maintenance_meta = await fetch_meta_batch(
+                    media,
+                    maintenance_ids,
+                    session=session,
+                )
+            except ProfilePrivacyError:
+                raise
+            except Exception as e:
+                log.error(
+                    "sync_stats_all(%s): maintenance fetch_meta_batch упал: %s",
+                    media,
+                    e,
+                )
 
         skipped_irrelevant = 0
         repaired = 0
@@ -739,7 +834,13 @@ async def sync_stats_all(
                 # точный release_status; повторный такой ответ остаётся no-op.
                 if not (rec.get("kind") or ""):
                     if fresh and (fresh.get("kind") or ""):
-                        titles[tid] = _merge_title_record(media, row, fresh, previous=rec)
+                        titles[tid] = _merge_title_record(
+                            media,
+                            row,
+                            fresh,
+                            previous=rec,
+                            meta_updated_at=meta_updated_at,
+                        )
                         repaired += 1
                         changed = True
                         continue
@@ -751,8 +852,20 @@ async def sync_stats_all(
                         rec["release_status"] = fresh["release_status"]
                         changed = True
 
+                refreshed = maintenance_meta.get(tid)
+                if refreshed is not None:
+                    titles[tid] = _merge_title_record(
+                        media,
+                        row,
+                        refreshed,
+                        previous=rec,
+                        meta_updated_at=meta_updated_at,
+                    )
+                    changed = True
+                    continue
+
                 # Существующая запись — обновляем только пользовательский стейт,
-                # метаданные (genres/studios/...) уже есть, не трогаем.
+                # если она не попала в успешный maintenance-ответ.
                 new_score  = _safe_int(row.get("score"))
                 new_status = (row.get("status") or "").lower()
                 new_rew    = _safe_int(row.get("rewatches"))
@@ -793,7 +906,14 @@ async def sync_stats_all(
                 if kind and not is_relevant(media, kind):
                     skipped_irrelevant += 1
                     continue
-                titles[tid] = _merge_title_record(media, row, meta)
+                titles[tid] = _merge_title_record(
+                    media,
+                    row,
+                    meta,
+                    meta_updated_at=(
+                        meta_updated_at if meta is not None else None
+                    ),
+                )
                 changed = True
 
         if skipped_irrelevant:

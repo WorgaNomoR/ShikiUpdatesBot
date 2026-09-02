@@ -1866,8 +1866,9 @@ async def polling_loop(bot: Bot) -> None:
 
             # Периодический (и ретрай-после-неудачного-старта) ресинк stats_all,
             # чтобы сбой одного запроса не оставлял статистику протухшей/пустой
-            # до перезапуска. Дёшево: list_export ×2 + избранное, meta — только
-            # по новым id. save_stats_all обновляет кэш, ротация ниже видит свежее.
+            # до перезапуска. Новая/битая мета загружается как correctness-работа,
+            # устаревшая — в фиксированном maintenance-бюджете. save_stats_all
+            # обновляет кэш, поэтому ротация ниже видит свежие данные.
             if _should_full_sync(last_full_sync, time.monotonic(), FULL_SYNC_INTERVAL):
                 try:
                     _, synced_ok = await sync_stats_all(fav=cycle_favourites)
