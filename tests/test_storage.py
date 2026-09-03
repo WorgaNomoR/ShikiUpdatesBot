@@ -99,6 +99,17 @@ def test_load_known_users_rejects_malformed_existing_state(
     assert json.loads(known_users_path.read_text(encoding="utf-8")) == payload
 
 
+def test_load_known_users_converts_invalid_utf8_to_state_error(user_registry_env):
+    known_users_path, _user_alerts_path = user_registry_env
+    original = b"\xff"
+    known_users_path.write_bytes(original)
+
+    with pytest.raises(storage.KnownUsersStateError):
+        storage.load_known_users()
+
+    assert known_users_path.read_bytes() == original
+
+
 @pytest.mark.parametrize("payload", [{}, {"enabled": 1}, {"enabled": True, "x": 1}])
 def test_load_user_alerts_rejects_malformed_existing_state(
     user_registry_env,
@@ -111,6 +122,17 @@ def test_load_user_alerts_rejects_malformed_existing_state(
         storage.load_user_alerts_enabled()
 
     assert json.loads(user_alerts_path.read_text(encoding="utf-8")) == payload
+
+
+def test_load_user_alerts_converts_invalid_utf8_to_state_error(user_registry_env):
+    _known_users_path, user_alerts_path = user_registry_env
+    original = b"\xff"
+    user_alerts_path.write_bytes(original)
+
+    with pytest.raises(storage.UserAlertsStateError):
+        storage.load_user_alerts_enabled()
+
+    assert user_alerts_path.read_bytes() == original
 
 
 @pytest.mark.asyncio

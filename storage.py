@@ -497,7 +497,12 @@ def load_known_users() -> dict[int, KnownUser]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         return known_users_from_payload(payload)
-    except (json.JSONDecodeError, OSError, KnownUsersStateError) as e:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+        KnownUsersStateError,
+    ) as e:
         log.error("load_known_users: реестр недоступен или повреждён: %s", e)
         raise KnownUsersStateError("реестр пользователей недоступен или повреждён") from e
 
@@ -541,7 +546,12 @@ def load_user_alerts_enabled() -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         return user_alerts_from_payload(payload)
-    except (json.JSONDecodeError, OSError, UserAlertsStateError) as e:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+        UserAlertsStateError,
+    ) as e:
         log.error("load_user_alerts_enabled: настройка недоступна или повреждена: %s", e)
         raise UserAlertsStateError("настройка уведомлений недоступна или повреждена") from e
 
