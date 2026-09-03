@@ -22,6 +22,221 @@ from storage import (
 
 
 @pytest.fixture
+def user_registry_env(monkeypatch, tmp_path):
+    """Изолировать реестр, настройку alerts и OWNER_ID."""
+    known_users_path = tmp_path / "known_users.json"
+    user_alerts_path = tmp_path / "user_alerts.json"
+    monkeypatch.setattr(storage, "KNOWN_USERS_FILE", known_users_path)
+    monkeypatch.setattr(storage, "USER_ALERTS_FILE", user_alerts_path)
+    monkeypatch.setattr(storage, "OWNER_ID", 999)
+    return known_users_path, user_alerts_path
+
+
+def _known_user(
+    user_id: int,
+    name: str = "Neo",
+    username: str | None = "the_one",
+    first_seen_at: str = "2026-09-03T10:20:30Z",
+) -> storage.KnownUser:
+    return storage.KnownUser(user_id, name, username, first_seen_at)
+
+
+def test_user_registry_missing_files_use_migration_defaults(user_registry_env):
+    assert storage.load_known_users() == {}
+    assert storage.list_known_users() == ()
+    assert storage.known_user_count() == 0
+    assert storage.load_user_alerts_enabled() is True
+
+
+def test_user_registry_roundtrip_and_queries_are_strict_and_sorted(user_registry_env):
+    known_users_path, _user_alerts_path = user_registry_env
+    users = {
+        30: _known_user(30, "Trinity", None, "2026-09-03T10:20:31Z"),
+        10: _known_user(10),
+    }
+
+    storage.save_known_users(users)
+
+    assert storage.load_known_users() == users
+    assert storage.get_known_user(30) == users[30]
+    assert storage.get_known_user(20) is None
+    assert storage.known_user_count() == 2
+    assert [user.user_id for user in storage.list_known_users()] == [10, 30]
+    assert list(json.loads(known_users_path.read_text(encoding="utf-8"))["users"]) == [
+        "10",
+        "30",
+    ]
+
+
+def test_save_known_users_rejects_key_record_identity_mismatch(user_registry_env):
+    with pytest.raises(storage.KnownUsersStateError):
+        storage.save_known_users({10: _known_user(20)})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"users": []},
+        {"users": {"01": {"display_name": "Neo", "username": None, "first_seen_at": "2026-09-03T10:20:30Z"}}},
+        {"users": {"10": {"display_name": "", "username": None, "first_seen_at": "2026-09-03T10:20:30Z"}}},
+        {"users": {"10": {"display_name": "Neo", "username": 7, "first_seen_at": "2026-09-03T10:20:30Z"}}},
+        {"users": {"10": {"display_name": "Neo", "username": None, "first_seen_at": "2026-09-03T10:20:30"}}},
+        {"users": {"10": {"display_name": "Neo", "username": None, "first_seen_at": "2026-09-03T10:20:30Z", "extra": True}}},
+    ],
+)
+def test_load_known_users_rejects_malformed_existing_state(
+    user_registry_env,
+    payload,
+):
+    known_users_path, _user_alerts_path = user_registry_env
+    known_users_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(storage.KnownUsersStateError):
+        storage.load_known_users()
+
+    assert json.loads(known_users_path.read_text(encoding="utf-8")) == payload
+
+
+@pytest.mark.parametrize("payload", [{}, {"enabled": 1}, {"enabled": True, "x": 1}])
+def test_load_user_alerts_rejects_malformed_existing_state(
+    user_registry_env,
+    payload,
+):
+    _known_users_path, user_alerts_path = user_registry_env
+    user_alerts_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(storage.UserAlertsStateError):
+        storage.load_user_alerts_enabled()
+
+    assert json.loads(user_alerts_path.read_text(encoding="utf-8")) == payload
+
+
+@pytest.mark.asyncio
+async def test_register_known_user_preserves_first_identity_and_timestamp(
+    user_registry_env,
+):
+    first = await storage.register_known_user(
+        10,
+        "Neo",
+        "the_one",
+        first_seen_at="2026-09-03T10:20:30Z",
+    )
+    repeated = await storage.register_known_user(
+        10,
+        "Thomas Anderson",
+        "changed",
+        first_seen_at="2026-09-03T10:21:30Z",
+    )
+
+    assert first == storage.KnownUserRegistration(
+        _known_user(10),
+        created=True,
+        should_alert=True,
+    )
+    assert repeated == storage.KnownUserRegistration(
+        _known_user(10),
+        created=False,
+        should_alert=False,
+    )
+    assert storage.load_known_users() == {10: _known_user(10)}
+
+
+@pytest.mark.asyncio
+async def test_register_known_user_rejects_noncanonical_explicit_timestamp(
+    user_registry_env,
+):
+    with pytest.raises(storage.KnownUsersStateError):
+        await storage.register_known_user(10, "Neo", None, first_seen_at="")
+
+    assert storage.load_known_users() == {}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_registration_creates_one_record_and_one_alert_decision(
+    user_registry_env,
+):
+    results = await asyncio.gather(
+        *(
+            storage.register_known_user(
+                10,
+                "Neo",
+                "the_one",
+                first_seen_at="2026-09-03T10:20:30Z",
+            )
+            for _ in range(12)
+        )
+    )
+
+    assert sum(result.created for result in results) == 1
+    assert sum(result.should_alert for result in results) == 1
+    assert storage.known_user_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_disabled_alerts_register_without_backlog_replay(user_registry_env):
+    assert await storage.set_user_alerts_enabled(False) is True
+    disabled = await storage.register_known_user(
+        10,
+        "Neo",
+        None,
+        first_seen_at="2026-09-03T10:20:30Z",
+    )
+    assert disabled.created is True
+    assert disabled.should_alert is False
+
+    assert await storage.set_user_alerts_enabled(True) is True
+    repeated = await storage.register_known_user(
+        10,
+        "Neo",
+        None,
+        first_seen_at="2026-09-03T10:21:30Z",
+    )
+    assert repeated.created is False
+    assert repeated.should_alert is False
+
+
+@pytest.mark.asyncio
+async def test_malformed_alert_settings_suppress_alert_but_keep_registration(
+    user_registry_env,
+):
+    _known_users_path, user_alerts_path = user_registry_env
+    original = '{"enabled": "broken"}'
+    user_alerts_path.write_text(original, encoding="utf-8")
+
+    result = await storage.register_known_user(
+        10,
+        "Neo",
+        None,
+        first_seen_at="2026-09-03T10:20:30Z",
+    )
+
+    assert result.created is True
+    assert result.should_alert is False
+    assert storage.known_user_count() == 1
+    assert user_alerts_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_setting_is_idempotent_and_malformed_state_is_not_overwritten(
+    user_registry_env,
+):
+    _known_users_path, user_alerts_path = user_registry_env
+    assert await storage.set_user_alerts_enabled(True) is False
+    assert not user_alerts_path.exists()
+    assert await storage.set_user_alerts_enabled(False) is True
+    assert await storage.set_user_alerts_enabled(False) is False
+    assert storage.load_user_alerts_enabled() is False
+
+    original = '{"enabled": null}'
+    user_alerts_path.write_text(original, encoding="utf-8")
+    with pytest.raises(storage.UserAlertsStateError):
+        await storage.set_user_alerts_enabled(True)
+    assert user_alerts_path.read_text(encoding="utf-8") == original
+
+
+@pytest.fixture
 def access_state_env(monkeypatch, tmp_path):
     """Изолировать список блокировок, subscribers и OWNER_ID."""
     blocked_path = tmp_path / "blocked_users.json"

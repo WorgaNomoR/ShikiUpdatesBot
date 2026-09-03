@@ -60,6 +60,7 @@ from handlers import (
     cmd_stop,
     cmd_subs,
     cmd_unblock,
+    cmd_useralerts,
     cmd_version,
     fact_next_cb,
     facts_apply_cb,
@@ -86,6 +87,7 @@ from storage import (
     reconcile_blocked_subscribers,
 )
 from updates import start_update_loop
+from user_registry import UserRegistryMiddleware
 
 
 async def main() -> None:
@@ -109,8 +111,12 @@ async def main() -> None:
     dp  = Dispatcher(storage=MemoryStorage())
 
     # Глобальная проверка списка блокировок — первый проектный middleware.
-    # Будущую регистрацию пользователей (#97) ставить только после этой строки.
     dp.update.outer_middleware(AccessControlMiddleware())
+
+    # Только сопоставленные message/callback регистрируются после общего gate.
+    user_registry_middleware = UserRegistryMiddleware()
+    dp.message.middleware(user_registry_middleware)
+    dp.callback_query.middleware(user_registry_middleware)
 
     # Регистрируем команды
     dp.message.register(cmd_start,     Command("start"))
@@ -130,6 +136,7 @@ async def main() -> None:
     dp.message.register(cmd_block,     Command("block"))
     dp.message.register(cmd_unblock,   Command("unblock"))
     dp.message.register(cmd_blocklist, Command("blocklist"))
+    dp.message.register(cmd_useralerts, Command("useralerts"))
     dp.inline_query.register(cmd_inline_search)
 
     # FSM-обработчики для /broadcast

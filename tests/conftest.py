@@ -74,6 +74,8 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(fact_bank, "FACTS_FILE", data / "facts.json")
     monkeypatch.setattr(storage, "SUBS_FILE", data / "subscribers.json")
     monkeypatch.setattr(storage, "BLOCKED_USERS_FILE", data / "blocked_users.json")
+    monkeypatch.setattr(storage, "KNOWN_USERS_FILE", data / "known_users.json")
+    monkeypatch.setattr(storage, "USER_ALERTS_FILE", data / "user_alerts.json")
     monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
     monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
     monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")

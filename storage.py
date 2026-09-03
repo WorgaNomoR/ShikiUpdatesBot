@@ -18,6 +18,7 @@ from pathlib import Path
 
 from config import (
     BLOCKED_USERS_FILE,
+    KNOWN_USERS_FILE,
     OWNER_ID,
     SEEN_FAVS_FILE,
     SEEN_IDS_FILE,
@@ -25,9 +26,11 @@ from config import (
     STATS_CURRENT_FILE,
     SUBS_FILE,
     UPDATE_STATE_FILE,
+    USER_ALERTS_FILE,
     log,
 )
 from utils import (
+    _parse_iso_utc,
     _utcnow,
     current_quarter,
     quarter_start,
@@ -357,6 +360,252 @@ async def remove_blocked_user(user_id: int) -> bool:
         blocked.remove(user_id)
         save_blocked_users(blocked)
         return True
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  known_users — НЕЗАВИСИМЫЙ РЕЕСТР ПОЛЬЗОВАТЕЛЕЙ БОТА
+# ═══════════════════════════════════════════════════════════════════
+
+class KnownUsersStateError(ValueError):
+    """Существующий реестр пользователей нельзя безопасно прочитать."""
+
+
+class UserAlertsStateError(ValueError):
+    """Настройку уведомлений о новых пользователях нельзя безопасно прочитать."""
+
+
+@dataclass(frozen=True)
+class KnownUser:
+    """Неизменяемые первоначальные сведения о пользователе бота."""
+
+    user_id: int
+    display_name: str
+    username: str | None
+    first_seen_at: str
+
+
+@dataclass(frozen=True)
+class KnownUserRegistration:
+    """Результат атомарной попытки зарегистрировать пользователя."""
+
+    user: KnownUser
+    created: bool
+    should_alert: bool
+
+
+def _validate_known_user_text(value: object, field: str) -> str:
+    """Проверить обязательное непустое строковое поле пользователя."""
+    if not isinstance(value, str) or not value.strip():
+        raise KnownUsersStateError(f"поле {field} должно быть непустой строкой")
+    return value
+
+
+def _validate_known_username(value: object) -> str | None:
+    """Проверить первоначальный username, который может отсутствовать."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise KnownUsersStateError("поле username должно быть непустой строкой или null")
+    return value
+
+
+def _validate_first_seen_at(value: object) -> str:
+    """Проверить каноническую UTC-метку с точностью до секунды."""
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise KnownUsersStateError("поле first_seen_at должно быть UTC-меткой")
+    parsed = _parse_iso_utc(value)
+    if parsed is None or value != f"{parsed.isoformat(timespec='seconds')}Z":
+        raise KnownUsersStateError("поле first_seen_at содержит некорректную UTC-метку")
+    return value
+
+
+def known_users_from_payload(payload: object) -> dict[int, KnownUser]:
+    """Строго проверить и разобрать канонический реестр пользователей."""
+    if not isinstance(payload, dict) or set(payload) != {"users"}:
+        raise KnownUsersStateError("неожиданная структура реестра пользователей")
+    raw_users = payload["users"]
+    if not isinstance(raw_users, dict):
+        raise KnownUsersStateError("поле users должно быть объектом")
+
+    users: dict[int, KnownUser] = {}
+    for raw_user_id, raw_user in raw_users.items():
+        if not isinstance(raw_user_id, str) or not raw_user_id.isascii() or not raw_user_id.isdecimal():
+            raise KnownUsersStateError("ключ пользователя должен быть каноническим Telegram ID")
+        try:
+            user_id = validate_telegram_user_id(int(raw_user_id))
+        except ValueError as e:
+            raise KnownUsersStateError("реестр содержит некорректный Telegram user ID") from e
+        if str(user_id) != raw_user_id or user_id == OWNER_ID:
+            raise KnownUsersStateError("реестр содержит недопустимый Telegram user ID")
+        if not isinstance(raw_user, dict) or set(raw_user) != {
+            "display_name",
+            "username",
+            "first_seen_at",
+        }:
+            raise KnownUsersStateError("неожиданная структура записи пользователя")
+        users[user_id] = KnownUser(
+            user_id=user_id,
+            display_name=_validate_known_user_text(
+                raw_user["display_name"],
+                "display_name",
+            ),
+            username=_validate_known_username(raw_user["username"]),
+            first_seen_at=_validate_first_seen_at(raw_user["first_seen_at"]),
+        )
+    return users
+
+
+def _known_users_json(users: dict[int, KnownUser]) -> str:
+    """Сериализовать проверенный реестр в стабильном порядке."""
+    for user_id, user in users.items():
+        if not isinstance(user, KnownUser) or user.user_id != user_id:
+            raise KnownUsersStateError(
+                "ключ реестра не совпадает с Telegram ID записи"
+            )
+    payload = {
+        "users": {
+            str(user_id): {
+                "display_name": user.display_name,
+                "username": user.username,
+                "first_seen_at": user.first_seen_at,
+            }
+            for user_id, user in sorted(users.items())
+        }
+    }
+    canonical = known_users_from_payload(payload)
+    return json.dumps(
+        {
+            "users": {
+                str(user_id): {
+                    "display_name": user.display_name,
+                    "username": user.username,
+                    "first_seen_at": user.first_seen_at,
+                }
+                for user_id, user in canonical.items()
+            }
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def load_known_users() -> dict[int, KnownUser]:
+    """Загрузить реестр; отсутствие файла означает пустое состояние."""
+    path = Path(KNOWN_USERS_FILE)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return known_users_from_payload(payload)
+    except (json.JSONDecodeError, OSError, KnownUsersStateError) as e:
+        log.error("load_known_users: реестр недоступен или повреждён: %s", e)
+        raise KnownUsersStateError("реестр пользователей недоступен или повреждён") from e
+
+
+def save_known_users(users: dict[int, KnownUser]) -> None:
+    """Атомарно сохранить строго проверенный реестр пользователей."""
+    _atomic_write(KNOWN_USERS_FILE, _known_users_json(users))
+
+
+def list_known_users() -> tuple[KnownUser, ...]:
+    """Вернуть пользователей в стабильном порядке Telegram ID."""
+    users = load_known_users()
+    return tuple(users[user_id] for user_id in sorted(users))
+
+
+def known_user_count() -> int:
+    """Вернуть количество сохранённых пользователей."""
+    return len(load_known_users())
+
+
+def get_known_user(user_id: int) -> KnownUser | None:
+    """Вернуть сохранённого пользователя по Telegram ID."""
+    return load_known_users().get(validate_telegram_user_id(user_id))
+
+
+def user_alerts_from_payload(payload: object) -> bool:
+    """Строго проверить настройку уведомлений о новых пользователях."""
+    if not isinstance(payload, dict) or set(payload) != {"enabled"}:
+        raise UserAlertsStateError("неожиданная структура настройки уведомлений")
+    enabled = payload["enabled"]
+    if not isinstance(enabled, bool):
+        raise UserAlertsStateError("поле enabled должно быть bool")
+    return enabled
+
+
+def load_user_alerts_enabled() -> bool:
+    """Прочитать настройку; отсутствие файла означает включённые уведомления."""
+    path = Path(USER_ALERTS_FILE)
+    if not path.exists():
+        return True
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return user_alerts_from_payload(payload)
+    except (json.JSONDecodeError, OSError, UserAlertsStateError) as e:
+        log.error("load_user_alerts_enabled: настройка недоступна или повреждена: %s", e)
+        raise UserAlertsStateError("настройка уведомлений недоступна или повреждена") from e
+
+
+def _save_user_alerts_enabled(enabled: bool) -> None:
+    """Атомарно сохранить проверенную настройку уведомлений."""
+    canonical = user_alerts_from_payload({"enabled": enabled})
+    _atomic_write(
+        USER_ALERTS_FILE,
+        json.dumps({"enabled": canonical}, ensure_ascii=False, indent=2),
+    )
+
+
+async def set_user_alerts_enabled(enabled: bool) -> bool:
+    """Установить настройку и вернуть, изменилась ли она."""
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled должен быть bool")
+    async with restorable_state_transaction():
+        current = load_user_alerts_enabled()
+        if current == enabled:
+            return False
+        _save_user_alerts_enabled(enabled)
+        return True
+
+
+async def register_known_user(
+    user_id: int,
+    display_name: str,
+    username: str | None,
+    *,
+    first_seen_at: str | None = None,
+) -> KnownUserRegistration:
+    """Атомарно создать пользователя и решить, нужно ли отправлять alert."""
+    user_id = validate_telegram_user_id(user_id)
+    if user_id == OWNER_ID:
+        raise ValueError("OWNER_ID не регистрируется как пользователь")
+    display_name = _validate_known_user_text(display_name, "display_name")
+    username = _validate_known_username(username)
+    if first_seen_at is None:
+        first_seen_at = f"{_utcnow().isoformat(timespec='seconds')}Z"
+    first_seen_at = _validate_first_seen_at(first_seen_at)
+
+    async with restorable_state_transaction():
+        users = load_known_users()
+        existing = users.get(user_id)
+        if existing is not None:
+            return KnownUserRegistration(existing, created=False, should_alert=False)
+        try:
+            alerts_enabled = load_user_alerts_enabled()
+        except UserAlertsStateError:
+            alerts_enabled = False
+        user = KnownUser(
+            user_id=user_id,
+            display_name=display_name,
+            username=username,
+            first_seen_at=first_seen_at,
+        )
+        users[user_id] = user
+        save_known_users(users)
+        return KnownUserRegistration(
+            user,
+            created=True,
+            should_alert=alerts_enabled,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════

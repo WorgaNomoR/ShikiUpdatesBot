@@ -48,6 +48,22 @@ def _quarter_payload(size: int, period: str) -> str:
     return prefix + ("x" * (size - len(prefix) - len(suffix))) + suffix
 
 
+def _known_users_payload(user_id=7, name="Neo") -> str:
+    """Собрать валидный строгий реестр пользователей."""
+    return json.dumps(
+        {
+            "users": {
+                str(user_id): {
+                    "display_name": name,
+                    "username": "the_one",
+                    "first_seen_at": "2026-09-03T10:20:30Z",
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+
+
 async def _cancel_after_started(awaitable, started: asyncio.Event) -> None:
     """Отменить awaitable после подтверждённого входа в проверяемую операцию."""
     task = asyncio.create_task(awaitable)
@@ -81,6 +97,11 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
         encoding="utf-8",
     )
     (backup_env / "stats_current.json").write_text('{"period": "2026-Q2"}', encoding="utf-8")
+    (backup_env / "known_users.json").write_text(
+        _known_users_payload(),
+        encoding="utf-8",
+    )
+    (backup_env / "user_alerts.json").write_text('{"enabled": false}', encoding="utf-8")
     (backup_env / "subscribers.json.tmp").write_text("garbage", encoding="utf-8")
     restore_stage = backup_env / ".restore-interrupted.tmp" / "new"
     storage._atomic_write(restore_stage / "subscribers.json", "staged")
@@ -92,6 +113,8 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     assert "subscribers.json" in names
     assert "blocked_users.json" in names
     assert "stats_current.json" in names
+    assert "known_users.json" in names
+    assert "user_alerts.json" in names
     assert "quarters/2026-Q1.json" in names          # вложенность сохранена
     assert "subscribers.json.tmp" not in names       # *.tmp исключён
     assert not any(name.startswith(".restore-") for name in names)
@@ -103,9 +126,11 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
 
 @pytest.mark.parametrize("name", [
     "blocked_users.json",
+    "known_users.json",
     "subscribers.json",
     "stats_current.json",
     "update_state.json",
+    "user_alerts.json",
     "quarters/2026-Q1.json",
     "quarters/2025-Q4.json",
 ])
@@ -465,6 +490,109 @@ async def test_restore_partial_corrupt_does_not_write_before_validation(backup_e
     with pytest.raises(ValueError):
         await backup.restore_backup_zip(raw)
     assert not (backup_env / "stats_current.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_roundtrips_known_users_and_alert_settings(backup_env):
+    raw = _zip_bytes(
+        {
+            "known_users.json": _known_users_payload(),
+            "user_alerts.json": '{"enabled": false}',
+        }
+    )
+
+    result = await backup.restore_backup_zip(raw)
+
+    assert set(result["restored"]) == {"known_users.json", "user_alerts.json"}
+    assert storage.get_known_user(7) == storage.KnownUser(
+        7,
+        "Neo",
+        "the_one",
+        "2026-09-03T10:20:30Z",
+    )
+    assert storage.load_user_alerts_enabled() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    [
+        ("known_users.json", '{"users": []}'),
+        ("user_alerts.json", '{"enabled": "yes"}'),
+    ],
+)
+async def test_malformed_registry_restore_member_rejects_entire_candidate(
+    backup_env,
+    name,
+    payload,
+):
+    storage.save_known_users(
+        {
+            8: storage.KnownUser(
+                8,
+                "Existing",
+                None,
+                "2026-09-03T10:20:30Z",
+            )
+        }
+    )
+    storage._atomic_write(backup_env / "stats_current.json", '{"period": "old", "events": []}')
+    raw = _zip_bytes(
+        {
+            "stats_current.json": '{"period": "new", "events": []}',
+            name: payload,
+        }
+    )
+
+    with pytest.raises(ValueError, match=name):
+        await backup.restore_backup_zip(raw)
+
+    assert storage.get_known_user(8) is not None
+    assert json.loads(
+        (backup_env / "stats_current.json").read_text(encoding="utf-8")
+    )["period"] == "old"
+
+
+@pytest.mark.asyncio
+async def test_restore_rolls_back_known_users_with_common_transaction(
+    backup_env,
+    monkeypatch,
+):
+    storage.save_known_users(
+        {
+            8: storage.KnownUser(
+                8,
+                "Existing",
+                None,
+                "2026-09-03T10:20:30Z",
+            )
+        }
+    )
+    storage._atomic_write(backup_env / "user_alerts.json", '{"enabled": true}')
+    raw = _zip_bytes(
+        {
+            "known_users.json": _known_users_payload(7, "New"),
+            "user_alerts.json": '{"enabled": false}',
+        }
+    )
+    real_publish = backup._publish_staged_file
+    calls = 0
+
+    def fail_second_publish(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("disk full")
+        real_publish(source, target)
+
+    monkeypatch.setattr(backup, "_publish_staged_file", fail_second_publish)
+
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        await backup.restore_backup_zip(raw)
+
+    assert storage.get_known_user(8) is not None
+    assert storage.get_known_user(7) is None
+    assert storage.load_user_alerts_enabled() is True
 
 
 # ─────────────────────────────────────────────────────────────

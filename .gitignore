@@ -221,6 +221,8 @@ __marimo__/
 # Bot specific — файлы состояния и статистики (не коммитить!)
 seen_ids.json
 subscribers.json
+known_users.json
+user_alerts.json
 seen_favourites.json
 stats_all.json
 stats_current.json
