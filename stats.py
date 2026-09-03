@@ -712,9 +712,8 @@ async def sync_stats_all(
     1. Скачиваем list_export для аниме и манги.
     2. Сверяем с titles{} в stats_all — находим новые/изменившиеся записи
        (новый id, либо изменился score/status/episodes/chapters).
-    3. Для записей, у которых ещё нет метаданных (новый id) — батч GraphQL.
-       Для существ, у которых поменялся только пользовательский стейт —
-       обновляем поля из экспорта.
+    3. Новые, безвидовые и повреждённые записи обогащаем одним correctness-
+       батчем GraphQL. Для остальных обновляем пользовательский стейт из экспорта.
     4. Отдельно обновляем до 50 самых старых метаданных каждого media-домена.
     5. Пересчитываем агрегаты, сохраняем.
 
@@ -764,6 +763,14 @@ async def sync_stats_all(
         # ID, которым нужны метаданные (отсутствуют в titles)
         new_ids = [tid for tid in valid_rows if tid not in titles]
 
+        # Синтаксически валидный JSON может хранить вместо title-record любое
+        # значение. Чиним только записи актуального экспорта; отсутствующие ID
+        # ниже удалит обычная очистка без попытки разобрать их содержимое.
+        malformed_ids = [
+            tid for tid in valid_rows
+            if tid in titles and not isinstance(titles[tid], dict)
+        ]
+
         # Ремонт битой меты (Codacy / баг «ваншоты не фильтруются»):
         # записи с пустым kind — это тайтлы, у которых мета не доехала при
         # первом заносе (GraphQL не вернул элемент → ВСЕ мета-поля пусты разом).
@@ -773,16 +780,27 @@ async def sync_stats_all(
         # запись даже с пустым kind; полностью повторный ответ остаётся no-op.
         retry_ids = [
             tid for tid in valid_rows
-            if tid in titles and not (titles[tid].get("kind") or "")
+            if (
+                tid in titles
+                and isinstance(titles[tid], dict)
+                and not (titles[tid].get("kind") or "")
+            )
         ]
 
-        # Новые записи и ремонт битой меты — correctness-работа: она всегда
-        # идёт отдельно и не расходует фиксированный maintenance-батч.
-        need_meta = new_ids + retry_ids
+        # Новые записи и оба вида ремонта — correctness-работа: один общий
+        # запрос всегда идёт отдельно и не расходует maintenance-батч.
+        need_meta = new_ids + retry_ids + malformed_ids
         meta_map: dict[str, dict] = {}
         if need_meta:
-            log.info("sync_stats_all(%s): тайтлов для обогащения: %d (новых %d, ремонт %d)",
-                     media, len(need_meta), len(new_ids), len(retry_ids))
+            log.info(
+                "sync_stats_all(%s): тайтлов для обогащения: %d "
+                "(новых %d, kind-ремонт %d, повреждённых %d)",
+                media,
+                len(need_meta),
+                len(new_ids),
+                len(retry_ids),
+                len(malformed_ids),
+            )
             try:
                 meta_map = await fetch_meta_batch(media, need_meta, session=session)
             except ProfilePrivacyError:
@@ -825,6 +843,22 @@ async def sync_stats_all(
             if tid in titles:
                 rec = titles[tid]
                 fresh = meta_map.get(tid)
+
+                # Непригодное значение заменяем канонической записью в любом
+                # случае. Только реально полученная мета заслуживает timestamp;
+                # missing-kind фолбэк останется correctness-кандидатом.
+                if not isinstance(rec, dict):
+                    applied_meta = fresh if isinstance(fresh, dict) else None
+                    titles[tid] = _merge_title_record(
+                        media,
+                        row,
+                        applied_meta,
+                        meta_updated_at=(
+                            meta_updated_at if applied_meta is not None else None
+                        ),
+                    )
+                    changed = True
+                    continue
 
                 # Ремонт битой меты: запись с пустым kind, и сейчас GraphQL
                 # вернул непустой kind → пересобираем ЦЕЛИКОМ (url/year/жанры/
@@ -922,11 +956,21 @@ async def sync_stats_all(
         if repaired:
             log.info("sync_stats_all(%s): дозапрошена битая мета (kind был пуст): %d",
                      media, repaired)
+        if malformed_ids:
+            log.warning(
+                "sync_stats_all(%s): восстановлено повреждённых title-записей: %d",
+                media,
+                len(malformed_ids),
+            )
         # Чистка существующих записей, чей kind не проходит фильтр
         # (самоочистка при изменении критерия или после обновления метаданных).
         stale_kind = [
             tid for tid, rec in titles.items()
-            if rec.get("kind") and not is_relevant(media, rec["kind"])
+            if (
+                isinstance(rec, dict)
+                and rec.get("kind")
+                and not is_relevant(media, rec["kind"])
+            )
         ]
         for tid in stale_kind:
             del titles[tid]
