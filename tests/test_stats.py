@@ -14,6 +14,7 @@
 
 import copy
 import json
+import logging
 import re
 from datetime import datetime, timedelta
 from unittest.mock import (
@@ -1465,6 +1466,7 @@ async def test_sync_recovers_non_dict_title_values_without_crashing(
     monkeypatch.setattr("stats._collect_favourites", fake_collect)
     monkeypatch.setattr("stats.save_stats_all", lambda value: None)
 
+    caplog.set_level(logging.INFO)
     result, ok = await smod.sync_stats_all(session=session)
 
     assert ok is True
