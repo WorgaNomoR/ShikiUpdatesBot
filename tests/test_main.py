@@ -25,13 +25,29 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     message_register = MagicMock(
         side_effect=lambda *args, **kwargs: registration_order.append("handler")
     )
+    message_middleware = MagicMock(
+        side_effect=lambda *args, **kwargs: registration_order.append(
+            "registry-message"
+        )
+    )
+    callback_middleware = MagicMock(
+        side_effect=lambda *args, **kwargs: registration_order.append(
+            "registry-callback"
+        )
+    )
     outer_middleware = MagicMock(
         side_effect=lambda *args, **kwargs: registration_order.append("middleware")
     )
     dispatcher = SimpleNamespace(
         update=SimpleNamespace(outer_middleware=outer_middleware),
-        message=SimpleNamespace(register=message_register),
-        callback_query=SimpleNamespace(register=MagicMock()),
+        message=SimpleNamespace(
+            register=message_register,
+            middleware=message_middleware,
+        ),
+        callback_query=SimpleNamespace(
+            register=MagicMock(),
+            middleware=callback_middleware,
+        ),
         inline_query=SimpleNamespace(register=MagicMock()),
         shutdown=SimpleNamespace(register=MagicMock()),
         start_polling=AsyncMock(side_effect=RuntimeError("polling stopped")),
@@ -97,6 +113,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.cmd_pick in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
+    assert main.cmd_useralerts in registered_messages
     app.dispatcher.inline_query.register.assert_called_once_with(
         main.cmd_inline_search
     )
@@ -112,6 +129,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert "blocklist" not in public_commands
     assert "facts" not in public_commands
     assert "pick" not in public_commands
+    assert "useralerts" not in public_commands
     facts_registrations = [
         call
         for call in app.dispatcher.message.register.call_args_list
@@ -141,15 +159,21 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         main.FactsStates.waiting_upload_file,
         main.FactsStates.waiting_apply_confirmation,
     )
-    assert app.registration_order[:3] == [
+    assert app.registration_order[:5] == [
         "facts-reload",
         "access-recovery",
         "middleware",
+        "registry-message",
+        "registry-callback",
     ]
     app.reload_facts.assert_called_once_with()
     app.reconcile_access.assert_awaited_once_with()
     middleware = app.dispatcher.update.outer_middleware.call_args.args[0]
     assert isinstance(middleware, main.AccessControlMiddleware)
+    message_registry = app.dispatcher.message.middleware.call_args.args[0]
+    callback_registry = app.dispatcher.callback_query.middleware.call_args.args[0]
+    assert isinstance(message_registry, main.UserRegistryMiddleware)
+    assert callback_registry is message_registry
     registered_callbacks = [
         call.args[0]
         for call in app.dispatcher.callback_query.register.call_args_list
@@ -192,6 +216,14 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     pick_filter = pick_registration.args[1]
     assert pick_filter.resolve(SimpleNamespace(data="pick:anime")) is True
     assert pick_filter.resolve(SimpleNamespace(data="fact:next:777:anime-word")) is False
+    useralerts_registration = next(
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.cmd_useralerts
+    )
+    useralerts_filter = useralerts_registration.args[1]
+    assert isinstance(useralerts_filter, main.Command)
+    assert useralerts_filter.commands == ("useralerts",)
     app.dispatcher.shutdown.register.assert_not_called()
     app.probe.assert_awaited_once_with(app.bot)
     app.start_updates.assert_called_once_with(app.bot)

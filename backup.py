@@ -37,14 +37,18 @@ from fact_bank import (
 )
 from storage import (
     BlockedUsersStateError,
+    KnownUsersStateError,
+    UserAlertsStateError,
     _atomic_write,
     blocked_users_from_payload,
+    known_users_from_payload,
     load_blocked_users,
     load_stats_current,
     load_subscribers,
     restorable_state_transaction,
     save_stats_current,
     subscribers_from_payload,
+    user_alerts_from_payload,
 )
 from telegram_delivery import send_with_retry
 from utils import (
@@ -71,7 +75,13 @@ _last_backup_sent_at: float | None = None   # monotonic-метка послед�
 
 _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
     "blocked_users.json", "facts.json", "subscribers.json", "stats_current.json",
-    "update_state.json",
+    "update_state.json", "known_users.json", "user_alerts.json",
+})
+
+_STRICT_IMPORT_FILES: frozenset[str] = frozenset({
+    "facts.json",
+    "known_users.json",
+    "user_alerts.json",
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -156,8 +166,9 @@ async def _shutdown_backup(bot: Bot) -> None:
 
 def _is_allowed_import_member(name: str) -> bool:
     """Разрешено ли имя из архива к восстановлению?
-    Бел.список: blocked_users.json, facts.json, subscribers.json,
-    stats_current.json, update_state.json и кварталы.
+    Бел.список: blocked_users.json, facts.json, known_users.json,
+    subscribers.json, stats_current.json, update_state.json, user_alerts.json
+    и кварталы.
     Глушим zip-slip: '..'-сегменты, абсолютные пути и бэкслеши отвергаем."""
     if not name or name.endswith("/"):
         return False
@@ -188,6 +199,18 @@ def _valid_import_payload(name: str, obj) -> bool:
         try:
             subscribers_from_payload(obj)
         except ValueError:
+            return False
+        return True
+    if name == "known_users.json":
+        try:
+            known_users_from_payload(obj)
+        except KnownUsersStateError:
+            return False
+        return True
+    if name == "user_alerts.json":
+        try:
+            user_alerts_from_payload(obj)
+        except UserAlertsStateError:
             return False
         return True
     if name == "stats_current.json":
@@ -418,12 +441,20 @@ async def restore_backup_zip(raw: bytes) -> dict:
                 zlib.error,
                 lzma.LZMAError,
             ) as e:
+                if name in _STRICT_IMPORT_FILES:
+                    raise ValueError(
+                        f"{name} в архиве повреждён; восстановление отменено"
+                    ) from e
                 log.warning("restore_backup_zip: пропускаю битый %s: %s", name, e)
                 skipped.append(name)
                 if name in {"blocked_users.json", "subscribers.json"}:
                     invalid_access_members.add(name)
                 continue
             if not _valid_import_payload(name, obj):   # и похож на ожидаемую структуру?
+                if name in _STRICT_IMPORT_FILES:
+                    raise ValueError(
+                        f"{name} в архиве повреждён; восстановление отменено"
+                    )
                 log.warning("restore_backup_zip: %s не похож на ожидаемый формат — пропускаю.", name)
                 skipped.append(name)
                 if name in {"blocked_users.json", "subscribers.json"}:

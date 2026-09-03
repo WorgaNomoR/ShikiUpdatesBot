@@ -4,8 +4,8 @@
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
 Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock, /blocklist,
-/broadcast, /backup, /facts, /pick, /status, /stats, /favs, /fact, /info,
-/version), inline-меню, рассылка, цикл уведомлений (check_and_notify*,
+/useralerts, /broadcast, /backup, /facts, /pick, /status, /stats, /favs, /fact,
+/info, /version), inline-меню, рассылка, цикл уведомлений (check_and_notify*,
 polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
 """
@@ -161,6 +161,7 @@ from storage import (
     STATS_ALL_VALID,
     BlockedUsersMutationError,
     BlockedUsersStateError,
+    UserAlertsStateError,
     _empty_stats_current,
     add_blocked_user,
     list_blocked_users,
@@ -178,6 +179,7 @@ from storage import (
     save_stats_all,
     save_stats_current,
     save_subscribers,
+    set_user_alerts_enabled,
     validate_telegram_user_id,
 )
 from telegram_delivery import is_blocked_error as _is_blocked_error
@@ -3099,6 +3101,51 @@ async def cmd_subs(message: Message) -> None:
         lines.append(f"{i}. {_subscriber_link(cid, uname)}")
     sep = "\n"
     await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_useralerts(
+    message: Message,
+    command: CommandObject | None = None,
+) -> None:
+    """Изменить owner-only настройку уведомлений о новых пользователях."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer(
+            "🚫 Эта команда только для владельца бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    value = command.args.strip().lower() if command and command.args else ""
+    if value not in {"on", "off"}:
+        await message.answer(
+            "Использование: <code>/useralerts on</code> или "
+            "<code>/useralerts off</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    enabled = value == "on"
+    try:
+        changed = await set_user_alerts_enabled(enabled)
+    except (UserAlertsStateError, OSError):
+        await message.answer(
+            "❌ Настройка уведомлений повреждена или недоступна. "
+            "Восстанови корректный файл через /backup.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    state = "включены" if enabled else "отключены"
+    prefix = "✅" if changed else "ℹ️"
+    suffix = (
+        "Отключить: <code>/useralerts off</code>."
+        if enabled
+        else "Включить снова: <code>/useralerts on</code>."
+    )
+    await message.answer(
+        f"{prefix} Уведомления о новых пользователях {state}.\n{suffix}",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 def _command_target_user_id(message: Message) -> int | None:
