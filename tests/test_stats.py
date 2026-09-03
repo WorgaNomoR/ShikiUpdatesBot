@@ -14,8 +14,13 @@
 
 import copy
 import json
+import logging
 import re
 from datetime import datetime, timedelta
+from unittest.mock import (
+    AsyncMock,
+    call,
+)
 
 import pytest
 
@@ -1419,6 +1424,369 @@ async def test_sync_kind_repair_preserves_known_release_status(monkeypatch):
     catalog = smod.build_pick_catalog(result)
     assert catalog is not None
     assert catalog.manga == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broken_value",
+    [None, "secret scalar", ["secret list"]],
+)
+async def test_sync_recovers_non_dict_title_values_without_crashing(
+    monkeypatch,
+    caplog,
+    broken_value,
+):
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {"101": broken_value}
+    row = {
+        "target_id": 101,
+        "target_title": "Current title",
+        "target_title_ru": "Актуальное название",
+        "score": 9,
+        "status": "watching",
+        "rewatches": 2,
+        "episodes": 7,
+    }
+    session = object()
+    fetch_meta = AsyncMock(return_value={})
+
+    async def fake_export(current_session, media):
+        assert current_session is session
+        return [row] if media == "anime" else []
+
+    async def fake_collect(current_session, value, fav=None):
+        return value
+
+    monkeypatch.setattr(
+        "stats.load_stats_all",
+        lambda **kwargs: copy.deepcopy(stats),
+    )
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fetch_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+
+    caplog.set_level(logging.INFO)
+    result, ok = await smod.sync_stats_all(session=session)
+
+    assert ok is True
+    fetch_meta.assert_awaited_once_with("anime", ["101"], session=session)
+    assert result["anime"]["titles"]["101"] == {
+        "title": "Актуальное название",
+        "title_en": "Current title",
+        "score": 9,
+        "status": "watching",
+        "rewatches": 2,
+        "url": "",
+        "poster_url": "",
+        "kind": "",
+        "release_status": "",
+        "year": None,
+        "shiki_score": None,
+        "genres": [],
+        "themes": [],
+        "demographic": [],
+        "episodes_watched": 7,
+        "episodes_total": None,
+        "duration": None,
+        "rating": None,
+        "origin": None,
+        "studios": [],
+    }
+    assert "повреждённых title-записей: 1" in caplog.text
+    assert "secret scalar" not in caplog.text
+    assert "secret list" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sync_fully_recovers_malformed_record_outside_maintenance_limit(
+    monkeypatch,
+):
+    now = datetime(2026, 9, 3, 10, 0, 0)
+    current_stamp = now.isoformat()
+    stats = storage._empty_stats_all()
+    maintenance_ids = [str(title_id) for title_id in range(100, 151)]
+    stats["anime"]["titles"] = {
+        "10": ["broken"],
+        "11": {
+            **_anime_rec(
+                status="planned",
+                score=1,
+                rewatches=0,
+                episodes_watched=0,
+                meta_updated_at=current_stamp,
+            ),
+            "title": "Сосед",
+        },
+        "999": "obsolete broken record",
+        **{
+            title_id: _anime_rec(
+                status="planned",
+                score=0,
+                rewatches=0,
+                episodes_watched=0,
+            )
+            for title_id in maintenance_ids
+        },
+    }
+    stats["manga"]["titles"] = {
+        "20": {
+            **_manga_record("Соседняя манга", "manga", status="watching"),
+            "meta_updated_at": current_stamp,
+        },
+    }
+    anime_rows = [
+        {
+            "target_id": 10,
+            "target_title": "Recovered",
+            "target_title_ru": "Восстановлено",
+            "score": 9,
+            "status": "completed",
+            "rewatches": 3,
+            "episodes": 12,
+        },
+        {
+            "target_id": 11,
+            "target_title": "Neighbour",
+            "target_title_ru": "Сосед",
+            "score": 7,
+            "status": "watching",
+            "rewatches": 1,
+            "episodes": 6,
+        },
+        *[
+            {
+                "target_id": int(title_id),
+                "target_title": f"Anime {title_id}",
+                "target_title_ru": f"Аниме {title_id}",
+                "score": 0,
+                "status": "planned",
+                "rewatches": 0,
+                "episodes": 0,
+            }
+            for title_id in maintenance_ids
+        ],
+    ]
+    manga_rows = [{
+        "target_id": 20,
+        "target_title": "Manga neighbour",
+        "target_title_ru": "Соседняя манга",
+        "score": 8,
+        "status": "completed",
+        "rewatches": 2,
+        "chapters": 40,
+        "volumes": 5,
+    }]
+    full_metadata = {
+        "url": "/animes/10",
+        "poster_url": "https://cdn.example/10.jpg",
+        "kind": "tv",
+        "release_status": "released",
+        "year": 2024,
+        "shiki_score": 8.5,
+        "genres": ["Драма"],
+        "themes": ["Музыка"],
+        "demographic": ["Сэйнэн"],
+        "episodes_total": 12,
+        "duration": 24,
+        "rating": "R-17",
+        "origin": "Оригинал",
+        "studios": ["Recovery Studio"],
+    }
+    session = object()
+
+    async def fake_export(current_session, media):
+        assert current_session is session
+        return anime_rows if media == "anime" else manga_rows
+
+    fetch_meta = AsyncMock(side_effect=[
+        {"10": full_metadata},
+        {
+            title_id: {
+                "kind": "tv",
+                "url": f"/animes/{title_id}",
+            }
+            for title_id in maintenance_ids[:50]
+        },
+    ])
+
+    async def fake_collect(current_session, value, fav=None):
+        return value
+
+    monkeypatch.setattr(
+        "stats.load_stats_all",
+        lambda **kwargs: copy.deepcopy(stats),
+    )
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fetch_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+
+    result, ok = await smod.sync_stats_all(session=session)
+
+    assert ok is True
+    assert fetch_meta.await_args_list == [
+        call("anime", ["10"], session=session),
+        call("anime", maintenance_ids[:50], session=session),
+    ]
+    recovered = result["anime"]["titles"]["10"]
+    assert recovered == {
+        "title": "Восстановлено",
+        "title_en": "Recovered",
+        "score": 9,
+        "status": "completed",
+        "rewatches": 3,
+        "url": "/animes/10",
+        "poster_url": "https://cdn.example/10.jpg",
+        "kind": "tv",
+        "release_status": "released",
+        "year": 2024,
+        "shiki_score": 8.5,
+        "genres": ["Драма"],
+        "themes": ["Музыка"],
+        "demographic": ["Сэйнэн"],
+        "episodes_watched": 12,
+        "episodes_total": 12,
+        "duration": 24,
+        "rating": "R-17",
+        "origin": "Оригинал",
+        "studios": ["Recovery Studio"],
+        "meta_updated_at": current_stamp,
+    }
+    assert "999" not in result["anime"]["titles"]
+    assert result["anime"]["titles"]["11"]["score"] == 7
+    assert result["anime"]["titles"]["11"]["episodes_watched"] == 6
+    assert result["anime"]["titles"]["11"]["rewatches"] == 1
+    manga = result["manga"]["titles"]["20"]
+    assert (
+        manga["score"],
+        manga["status"],
+        manga["chapters_read"],
+        manga["volumes_read"],
+        manga["rewatches"],
+    ) == (8, "completed", 40, 5, 2)
+    aggregates = result["anime"]["aggregates"]
+    assert aggregates["total_completed"] == 1
+    assert aggregates["genres"] == {"Драма": 1}
+    assert aggregates["studios"] == {"Recovery Studio": 1}
+    assert "meta_updated_at" not in result["anime"]["titles"]["150"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_result", [RuntimeError("offline"), {}])
+async def test_sync_retries_malformed_record_after_failed_or_partial_metadata(
+    monkeypatch,
+    first_result,
+):
+    state = storage._empty_stats_all()
+    state["manga"]["titles"] = {"30": None}
+    row = {
+        "target_id": 30,
+        "target_title": "Current manga",
+        "target_title_ru": "Актуальная манга",
+        "score": 6,
+        "status": "watching",
+        "rewatches": 4,
+        "chapters": 18,
+        "volumes": 3,
+    }
+    session = object()
+    full_metadata = {
+        "kind": "manga",
+        "url": "/mangas/30",
+        "year": 2020,
+        "genres": ["Приключения"],
+    }
+    fetch_meta = AsyncMock(side_effect=[first_result, {"30": full_metadata}])
+
+    async def fake_export(current_session, media):
+        return [row] if media == "manga" else []
+
+    async def fake_collect(current_session, value, fav=None):
+        return value
+
+    def save(value):
+        nonlocal state
+        state = copy.deepcopy(value)
+
+    monkeypatch.setattr(
+        "stats.load_stats_all",
+        lambda **kwargs: copy.deepcopy(state),
+    )
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fetch_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", save)
+
+    first, first_ok = await smod.sync_stats_all(session=session)
+    second, second_ok = await smod.sync_stats_all(session=session)
+
+    safe = first["manga"]["titles"]["30"]
+    assert first_ok is True
+    assert safe["kind"] == ""
+    assert "meta_updated_at" not in safe
+    assert (
+        safe["score"],
+        safe["status"],
+        safe["chapters_read"],
+        safe["volumes_read"],
+        safe["rewatches"],
+    ) == (6, "watching", 18, 3, 4)
+    assert second_ok is True
+    repaired = second["manga"]["titles"]["30"]
+    assert repaired["kind"] == "manga"
+    assert repaired["genres"] == ["Приключения"]
+    assert "meta_updated_at" in repaired
+    assert fetch_meta.await_args_list == [
+        call("manga", ["30"], session=session),
+        call("manga", ["30"], session=session),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_malformed_record_privacy_failure_preserves_file_and_cache(
+    monkeypatch,
+    tmp_path,
+):
+    initial = storage._empty_stats_all()
+    initial["anime"]["titles"] = {"40": ["broken", "private"]}
+    stats_file = tmp_path / "stats_all.json"
+    stats_file.write_text(
+        json.dumps(initial, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(storage, "STATS_ALL_FILE", stats_file)
+    monkeypatch.setattr(storage, "_stats_all_cache", None)
+    monkeypatch.setattr(storage, "_stats_all_cache_ts", 0.0)
+    row = {
+        "target_id": 40,
+        "target_title": "Private",
+        "target_title_ru": "Приватный",
+        "score": 8,
+        "status": "completed",
+        "rewatches": 0,
+        "episodes": 12,
+    }
+
+    async def fake_export(session, media):
+        return [row] if media == "anime" else []
+
+    async def private_meta(media, ids, session=None):
+        raise shiki_api.ProfilePrivacyError("fetch_meta_batch(anime)")
+
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", private_meta)
+    monkeypatch.setattr(
+        "stats.save_stats_all",
+        lambda value: pytest.fail("privacy failure опубликовал recovery"),
+    )
+
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await smod.sync_stats_all(session=object())
+
+    assert json.loads(stats_file.read_text(encoding="utf-8")) == initial
+    assert storage.load_stats_all() == initial
 
 
 # ════════════════════════════════════════════════════════════════
