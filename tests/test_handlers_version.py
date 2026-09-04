@@ -40,7 +40,11 @@ async def test_version_refreshes_and_renders(monkeypatch):
     }
     refresh = AsyncMock(return_value=state)
     monkeypatch.setattr(handlers, "refresh_update_state", refresh)
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {"last_backup_at": None})
+    monkeypatch.setattr(
+        handlers,
+        "load_subscription_backup_state",
+        lambda: {"last_backup_at": None},
+    )
     monkeypatch.setattr(
         handlers,
         "get_runtime_snapshot",
@@ -87,7 +91,7 @@ async def test_info_is_public_cache_only_and_uses_html(monkeypatch, info_preview
     monkeypatch.setattr(handlers, "load_update_state", lambda: state.copy())
     monkeypatch.setattr(
         handlers,
-        "load_stats_current",
+        "load_subscription_backup_state",
         lambda: {"last_backup_at": 1_750_000_000},
     )
     monkeypatch.setattr(
@@ -112,7 +116,7 @@ async def test_info_is_public_cache_only_and_uses_html(monkeypatch, info_preview
     text = message.answer_photo.await_args.kwargs["caption"]
     assert "Работает: 01:01:01" in text
     assert "Проверка новых событий: остановлена" in text
-    assert "Последняя плановая резервная копия:" in text
+    assert "Последняя автоматическая резервная копия:" in text
     assert "GNU General Public License версии 3 или более поздней" in text
     assert len(text) <= 1024
     assert message.answer_photo.await_args.kwargs["parse_mode"] == ParseMode.HTML
@@ -129,7 +133,7 @@ async def test_info_reuses_telegram_file_id_after_first_upload(
     load_preview = MagicMock(return_value=info_preview)
     monkeypatch.setattr(handlers, "_load_info_preview", load_preview)
     monkeypatch.setattr(handlers, "load_update_state", lambda: {})
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    monkeypatch.setattr(handlers, "load_subscription_backup_state", lambda: {})
     first = AsyncMock()
     first.from_user = MagicMock(id=handlers.OWNER_ID + 1)
     first.answer_photo.return_value = MagicMock(
@@ -156,7 +160,7 @@ async def test_info_falls_back_to_text_when_photo_is_rejected(
 ):
     monkeypatch.setattr(handlers, "_info_preview_file_id", cached_preview)
     monkeypatch.setattr(handlers, "load_update_state", lambda: {})
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    monkeypatch.setattr(handlers, "load_subscription_backup_state", lambda: {})
     message = AsyncMock()
     message.from_user = MagicMock(id=handlers.OWNER_ID + 1)
     message.answer_photo.side_effect = TelegramBadRequest(
@@ -193,7 +197,7 @@ async def test_info_degrades_without_exposing_local_error(monkeypatch):
     monkeypatch.setattr(handlers, "load_update_state", lambda: {})
     monkeypatch.setattr(
         handlers,
-        "load_stats_current",
+        "load_subscription_backup_state",
         MagicMock(side_effect=RuntimeError("C:/secret/private.json")),
     )
     monkeypatch.setattr(handlers, "_load_info_preview", lambda: None)
@@ -203,7 +207,7 @@ async def test_info_degrades_without_exposing_local_error(monkeypatch):
     await handlers.cmd_info(message)
 
     text = message.answer.await_args.args[0]
-    assert "Последняя плановая резервная копия: неизвестно" in text
+    assert "Последняя автоматическая резервная копия: неизвестно" in text
     assert "C:/secret" not in text
     assert "RuntimeError" not in text
 
@@ -217,7 +221,7 @@ async def test_info_owner_gets_guarded_refresh_button_without_fetch(monkeypatch)
         "load_update_state",
         lambda: {"release_url": "https://release"},
     )
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    monkeypatch.setattr(handlers, "load_subscription_backup_state", lambda: {})
     message = AsyncMock()
     message.from_user = MagicMock(id=handlers.OWNER_ID)
 
@@ -229,18 +233,21 @@ async def test_info_owner_gets_guarded_refresh_button_without_fetch(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_info_reads_last_planned_backup_without_writing(monkeypatch):
+async def test_info_reads_last_automatic_backup_without_writing(monkeypatch):
     current = {"last_backup_at": 1_750_000_000, "events": []}
+    load = MagicMock(return_value=current)
     save = MagicMock()
     monkeypatch.setattr(handlers, "load_update_state", lambda: {})
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: current)
-    monkeypatch.setattr(handlers, "save_stats_current", save)
+    monkeypatch.setattr(handlers, "load_subscription_backup_state", load)
+    monkeypatch.setattr(handlers, "save_subscriber_state", save)
     message = AsyncMock()
     message.from_user = MagicMock(id=handlers.OWNER_ID + 1)
 
     await handlers.cmd_info(message)
 
+    load.assert_called_once_with()
     assert current == {"last_backup_at": 1_750_000_000, "events": []}
+    assert "15.06.2025, 15:06 UTC" in message.answer_photo.await_args.kwargs["caption"]
     save.assert_not_called()
 
 
@@ -269,7 +276,11 @@ async def test_owner_version_refresh_callback_updates_html(monkeypatch):
     state = {"latest_main_version": "v1.3.0", "latest_version": "v1.2.0"}
     refresh = AsyncMock(return_value=state)
     monkeypatch.setattr(handlers, "refresh_update_state", refresh)
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {"last_backup_at": None})
+    monkeypatch.setattr(
+        handlers,
+        "load_subscription_backup_state",
+        lambda: {"last_backup_at": None},
+    )
     callback = AsyncMock()
     callback.from_user = MagicMock(id=handlers.OWNER_ID)
     callback.message = AsyncMock()
@@ -293,7 +304,7 @@ async def test_owner_refresh_edits_photo_caption_with_html(monkeypatch):
         "refresh_update_state",
         AsyncMock(return_value=state),
     )
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    monkeypatch.setattr(handlers, "load_subscription_backup_state", lambda: {})
     callback = AsyncMock()
     callback.from_user = MagicMock(id=handlers.OWNER_ID)
     callback.message = AsyncMock()
@@ -315,7 +326,7 @@ async def test_owner_refresh_handles_non_editable_message(monkeypatch, has_photo
         "refresh_update_state",
         AsyncMock(return_value={"latest_main_version": "v1.3.0"}),
     )
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {})
+    monkeypatch.setattr(handlers, "load_subscription_backup_state", lambda: {})
     callback = AsyncMock()
     callback.from_user = MagicMock(id=handlers.OWNER_ID)
     callback.message = AsyncMock()

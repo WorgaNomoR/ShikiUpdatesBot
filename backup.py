@@ -12,10 +12,13 @@ import asyncio
 import io
 import json
 import lzma
+import math
 import tempfile
 import time
+import weakref
 import zipfile
 import zlib
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from aiogram import Bot
@@ -38,23 +41,23 @@ from fact_bank import (
 from storage import (
     BlockedUsersStateError,
     KnownUsersStateError,
+    SubscriberState,
+    SubscriptionBackupStateError,
     UserAlertsStateError,
     _atomic_write,
     blocked_users_from_payload,
+    ensure_backup_schedule,
     known_users_from_payload,
     load_blocked_users,
-    load_stats_current,
-    load_subscribers,
+    load_subscriber_state,
     restorable_state_transaction,
-    save_stats_current,
-    subscribers_from_payload,
+    save_subscriber_state,
+    subscriber_state_from_payload,
     user_alerts_from_payload,
 )
+from storage import subscriber_state_json as storage_subscriber_state_json
 from telegram_delivery import send_with_retry
-from utils import (
-    _subscriber_link,
-    _utcnow,
-)
+from utils import _utcnow
 
 # ═══════════════════════════════════════════════════════════════════
 #  КОНСТАНТЫ И СОСТОЯНИЕ
@@ -73,6 +76,12 @@ SHUTDOWN_BACKUP_TIMEOUT  = 8    # с: жёсткий потолок отправ
 
 _last_backup_sent_at: float | None = None   # monotonic-метка последнего успешного бэкапа
 
+SUBSCRIPTION_BACKUP_INTERVAL = 24 * 60 * 60
+
+_automatic_backup_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
 _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
     "blocked_users.json", "facts.json", "subscribers.json", "stats_current.json",
     "update_state.json", "known_users.json", "user_alerts.json",
@@ -90,6 +99,102 @@ _IMPORT_ALLOWED_DIR = "quarters"
 def _backup_filename() -> str:
     """Имя архива с меткой времени UTC — чтобы файлы не перезатирались в чате."""
     return f"shikibot-backup-{_utcnow().strftime('%Y%m%d-%H%M%S')}.zip"
+
+
+def _automatic_backup_lock() -> asyncio.Lock:
+    """Вернуть общий lock автоматической доставки для текущего event loop."""
+    loop = asyncio.get_running_loop()
+    lock = _automatic_backup_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _automatic_backup_locks[loop] = lock
+    return lock
+
+
+@asynccontextmanager
+async def automatic_backup_delivery():
+    """Сериализовать automatic backup без удержания restorable-state lock."""
+    async with _automatic_backup_lock():
+        yield
+
+
+def _valid_past_timestamp(value: object, now: float) -> float | None:
+    """Вернуть конечную непросроченную UTC-метку либо None."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        or value > now
+    ):
+        return None
+    return float(value)
+
+
+def _prepare_schedule(state: SubscriberState, now: float) -> bool:
+    """Мигрировать расписание и сбросить недостоверные будущие метки."""
+    changed = ensure_backup_schedule(state, now=now)
+    schedule = state.backup_schedule
+    last = _valid_past_timestamp(schedule.get("last_backup_at"), now)
+    if schedule.get("last_backup_at") is not None and last is None:
+        schedule["last_backup_at"] = None
+        changed = True
+    weekly_started = _valid_past_timestamp(schedule.get("weekly_started_at"), now)
+    if weekly_started is None:
+        schedule["weekly_started_at"] = now
+        changed = True
+    return changed
+
+
+def prepare_backup_schedule(state: SubscriberState, now: float) -> bool:
+    """Подготовить durable-расписание для внешнего automatic backup flow."""
+    return _prepare_schedule(state, now)
+
+
+def _subscription_backup_due(schedule: dict, now: float) -> bool:
+    """Пора ли доставлять существующий pending subscription batch."""
+    if schedule.get("pending") is None:
+        return False
+    last = _valid_past_timestamp(schedule.get("last_backup_at"), now)
+    return last is None or now - last >= SUBSCRIPTION_BACKUP_INTERVAL
+
+
+def _subscription_backup_caption(pending: dict, subscriber_count: int) -> str:
+    """Собрать честную агрегированную подпись подписочного бэкапа."""
+    if pending["counts_known"]:
+        details = (
+            f"➕ Подписок: <b>{pending['subscriptions']}</b>\n"
+            f"➖ Отписок: <b>{pending['unsubscriptions']}</b>"
+        )
+    else:
+        details = (
+            "⚠️ Точные количества прошлых изменений недоступны: "
+            "служебное состояние было повреждено."
+        )
+    return (
+        "👥 Накопленные изменения подписок.\n"
+        f"{details}\n"
+        f"Сейчас подписчиков: <b>{subscriber_count}</b>\n\n"
+        f"{BACKUP_TAG}"
+    )
+
+
+def _remaining_pending_after_success(current: dict, delivered: dict) -> dict | None:
+    """Оставить только изменения, накопленные после снимка отправки."""
+    if current.get("token") != delivered.get("token"):
+        raise SubscriptionBackupStateError("pending batch был заменён во время отправки")
+    remaining_subscriptions = current["subscriptions"] - delivered["subscriptions"]
+    remaining_unsubscriptions = current["unsubscriptions"] - delivered["unsubscriptions"]
+    if remaining_subscriptions < 0 or remaining_unsubscriptions < 0:
+        raise SubscriptionBackupStateError("pending batch уменьшился во время отправки")
+    if remaining_subscriptions + remaining_unsubscriptions == 0:
+        return None
+    return {
+        "subscriptions": remaining_subscriptions,
+        "unsubscriptions": remaining_unsubscriptions,
+        "counts_known": True,
+        "token": current["token"],
+    }
 
 
 def _build_backup_zip() -> bytes:
@@ -197,7 +302,9 @@ def _valid_import_payload(name: str, obj) -> bool:
         return True
     if name == "subscribers.json":
         try:
-            subscribers_from_payload(obj)
+            subscriber_state_from_payload(obj, strict_schedule=True)
+        except SubscriptionBackupStateError:
+            raise
         except ValueError:
             return False
         return True
@@ -237,9 +344,12 @@ def _valid_import_payload(name: str, obj) -> bool:
     return False
 
 
-def _subscribers_from_import_payload(payload: str) -> dict[int, str]:
+def _subscriber_state_from_import_payload(payload: str) -> SubscriberState:
     """Разобрать уже проверенный candidate subscribers.json."""
-    return subscribers_from_payload(json.loads(payload))
+    return subscriber_state_from_payload(
+        json.loads(payload),
+        strict_schedule=True,
+    )
 
 
 def _prepare_access_restore_candidate(pending: dict[str, str]) -> dict[str, str]:
@@ -264,10 +374,26 @@ def _prepare_access_restore_candidate(pending: dict[str, str]) -> dict[str, str]
             ) from e
 
     if "subscribers.json" in pending:
-        subscribers = _subscribers_from_import_payload(pending["subscribers.json"])
+        subscriber_state = _subscriber_state_from_import_payload(
+            pending["subscribers.json"]
+        )
+        if subscriber_state.schedule_missing:
+            restored_at = time.time()
+            ensure_backup_schedule(subscriber_state, now=restored_at)
+            if "stats_current.json" in pending:
+                legacy_current = json.loads(pending["stats_current.json"])
+                legacy_anchor = _valid_past_timestamp(
+                    legacy_current.get("last_backup_at"),
+                    restored_at,
+                )
+                subscriber_state.backup_schedule["weekly_started_at"] = (
+                    legacy_anchor if legacy_anchor is not None else restored_at
+                )
+        subscribers = subscriber_state.subscribers
         publish_subscribers = True
     else:
-        subscribers = load_subscribers()
+        subscriber_state = load_subscriber_state(strict_subscribers=True)
+        subscribers = subscriber_state.subscribers
         publish_subscribers = any(user_id in subscribers for user_id in blocked)
 
     filtered = {
@@ -276,11 +402,8 @@ def _prepare_access_restore_candidate(pending: dict[str, str]) -> dict[str, str]
         if chat_id not in blocked
     }
     if publish_subscribers:
-        pending["subscribers.json"] = json.dumps(
-            {"subscribers": {str(key): value for key, value in filtered.items()}},
-            ensure_ascii=False,
-            indent=2,
-        )
+        subscriber_state.subscribers = filtered
+        pending["subscribers.json"] = storage_subscriber_state_json(subscriber_state)
     return pending
 
 
@@ -482,42 +605,93 @@ async def restore_backup_zip(raw: bytes) -> dict:
     return {"restored": restored, "skipped": skipped}
 
 
-async def _backup_after_subscription(
-    bot: Bot, chat_id: int, name: str, subscribed: bool,
-) -> None:
-    """Авто-бэкап на (от)подписку: владельцу уходит свежий архив состояния,
-    в подписи — кто и что сделал (имя кликабельно, ведёт в профиль) и сколько
-    подписчиков осталось. «Два в одном»: индикация события + страховка списка."""
-    subs = load_subscribers()
-    head = (f"➕ Новый подписчик: {_subscriber_link(chat_id, name)}"
-            if subscribed else
-            f"➖ Отписался: {_subscriber_link(chat_id, name)}")
-    caption = f"{head}\nВсего подписчиков: <b>{len(subs)}</b>\n\n{BACKUP_TAG}"
-    await send_backup(bot, caption)
+async def _backup_after_subscription(bot: Bot) -> bool:
+    """Если rolling-окно открыто, доставить накопленный subscription batch."""
+    async with automatic_backup_delivery():
+        now = time.time()
+        async with restorable_state_transaction():
+            state = load_subscriber_state(strict_subscribers=True)
+            if _prepare_schedule(state, now):
+                save_subscriber_state(state)
+            pending = state.backup_schedule.get("pending")
+            if pending is None or not _subscription_backup_due(
+                state.backup_schedule,
+                now,
+            ):
+                return False
+            delivered = dict(pending)
+            subscriber_count = len(state.subscribers)
+
+        if not await send_backup(
+            bot,
+            _subscription_backup_caption(delivered, subscriber_count),
+        ):
+            return False
+
+        completed_at = time.time()
+        async with restorable_state_transaction():
+            state = load_subscriber_state(strict_subscribers=True)
+            current = state.backup_schedule.get("pending")
+            if current is None:
+                log.warning(
+                    "subscription backup: pending исчез во время отправки; "
+                    "успех не подтверждаю в durable state."
+                )
+                return False
+            try:
+                remaining = _remaining_pending_after_success(current, delivered)
+            except SubscriptionBackupStateError as e:
+                log.warning(
+                    "subscription backup: состояние заменено во время отправки: %s",
+                    e,
+                )
+                return False
+            state.backup_schedule["last_backup_at"] = completed_at
+            state.backup_schedule["pending"] = remaining
+            save_subscriber_state(state)
+        return True
 
 
 async def _weekly_backup_if_due(bot: Bot, cur: dict) -> dict:
-    """Еженедельный авто-бэкап состояния по метке last_backup_at в stats_current.
-    Первый раз (метки нет) — только проставляем время, не шлём: иначе на каждом
-    рестарте эфемерного хоста улетал бы бэкап. Первый плановый уйдёт через
-    WEEKLY_BACKUP_INTERVAL аптайма; под/отписки и ротация бэкапят независимо."""
-    now = time.time()
-    async with restorable_state_transaction():
-        cur = load_stats_current()
-        last = cur.get("last_backup_at")
-        if last is None:
-            cur["last_backup_at"] = now
-            save_stats_current(cur)
-            return cur
-    if (now - last) < WEEKLY_BACKUP_INTERVAL:
-        return cur
-    caption = (f"🗓️ Еженедельный бэкап состояния.\n"
-               f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}")
-    if await send_backup(bot, caption):
+    """Доставить weekly fallback только после полного семидневного интервала."""
+    async with automatic_backup_delivery():
+        now = time.time()
         async with restorable_state_transaction():
-            cur = load_stats_current()
-            cur["last_backup_at"] = now
-            save_stats_current(cur)
+            state = load_subscriber_state(strict_subscribers=True)
+            if _prepare_schedule(state, now):
+                save_subscriber_state(state)
+            schedule = state.backup_schedule
+            if _subscription_backup_due(schedule, now):
+                return cur
+            last = _valid_past_timestamp(schedule.get("last_backup_at"), now)
+            weekly_started = _valid_past_timestamp(
+                schedule.get("weekly_started_at"),
+                now,
+            )
+            anchor = last if last is not None else weekly_started
+            if anchor is None or now - anchor < WEEKLY_BACKUP_INTERVAL:
+                return cur
+            expected_state = storage_subscriber_state_json(state)
+            subscriber_count = len(state.subscribers)
+
+        caption = (
+            "🗓️ Еженедельный бэкап состояния.\n"
+            f"Подписчиков: <b>{subscriber_count}</b>\n\n{BACKUP_TAG}"
+        )
+        if not await send_backup(bot, caption):
+            return cur
+
+        completed_at = time.time()
+        async with restorable_state_transaction():
+            state = load_subscriber_state(strict_subscribers=True)
+            if storage_subscriber_state_json(state) != expected_state:
+                log.warning(
+                    "weekly backup: subscriber-state изменился во время отправки; "
+                    "успех не подтверждаю в durable state."
+                )
+                return cur
+            state.backup_schedule["last_backup_at"] = completed_at
+            save_subscriber_state(state)
     return cur
 
 
