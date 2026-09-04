@@ -539,7 +539,7 @@ def test_version_renderer_escapes_content_and_rejects_unsafe_links(monkeypatch):
     assert "Актуальная версия проекта: <code>неизвестна</code>" in text
     assert "Последняя версия для Windows: <code>неизвестна</code>" in text
     assert "javascript:" not in text
-    assert "Последняя плановая резервная копия: неизвестно" in text
+    assert "Последняя автоматическая резервная копия: неизвестно" in text
     assert keyboard.inline_keyboard[0][0].url == "https://github.test/releases/latest"
 
     monkeypatch.setattr(

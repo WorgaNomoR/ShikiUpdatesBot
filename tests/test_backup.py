@@ -18,6 +18,7 @@ from unittest.mock import (
     AsyncMock,
     Mock,
 )
+from uuid import uuid4
 
 import aiohttp
 import pytest
@@ -61,6 +62,27 @@ def _known_users_payload(user_id=7, name="Neo") -> str:
             }
         },
         ensure_ascii=False,
+    )
+
+
+def _save_subscriber_schedule(
+    subscribers: dict[int, str] | None = None,
+    *,
+    last_backup_at: object = None,
+    weekly_started_at: object = None,
+    pending: dict | None = None,
+) -> None:
+    """Опубликовать канонический subscriber-state для scheduler-тестов."""
+    storage.save_subscriber_state(
+        storage.SubscriberState(
+            subscribers or {},
+            {
+                "version": 1,
+                "last_backup_at": last_backup_at,
+                "weekly_started_at": weekly_started_at,
+                "pending": pending,
+            },
+        )
     )
 
 
@@ -259,6 +281,58 @@ async def test_restore_round_trip(backup_env):
     assert storage.load_update_state()["latest_main_version"] == "v1.3.0"
     assert (backup_env / "quarters" / "2026-Q1.json").exists()
     assert not (backup_env / "seen_ids.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_roundtrips_subscription_pending_schedule(backup_env):
+    expected = storage.SubscriberState(
+        {123: "Alice"},
+        {
+            "version": 1,
+            "last_backup_at": 123.0,
+            "weekly_started_at": 100.0,
+            "pending": {
+                "subscriptions": 3,
+                "unsubscriptions": 1,
+                "counts_known": True,
+                "token": uuid4().hex,
+            },
+        },
+    )
+
+    result = await backup.restore_backup_zip(
+        _zip_bytes({"subscribers.json": storage.subscriber_state_json(expected)})
+    )
+
+    assert result["restored"] == ["subscribers.json"]
+    restored = storage.load_subscriber_state(strict_subscribers=True)
+    assert restored.subscribers == expected.subscribers
+    assert restored.backup_schedule == expected.backup_schedule
+
+
+@pytest.mark.asyncio
+async def test_legacy_restore_migrates_weekly_anchor_from_stats_current(
+    backup_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(backup.time, "time", lambda: 2_000_000_000.0)
+
+    await backup.restore_backup_zip(
+        _zip_bytes(
+            {
+                "subscribers.json": '{"subscribers": {"123": "Alice"}}',
+                "stats_current.json": (
+                    '{"period": "2026-Q2", "events": [], '
+                    '"last_backup_at": 1900000000.0}'
+                ),
+            }
+        )
+    )
+
+    schedule = storage.load_subscription_backup_state()
+    assert schedule["last_backup_at"] is None
+    assert schedule["weekly_started_at"] == 1_900_000_000.0
+    assert schedule["pending"] is None
 
 
 @pytest.mark.asyncio
@@ -678,35 +752,279 @@ async def test_send_backup_build_failure_is_not_retried(backup_env, monkeypatch)
 # ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_backup_after_subscription_subscribe(backup_env, monkeypatch):
-    (backup_env / "subscribers.json").write_text(
-        '{"subscribers": {"7": "Neo"}}', encoding="utf-8")
+async def test_first_eligible_subscription_sends_and_clears_pending(
+    backup_env,
+    monkeypatch,
+):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr("backup.send_backup", sent)
     bot = AsyncMock()
 
-    await backup._backup_after_subscription(bot, 7, "Neo", subscribed=True)
+    assert await backup._backup_after_subscription(bot) is True
 
     sent.assert_awaited_once()
     caption = sent.call_args.args[1]
-    assert "➕" in caption
-    assert 'tg://user?id=7' in caption
-    assert '<code>7</code>' in caption
+    assert "Подписок: <b>1</b>" in caption
+    assert "Отписок: <b>0</b>" in caption
+    assert "Сейчас подписчиков: <b>1</b>" in caption
     assert backup.BACKUP_TAG in caption
+    schedule = storage.load_subscription_backup_state()
+    assert isinstance(schedule["last_backup_at"], float)
+    assert schedule["pending"] is None
 
 
 @pytest.mark.asyncio
-async def test_backup_after_subscription_unsubscribe(backup_env, monkeypatch):
-    (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
+async def test_subscription_changes_aggregate_while_not_due(backup_env, monkeypatch):
+    now = time.time()
+    _save_subscriber_schedule(
+        {5: "Trinity"},
+        last_backup_at=now,
+        weekly_started_at=now,
+    )
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    await storage.mutate_subscription(8, "Morpheus", subscribed=True)
+    await storage.mutate_subscription(5, "Trinity", subscribed=False)
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr("backup.send_backup", sent)
 
-    await backup._backup_after_subscription(AsyncMock(), 5, "Trinity", subscribed=False)
+    assert await backup._backup_after_subscription(AsyncMock()) is False
 
-    caption = sent.call_args.args[1]
-    assert "➖" in caption
-    assert 'tg://user?id=5' in caption
-    assert '<code>5</code>' in caption
+    sent.assert_not_awaited()
+    pending = storage.load_subscription_backup_state()["pending"]
+    assert pending["subscriptions"] == 2
+    assert pending["unsubscriptions"] == 1
+    assert pending["counts_known"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_subscription_delivery_keeps_state_for_retry(
+    backup_env,
+    monkeypatch,
+):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    sent = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr("backup.send_backup", sent)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is False
+    failed = storage.load_subscription_backup_state()
+    assert failed["last_backup_at"] is None
+    assert failed["pending"]["subscriptions"] == 1
+
+    assert await backup._backup_after_subscription(AsyncMock()) is True
+    retried = storage.load_subscription_backup_state()
+    assert retried["pending"] is None
+    assert isinstance(retried["last_backup_at"], float)
+
+
+@pytest.mark.asyncio
+async def test_subscription_change_during_send_remains_pending(backup_env, monkeypatch):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+
+    async def send_and_change(_bot, _caption):
+        await storage.mutate_subscription(8, "Trinity", subscribed=True)
+        return True
+
+    monkeypatch.setattr("backup.send_backup", send_and_change)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is True
+
+    state = storage.load_subscription_backup_state()
+    assert isinstance(state["last_backup_at"], float)
+    assert state["pending"]["subscriptions"] == 1
+    assert state["pending"]["unsubscriptions"] == 0
+    assert state["pending"]["counts_known"] is True
+
+
+@pytest.mark.asyncio
+async def test_subscription_send_does_not_hold_restorable_lock(backup_env, monkeypatch):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+
+    async def send_while_locking(_bot, _caption):
+        async with storage.restorable_state_transaction():
+            return True
+
+    monkeypatch.setattr("backup.send_backup", send_while_locking)
+
+    assert await asyncio.wait_for(
+        backup._backup_after_subscription(AsyncMock()),
+        timeout=5,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_subscription_delivery_sends_one_backup(
+    backup_env,
+    monkeypatch,
+):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def send_once(_bot, _caption):
+        started.set()
+        await release.wait()
+        return True
+
+    sent = AsyncMock(side_effect=send_once)
+    monkeypatch.setattr("backup.send_backup", sent)
+    first = asyncio.create_task(backup._backup_after_subscription(AsyncMock()))
+    await started.wait()
+    second = asyncio.create_task(backup._backup_after_subscription(AsyncMock()))
+    release.set()
+
+    assert await asyncio.gather(first, second) == [True, False]
+    sent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_subscription_pending_survives_restart_until_due(
+    backup_env,
+    monkeypatch,
+):
+    now = time.time()
+    _save_subscriber_schedule(last_backup_at=now, weekly_started_at=now)
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    monkeypatch.setattr(backup.time, "time", lambda: now + 60)
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backup.send_backup", sent)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is False
+    assert storage.load_subscriber_state().backup_schedule["pending"] is not None
+
+    monkeypatch.setattr(
+        backup.time,
+        "time",
+        lambda: now + backup.SUBSCRIPTION_BACKUP_INTERVAL,
+    )
+    assert await backup._backup_after_subscription(AsyncMock()) is True
+    assert storage.load_subscriber_state().backup_schedule["pending"] is None
+
+
+@pytest.mark.asyncio
+async def test_restore_during_subscription_send_is_not_acknowledged(
+    backup_env,
+    monkeypatch,
+):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    restored = storage.SubscriberState(
+        {8: "Trinity"},
+        {
+            "version": 1,
+            "last_backup_at": 100.0,
+            "weekly_started_at": 100.0,
+            "pending": {
+                "subscriptions": 4,
+                "unsubscriptions": 2,
+                "counts_known": True,
+                "token": uuid4().hex,
+            },
+        },
+    )
+
+    async def send_and_restore(_bot, _caption):
+        await backup.restore_backup_zip(
+            _zip_bytes({"subscribers.json": storage.subscriber_state_json(restored)})
+        )
+        return True
+
+    monkeypatch.setattr("backup.send_backup", send_and_restore)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is False
+    state = storage.load_subscriber_state(strict_subscribers=True)
+    assert state.subscribers == {8: "Trinity"}
+    assert state.backup_schedule == restored.backup_schedule
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_backup_at", [None, 100.0, 2_000_000.0])
+async def test_missing_stale_and_future_timestamp_make_pending_eligible(
+    backup_env,
+    monkeypatch,
+    last_backup_at,
+):
+    now = 1_000_000.0
+    pending = {
+        "subscriptions": 1,
+        "unsubscriptions": 0,
+        "counts_known": True,
+        "token": uuid4().hex,
+    }
+    _save_subscriber_schedule(
+        {7: "Neo"},
+        last_backup_at=last_backup_at,
+        weekly_started_at=100.0,
+        pending=pending,
+    )
+    monkeypatch.setattr(backup.time, "time", lambda: now)
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backup.send_backup", sent)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is True
+    sent.assert_awaited_once()
+    assert storage.load_subscription_backup_state()["last_backup_at"] == now
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broken_schedule",
+    [
+        {
+            "version": 1,
+            "last_backup_at": "yesterday",
+            "weekly_started_at": 100.0,
+            "pending": None,
+        },
+        {
+            "version": 1,
+            "last_backup_at": 100.0,
+            "weekly_started_at": 100.0,
+        },
+        {
+            "version": 1,
+            "last_backup_at": 100.0,
+            "weekly_started_at": 100.0,
+            "pending": {"subscriptions": 1},
+        },
+    ],
+)
+async def test_malformed_schedule_sends_honest_recovery_backup(
+    backup_env,
+    monkeypatch,
+    broken_schedule,
+):
+    storage.SUBS_FILE.write_text(
+        json.dumps(
+            {
+                "subscribers": {"7": "Neo"},
+                "backup_schedule": broken_schedule,
+            }
+        ),
+        encoding="utf-8",
+    )
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backup.send_backup", sent)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is True
+    assert "Точные количества прошлых изменений недоступны" in sent.call_args.args[1]
+    assert storage.load_subscription_backup_state()["pending"] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_legacy_schedule_does_not_invent_pending_change(
+    backup_env,
+    monkeypatch,
+):
+    storage.SUBS_FILE.write_text(
+        '{"subscribers": {"7": "Neo"}}',
+        encoding="utf-8",
+    )
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backup.send_backup", sent)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is False
+    sent.assert_not_awaited()
+    assert storage.load_subscriber_state(strict_subscribers=True).schedule_missing is False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -714,7 +1032,10 @@ async def test_backup_after_subscription_unsubscribe(backup_env, monkeypatch):
 # ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_weekly_backup_first_time_marks_without_sending(backup_env, monkeypatch):
+async def test_weekly_backup_first_time_sets_anchor_without_sending(
+    backup_env,
+    monkeypatch,
+):
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr("backup.send_backup", sent)
     cur = {"period": "2026-Q2", "events": []}   # нет last_backup_at
@@ -723,7 +1044,10 @@ async def test_weekly_backup_first_time_marks_without_sending(backup_env, monkey
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
     sent.assert_not_awaited()
-    assert isinstance(out["last_backup_at"], float)
+    assert out is cur
+    schedule = storage.load_subscription_backup_state()
+    assert schedule["last_backup_at"] is None
+    assert isinstance(schedule["weekly_started_at"], float)
 
 
 @pytest.mark.asyncio
@@ -731,13 +1055,14 @@ async def test_weekly_backup_not_due_does_nothing(backup_env, monkeypatch):
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr("backup.send_backup", sent)
     ts = time.time()
-    cur = {"period": "2026-Q2", "events": [], "last_backup_at": ts}
-    storage.save_stats_current(cur)
+    cur = {"period": "2026-Q2", "events": []}
+    _save_subscriber_schedule(last_backup_at=ts, weekly_started_at=ts)
 
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
     sent.assert_not_awaited()
-    assert out["last_backup_at"] == ts
+    assert out is cur
+    assert storage.load_subscription_backup_state()["last_backup_at"] == ts
 
 
 @pytest.mark.asyncio
@@ -745,50 +1070,46 @@ async def test_weekly_backup_due_sends_and_updates(backup_env, monkeypatch):
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr("backup.send_backup", sent)
     old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
-    cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
-    storage.save_stats_current(cur)
+    cur = {"period": "2026-Q2", "events": []}
+    _save_subscriber_schedule(last_backup_at=old, weekly_started_at=old)
 
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
     sent.assert_awaited_once()
-    assert out["last_backup_at"] > old
+    assert out is cur
+    assert storage.load_subscription_backup_state()["last_backup_at"] > old
 
 
 @pytest.mark.asyncio
 async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monkeypatch):
     monkeypatch.setattr("backup.send_backup", AsyncMock(return_value=False))
     old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
-    cur = {"period": "2026-Q2", "events": [], "last_backup_at": old}
-    storage.save_stats_current(cur)
+    cur = {"period": "2026-Q2", "events": []}
+    _save_subscriber_schedule(last_backup_at=old, weekly_started_at=old)
 
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
-    assert out["last_backup_at"] == old   # не сдвигаем метку, если не ушло
+    assert out is cur
+    assert storage.load_subscription_backup_state()["last_backup_at"] == old
 
 
-# ─────────────────────────────────────────────────────────────
-#  Структура stats_current
-# ─────────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_subscription_success_prevents_immediate_weekly_duplicate(
+    backup_env,
+    monkeypatch,
+):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("backup.send_backup", sent)
 
-def test_empty_stats_current_has_last_backup_at():
-    fresh = storage._empty_stats_current("2026-Q2")
-    assert "last_backup_at" in fresh
-    assert fresh["last_backup_at"] is None
-    assert fresh["pending_quarter_delivery"] is None
+    assert await backup._backup_after_subscription(AsyncMock()) is True
+    await backup._weekly_backup_if_due(
+        AsyncMock(),
+        {"period": "2026-Q2", "events": []},
+    )
 
+    sent.assert_awaited_once()
 
-def test_load_stats_current_backfills_last_backup_at(backup_env):
-    # файл старого формата без last_backup_at
-    storage.STATS_CURRENT_FILE.write_text(json.dumps({
-        "period": "2026-Q2",
-        "period_start": "2026-04-01T00:00:00",
-        "tracking_since": "2026-04-01T00:00:00",
-        "last_report_sent": None,
-        "events": [],
-    }), encoding="utf-8")
-    data = storage.load_stats_current()
-    assert data["last_backup_at"] is None
-    assert data["pending_quarter_delivery"] is None
 
 # ─────────────────────────────────────────────────────────────
 #  Бэкап при остановке (SIGTERM) + monotonic-метка для дебаунса
@@ -809,15 +1130,49 @@ async def test_send_backup_sets_last_backup_clock(backup_env):
 
 
 @pytest.mark.asyncio
+async def test_manual_backup_does_not_change_automatic_schedule(backup_env):
+    pending = {
+        "subscriptions": 2,
+        "unsubscriptions": 1,
+        "counts_known": True,
+        "token": uuid4().hex,
+    }
+    _save_subscriber_schedule(
+        {7: "Neo"},
+        last_backup_at=123.0,
+        weekly_started_at=100.0,
+        pending=pending,
+    )
+    before = storage.load_subscription_backup_state()
+
+    assert await backup.send_backup(AsyncMock(), f"Вручную\n\n{backup.BACKUP_TAG}")
+
+    assert storage.load_subscription_backup_state() == before
+
+
+@pytest.mark.asyncio
 async def test_shutdown_backup_sends_when_no_recent(backup_env, monkeypatch):
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr("backup.send_backup", sent)
+    _save_subscriber_schedule(
+        last_backup_at=123.0,
+        weekly_started_at=100.0,
+        pending={
+            "subscriptions": 1,
+            "unsubscriptions": 0,
+            "counts_known": True,
+            "token": uuid4().hex,
+        },
+    )
+    before = storage.load_subscription_backup_state()
     monkeypatch.setattr("backup._last_backup_sent_at", None)
-    await backup._shutdown_backup(AsyncMock())
-    sent.assert_awaited_once()
-    caption = sent.call_args.args[1]
+    bot = AsyncMock()
+
+    await backup._shutdown_backup(bot)
+
+    bot.send_document.assert_awaited_once()
+    caption = bot.send_document.await_args.kwargs["caption"]
     assert backup.BACKUP_TAG in caption
     assert "SIGTERM" in caption
+    assert storage.load_subscription_backup_state() == before
 
 
 @pytest.mark.asyncio
@@ -896,6 +1251,39 @@ async def test_restore_rejects_malformed_subscribers(backup_env, payload):
     with pytest.raises(ValueError):          # единственный файл невалиден → нечего восстанавливать
         await backup.restore_backup_zip(raw)
     assert not (backup_env / "subscribers.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_malformed_current_backup_schedule(backup_env):
+    current = storage.SubscriberState(
+        {1: "Current"},
+        {
+            "version": 1,
+            "last_backup_at": 100.0,
+            "weekly_started_at": 100.0,
+            "pending": None,
+        },
+    )
+    storage.save_subscriber_state(current)
+    before = storage.SUBS_FILE.read_bytes()
+    malformed = json.dumps(
+        {
+            "subscribers": {"2": "Restored"},
+            "backup_schedule": {
+                "version": 1,
+                "last_backup_at": 100.0,
+                "weekly_started_at": 100.0,
+                "pending": {"subscriptions": 1},
+            },
+        }
+    )
+
+    with pytest.raises(storage.SubscriptionBackupStateError):
+        await backup.restore_backup_zip(
+            _zip_bytes({"subscribers.json": malformed})
+        )
+
+    assert storage.SUBS_FILE.read_bytes() == before
 
 
 @pytest.mark.asyncio
@@ -998,8 +1386,23 @@ async def test_restore_filters_subscribers_against_candidate_blocked_users(backu
 
 
 @pytest.mark.asyncio
-async def test_restore_blocked_users_alone_removes_current_subscriber(backup_env):
-    storage.save_subscribers({7: "Blocked", 8: "Allowed"})
+async def test_restore_blocked_users_alone_preserves_legacy_weekly_anchor(
+    backup_env,
+    monkeypatch,
+):
+    legacy_anchor = 1_900_000_000.0
+    monkeypatch.setattr(backup.time, "time", lambda: 2_000_000_000.0)
+    storage.SUBS_FILE.write_text(
+        '{"subscribers": {"7": "Blocked", "8": "Allowed"}}',
+        encoding="utf-8",
+    )
+    storage.save_stats_current(
+        {
+            "period": "2026-Q2",
+            "events": [],
+            "last_backup_at": legacy_anchor,
+        }
+    )
 
     result = await backup.restore_backup_zip(
         _zip_bytes({"blocked_users.json": '{"blocked_user_ids": [7]}'})
@@ -1007,6 +1410,10 @@ async def test_restore_blocked_users_alone_removes_current_subscriber(backup_env
 
     assert set(result["restored"]) == {"blocked_users.json", "subscribers.json"}
     assert storage.load_subscribers() == {8: "Allowed"}
+    schedule = storage.load_subscription_backup_state()
+    assert schedule["last_backup_at"] is None
+    assert schedule["weekly_started_at"] == legacy_anchor
+    assert schedule["pending"] is None
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -591,6 +592,115 @@ def test_subscribers_roundtrip(monkeypatch, tmp_path):
     assert loaded == original
 
 
+@pytest.mark.asyncio
+async def test_subscription_mutations_are_atomic_durable_and_idempotent(backup_env):
+    first = await storage.mutate_subscription(111, "Alice", subscribed=True)
+    repeated_start = await storage.mutate_subscription(
+        111,
+        "Alice renamed",
+        subscribed=True,
+    )
+    stopped = await storage.mutate_subscription(111, "Alice", subscribed=False)
+    repeated_stop = await storage.mutate_subscription(111, "Alice", subscribed=False)
+
+    assert first == storage.SubscriptionMutation(True, 1)
+    assert repeated_start == storage.SubscriptionMutation(False, 1)
+    assert stopped == storage.SubscriptionMutation(True, 0)
+    assert repeated_stop == storage.SubscriptionMutation(False, 0)
+    state = storage.load_subscriber_state(strict_subscribers=True)
+    assert state.subscribers == {}
+    assert state.backup_schedule["pending"]["subscriptions"] == 1
+    assert state.backup_schedule["pending"]["unsubscriptions"] == 1
+    assert state.backup_schedule["pending"]["counts_known"] is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_subscription_mutations_do_not_lose_counts(backup_env):
+    storage.save_subscribers({1: "One", 2: "Two"})
+
+    results = await asyncio.gather(
+        storage.mutate_subscription(3, "Three", subscribed=True),
+        storage.mutate_subscription(4, "Four", subscribed=True),
+        storage.mutate_subscription(1, "One", subscribed=False),
+        storage.mutate_subscription(2, "Two", subscribed=False),
+    )
+
+    assert all(result.changed for result in results)
+    state = storage.load_subscriber_state(strict_subscribers=True)
+    assert state.subscribers == {3: "Three", 4: "Four"}
+    assert state.backup_schedule["pending"]["subscriptions"] == 2
+    assert state.backup_schedule["pending"]["unsubscriptions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_subscription_publication_failure_keeps_previous_combined_state(
+    backup_env,
+    monkeypatch,
+):
+    storage.save_subscribers({1: "One"})
+    before = storage.SUBS_FILE.read_bytes()
+    monkeypatch.setattr(
+        storage,
+        "_atomic_write",
+        lambda *_args: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError):
+        await storage.mutate_subscription(2, "Two", subscribed=True)
+
+    assert storage.SUBS_FILE.read_bytes() == before
+
+
+def test_legacy_subscriber_writer_preserves_backup_schedule(backup_env):
+    state = storage.SubscriberState(
+        {1: "One"},
+        {
+            "version": 1,
+            "last_backup_at": 123.0,
+            "weekly_started_at": 100.0,
+            "pending": {
+                "subscriptions": 2,
+                "unsubscriptions": 1,
+                "counts_known": True,
+                "token": uuid4().hex,
+            },
+        },
+    )
+    storage.save_subscriber_state(state)
+
+    storage.save_subscribers({2: "Two"})
+
+    restored = storage.load_subscriber_state(strict_subscribers=True)
+    assert restored.subscribers == {2: "Two"}
+    assert restored.backup_schedule == state.backup_schedule
+
+
+@pytest.mark.asyncio
+async def test_user_registry_and_alert_settings_do_not_create_backup_pending(
+    backup_env,
+):
+    state = storage.SubscriberState(
+        {1: "One"},
+        {
+            "version": 1,
+            "last_backup_at": 123.0,
+            "weekly_started_at": 100.0,
+            "pending": None,
+        },
+    )
+    storage.save_subscriber_state(state)
+
+    await storage.register_known_user(
+        7,
+        "Neo",
+        "the_one",
+        first_seen_at="2026-09-03T10:20:30Z",
+    )
+    await storage.set_user_alerts_enabled(False)
+
+    assert storage.load_subscription_backup_state() == state.backup_schedule
+
+
 def test_save_seen_ids_removes_tmp_file(monkeypatch, tmp_path):
     file = tmp_path / "seen_ids.json"
 
@@ -776,6 +886,29 @@ def test_save_stats_all_writes_file_and_updates_cache(monkeypatch, tmp_path):
 #  stats_current.json — бэкофиллы и первый запуск
 # ═══════════════════════════════════════════════════════════════════
 
+def test_empty_stats_current_keeps_only_quarter_delivery_state():
+    fresh = storage._empty_stats_current("2026-Q2")
+    assert "last_backup_at" not in fresh
+    assert fresh["pending_quarter_delivery"] is None
+
+
+def test_load_stats_current_does_not_add_backup_schedule_fields(backup_env):
+    storage.STATS_CURRENT_FILE.write_text(
+        json.dumps(
+            {
+                "period": "2026-Q2",
+                "period_start": "2026-04-01T00:00:00",
+                "tracking_since": "2026-04-01T00:00:00",
+                "last_report_sent": None,
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    data = storage.load_stats_current()
+    assert "last_backup_at" not in data
+    assert data["pending_quarter_delivery"] is None
+
 def test_load_stats_current_backfills_tracking_since_from_period_start(monkeypatch, tmp_path):
     """Старый файл без tracking_since -> подставляем period_start."""
     f = tmp_path / "stats_current.json"
@@ -789,7 +922,7 @@ def test_load_stats_current_backfills_tracking_since_from_period_start(monkeypat
 
     data = storage.load_stats_current()
     assert data["tracking_since"] == "2026-04-01T00:00:00"
-    assert data["last_backup_at"] is None          # заодно бэкофилл last_backup_at
+    assert "last_backup_at" not in data
     assert data["pending_quarter_delivery"] is None
 
 

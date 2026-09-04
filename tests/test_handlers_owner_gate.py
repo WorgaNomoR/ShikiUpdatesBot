@@ -12,6 +12,7 @@ import pytest
 
 import handlers
 import runtime_status
+import storage
 from utils import _utcnow
 
 
@@ -95,8 +96,16 @@ def test_stale_polling_done_callback_does_not_hide_new_active_task(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_owner_start_rearms_loop(monkeypatch, fake_loop):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
-    monkeypatch.setattr(handlers, "save_subscribers", lambda s: None)
+    monkeypatch.setattr(
+        handlers,
+        "mutate_subscription",
+        AsyncMock(
+            return_value=storage.SubscriptionMutation(
+                changed=True,
+                subscriber_count=1,
+            ),
+        ),
+    )
     monkeypatch.setattr(handlers, "_backup_after_subscription", AsyncMock())
     msg = AsyncMock()
     msg.from_user = MagicMock(id=handlers.OWNER_ID, full_name="Owner")
@@ -109,8 +118,16 @@ async def test_owner_start_rearms_loop(monkeypatch, fake_loop):
 
 @pytest.mark.asyncio
 async def test_non_owner_start_does_not_touch_loop(monkeypatch, fake_loop):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
-    monkeypatch.setattr(handlers, "save_subscribers", lambda s: None)
+    monkeypatch.setattr(
+        handlers,
+        "mutate_subscription",
+        AsyncMock(
+            return_value=storage.SubscriptionMutation(
+                changed=True,
+                subscriber_count=1,
+            ),
+        ),
+    )
     monkeypatch.setattr(handlers, "_backup_after_subscription", AsyncMock())
     msg = AsyncMock()
     msg.from_user = MagicMock(id=handlers.OWNER_ID + 1, full_name="Someone")
@@ -128,7 +145,11 @@ def test_build_startup_text_renders_snapshot(monkeypatch):
                         lambda: {f"anime_{i}" for i in range(37)})
     monkeypatch.setattr(handlers, "load_stats_all",
                         lambda: {"updated_at": _utcnow().isoformat()})
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: {"last_backup_at": None})
+    monkeypatch.setattr(
+        handlers,
+        "load_subscription_backup_state",
+        lambda: {"last_backup_at": None},
+    )
     txt = handlers._build_startup_text()
     assert txt.startswith("🟢 Бот запущен")
     assert "Подписчиков: 3" in txt

@@ -393,7 +393,7 @@ def build_version_text(
         f"Работает: {_format_uptime(runtime.uptime_seconds)}\n"
         "Последнее полное обновление данных: "
         f"{_format_wall_time(runtime.last_full_sync_at, missing='ещё не завершалось')}\n"
-        "Последняя плановая резервная копия: "
+        "Последняя автоматическая резервная копия: "
         f"{_format_wall_time(last_backup_at, missing='ещё не выполнялась')}\n"
         f"Проверка новых событий: {polling}\n\n"
         "Copyright © 2026 WorgaNomoR.\n"

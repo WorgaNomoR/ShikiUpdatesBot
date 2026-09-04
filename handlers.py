@@ -49,6 +49,8 @@ from backup import (
     IMPORT_DOCUMENT_MAX_BYTES,
     _backup_after_subscription,
     _weekly_backup_if_due,
+    automatic_backup_delivery,
+    prepare_backup_schedule,
     restore_backup_zip,
     send_backup,
 )
@@ -170,16 +172,21 @@ from storage import (
     load_stats_all,
     load_stats_all_snapshot,
     load_stats_current,
+    load_subscriber_state,
     load_subscribers,
+    load_subscription_backup_state,
     load_update_state,
+    mutate_subscription,
     remove_blocked_user,
     restorable_state_transaction,
     save_seen_favourites,
     save_seen_ids,
     save_stats_all,
     save_stats_current,
+    save_subscriber_state,
     save_subscribers,
     set_user_alerts_enabled,
+    subscriber_state_json,
     validate_telegram_user_id,
 )
 from telegram_delivery import is_blocked_error as _is_blocked_error
@@ -433,22 +440,43 @@ async def _deliver_pending_quarter(bot: Bot, cur: dict) -> dict:
             len(pending["report_messages"]),
         )
 
-    backup_sent = await send_backup(
-        bot,
-        f"🗓️ Ротация квартала: {h(quarter_label(pending['old_period']))} → "
-        f"{h(quarter_label(pending['new_period']))}.\n"
-        f"Снапшот состояния.\n\n{BACKUP_TAG}",
-    )
-    if not backup_sent:
-        return load_stats_current()
+    async with automatic_backup_delivery():
+        prepared_at = time.time()
+        async with restorable_state_transaction():
+            cur = load_stats_current()
+            if cur.get(_PENDING_QUARTER_DELIVERY) != pending:
+                return cur
+            subscriber_state = load_subscriber_state(strict_subscribers=True)
+            if prepare_backup_schedule(subscriber_state, prepared_at):
+                save_subscriber_state(subscriber_state)
+            expected_subscriber_state = subscriber_state_json(subscriber_state)
 
-    async with restorable_state_transaction():
-        cur = load_stats_current()
-        if cur.get(_PENDING_QUARTER_DELIVERY) != pending:
-            return cur
-        cur["last_backup_at"] = time.time()
-        cur[_PENDING_QUARTER_DELIVERY] = None
-        save_stats_current(cur)
+        backup_sent = await send_backup(
+            bot,
+            f"🗓️ Ротация квартала: {h(quarter_label(pending['old_period']))} → "
+            f"{h(quarter_label(pending['new_period']))}.\n"
+            f"Снапшот состояния.\n\n{BACKUP_TAG}",
+        )
+        if not backup_sent:
+            return load_stats_current()
+
+        completed_at = time.time()
+        async with restorable_state_transaction():
+            cur = load_stats_current()
+            subscriber_state = load_subscriber_state(strict_subscribers=True)
+            if (
+                cur.get(_PENDING_QUARTER_DELIVERY) != pending
+                or subscriber_state_json(subscriber_state) != expected_subscriber_state
+            ):
+                log.warning(
+                    "rotate_quarter: состояние изменилось во время backup; "
+                    "доставка останется pending для безопасного retry."
+                )
+                return cur
+            subscriber_state.backup_schedule["last_backup_at"] = completed_at
+            save_subscriber_state(subscriber_state)
+            cur[_PENDING_QUARTER_DELIVERY] = None
+            save_stats_current(cur)
     return cur
 
 
@@ -1853,6 +1881,12 @@ async def polling_loop(bot: Bot) -> None:
         except Exception as e:
             log.exception("Ошибка ротации квартала при старте: %s", e)
 
+    try:
+        await _backup_after_subscription(bot)
+        cur = await _weekly_backup_if_due(bot, cur)
+    except Exception as e:
+        log.exception("Ошибка automatic backup при старте: %s", e)
+
     while True:
         try:
             log.info("Проверяем историю и избранное...")
@@ -1888,7 +1922,10 @@ async def polling_loop(bot: Bot) -> None:
             # Внутри — защита last_report_sent от повторной отправки.
             cur = await rotate_quarter_if_needed(bot, cur, load_stats_all())
 
-            # Еженедельный авто-бэкап состояния (по last_backup_at в stats_current).
+            # Subscription pending имеет приоритет над weekly fallback.
+            await _backup_after_subscription(bot)
+
+            # Еженедельный авто-бэкап использует общий durable timestamp.
             cur = await _weekly_backup_if_due(bot, cur)
 
             heartbeat()  # отметить успешный цикл для healthcheck-watchdog
@@ -1979,7 +2016,6 @@ def _build_startup_text() -> str:
     протухлость и есть диагностика."""
     try:
         stats_all = load_stats_all()
-        cur = load_stats_current()
         return build_startup_snapshot(
             display_name=DISPLAY_NAME,
             shiki_user=SHIKI_USER,
@@ -1988,7 +2024,7 @@ def _build_startup_text() -> str:
             seen_ids_count=len(load_seen_ids()),
             seen_favs_count=len(load_seen_favourites()),
             stats_updated_at=stats_all.get("updated_at"),
-            last_backup_at=cur.get("last_backup_at"),
+            last_backup_at=load_subscription_backup_state().get("last_backup_at"),
         )
     except Exception as e:
         log.warning("Не удалось собрать стартовый снапшот, шлём голый пинг: %s", e)
@@ -3031,14 +3067,13 @@ async def cmd_start(
     if inline_search_start:
         answer_kwargs["reply_markup"] = _return_to_inline_keyboard()
 
-    async with restorable_state_transaction():
-        subs = load_subscribers()
-        already_subscribed = chat_id in subs
-        if not already_subscribed:
-            subs[chat_id] = name
-            save_subscribers(subs)
+    mutation = await mutate_subscription(
+        chat_id,
+        name,
+        subscribed=True,
+    )
 
-    if already_subscribed:
+    if not mutation.changed:
         await message.answer(
             f"☕ Ты уже подписан, {h(name)}! Буду слать новости об активности "
             f"{h(DISPLAY_NAME_CONTEXT.genitive)}.",
@@ -3046,8 +3081,16 @@ async def cmd_start(
         )
         return
 
-    log.info("Новый подписчик: %s (chat_id=%d). Всего: %d.", name, chat_id, len(subs))
-    await _backup_after_subscription(message.bot, chat_id, name, subscribed=True)
+    log.info(
+        "Новый подписчик: %s (chat_id=%d). Всего: %d.",
+        name,
+        chat_id,
+        mutation.subscriber_count,
+    )
+    try:
+        await _backup_after_subscription(message.bot)
+    except Exception as e:
+        log.exception("Не удалось обработать подписочный backup после /start: %s", e)
     reply = (
         f"✅ Подписка оформлена, {h(name)}!\n"
         "Теперь ты будешь получать уведомления об активности "
@@ -3062,21 +3105,28 @@ async def cmd_stop(message: Message) -> None:
     chat_id = message.chat.id
     name = message.from_user.full_name if message.from_user else str(chat_id)
 
-    async with restorable_state_transaction():
-        subs = load_subscribers()
-        was_subscribed = chat_id in subs
-        if was_subscribed:
-            subs.pop(chat_id)
-            save_subscribers(subs)
+    mutation = await mutate_subscription(
+        chat_id,
+        name,
+        subscribed=False,
+    )
 
-    if not was_subscribed:
+    if not mutation.changed:
         await message.answer(
             "🤔 Ты и так не подписан. Напиши /start чтобы подписаться."
         )
         return
 
-    log.info("Отписался: %s (chat_id=%d). Осталось: %d.", name, chat_id, len(subs))
-    await _backup_after_subscription(message.bot, chat_id, name, subscribed=False)
+    log.info(
+        "Отписался: %s (chat_id=%d). Осталось: %d.",
+        name,
+        chat_id,
+        mutation.subscriber_count,
+    )
+    try:
+        await _backup_after_subscription(message.bot)
+    except Exception as e:
+        log.exception("Не удалось обработать подписочный backup после /stop: %s", e)
     reply = (
         f"👋 Ты отписан, {name}. Жаль терять такого зрителя!\n"
         "Если передумаешь — /start"
@@ -3511,9 +3561,9 @@ async def cmd_version(message: Message) -> None:
 def _build_info_text(state: dict) -> str:
     """Собрать локальный runtime-снимок без раскрытия ошибок чтения."""
     try:
-        last_backup_at = load_stats_current().get("last_backup_at")
+        last_backup_at = load_subscription_backup_state().get("last_backup_at")
     except Exception as e:
-        log.warning("Не удалось прочитать время планового backup для /info: %s", e)
+        log.warning("Не удалось прочитать время automatic backup для /info: %s", e)
         last_backup_at = "unknown"
     try:
         runtime = get_runtime_snapshot()

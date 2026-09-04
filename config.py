@@ -84,7 +84,7 @@ DISPLAY_NAME_GENDER = (
 CHECK_INTERVAL        = _int_env("CHECK_INTERVAL", 15 * 60)          # проверка истории, сек (15 мин)
 ERROR_NOTIFY_INTERVAL = _int_env("ERROR_NOTIFY_INTERVAL", 30 * 60)   # антиспам уведомлений об ошибке
 FULL_SYNC_INTERVAL    = _int_env("FULL_SYNC_INTERVAL", 6 * 60 * 60)  # пересинк stats_all в цикле (6 ч)
-WEEKLY_BACKUP_INTERVAL = 7 * 24 * 60 * 60  # еженедельный авто-бэкап состояния (по last_backup_at)
+WEEKLY_BACKUP_INTERVAL = 7 * 24 * 60 * 60  # fallback от общего successful-auto timestamp
 
 # ─────────────────────────────────────────────
 #  ПУТИ К ФАЙЛАМ ДАННЫХ

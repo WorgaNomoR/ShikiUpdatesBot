@@ -1202,5 +1202,5 @@ def build_startup_snapshot(
 
     lines.append("")
     lines.append(f"📊 Последняя синхронизация статистики: {_fmt_moment(stats_dt)}")
-    lines.append(f"💾 Последний плановый бэкап: {_fmt_moment(_parse_ts(last_backup_at))}")
+    lines.append(f"💾 Последний автоматический бэкап: {_fmt_moment(_parse_ts(last_backup_at))}")
     return "\n".join(lines)

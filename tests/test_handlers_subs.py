@@ -13,6 +13,7 @@ import pytest
 from aiogram.enums import ParseMode
 
 import handlers
+import storage
 from name_grammar import build_display_name_context
 
 # ── /subs — только для владельца, ветвление по наличию подписчиков ──
@@ -92,9 +93,8 @@ async def test_cmd_subs_escapes_html_in_subscriber_names(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cmd_stop_when_not_subscribed_does_nothing(monkeypatch):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
-    saved = []
-    monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(s))
+    mutate = AsyncMock(return_value=storage.SubscriptionMutation(False, 0))
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
     backup = AsyncMock()
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
 
@@ -106,15 +106,14 @@ async def test_cmd_stop_when_not_subscribed_does_nothing(monkeypatch):
     await handlers.cmd_stop(msg)
 
     msg.answer.assert_awaited_once()
-    assert saved == []                            # ничего не сохраняли
+    mutate.assert_awaited_once_with(555, "Ghost", subscribed=False)
     backup.assert_not_awaited()                   # и бэкап не гоняли
 
 
 @pytest.mark.asyncio
 async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {555: "Neo", 777: "Trinity"})
-    saved = []
-    monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(dict(s)))
+    mutate = AsyncMock(return_value=storage.SubscriptionMutation(True, 1))
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
     backup = AsyncMock()
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
 
@@ -126,17 +125,41 @@ async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
 
     await handlers.cmd_stop(msg)
 
-    assert saved == [{777: "Trinity"}]            # 555 удалён, остальные целы
-    # полная сигнатура: (bot, chat_id, name, subscribed=False) — ловит перестановку
-    backup.assert_awaited_once_with(msg.bot, 555, "Neo", subscribed=False)
+    mutate.assert_awaited_once_with(555, "Neo", subscribed=False)
+    backup.assert_awaited_once_with(msg.bot)
     msg.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cmd_stop_confirms_saved_change_when_backup_scheduler_fails(monkeypatch):
+    monkeypatch.setattr(
+        handlers,
+        "mutate_subscription",
+        AsyncMock(return_value=storage.SubscriptionMutation(True, 0)),
+    )
+    backup = AsyncMock(side_effect=OSError("read failure"))
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Neo", id=555)
+    msg.bot = MagicMock()
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_stop(msg)
+
+    backup.assert_awaited_once_with(msg.bot)
+    assert "отписан" in msg.answer.await_args.args[0]
 
 
 # ── /start — подписка зрителя + авто-бэкап (зеркало /stop) ──
 
 @pytest.mark.asyncio
 async def test_cmd_start_already_subscribed_uses_genitive_display_name(monkeypatch):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {555: "Morpheus"})
+    monkeypatch.setattr(
+        handlers,
+        "mutate_subscription",
+        AsyncMock(return_value=storage.SubscriptionMutation(False, 1)),
+    )
     monkeypatch.setattr(
         handlers,
         "DISPLAY_NAME_CONTEXT",
@@ -157,14 +180,13 @@ async def test_cmd_start_already_subscribed_uses_genitive_display_name(monkeypat
 
 @pytest.mark.asyncio
 async def test_cmd_start_subscribes_and_triggers_backup(monkeypatch):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    mutate = AsyncMock(return_value=storage.SubscriptionMutation(True, 1))
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
     monkeypatch.setattr(
         handlers,
         "DISPLAY_NAME_CONTEXT",
         build_display_name_context("Костя"),
     )
-    saved = []
-    monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(dict(s)))
     backup = AsyncMock()
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
 
@@ -176,13 +198,33 @@ async def test_cmd_start_subscribes_and_triggers_backup(monkeypatch):
 
     await handlers.cmd_start(msg)
 
-    assert saved == [{555: "Morpheus"}]            # новый подписчик сохранён
-    # полная сигнатура: (bot, chat_id, name, subscribed=True) — ловит subscribed-флип
-    backup.assert_awaited_once_with(msg.bot, 555, "Morpheus", subscribed=True)
+    mutate.assert_awaited_once_with(555, "Morpheus", subscribed=True)
+    backup.assert_awaited_once_with(msg.bot)
     msg.answer.assert_awaited_once()
     reply = msg.answer.call_args.args[0]
     assert "об активности Кости" in reply
     assert "активности Костя" not in reply
+
+
+@pytest.mark.asyncio
+async def test_cmd_start_confirms_saved_change_when_backup_scheduler_fails(monkeypatch):
+    monkeypatch.setattr(
+        handlers,
+        "mutate_subscription",
+        AsyncMock(return_value=storage.SubscriptionMutation(True, 1)),
+    )
+    backup = AsyncMock(side_effect=OSError("read failure"))
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    msg = MagicMock()
+    msg.chat.id = 555
+    msg.from_user = MagicMock(full_name="Neo", id=555)
+    msg.bot = MagicMock()
+    msg.answer = AsyncMock()
+
+    await handlers.cmd_start(msg)
+
+    backup.assert_awaited_once_with(msg.bot)
+    assert "Подписка оформлена" in msg.answer.await_args.args[0]
 
 
 @pytest.mark.parametrize("already_subscribed", [True, False])
@@ -194,15 +236,15 @@ async def test_cmd_start_escapes_html_names_in_both_branches(
     """Оба ответа /start включают HTML: экранируем имя подписчика и
     склонённое DISPLAY_NAME, а в хранилище оставляем исходное имя."""
     subscriber_name = "<Neo & Trinity>"
-    initial_subs = {555: subscriber_name} if already_subscribed else {}
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: initial_subs.copy())
+    mutate = AsyncMock(
+        return_value=storage.SubscriptionMutation(not already_subscribed, 1)
+    )
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
     monkeypatch.setattr(
         handlers,
         "DISPLAY_NAME_CONTEXT",
         build_display_name_context("<Костя & Co>", "none"),
     )
-    saved = []
-    monkeypatch.setattr(handlers, "save_subscribers", lambda s: saved.append(dict(s)))
     backup = AsyncMock()
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
 
@@ -223,11 +265,10 @@ async def test_cmd_start_escapes_html_names_in_both_branches(
     assert msg.answer.call_args.kwargs == {"parse_mode": ParseMode.HTML}
 
     if already_subscribed:
-        assert saved == []
         backup.assert_not_awaited()
     else:
-        assert saved == [{555: subscriber_name}]
-        backup.assert_awaited_once_with(msg.bot, 555, subscriber_name, subscribed=True)
+        backup.assert_awaited_once_with(msg.bot)
+    mutate.assert_awaited_once_with(555, subscriber_name, subscribed=True)
 
 
 @pytest.mark.parametrize("already_subscribed", [True, False])
@@ -236,9 +277,13 @@ async def test_inline_search_deep_link_adds_only_manual_return_button(
     monkeypatch,
     already_subscribed,
 ):
-    initial = {555: "Morpheus"} if already_subscribed else {}
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: initial.copy())
-    monkeypatch.setattr(handlers, "save_subscribers", MagicMock())
+    monkeypatch.setattr(
+        handlers,
+        "mutate_subscription",
+        AsyncMock(
+            return_value=storage.SubscriptionMutation(not already_subscribed, 1)
+        ),
+    )
     monkeypatch.setattr(handlers, "_backup_after_subscription", AsyncMock())
     search_service = MagicMock()
     monkeypatch.setattr(handlers, "_inline_search_service", search_service)
@@ -260,10 +305,9 @@ async def test_inline_search_deep_link_adds_only_manual_return_button(
 
 @pytest.mark.asyncio
 async def test_inline_search_parameter_in_group_keeps_ordinary_start_response(monkeypatch):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {-100: "Group"})
-    save = MagicMock()
+    mutate = AsyncMock(return_value=storage.SubscriptionMutation(False, 1))
     backup = AsyncMock()
-    monkeypatch.setattr(handlers, "save_subscribers", save)
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
     msg = MagicMock()
     msg.chat.id = -100
@@ -273,7 +317,7 @@ async def test_inline_search_parameter_in_group_keeps_ordinary_start_response(mo
     await handlers.cmd_start(msg, MagicMock(args="inline_search"))
 
     assert msg.answer.await_args.kwargs == {"parse_mode": ParseMode.HTML}
-    save.assert_not_called()
+    mutate.assert_awaited_once_with(-100, "Morpheus", subscribed=True)
     backup.assert_not_awaited()
 
 
@@ -281,13 +325,11 @@ async def test_inline_search_parameter_in_group_keeps_ordinary_start_response(mo
 async def test_inline_limit_deep_link_explains_and_changes_no_subscription_state(
     monkeypatch,
 ):
-    load = MagicMock()
-    save = MagicMock()
+    mutate = AsyncMock()
     backup = AsyncMock()
     polling = MagicMock()
     search_service = MagicMock()
-    monkeypatch.setattr(handlers, "load_subscribers", load)
-    monkeypatch.setattr(handlers, "save_subscribers", save)
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
     monkeypatch.setattr(handlers, "start_polling_loop", polling)
     monkeypatch.setattr(handlers, "_inline_search_service", search_service)
@@ -303,8 +345,7 @@ async def test_inline_limit_deep_link_explains_and_changes_no_subscription_state
     assert "меньше чем через минуту" in text
     keyboard = msg.answer.await_args.kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].switch_inline_query == ""
-    load.assert_not_called()
-    save.assert_not_called()
+    mutate.assert_not_awaited()
     backup.assert_not_awaited()
     polling.assert_not_called()
     assert search_service.method_calls == []
@@ -315,14 +356,12 @@ async def test_info_deep_link_is_private_read_only_and_does_not_subscribe(
     monkeypatch,
 ):
     send_info = AsyncMock()
-    load = MagicMock()
-    save = MagicMock()
+    mutate = AsyncMock()
     backup = AsyncMock()
     polling = MagicMock()
     search_service = MagicMock()
     monkeypatch.setattr(handlers, "_send_info", send_info)
-    monkeypatch.setattr(handlers, "load_subscribers", load)
-    monkeypatch.setattr(handlers, "save_subscribers", save)
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
     monkeypatch.setattr(handlers, "start_polling_loop", polling)
     monkeypatch.setattr(handlers, "_inline_search_service", search_service)
@@ -333,8 +372,7 @@ async def test_info_deep_link_is_private_read_only_and_does_not_subscribe(
     await handlers.cmd_start(msg, MagicMock(args="info"))
 
     send_info.assert_awaited_once_with(msg)
-    load.assert_not_called()
-    save.assert_not_called()
+    mutate.assert_not_awaited()
     backup.assert_not_awaited()
     polling.assert_not_called()
     assert search_service.method_calls == []

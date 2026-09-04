@@ -931,7 +931,7 @@ def test_startup_snapshot_tracking_not_initialized_but_stats_present():
     assert "уйдут в тишину" in txt
     assert "Чистый инстанс" not in txt
     assert "Последняя синхронизация статистики:" in txt
-    assert "💾 Последний плановый бэкап: нет данных" in txt    # бэкапа не было
+    assert "💾 Последний автоматический бэкап: нет данных" in txt
 
 
 def test_startup_snapshot_survives_bad_timestamps():

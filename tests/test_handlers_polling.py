@@ -5,6 +5,7 @@ from unittest.mock import (
     AsyncMock,
     MagicMock,
 )
+from uuid import uuid4
 
 import pytest
 
@@ -34,6 +35,70 @@ def _patch_stats(monkeypatch, main):
         return cur
 
     monkeypatch.setattr("handlers.rotate_quarter_if_needed", fake_rotate)
+
+
+@pytest.mark.asyncio
+async def test_polling_services_due_subscription_before_weekly(monkeypatch):
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
+    monkeypatch.setattr(
+        "handlers.load_stats_current",
+        lambda: {"period": "2026-Q2", "events": []},
+    )
+    monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
+    monkeypatch.setattr(
+        "handlers.fetch_favourites",
+        AsyncMock(return_value={"animes": [], "mangas": []}),
+    )
+    monkeypatch.setattr(
+        "handlers.sync_stats_all",
+        AsyncMock(return_value=(storage._empty_stats_all(), True)),
+    )
+    order = []
+
+    async def rotate(_bot, cur, _stats_all, resync=False):
+        order.append("quarter")
+        return cur
+
+    async def subscription(_bot):
+        order.append("subscription")
+        return True
+
+    async def weekly(_bot, cur):
+        order.append("weekly")
+        if order.count("weekly") == 2:
+            raise asyncio.CancelledError
+        return cur
+
+    async def check(_bot, seen, cur):
+        return seen, cur
+
+    async def check_favourites(_bot, seen, favourites=None):
+        return seen, False
+
+    monkeypatch.setattr("handlers.rotate_quarter_if_needed", rotate)
+    monkeypatch.setattr("handlers._backup_after_subscription", subscription)
+    monkeypatch.setattr("handlers._weekly_backup_if_due", weekly)
+    monkeypatch.setattr("handlers.check_and_notify", check)
+    monkeypatch.setattr("handlers.check_and_notify_favourites", check_favourites)
+
+    async def no_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(handlers.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(object())
+
+    assert order == [
+        "quarter",
+        "subscription",
+        "weekly",
+        "quarter",
+        "subscription",
+        "weekly",
+    ]
 
 
 @pytest.mark.asyncio
@@ -701,12 +766,32 @@ async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
     monkeypatch.setattr(handlers.asyncio, "sleep", _no_sleep)
 
     bot = AsyncMock()
+    subscription_pending = {
+        "subscriptions": 2,
+        "unsubscriptions": 1,
+        "counts_known": True,
+        "token": uuid4().hex,
+    }
+    storage.save_subscriber_state(
+        storage.SubscriberState(
+            {7: "Neo"},
+            {
+                "version": 1,
+                "last_backup_at": None,
+                "weekly_started_at": 100.0,
+                "pending": subscription_pending,
+            },
+        )
+    )
     storage.save_stats_current(old_cur)
     await handlers.rotate_quarter_if_needed(bot, old_cur, {})   # resync=True (дефолт)
 
     # 1. Бэкап-снапшот ротации ушёл владельцу с тегом.
     sent.assert_awaited_once()
     assert backup.BACKUP_TAG in sent.call_args.args[1]
+    backup_schedule = storage.load_subscription_backup_state()
+    assert isinstance(backup_schedule["last_backup_at"], float)
+    assert backup_schedule["pending"] == subscription_pending
 
     # 2. _update_by_quarter реально агрегировал квартал в stats_all.
     a_bq = saved["sa"]["anime"]["aggregates"]["by_quarter"]["2026-Q2"]
@@ -824,7 +909,7 @@ async def test_rotation_retries_report_before_marking_delivery(
 
     assert first["period"] == "2026-Q3"
     assert first["last_report_sent"] is None
-    assert first["last_backup_at"] is None
+    assert storage.load_subscription_backup_state()["last_backup_at"] is None
     assert first["pending_quarter_delivery"]["report_sent"] is False
     backup_send.assert_not_awaited()
 
@@ -838,7 +923,10 @@ async def test_rotation_retries_report_before_marking_delivery(
     assert bot.send_message.await_count == 2
     backup_send.assert_awaited_once()
     assert second["last_report_sent"] == "2026-Q3"
-    assert isinstance(second["last_backup_at"], float)
+    assert isinstance(
+        storage.load_subscription_backup_state()["last_backup_at"],
+        float,
+    )
     assert second["pending_quarter_delivery"] is None
 
 
@@ -872,7 +960,7 @@ async def test_rotation_retries_backup_without_repeating_report(
     )
 
     assert first["last_report_sent"] == "2026-Q3"
-    assert first["last_backup_at"] is None
+    assert storage.load_subscription_backup_state()["last_backup_at"] is None
     assert first["pending_quarter_delivery"]["report_sent"] is True
 
     second = await handlers.rotate_quarter_if_needed(
@@ -885,5 +973,8 @@ async def test_rotation_retries_backup_without_repeating_report(
     bot.send_message.assert_awaited_once()
     assert backup_send.await_count == 2
     assert second["last_report_sent"] == "2026-Q3"
-    assert isinstance(second["last_backup_at"], float)
+    assert isinstance(
+        storage.load_subscription_backup_state()["last_backup_at"],
+        float,
+    )
     assert second["pending_quarter_delivery"] is None

@@ -11,6 +11,9 @@
 
 import asyncio
 import json
+import math
+import time
+import uuid
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -39,6 +42,31 @@ from utils import (
 _restorable_state_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
     weakref.WeakKeyDictionary()
 )
+
+_BACKUP_SCHEDULE_KEY = "backup_schedule"
+_BACKUP_SCHEDULE_VERSION = 1
+
+
+class SubscriptionBackupStateError(ValueError):
+    """Состояние отложенного подписочного бэкапа повреждено."""
+
+
+@dataclass
+class SubscriberState:
+    """Подписчики вместе с атомарно публикуемым состоянием их бэкапа."""
+
+    subscribers: dict[int, str]
+    backup_schedule: dict
+    schedule_missing: bool = False
+    schedule_malformed: bool = False
+
+
+@dataclass(frozen=True)
+class SubscriptionMutation:
+    """Результат идемпотентного изменения подписки."""
+
+    changed: bool
+    subscriber_count: int
 
 
 def _restorable_state_lock() -> asyncio.Lock:
@@ -113,30 +141,256 @@ def subscribers_from_payload(payload: object) -> dict[int, str]:
         raise ValueError("ключ подписчика должен быть числовым ID") from e
 
 
+def _empty_backup_schedule() -> dict:
+    """Каноническое пустое состояние автоматических бэкапов."""
+    return {
+        "version": _BACKUP_SCHEDULE_VERSION,
+        "last_backup_at": None,
+        "weekly_started_at": None,
+        "pending": None,
+    }
+
+
+def _valid_stored_timestamp(value: object) -> bool:
+    """Допустимо ли число как сохранённая UTC-метка без оценки будущего."""
+    return (
+        value is None
+        or (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and value >= 0
+        )
+    )
+
+
+def _pending_subscription_backup_from_payload(payload: object) -> dict | None:
+    """Проверить канонический накопленный batch подписочного бэкапа."""
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or set(payload) != {
+        "subscriptions",
+        "unsubscriptions",
+        "counts_known",
+        "token",
+    }:
+        raise SubscriptionBackupStateError("неожиданная структура pending")
+    subscriptions = payload.get("subscriptions")
+    unsubscriptions = payload.get("unsubscriptions")
+    counts_known = payload.get("counts_known")
+    token = payload.get("token")
+    if (
+        isinstance(subscriptions, bool)
+        or not isinstance(subscriptions, int)
+        or subscriptions < 0
+        or isinstance(unsubscriptions, bool)
+        or not isinstance(unsubscriptions, int)
+        or unsubscriptions < 0
+        or not isinstance(counts_known, bool)
+        or not isinstance(token, str)
+        or not token
+        or len(token) > 128
+        or (counts_known and subscriptions + unsubscriptions == 0)
+    ):
+        raise SubscriptionBackupStateError("некорректное значение pending")
+    return {
+        "subscriptions": subscriptions,
+        "unsubscriptions": unsubscriptions,
+        "counts_known": counts_known,
+        "token": token,
+    }
+
+
+def backup_schedule_from_payload(payload: object) -> dict:
+    """Строго проверить актуальную схему автоматических бэкапов."""
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "last_backup_at",
+        "weekly_started_at",
+        "pending",
+    }:
+        raise SubscriptionBackupStateError("неожиданная структура backup_schedule")
+    if payload.get("version") != _BACKUP_SCHEDULE_VERSION:
+        raise SubscriptionBackupStateError("неподдерживаемая версия backup_schedule")
+    if not _valid_stored_timestamp(payload.get("last_backup_at")):
+        raise SubscriptionBackupStateError("некорректный last_backup_at")
+    if not _valid_stored_timestamp(payload.get("weekly_started_at")):
+        raise SubscriptionBackupStateError("некорректный weekly_started_at")
+    return {
+        "version": _BACKUP_SCHEDULE_VERSION,
+        "last_backup_at": payload.get("last_backup_at"),
+        "weekly_started_at": payload.get("weekly_started_at"),
+        "pending": _pending_subscription_backup_from_payload(payload.get("pending")),
+    }
+
+
+def subscriber_state_from_payload(
+    payload: object,
+    *,
+    strict_schedule: bool = False,
+) -> SubscriberState:
+    """Разобрать подписчиков и совместимое состояние их бэкапа."""
+    subscribers = subscribers_from_payload(payload)
+    if not isinstance(payload, dict):
+        raise ValueError("состояние подписчиков должно быть объектом")
+    if _BACKUP_SCHEDULE_KEY not in payload:
+        return SubscriberState(
+            subscribers,
+            _empty_backup_schedule(),
+            schedule_missing=True,
+        )
+    try:
+        schedule = backup_schedule_from_payload(payload.get(_BACKUP_SCHEDULE_KEY))
+    except SubscriptionBackupStateError:
+        if strict_schedule:
+            raise
+        log.error("Состояние подписочного бэкапа повреждено; требуется recovery backup.")
+        schedule = _empty_backup_schedule()
+        schedule["pending"] = {
+            "subscriptions": 0,
+            "unsubscriptions": 0,
+            "counts_known": False,
+            "token": uuid.uuid4().hex,
+        }
+        return SubscriberState(
+            subscribers,
+            schedule,
+            schedule_malformed=True,
+        )
+    return SubscriberState(subscribers, schedule)
+
+
+def load_subscriber_state(*, strict_subscribers: bool = False) -> SubscriberState:
+    """Загрузить полный subscriber-state с безопасным recovery расписания."""
+    path = Path(SUBS_FILE)
+    if not path.exists():
+        return SubscriberState(
+            {},
+            _empty_backup_schedule(),
+            schedule_missing=True,
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return subscriber_state_from_payload(payload)
+    except (json.JSONDecodeError, OSError, ValueError):
+        if strict_subscribers:
+            raise
+        log.warning("Не удалось прочитать %s, начинаем с пустого списка.", SUBS_FILE)
+        return SubscriberState(
+            {},
+            _empty_backup_schedule(),
+            schedule_missing=True,
+        )
+
+
+def load_subscription_backup_state() -> dict:
+    """Вернуть независимый снимок durable-расписания автоматических бэкапов."""
+    state = load_subscriber_state()
+    return json.loads(json.dumps(state.backup_schedule))
+
+
+def subscriber_state_json(state: SubscriberState) -> str:
+    """Сериализовать единый subscriber-state без потери backup metadata."""
+    schedule = backup_schedule_from_payload(state.backup_schedule)
+    return json.dumps(
+        {
+            "subscribers": {
+                str(key): value
+                for key, value in state.subscribers.items()
+            },
+            _BACKUP_SCHEDULE_KEY: schedule,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def save_subscriber_state(state: SubscriberState) -> None:
+    """Атомарно опубликовать подписчиков и состояние их бэкапа."""
+    _atomic_write(SUBS_FILE, subscriber_state_json(state))
+    state.schedule_missing = False
+    state.schedule_malformed = False
+
+
+def _legacy_weekly_anchor(now: float | None = None) -> float | None:
+    """Взять старую плановую метку только как начало weekly-интервала."""
+    path = Path(STATS_CURRENT_FILE)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = payload.get("last_backup_at") if isinstance(payload, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+    if (
+        not _valid_stored_timestamp(value)
+        or value is None
+        or (now is not None and value > now)
+    ):
+        return None
+    return float(value)
+
+
+def ensure_backup_schedule(state: SubscriberState, *, now: float | None = None) -> bool:
+    """Мигрировать legacy/recovery состояние в канонический durable-вид."""
+    changed = state.schedule_missing or state.schedule_malformed
+    if state.schedule_missing:
+        anchor = _legacy_weekly_anchor(now)
+        state.backup_schedule["weekly_started_at"] = anchor if anchor is not None else now
+    return changed
+
+
+async def mutate_subscription(
+    chat_id: int,
+    name: str,
+    *,
+    subscribed: bool,
+) -> SubscriptionMutation:
+    """Атомарно изменить подписчика и накопить соответствующий backup delta."""
+    async with restorable_state_transaction():
+        state = load_subscriber_state(strict_subscribers=True)
+        ensure_backup_schedule(state, now=time.time())
+        changed = (chat_id not in state.subscribers) if subscribed else (chat_id in state.subscribers)
+        if not changed:
+            if state.schedule_missing or state.schedule_malformed:
+                save_subscriber_state(state)
+            return SubscriptionMutation(False, len(state.subscribers))
+
+        if subscribed:
+            state.subscribers[chat_id] = name
+        else:
+            state.subscribers.pop(chat_id)
+
+        pending = state.backup_schedule.get("pending")
+        if pending is None:
+            pending = {
+                "subscriptions": 0,
+                "unsubscriptions": 0,
+                "counts_known": True,
+                "token": uuid.uuid4().hex,
+            }
+        else:
+            pending = dict(pending)
+        key = "subscriptions" if subscribed else "unsubscriptions"
+        pending[key] += 1
+        state.backup_schedule["pending"] = pending
+        save_subscriber_state(state)
+        return SubscriptionMutation(True, len(state.subscribers))
+
+
 def load_subscribers() -> dict[int, str]:
     """
     Загружаем подписчиков из JSON.
     Формат хранилища: {"subscribers": {"123456": "Имя", "789012": "Имя2"}}
     Возвращаем dict[chat_id: int, name: str].
     """
-    path = Path(SUBS_FILE)
-    if path.exists():
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            return subscribers_from_payload(payload)
-        except (json.JSONDecodeError, OSError, ValueError):
-            log.warning("Не удалось прочитать %s, начинаем с пустого списка.", SUBS_FILE)
-    return {}
+    return load_subscriber_state().subscribers
 
 
-def _load_subscribers_for_access_recovery() -> dict[int, str]:
-    """Строго загрузить подписчиков для fail-safe сверки при запуске."""
-    path = Path(SUBS_FILE)
-    if not path.exists():
-        return {}
+def _load_subscriber_state_for_access_recovery() -> SubscriberState:
+    """Строго загрузить subscriber-state для fail-safe access-сверки."""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return subscribers_from_payload(payload)
+        return load_subscriber_state(strict_subscribers=True)
     except (json.JSONDecodeError, OSError, ValueError) as e:
         log.error(
             "access-control: подписчики недоступны для сверки при запуске: %s",
@@ -147,12 +401,16 @@ def _load_subscribers_for_access_recovery() -> dict[int, str]:
         ) from e
 
 
+def _load_subscribers_for_access_recovery() -> dict[int, str]:
+    """Строго загрузить подписчиков для обратной совместимости helper API."""
+    return _load_subscriber_state_for_access_recovery().subscribers
+
+
 def save_subscribers(subs: dict[int, str]) -> None:
-    """Сохраняем подписчиков в JSON (атомарно)."""
-    _atomic_write(
-        SUBS_FILE,
-        json.dumps({"subscribers": {str(k): v for k, v in subs.items()}}, ensure_ascii=False, indent=2),
-    )
+    """Сохранить подписчиков, не меняя durable backup metadata."""
+    state = load_subscriber_state()
+    state.subscribers = dict(subs)
+    save_subscriber_state(state)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -250,12 +508,16 @@ def save_blocked_users(blocked: set[int]) -> None:
     _atomic_write(BLOCKED_USERS_FILE, _blocked_users_json(blocked))
 
 
-def _subscribers_json(subscribers: dict[int, str]) -> str:
+def _subscribers_json(
+    subscribers: dict[int, str],
+    backup_schedule: dict | None = None,
+) -> str:
     """Сериализовать подписчиков для общей access-control транзакции."""
-    return json.dumps(
-        {"subscribers": {str(k): v for k, v in subscribers.items()}},
-        ensure_ascii=False,
-        indent=2,
+    return subscriber_state_json(
+        SubscriberState(
+            dict(subscribers),
+            backup_schedule or _empty_backup_schedule(),
+        )
     )
 
 
@@ -310,7 +572,8 @@ async def add_blocked_user(user_id: int) -> tuple[bool, bool]:
         raise ValueError("OWNER_ID нельзя заблокировать")
     async with restorable_state_transaction():
         blocked = load_blocked_users()
-        subscribers = _load_subscribers_for_access_recovery()
+        subscriber_state = _load_subscriber_state_for_access_recovery()
+        subscribers = subscriber_state.subscribers
         added = user_id not in blocked
         subscriber_removed = user_id in subscribers
         if not added and not subscriber_removed:
@@ -321,7 +584,10 @@ async def add_blocked_user(user_id: int) -> tuple[bool, bool]:
         }
         if subscriber_removed:
             subscribers.pop(user_id)
-            payloads[Path(SUBS_FILE)] = _subscribers_json(subscribers)
+            payloads[Path(SUBS_FILE)] = _subscribers_json(
+                subscribers,
+                subscriber_state.backup_schedule,
+            )
         _publish_access_state(payloads)
         return added, subscriber_removed
 
@@ -334,13 +600,15 @@ async def reconcile_blocked_subscribers() -> set[int]:
     """
     async with restorable_state_transaction():
         blocked = load_blocked_users()
-        subscribers = _load_subscribers_for_access_recovery()
+        subscriber_state = _load_subscriber_state_for_access_recovery()
+        subscribers = subscriber_state.subscribers
         stale_ids = blocked.intersection(subscribers)
         if not stale_ids:
             return set()
         for user_id in stale_ids:
             subscribers.pop(user_id)
-        save_subscribers(subscribers)
+        subscriber_state.subscribers = subscribers
+        save_subscriber_state(subscriber_state)
         log.warning(
             "access-control: при запуске удалены подписки заблокированных ID: %s",
             sorted(stale_ids),
@@ -751,7 +1019,6 @@ def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict
         "period_start": qs,
         "tracking_since": tracking_since or qs,
         "last_report_sent": None,
-        "last_backup_at": None,   # время последнего авто-бэкапа (для еженедельной отправки)
         "pending_quarter_delivery": None,
         "events": [],   # [{id, media, event, score, recorded_at}]
     }
@@ -773,8 +1040,6 @@ def load_stats_current() -> dict:
                 # Бэкофилл для файлов, созданных до появления поля tracking_since
                 if "tracking_since" not in data:
                     data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
-                # Бэкофилл для файлов до появления last_backup_at (еженедельный авто-бэкап)
-                data.setdefault("last_backup_at", None)
                 data.setdefault("pending_quarter_delivery", None)
                 return data
             log.warning("load_stats_current: неожиданная структура, сбрасываем.")
