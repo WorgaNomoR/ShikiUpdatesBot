@@ -395,6 +395,8 @@ def _prepare_access_restore_candidate(pending: dict[str, str]) -> dict[str, str]
         subscriber_state = load_subscriber_state(strict_subscribers=True)
         subscribers = subscriber_state.subscribers
         publish_subscribers = any(user_id in subscribers for user_id in blocked)
+        if publish_subscribers and subscriber_state.schedule_missing:
+            ensure_backup_schedule(subscriber_state, now=time.time())
 
     filtered = {
         chat_id: name

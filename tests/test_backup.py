@@ -18,6 +18,7 @@ from unittest.mock import (
     AsyncMock,
     Mock,
 )
+from uuid import uuid4
 
 import aiohttp
 import pytest
@@ -294,7 +295,7 @@ async def test_restore_roundtrips_subscription_pending_schedule(backup_env):
                 "subscriptions": 3,
                 "unsubscriptions": 1,
                 "counts_known": True,
-                "token": "restored-batch",
+                "token": uuid4().hex,
             },
         },
     )
@@ -916,7 +917,7 @@ async def test_restore_during_subscription_send_is_not_acknowledged(
                 "subscriptions": 4,
                 "unsubscriptions": 2,
                 "counts_known": True,
-                "token": "restored-batch",
+                "token": uuid4().hex,
             },
         },
     )
@@ -947,7 +948,7 @@ async def test_missing_stale_and_future_timestamp_make_pending_eligible(
         "subscriptions": 1,
         "unsubscriptions": 0,
         "counts_known": True,
-        "token": "batch",
+        "token": uuid4().hex,
     }
     _save_subscriber_schedule(
         {7: "Neo"},
@@ -1134,7 +1135,7 @@ async def test_manual_backup_does_not_change_automatic_schedule(backup_env):
         "subscriptions": 2,
         "unsubscriptions": 1,
         "counts_known": True,
-        "token": "batch",
+        "token": uuid4().hex,
     }
     _save_subscriber_schedule(
         {7: "Neo"},
@@ -1158,16 +1159,17 @@ async def test_shutdown_backup_sends_when_no_recent(backup_env, monkeypatch):
             "subscriptions": 1,
             "unsubscriptions": 0,
             "counts_known": True,
-            "token": "batch",
+            "token": uuid4().hex,
         },
     )
     before = storage.load_subscription_backup_state()
-    sent = AsyncMock(return_value=True)
-    monkeypatch.setattr("backup.send_backup", sent)
     monkeypatch.setattr("backup._last_backup_sent_at", None)
-    await backup._shutdown_backup(AsyncMock())
-    sent.assert_awaited_once()
-    caption = sent.call_args.args[1]
+    bot = AsyncMock()
+
+    await backup._shutdown_backup(bot)
+
+    bot.send_document.assert_awaited_once()
+    caption = bot.send_document.await_args.kwargs["caption"]
     assert backup.BACKUP_TAG in caption
     assert "SIGTERM" in caption
     assert storage.load_subscription_backup_state() == before
@@ -1384,8 +1386,23 @@ async def test_restore_filters_subscribers_against_candidate_blocked_users(backu
 
 
 @pytest.mark.asyncio
-async def test_restore_blocked_users_alone_removes_current_subscriber(backup_env):
-    storage.save_subscribers({7: "Blocked", 8: "Allowed"})
+async def test_restore_blocked_users_alone_preserves_legacy_weekly_anchor(
+    backup_env,
+    monkeypatch,
+):
+    legacy_anchor = 1_900_000_000.0
+    monkeypatch.setattr(backup.time, "time", lambda: 2_000_000_000.0)
+    storage.SUBS_FILE.write_text(
+        '{"subscribers": {"7": "Blocked", "8": "Allowed"}}',
+        encoding="utf-8",
+    )
+    storage.save_stats_current(
+        {
+            "period": "2026-Q2",
+            "events": [],
+            "last_backup_at": legacy_anchor,
+        }
+    )
 
     result = await backup.restore_backup_zip(
         _zip_bytes({"blocked_users.json": '{"blocked_user_ids": [7]}'})
@@ -1393,6 +1410,10 @@ async def test_restore_blocked_users_alone_removes_current_subscriber(backup_env
 
     assert set(result["restored"]) == {"blocked_users.json", "subscribers.json"}
     assert storage.load_subscribers() == {8: "Allowed"}
+    schedule = storage.load_subscription_backup_state()
+    assert schedule["last_backup_at"] is None
+    assert schedule["weekly_started_at"] == legacy_anchor
+    assert schedule["pending"] is None
 
 
 @pytest.mark.asyncio

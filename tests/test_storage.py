@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -661,7 +662,7 @@ def test_legacy_subscriber_writer_preserves_backup_schedule(backup_env):
                 "subscriptions": 2,
                 "unsubscriptions": 1,
                 "counts_known": True,
-                "token": "batch",
+                "token": uuid4().hex,
             },
         },
     )

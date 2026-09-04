@@ -5,6 +5,7 @@ from unittest.mock import (
     AsyncMock,
     MagicMock,
 )
+from uuid import uuid4
 
 import pytest
 
@@ -769,7 +770,7 @@ async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
         "subscriptions": 2,
         "unsubscriptions": 1,
         "counts_known": True,
-        "token": "quarter-survivor",
+        "token": uuid4().hex,
     }
     storage.save_subscriber_state(
         storage.SubscriberState(
