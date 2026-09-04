@@ -18,6 +18,11 @@ import shiki_api
 import stats as smod
 import storage
 from handlers import check_and_notify_favourites
+from report_delivery import ReportDeliveryResult
+from report_model import (
+    plain_report,
+    rendered_html,
+)
 from storage import (
     load_seen_favourites,
     save_seen_favourites,
@@ -438,7 +443,7 @@ def test_build_favourites_messages_has_ranobe_and_industry_blocks():
     stats = storage._empty_stats_all()
     stats["favourites"]["ranobe"] = [{"id": "1", "title": "Ранобэ-тайтл", "url": ""}]
     stats["favourites"]["people"] = [{"id": "2", "title": "Человек", "url": ""}]
-    msg = smod.build_favourites_messages(stats)[0]
+    msg = rendered_html(smod.build_favourites_messages(stats))[0]
     assert "Ранобэ" in msg
     assert "Люди индустрии" in msg
 
@@ -673,10 +678,15 @@ async def test_check_and_notify_favourites_explicit_none_skips_without_refetch(
 async def test_cmd_favs_sends_report_with_preview_disabled(monkeypatch):
     """Успех: строит отчёт по избранному и шлёт его с disable_preview=True
     (у избранного длинные списки — превью-ссылки только мусорят)."""
-    monkeypatch.setattr(handlers, "_stats_report_favourites",
-                        AsyncMock(return_value=["fav-1", "fav-2"]))
+    report = plain_report("fav")
+    monkeypatch.setattr(
+        handlers,
+        "_stats_report_favourites",
+        AsyncMock(return_value=report),
+    )
     send = AsyncMock()
-    monkeypatch.setattr(handlers, "_send_stats_reports", send)
+    send.return_value = ReportDeliveryResult(True, 1, 1)
+    monkeypatch.setattr(handlers, "deliver_report", send)
 
     msg = MagicMock()
     msg.bot = MagicMock()
@@ -688,7 +698,7 @@ async def test_cmd_favs_sends_report_with_preview_disabled(monkeypatch):
     send.assert_awaited_once()
     args, kwargs = send.call_args
     assert args[0] is msg.bot and args[1] == 777
-    assert args[2] == ["fav-1", "fav-2"]          # именно построенный отчёт
+    assert args[2] is report
     assert kwargs.get("disable_preview") is True
     msg.answer.assert_not_awaited()               # ошибок не было
 
@@ -699,7 +709,7 @@ async def test_cmd_favs_reports_error_and_skips_send(monkeypatch):
     monkeypatch.setattr(handlers, "_stats_report_favourites",
                         AsyncMock(side_effect=RuntimeError("boom")))
     send = AsyncMock()
-    monkeypatch.setattr(handlers, "_send_stats_reports", send)
+    monkeypatch.setattr(handlers, "deliver_report", send)
 
     msg = MagicMock()
     msg.answer = AsyncMock()

@@ -5,9 +5,8 @@
 (_collect_favourites), фильтр мусора по kind, metadata-retry в sync_stats_all,
 и smoke-тесты билдеров отчётов.
 
-Форматтеры отчётов (messages._fmt_mono_rows / _top_block / _score_dist_block
-и т.п.) тестируются здесь же — низкоуровневые хелперы рендера отчётов stats,
-живут рядом со своими потребителями.
+Report builders тестируются здесь как чистые producers типизированной модели;
+HTML rendering и chunking имеют отдельный авторитетный test_report_model.py.
 
 Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
@@ -30,6 +29,13 @@ import shiki_api
 import stats as smod
 import storage
 import utils
+from report_model import (
+    Bold,
+    Link,
+    Report,
+    Text,
+    rendered_html,
+)
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
@@ -47,59 +53,6 @@ def _export_manga_row(tid, status="completed", chapters=1):
             "target_title_ru": "x", "score": 0, "status": status,
             "rewatches": 0, "chapters": chapters, "volumes": 0}
 
-
-# ════════════════════════════════════════════════════════════════
-#  Форматтеры
-# ════════════════════════════════════════════════════════════════
-
-def test_section_header():
-    assert messages._section_header("🎬", "АНИМЕ") == "<b>━━━━━ 🎬 АНИМЕ ━━━━━</b>"
-
-def test_fmt_mono_rows_empty():
-    assert messages._fmt_mono_rows([]) == ""
-
-def test_fmt_mono_rows_basic_alignment():
-    out = messages._fmt_mono_rows([("Экшен", 66), ("Триллер", 45)])
-    assert "<code>" in out and "</code>" in out
-    assert "66" in out and "45" in out
-
-def test_fmt_mono_rows_percent():
-    out = messages._fmt_mono_rows([("Экшен", 50)], show_percent=True, total=100)
-    assert "50%" in out
-
-def test_fmt_mono_rows_percent_skipped_without_total():
-    out = messages._fmt_mono_rows([("Экшен", 50)], show_percent=True, total=0)
-    assert "%" not in out
-
-def test_fmt_mono_rows_html_escape():
-    out = messages._fmt_mono_rows([("A & B", 5)])
-    assert "&amp;" in out
-
-def test_top_block_empty_counter():
-    assert messages._top_block("🎭", "Жанры", {}, 8) == []
-
-def test_top_block_structure():
-    block = messages._top_block("🎨", "Студии", {"MAPPA": 12, "Bones": 9}, 6)
-    assert len(block) == 2
-    assert "Студии" in block[0]
-    assert "<code>" in block[1]
-
-def test_score_dist_block_empty():
-    assert messages._score_dist_block({}) == []
-
-def test_score_dist_block_star_marker_and_order():
-    # score_dist: оценка -> сколько раз; нули (без оценки) игнорируются
-    block = messages._score_dist_block({"10": 5, "9": 8, "0": 3})
-    body = block[1]
-    assert "★10" in body and "★9" in body
-    assert "★0" not in body  # нулевая оценка не показывается
-    # порядок по убыванию: ★10 раньше ★9
-    assert body.index("★10") < body.index("★9")
-
-def test_fmt_kinds_order_and_skip_zero():
-    out = messages._fmt_kinds({"tv": 61, "movie": 36, "ova": 0}, smod._KIND_RU_ANIME)
-    assert "Сериалы 61" in out and "Фильмы 36" in out
-    assert "OVA" not in out  # ноль пропускается
 
 def test_avg_score_from_dist():
     # (10*1 + 8*2) / 3 = 8.67
@@ -611,18 +564,17 @@ def _populated_stats():
     ]
     return stats
 
-def test_smoke_build_stats_all_returns_list():
-    msgs = smod.build_stats_all_messages(_populated_stats())
-    assert isinstance(msgs, list)
-    assert all(isinstance(m, str) for m in msgs)
-    assert msgs  # непустой
+def test_smoke_build_stats_all_returns_report():
+    report = smod.build_stats_all_messages(_populated_stats())
+    assert isinstance(report, Report)
+    assert rendered_html(report)
 
 
 def test_stats_all_normalizes_aware_updated_at_to_utc_date():
     stats = _populated_stats()
     stats["updated_at"] = "2026-08-06T01:30:00+03:00"
 
-    message = smod.build_stats_all_messages(stats)[0]
+    message = rendered_html(smod.build_stats_all_messages(stats))[0]
 
     assert "актуально на 05.08.2026" in message
     assert "актуально на 06.08.2026" not in message
@@ -636,22 +588,36 @@ def test_stats_all_translates_ranobe_kinds(kind):
         "kinds": {"manga": 1, kind: 3},
     })
 
-    manga_message = smod.build_stats_all_messages(stats)[1]
+    manga_message = rendered_html(smod.build_stats_all_messages(stats))[1]
 
     assert "Манга" in manga_message
     assert "Ранобэ" in manga_message
     assert "light_novel" not in manga_message
     assert "ranobe" not in manga_message
 
-def test_smoke_build_favourites_returns_list():
-    msgs = smod.build_favourites_messages(_populated_stats())
-    assert isinstance(msgs, list) and all(isinstance(m, str) for m in msgs)
+def test_smoke_build_favourites_returns_report():
+    assert isinstance(smod.build_favourites_messages(_populated_stats()), Report)
 
-def test_smoke_build_current_returns_list():
+
+def test_favourites_keep_untrusted_values_plain_until_renderer_boundary():
+    stats = storage._empty_stats_all()
+    stats["favourites"]["anime"] = [{
+        "title": "A <B> & C",
+        "url": '/animes/1?x=1&label="quoted"',
+    }]
+
+    report = smod.build_favourites_messages(stats)
+    title_node = report.units[0].sections[1].items[1].parts[1]
+
+    assert title_node == Link(
+        "A <B> & C",
+        'https://shikimori.io/animes/1?x=1&label="quoted"',
+    )
+
+def test_smoke_build_current_returns_report():
     cur = {"period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
            "tracking_since": "2026-04-01T00:00:00", "events": []}
-    msgs = smod.build_current_stats_messages(cur, _populated_stats())
-    assert isinstance(msgs, list) and all(isinstance(m, str) for m in msgs)
+    assert isinstance(smod.build_current_stats_messages(cur, _populated_stats()), Report)
 
 
 def test_current_and_quarterly_reports_keep_distinct_structure():
@@ -665,11 +631,20 @@ def test_current_and_quarterly_reports_keep_distinct_structure():
         {"period": "2026-Q1", "anime_completed": 1, "manga_completed": 0},
     )
 
-    assert len(current) == 2
-    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" not in current[0]
-    assert len(quarterly) == 3
-    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in quarterly[0]
-    assert "Сравнение" in quarterly[2]
+    assert len(current.units) == 2
+    assert current.units[0].sections[0].items[0].parts == (
+        Text("📊 "),
+        Bold("Статистика с 01.04.2026 по 30.06.2026"),
+    )
+    assert len(quarterly.units) == 3
+    assert quarterly.units[0].sections[0].items[0].parts == (
+        Text("📊 "),
+        Bold("КВАРТАЛЬНЫЙ ОТЧЁТ"),
+    )
+    assert quarterly.units[2].sections[0].items[0].parts == (
+        Text("📈 "),
+        Bold("Сравнение с январь — март 2026:"),
+    )
 
 
 def test_quarter_report_links_contain_canonical_domain_once():
@@ -694,13 +669,11 @@ def test_quarter_report_links_contain_canonical_domain_once():
     }
 
     reports = (
-        smod.build_current_stats_messages(cur, stats),
-        smod.build_quarterly_report_messages(cur, stats, prev_quarter=None),
+        rendered_html(smod.build_current_stats_messages(cur, stats)),
+        rendered_html(smod.build_quarterly_report_messages(cur, stats, prev_quarter=None)),
     )
 
     for messages_list in reports:
-        assert isinstance(messages_list, list)
-        assert all(isinstance(message, str) for message in messages_list)
         hrefs = re.findall(r'href="([^"]*)"', "\n".join(messages_list))
         assert hrefs == [
             "https://shikimori.io/animes/790-ergo-proxy",
@@ -762,10 +735,10 @@ def test_quarter_reports_treat_non_list_events_as_empty(invalid_events):
            "tracking_since": "2026-04-01T00:00:00", "events": invalid_events}
 
     prepared = smod._prepare_quarter_report(cur, _populated_stats())
-    current = smod.build_current_stats_messages(cur, _populated_stats())
-    quarterly = smod.build_quarterly_report_messages(
+    current = rendered_html(smod.build_current_stats_messages(cur, _populated_stats()))
+    quarterly = rendered_html(smod.build_quarterly_report_messages(
         cur, _populated_stats(), prev_quarter=None,
-    )
+    ))
 
     assert prepared == {
         "anime": {"completed": [], "dropped": [], "planned": 0},
@@ -773,7 +746,6 @@ def test_quarter_reports_treat_non_list_events_as_empty(invalid_events):
     }
     assert len(current) == 2
     assert len(quarterly) == 2
-    assert all(isinstance(message, str) for message in current + quarterly)
 
 
 def test_quarter_reports_normalize_event_id_and_score_fields():
@@ -807,8 +779,8 @@ def test_quarter_reports_normalize_event_id_and_score_fields():
 
     prepared = smod._prepare_quarter_report(cur, stats)
     reports = (
-        smod.build_current_stats_messages(cur, stats),
-        smod.build_quarterly_report_messages(cur, stats, prev_quarter=None),
+        rendered_html(smod.build_current_stats_messages(cur, stats)),
+        rendered_html(smod.build_quarterly_report_messages(cur, stats, prev_quarter=None)),
     )
 
     assert prepared["anime"]["completed"] == [{
@@ -816,15 +788,13 @@ def test_quarter_reports_normalize_event_id_and_score_fields():
         "score": 9,
     }]
     for messages_list in reports:
-        assert isinstance(messages_list, list)
-        assert all(isinstance(message, str) for message in messages_list)
         assert "Средняя оценка: <b>9.0</b>" in messages_list[0]
 
 def test_smoke_empty_stats_no_crash():
     # Пустая структура не должна ронять билдеры
     empty = storage._empty_stats_all()
-    assert smod.build_stats_all_messages(empty)
-    assert smod.build_favourites_messages(empty)
+    assert isinstance(smod.build_stats_all_messages(empty), Report)
+    assert isinstance(smod.build_favourites_messages(empty), Report)
 
 @pytest.mark.asyncio
 async def test_smoke_async_report_builders(monkeypatch):
@@ -834,8 +804,8 @@ async def test_smoke_async_report_builders(monkeypatch):
         "tracking_since": "2026-04-01T00:00:00", "events": []})
     for builder in (handlers._stats_report_all, handlers._stats_report_current,
                     handlers._stats_report_favourites):
-        msgs = await builder()
-        assert isinstance(msgs, list) and all(isinstance(m, str) for m in msgs)
+        report = await builder()
+        assert isinstance(report, Report)
 
 
 # ── Регрессия: ссылки содержат домен РОВНО один раз (нет двойного домена) ──
@@ -846,7 +816,7 @@ def test_links_single_domain_in_favourites():
     stats["favourites"]["anime"] = [
         {"id": "1", "title": "Тест", "url": "https://shikimori.io/animes/226", "score": 10}
     ]
-    msg = smod.build_favourites_messages(stats)[0]
+    msg = rendered_html(smod.build_favourites_messages(stats))[0]
     # Домен должен встречаться ровно один раз в href
     hrefs = re.findall(r'href="([^"]*)"', msg)
     assert hrefs, "должна быть ссылка"

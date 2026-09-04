@@ -304,9 +304,12 @@ def test_corrupted_blocked_users_state_never_degrades_to_empty(
 ):
     blocked_path, _subscribers_path = access_state_env
     blocked_path.write_text(payload, encoding="utf-8")
+    original = blocked_path.read_bytes()
 
     with pytest.raises(BlockedUsersStateError):
         load_blocked_users()
+
+    assert blocked_path.read_bytes() == original
 
 
 def test_owner_id_is_rejected_by_storage_save_and_check(access_state_env):

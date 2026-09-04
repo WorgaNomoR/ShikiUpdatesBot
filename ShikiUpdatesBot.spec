@@ -9,7 +9,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    copy_metadata,
+)
 
 root = Path(SPECPATH)
 sys.path.insert(0, str(root))

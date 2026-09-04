@@ -2,11 +2,16 @@
 # Copyright (C) 2026  WorgaNomoR
 """Тесты handlers: меню /stats — кнопка ❌ Закрыть, reply, удаление меню+команды."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 
 import handlers
+from report_delivery import ReportDeliveryResult
+from report_model import plain_report
 
 
 def test_stats_menu_kb_has_close_button():
@@ -53,3 +58,56 @@ async def test_stats_menu_close_answers_and_delegates_cleanup(monkeypatch):
     callback.answer.assert_awaited_once_with()
     cleanup.assert_awaited_once_with(menu)
     callback.message.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_stats_all_keeps_direct_path_and_default_preview_policy(monkeypatch):
+    report = plain_report("all-report")
+    monkeypatch.setattr(handlers, "_stats_report_all", AsyncMock(return_value=report))
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr(handlers, "deliver_report", delivery)
+    message = MagicMock()
+    message.text = "/stats all"
+    message.bot = MagicMock()
+    message.chat.id = 777
+    message.answer = AsyncMock()
+
+    await handlers.cmd_stats(message)
+
+    delivery.assert_awaited_once_with(
+        message.bot,
+        777,
+        report,
+        notify_partial=True,
+    )
+    message.reply.assert_not_called()
+    message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stats_menu_selection_keeps_cleanup_and_shared_delivery(monkeypatch):
+    report = plain_report("current-report")
+    builder = AsyncMock(return_value=report)
+    monkeypatch.setitem(handlers._STATS_BUILDERS, "current", builder)
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr(handlers, "deliver_report", delivery)
+    callback = MagicMock()
+    callback.data = "stats:current"
+    callback.answer = AsyncMock()
+    callback.message.delete = AsyncMock()
+    callback.message.edit_reply_markup = AsyncMock()
+    callback.message.bot = MagicMock()
+    callback.message.chat.id = 888
+    callback.message.answer = AsyncMock()
+
+    await handlers.stats_menu_cb(callback)
+
+    callback.answer.assert_awaited_once_with()
+    callback.message.delete.assert_awaited_once_with()
+    builder.assert_awaited_once_with()
+    delivery.assert_awaited_once_with(
+        callback.message.bot,
+        888,
+        report,
+        notify_partial=True,
+    )

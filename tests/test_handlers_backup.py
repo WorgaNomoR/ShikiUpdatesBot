@@ -29,8 +29,10 @@ async def test_cmd_backup_rejects_non_owner(backup_env):
     msg = MagicMock()
     msg.from_user.id = 1  # не владелец
     msg.answer = AsyncMock()
+    msg.reply = AsyncMock()
     await handlers.cmd_backup(msg)
     msg.answer.assert_awaited_once()
+    msg.reply.assert_not_awaited()
     # меню не показано (нет reply_markup)
     assert "reply_markup" not in msg.answer.call_args.kwargs
 
