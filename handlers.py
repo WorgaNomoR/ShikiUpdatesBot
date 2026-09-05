@@ -119,6 +119,15 @@ from messages import (
     extract_score_change,
     format_rate_entry,
 )
+from report_delivery import (
+    deliver_rendered_report,
+    deliver_report,
+)
+from report_model import (
+    Report,
+    plain_report,
+    rendered_html,
+)
 from runtime import RESOURCE_ROOT
 from runtime_status import (
     RuntimeSnapshot,
@@ -374,6 +383,7 @@ async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> list[Me
 # ═══════════════════════════════════════════════════════════════════
 
 _PENDING_QUARTER_DELIVERY = "pending_quarter_delivery"
+_QUARTER_ROTATION_ATTEMPTS = 3
 
 
 def _valid_pending_quarter_delivery(cur: dict) -> dict | None:
@@ -420,10 +430,19 @@ async def _deliver_pending_quarter(bot: Bot, cur: dict) -> dict:
         return cur
 
     if not pending["report_sent"]:
-        for msg in pending["report_messages"]:
-            if not await _send_long(bot, OWNER_ID, msg):
-                return load_stats_current()
-            await asyncio.sleep(0.4)
+        result = await deliver_rendered_report(
+            bot,
+            OWNER_ID,
+            pending["report_messages"],
+        )
+        if not result.delivered:
+            log.error(
+                "rotate_quarter: отчёт остановлен после %d/%d сообщений: %s",
+                result.delivered_units,
+                result.total_units,
+                result.error,
+            )
+            return load_stats_current()
 
         async with restorable_state_transaction():
             cur = load_stats_current()
@@ -513,102 +532,87 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
         except Exception as e:
             log.error("rotate_quarter: sync_stats_all упал: %s", e)
 
-    async with restorable_state_transaction():
-        cur = load_stats_current()
-        if cur.get("period") == now_period:
-            return cur
+    for attempt in range(1, _QUARTER_ROTATION_ATTEMPTS + 1):
+        async with restorable_state_transaction():
+            cur = load_stats_current()
+            if cur.get("period") == now_period:
+                return cur
 
-        old_period = cur.get("period", "???")
-        if cur.get("last_report_sent") == now_period:
-            # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
-            log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
+            old_period = cur.get("period", "???")
+            if cur.get("last_report_sent") == now_period:
+                # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
+                log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
+                fresh = _empty_stats_current(now_period)
+                fresh["last_report_sent"] = now_period
+                save_stats_current(fresh)
+                return fresh
+
+            log.info("rotate_quarter: квартал сменился %s → %s.", old_period, now_period)
+
+            # Строим только логическую модель. Telegram HTML renderer запускается
+            # уже после освобождения restorable-state lock.
+            prev_period = previous_quarter(old_period)
+            prev_quarter = _load_prev_quarter_summary(prev_period) if prev_period else None
+            try:
+                report = build_quarterly_report_messages(cur, stats_all, prev_quarter)
+            except Exception as e:
+                log.error("rotate_quarter: build_quarterly_report_messages упал: %s", e)
+                report = plain_report(
+                    f"⚠️ Отчёт за {quarter_label(old_period)} "
+                    f"не удалось сформировать: {e}"
+                )
+            expected_cur = cur
+
+        try:
+            report_messages = rendered_html(report)
+        except Exception as e:
+            log.error("rotate_quarter: report renderer упал: %s", e)
+            report_messages = rendered_html(plain_report(
+                f"⚠️ Отчёт за {quarter_label(old_period)} "
+                f"не удалось отобразить: {e}"
+            ))
+
+        async with restorable_state_transaction():
+            cur = load_stats_current()
+            if cur != expected_cur:
+                # Новое квартальное событие могло успеть опубликоваться, пока
+                # renderer работал без lock. Перестраиваем модель без потери.
+                if attempt == _QUARTER_ROTATION_ATTEMPTS:
+                    log.warning(
+                        "rotate_quarter: состояние менялось во время %d попыток; "
+                        "ротация отложена до следующего polling-цикла.",
+                        _QUARTER_ROTATION_ATTEMPTS,
+                    )
+                    return cur
+                continue
+
+            # Снапшот квартала и новый текущий квартал публикуются под одним lock.
+            _save_quarter_snapshot(old_period, cur, stats_all)
+
+            try:
+                _update_by_quarter(stats_all, old_period, cur)
+                save_stats_all(stats_all)
+            except Exception as e:
+                log.error("rotate_quarter: обновление by_quarter: %s", e)
+
             fresh = _empty_stats_current(now_period)
-            fresh["last_report_sent"] = now_period
+            fresh[_PENDING_QUARTER_DELIVERY] = {
+                "old_period": old_period,
+                "new_period": now_period,
+                "report_messages": report_messages,
+                "report_sent": False,
+            }
             save_stats_current(fresh)
-            return fresh
-
-        log.info("rotate_quarter: квартал сменился %s → %s.", old_period, now_period)
-
-        # Сравниваем закрываемый квартал с предшествующим ему снапшотом.
-        prev_period = previous_quarter(old_period)
-        prev_quarter = _load_prev_quarter_summary(prev_period) if prev_period else None
-
-        try:
-            report_msgs = build_quarterly_report_messages(cur, stats_all, prev_quarter)
-        except Exception as e:
-            log.error("rotate_quarter: build_quarterly_report_messages упал: %s", e)
-            report_msgs = [
-                f"⚠️ Отчёт за {h(quarter_label(old_period))} "
-                f"не удалось сформировать: {h(str(e))}"
-            ]
-
-        # Снапшот квартала и новый текущий квартал публикуются под одним lock.
-        _save_quarter_snapshot(old_period, cur, stats_all)
-
-        try:
-            _update_by_quarter(stats_all, old_period, cur)
-            save_stats_all(stats_all)
-        except Exception as e:
-            log.error("rotate_quarter: обновление by_quarter: %s", e)
-
-        fresh = _empty_stats_current(now_period)
-        fresh[_PENDING_QUARTER_DELIVERY] = {
-            "old_period": old_period,
-            "new_period": now_period,
-            "report_messages": report_msgs,
-            "report_sent": False,
-        }
-        save_stats_current(fresh)
+        break
 
     return await _deliver_pending_quarter(bot, fresh)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  ОТПРАВКА ДЛИННЫХ СООБЩЕНИЙ
-# ═══════════════════════════════════════════════════════════════════
-
-async def _send_long(bot: Bot, chat_id: int, text: str,
-                     disable_preview: bool = False) -> bool:
-    """
-    Отправка с разбивкой по строкам если > 4000 символов (не рвём HTML-теги).
-
-    disable_preview — отключить превью ссылок. По умолчанию False (превью есть):
-    для большинства отчётов первая ссылка ведёт на осмысленный тайтл (топ
-    квартала), и карточка уместна. True используем для /favs, где первая
-    ссылка всегда одна и та же (первое избранное) и превью лишь мешает.
-    """
-    MAX = 4000
-    try:
-        if len(text) <= MAX:
-            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
-                                   disable_web_page_preview=disable_preview)
-            return True
-        chunks: list[str] = []
-        buf = ""
-        for line in text.splitlines(keepends=True):
-            if len(buf) + len(line) > MAX:
-                if buf:
-                    chunks.append(buf)
-                buf = line
-            else:
-                buf += line
-        if buf:
-            chunks.append(buf)
-        for chunk in chunks:
-            await bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML,
-                                   disable_web_page_preview=disable_preview)
-            await asyncio.sleep(0.5)
-        return True
-    except Exception as e:
-        log.error("_send_long: не удалось отправить (chat_id=%d): %s", chat_id, e)
-        return False
 
 
 # ═══════════════════════════════════════════════════════════════
 #  /stats — МЕНЮ С КНОПКАМИ (расширяемое)
 #
 #  Чтобы добавить новый вид отчёта:
-#    1. Написать async-builder, возвращающий list[str] (сообщения).
+#    1. Написать async-builder, возвращающий Report.
 #    2. Добавить запись в _STATS_MENU: (callback_key, label, builder, row).
 #  Всё остальное (клавиатура, обработка нажатия) работает автоматически.
 #
@@ -616,20 +620,20 @@ async def _send_long(bot: Bot, chat_id: int, text: str,
 #  (горизонтальная группа), с разным — в разные ряды (вертикаль).
 # ═══════════════════════════════════════════════════════════════
 
-async def _stats_report_current() -> list[str]:
+async def _stats_report_current() -> Report:
     """Отчёт за текущий квартал."""
     stats_all = load_stats_all()
     cur = load_stats_current()
     return build_current_stats_messages(cur, stats_all)
 
 
-async def _stats_report_all() -> list[str]:
+async def _stats_report_all() -> Report:
     """Отчёт за всё время."""
     stats_all = load_stats_all()
     return build_stats_all_messages(stats_all)
 
 
-async def _stats_report_favourites() -> list[str]:
+async def _stats_report_favourites() -> Report:
     """Отчёт по избранному (любимое). Переиспользуем для /favs и для кнопки."""
     stats_all = load_stats_all()
     return build_favourites_messages(stats_all)
@@ -665,16 +669,6 @@ def _stats_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def _send_stats_reports(bot: Bot, chat_id: int, msgs: list[str],
-                              disable_preview: bool = False) -> None:
-    """Отправляет список сообщений отчёта в чат (по сообщению на тему)."""
-    for msg in msgs:
-        if not msg or not msg.strip():
-            continue
-        await _send_long(bot, chat_id, msg, disable_preview=disable_preview)
-        await asyncio.sleep(0.3)
-
-
 async def cmd_stats(message: Message) -> None:
     """
     /stats      — показывает меню выбора отчёта (кнопки).
@@ -692,12 +686,24 @@ async def cmd_stats(message: Message) -> None:
     # Быстрый путь: /stats all — сразу полный отчёт, минуя меню (совместимость)
     if arg in ("all", "всё", "все"):
         try:
-            msgs = await _stats_report_all()
+            report = await _stats_report_all()
         except Exception as e:
             log.error("cmd_stats: формирование all: %s", e)
             await message.answer("⚠️ Не удалось сформировать статистику, попробуй позже.")
             return
-        await _send_stats_reports(message.bot, message.chat.id, msgs)
+        result = await deliver_report(
+            message.bot,
+            message.chat.id,
+            report,
+            notify_partial=True,
+        )
+        if not result.delivered:
+            log.error(
+                "cmd_stats: доставка остановлена после %d/%d частей: %s",
+                result.delivered_units,
+                result.total_units,
+                result.error,
+            )
         return
 
     # Иначе — показываем меню с кнопками. Отправляем ОТВЕТОМ на команду
@@ -779,13 +785,26 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
 
     # Строим и шлём отчёт
     try:
-        msgs = await builder()
+        report = await builder()
     except Exception as e:
         log.error("stats_menu_cb: формирование (%s): %s", key, e)
         await callback.message.answer("⚠️ Не удалось сформировать статистику, попробуй позже.")
         return
 
-    await _send_stats_reports(callback.message.bot, callback.message.chat.id, msgs)
+    result = await deliver_report(
+        callback.message.bot,
+        callback.message.chat.id,
+        report,
+        notify_partial=True,
+    )
+    if not result.delivered:
+        log.error(
+            "stats_menu_cb: доставка (%s) остановлена после %d/%d частей: %s",
+            key,
+            result.delivered_units,
+            result.total_units,
+            result.error,
+        )
 
 
 def _pick_root_keyboard() -> InlineKeyboardMarkup:
@@ -1406,12 +1425,25 @@ async def cmd_favs(message: Message) -> None:
     Доступна всем. Не делает сетевых запросов (читает файлы).
     """
     try:
-        msgs = await _stats_report_favourites()
+        report = await _stats_report_favourites()
     except Exception as e:
         log.error("cmd_favs: формирование: %s", e)
         await message.answer("⚠️ Не удалось загрузить избранное, попробуй позже.")
         return
-    await _send_stats_reports(message.bot, message.chat.id, msgs, disable_preview=True)
+    result = await deliver_report(
+        message.bot,
+        message.chat.id,
+        report,
+        disable_preview=True,
+        notify_partial=True,
+    )
+    if not result.delivered:
+        log.error(
+            "cmd_favs: доставка остановлена после %d/%d частей: %s",
+            result.delivered_units,
+            result.total_units,
+            result.error,
+        )
 
 # ═══════════════════════════════════════════════════════════════
 #  ОСНОВНАЯ ЛОГИКА

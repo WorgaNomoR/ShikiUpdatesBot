@@ -3,9 +3,9 @@
 """
 Тексты и форматирование ShikiUpdatesBot.
 
-Банк шаблонов уведомлений, парсеры описаний истории, построение сообщений
-и презентационные форматтеры отчётов. Зависит от config/utils/shiki_api;
-доменную агрегацию (stats) и хендлеры не знает — они зависят от него.
+Банк шаблонов уведомлений, парсеры описаний истории и построение коротких
+сообщений. Зависит от config/utils/shiki_api; доменную агрегацию (stats),
+типизированные отчёты и хендлеры не знает — они зависят от него.
 """
 
 import random
@@ -900,156 +900,6 @@ def build_favourite_message(category: str, item: dict) -> str:
     return text
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  ФОРМАТТЕРЫ ОТЧЁТОВ (общий вид для /stats и квартального отчёта)
-# ═══════════════════════════════════════════════════════════════════
-
-def _top_dict(counter: dict, n: int) -> list[tuple[str, int]]:
-    """Топ-N пар (ключ, count) по убыванию."""
-    return sorted(counter.items(), key=lambda x: x[1], reverse=True)[:n]
-
-
-def _fmt_counter(counter: dict, n: int, sep: str = "  ·  ") -> str:
-    """'Экшен (34) · Драма (28)'. Оставлено для совместимости/коротких строк."""
-    return sep.join(f"{h(k)} ({v})" for k, v in _top_dict(counter, n))
-
-
-def _section_header(emoji: str, title: str) -> str:
-    """Акцентированный заголовок архиблока: '━━━━━ 🎬 АНИМЕ ━━━━━' (жирный)."""
-    line = "━" * 5
-    return f"<b>{line} {emoji} {h(title)} {line}</b>"
-
-
-def _fmt_mono_rows(pairs: list[tuple[str, int]], show_percent: bool = False,
-                   total: int = 0) -> str:
-    """
-    Моноширинный блок с выровненными колонками и точками-лидерами:
-        Экшен ······· 66  46%
-        Триллер ····· 45  31%
-    pairs — [(имя, число), ...] (уже отсортированные, обрезанные).
-    show_percent — добавить долю от total (только если total > 0).
-    Возвращает строку в <code>...</code> или '' если pairs пуст.
-
-    Кириллица и латиница в моноширинном Telegram занимают 1 знак,
-    поэтому выравнивание по len() корректно.
-    """
-    if not pairs:
-        return ""
-    name_w = max(len(name) for name, _ in pairs)
-    num_w  = max(len(str(c)) for _, c in pairs)
-    rows = []
-    for name, count in pairs:
-        dots = "·" * (name_w - len(name) + 1)
-        num_str = str(count).rjust(num_w)
-        line = f"{name} {dots} {num_str}"
-        if show_percent and total > 0:
-            line += f"  {round(count / total * 100)}%"
-        rows.append(line)
-    return f"<code>{h(chr(10).join(rows))}</code>"
-
-
-def _top_block(emoji: str, title: str, counter: dict, n: int,
-               show_percent: bool = False, total: int = 0) -> list[str]:
-    """
-    Полный блок топа: заголовок-строка + моноширинные колонки.
-    Возвращает список строк (для extend) или [] если counter пуст.
-    """
-    pairs = _top_dict(counter, n)
-    if not pairs:
-        return []
-    body = _fmt_mono_rows(pairs, show_percent=show_percent, total=total)
-    if not body:
-        return []
-    return [f"{emoji} <b>{h(title)}</b>", body]
-
-
-def _fmt_kinds(kinds: dict, labels: dict) -> str:
-    """Разбивка по типам: 'Сериалы 95 · Фильмы 12 · OVA 8'.
-    Порядок — как в labels (tv/movie/ova/ona), неизвестные kind в конце.
-    Возвращает '' если данных нет.
-    """
-    if not kinds:
-        return ""
-    parts = []
-    # Сначала известные типы в порядке labels
-    for key, name in labels.items():
-        cnt = kinds.get(key, 0)
-        if cnt:
-            parts.append(f"{name} {cnt}")
-    # Затем неизвестные (на случай если API подкинет новый kind)
-    for key, cnt in kinds.items():
-        if key not in labels and cnt:
-            parts.append(f"{h(key)} {cnt}")
-    return "  ·  ".join(parts)
-
-
-def _fmt_score_dist(dist: dict) -> str:
-    """Распределение оценок без нулей (0 = без оценки): '10×8 · 9×15'.
-    Оставлено для обратной совместимости; в отчётах теперь используется
-    вертикальный блок _score_dist_block.
-    """
-    pairs = [(int(s), c) for s, c in dist.items() if _safe_int(s) > 0]
-    if not pairs:
-        return "нет оценок"
-    return "  ·  ".join(f"{s}×{c}" for s, c in sorted(pairs, reverse=True))
-
-
-def _score_dist_block(dist: dict) -> list[str]:
-    """
-    Вертикальный блок распределения оценок:
-        📊 Оценки
-        ★10 ·· 5
-         ★9 ·· 8
-         ★8 · 19
-    Оценка помечена ★, точки — лидеры к количеству (как в остальных блоках).
-    Порядок — по убыванию оценки (10 → 1), не по количеству.
-    Возвращает [] если оценок нет.
-    """
-    pairs = [(_safe_int(s), c) for s, c in dist.items() if _safe_int(s) > 0]
-    if not pairs:
-        return []
-    pairs.sort(key=lambda x: x[0], reverse=True)
-    # Ключ — '★N', выровняем по ширине самой длинной метки (★10 шире ★9)
-    rows = [(f"★{score}", count) for score, count in pairs]
-    body = _fmt_mono_rows(rows)
-    return ["📊 <b>Оценки</b>", body] if body else []
-
-
-def _status_block(
-    agg: dict,
-    *,
-    completed_label: str,
-    watching_label: str,
-) -> list[str]:
-    """Вертикальный блок статусов с медиаспецифичными подписями."""
-    rows = [
-        (completed_label, agg.get("total_completed", 0)),
-        ("Брошено", agg.get("total_dropped", 0)),
-        (watching_label, agg.get("total_watching", 0)),
-        ("В планах", agg.get("total_planned", 0)),
-        ("Отложено", agg.get("total_on_hold", 0)),
-    ]
-    rows = [(n, c) for n, c in rows if c]
-    body = _fmt_mono_rows(rows)
-    return ["📦 <b>Статусы</b>", body] if body else []
-
-
-def _kinds_block(kinds: dict, labels: dict) -> list[str]:
-    """Вертикальный блок типов (Сериалы/Фильмы/OVA или Манга/Манхва/...)."""
-    if not kinds:
-        return []
-    pairs = []
-    for key, name in labels.items():
-        cnt = kinds.get(key, 0)
-        if cnt:
-            pairs.append((name, cnt))
-    for key, cnt in kinds.items():
-        if key not in labels and cnt:
-            pairs.append((str(key), cnt))
-    body = _fmt_mono_rows(pairs)
-    return ["🎞 <b>Типы</b>", body] if body else []
-
-
 def _avg_score_from_dist(dist: dict) -> float | None:
     """Средняя оценка из распределения (игнорируя 0 = без оценки)."""
     total = count = 0
@@ -1061,13 +911,6 @@ def _avg_score_from_dist(dist: dict) -> float | None:
     return round(total / count, 2) if count else None
 
 
-def _title_link_from_rec(tid: str, rec: dict) -> str:
-    """HTML-ссылка из записи titles{}."""
-    title = h(rec.get("title") or "???")
-    url = _rel_url(rec.get("url"))
-    return f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
-
-
 def _pct_diff(curr: int, prev: int) -> str:
     """'↑ 25% (9 → 12)'."""
     if prev == 0:
@@ -1077,21 +920,6 @@ def _pct_diff(curr: int, prev: int) -> str:
         return f"→ без изменений ({curr})"
     pct = round(abs(delta) / prev * 100)
     return f"{'↑' if delta > 0 else '↓'} {pct}% ({prev} → {curr})"
-
-
-def _fav_lines(items: list[dict]) -> list[str]:
-    """Строки одного блока избранного: '• <ссылка> — ⭐9' (оценка опц.)."""
-    lines = []
-    for it in items:
-        title = h(it.get("title") or "???")
-        url = _rel_url(it.get("url"))
-        name = f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
-        score = it.get("score")
-        if isinstance(score, int) and score > 0:
-            lines.append(f"  • {name} — ⭐{score}")
-        else:
-            lines.append(f"  • {name}")
-    return lines
 
 
 # ═══════════════════════════════════════════════════════════════════

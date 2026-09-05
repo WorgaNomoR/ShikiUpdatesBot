@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import (
     AsyncMock,
     MagicMock,
@@ -14,6 +15,14 @@ import config
 import handlers
 import shiki_api
 import storage
+from report_model import (
+    Report,
+    plain_report,
+)
+
+
+class _RendererReached(RuntimeError):
+    pass
 
 
 # ─────────────────────────────────────────────────────────────
@@ -714,6 +723,88 @@ async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
 #  мокал rotate на уровне цикла.
 # ═══════════════════════════════════════════════════════════════════
 
+
+@pytest.mark.asyncio
+async def test_quarter_renderer_runs_without_restorable_state_lock(monkeypatch):
+    lock_depth = 0
+
+    @asynccontextmanager
+    async def transaction():
+        nonlocal lock_depth
+        lock_depth += 1
+        try:
+            yield
+        finally:
+            lock_depth -= 1
+
+    def render(report):
+        assert lock_depth == 0
+        raise _RendererReached
+
+    old_cur = {"period": "2026-Q2", "events": []}
+    monkeypatch.setattr(handlers, "restorable_state_transaction", transaction)
+    monkeypatch.setattr(handlers, "load_stats_current", lambda: old_cur)
+    monkeypatch.setattr(handlers, "current_quarter", lambda: "2026-Q3")
+    monkeypatch.setattr(handlers, "_load_prev_quarter_summary", lambda *args: None)
+    monkeypatch.setattr(handlers, "rendered_html", render)
+
+    with pytest.raises(_RendererReached):
+        await handlers.rotate_quarter_if_needed(
+            AsyncMock(),
+            old_cur,
+            {},
+            resync=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_quarter_rotation_defers_after_repeated_state_changes(monkeypatch):
+    state = {"cur": {"period": "2026-Q2", "events": [], "generation": 0}}
+    render_calls = 0
+
+    def render(report):
+        nonlocal render_calls
+        render_calls += 1
+        if render_calls > 3:
+            pytest.fail("Ротация не остановилась после трёх попыток")
+        state["cur"] = {
+            "period": "2026-Q2",
+            "events": [],
+            "generation": render_calls,
+        }
+        return ["REPORT"]
+
+    snapshot = MagicMock()
+    save_current = MagicMock()
+    deliver_pending = AsyncMock()
+    monkeypatch.setattr(handlers, "load_stats_current", lambda: state["cur"])
+    monkeypatch.setattr(handlers, "current_quarter", lambda: "2026-Q3")
+    monkeypatch.setattr(handlers, "_load_prev_quarter_summary", lambda *args: None)
+    monkeypatch.setattr(
+        handlers,
+        "build_quarterly_report_messages",
+        lambda *args: plain_report("REPORT"),
+    )
+    monkeypatch.setattr(handlers, "rendered_html", render)
+    monkeypatch.setattr(handlers, "_save_quarter_snapshot", snapshot)
+    monkeypatch.setattr(handlers, "save_stats_current", save_current)
+    monkeypatch.setattr(handlers, "_deliver_pending_quarter", deliver_pending)
+
+    result = await handlers.rotate_quarter_if_needed(
+        AsyncMock(),
+        state["cur"],
+        {},
+        resync=False,
+    )
+
+    assert result is state["cur"]
+    assert result["generation"] == 3
+    assert render_calls == 3
+    snapshot.assert_not_called()
+    save_current.assert_not_called()
+    deliver_pending.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
     """Расхоловленный (#35): чистые хелперы _update_by_quarter и
@@ -801,7 +892,7 @@ async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
 
     # 3. build_quarterly_report_messages реально собрал отчёт (3 темы),
     #    с заголовком, реальными тайтлами и блоком сравнения (prev-summary дан).
-    report = [c.args[1] for c in bot.send_message.await_args_list]
+    report = [call.kwargs["text"] for call in bot.send_message.await_args_list]
     assert len(report) == 3
     assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in report[0]
     assert "Аниме-Один" in report[0]
@@ -835,7 +926,7 @@ async def test_quarter_rotation_without_preceding_snapshot_omits_comparison(
     storage.save_stats_current(cur)
     await handlers.rotate_quarter_if_needed(bot, cur, storage._empty_stats_all(), resync=False)
 
-    report = [call.args[1] for call in bot.send_message.await_args_list]
+    report = [call.kwargs["text"] for call in bot.send_message.await_args_list]
     assert report
     assert all("Сравнение" not in message for message in report)
 
@@ -847,7 +938,10 @@ async def test_rotation_skips_resync_at_boot(backup_env, monkeypatch):
     sync = AsyncMock(return_value=({}, True))
     monkeypatch.setattr("handlers.sync_stats_all", sync)
     monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
-    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "handlers.build_quarterly_report_messages",
+        lambda *args, **kwargs: Report(()),
+    )
     monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
     monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
     monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
@@ -865,7 +959,10 @@ async def test_rotation_resyncs_in_loop(backup_env, monkeypatch):
     sync = AsyncMock(return_value=({}, True))
     monkeypatch.setattr("handlers.sync_stats_all", sync)
     monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
-    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "handlers.build_quarterly_report_messages",
+        lambda *args, **kwargs: Report(()),
+    )
     monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *a, **k: None)
     monkeypatch.setattr("handlers._update_by_quarter", lambda *a, **k: None)
     monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *a, **k: None)
@@ -885,7 +982,7 @@ async def test_rotation_retries_report_before_marking_delivery(
     monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
     monkeypatch.setattr(
         "handlers.build_quarterly_report_messages",
-        lambda *args: ["REPORT"],
+        lambda *args: plain_report("REPORT"),
     )
     monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *args: None)
     monkeypatch.setattr("handlers._update_by_quarter", lambda *args: None)
@@ -938,7 +1035,7 @@ async def test_rotation_retries_backup_without_repeating_report(
     monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
     monkeypatch.setattr(
         "handlers.build_quarterly_report_messages",
-        lambda *args: ["REPORT"],
+        lambda *args: plain_report("REPORT"),
     )
     monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *args: None)
     monkeypatch.setattr("handlers._update_by_quarter", lambda *args: None)

@@ -144,58 +144,6 @@ def test_h_plain_text():
 
 
 # ==========================================================
-# _status_block()
-# ==========================================================
-
-def test_status_block_uses_anime_labels_and_preserves_order():
-    block = messages._status_block(
-        {
-            "total_completed": 3,
-            "total_dropped": 2,
-            "total_watching": 1,
-            "total_planned": 4,
-            "total_on_hold": 5,
-        },
-        completed_label="Завершено",
-        watching_label="Смотрю",
-    )
-
-    assert block == [
-        "📦 <b>Статусы</b>",
-        "<code>Завершено · 3\n"
-        "Брошено ··· 2\n"
-        "Смотрю ···· 1\n"
-        "В планах ·· 4\n"
-        "Отложено ·· 5</code>",
-    ]
-
-
-def test_status_block_uses_manga_labels_and_hides_zeroes():
-    block = messages._status_block(
-        {
-            "total_completed": 2,
-            "total_dropped": 0,
-            "total_watching": 1,
-            "total_planned": 0,
-            "total_on_hold": 0,
-        },
-        completed_label="Прочитано",
-        watching_label="Читаю",
-    )
-
-    assert block == [
-        "📦 <b>Статусы</b>",
-        "<code>Прочитано · 2\nЧитаю ····· 1</code>",
-    ]
-
-
-def test_status_block_empty_aggregate_returns_empty_list():
-    assert messages._status_block(
-        {}, completed_label="Завершено", watching_label="Смотрю",
-    ) == []
-
-
-# ==========================================================
 # build_message()
 # ==========================================================
 

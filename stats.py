@@ -4,9 +4,9 @@
 Статистика ShikiUpdatesBot.
 
 Доменный слой: агрегирование списков, синхронизация stats_all, события
-текущего квартала, снапшоты кварталов, построение отчётов (/stats, /favs,
-квартальный). Зависит от config/utils/storage/shiki_api/messages; знают о нём
-только хендлеры.
+текущего квартала, снапшоты кварталов, построение типизированных отчётов
+(/stats, /favs, квартальный). Зависит от config/utils/storage/shiki_api,
+messages/report_model; знают о нём только хендлеры.
 """
 
 import json
@@ -24,13 +24,22 @@ from config import (
 )
 from messages import (
     _avg_score_from_dist,
-    _fav_lines,
-    _kinds_block,
     _pct_diff,
-    _score_dist_block,
-    _section_header,
-    _status_block,
-    _top_block,
+)
+from report_model import (
+    Bold,
+    Italic,
+    Line,
+    Link,
+    Report,
+    Row,
+    Rows,
+    Section,
+    Text,
+    Unit,
+    line,
+    section,
+    unit,
 )
 from shiki_api import (
     _STAT_STATUSES,
@@ -52,7 +61,6 @@ from utils import (
     _rel_url,
     _safe_int,
     _utcnow,
-    h,
     quarter_label,
     tracking_period_label,
 )
@@ -1129,194 +1137,305 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
     return out
 
 
-def _build_quarter_section(records: list[dict], media: str) -> list[str]:
-    """Строки секции (аниме/манга) для отчётов на основе titles-записей квартала."""
-    lines: list[str] = []
+def _header_line(emoji: str, title: str) -> Line:
+    """Типизированный акцентированный заголовок архиблока."""
+    border = "━" * 5
+    return line(Bold(f"{border} {emoji} {title} {border}"))
+
+
+def _counter_rows(
+    pairs: list[tuple[str, int]],
+    *,
+    show_percent: bool = False,
+    total: int = 0,
+) -> Rows:
+    """Логические выровненные rows без готового HTML."""
+    return Rows(tuple(
+        Row(
+            str(name),
+            str(count),
+            f"  {round(count / total * 100)}%" if show_percent and total > 0 else "",
+        )
+        for name, count in pairs
+    ))
+
+
+def _top_pairs(counter: dict, count: int) -> list[tuple[str, int]]:
+    """Топ-N пар в прежнем стабильном порядке по убыванию count."""
+    return sorted(counter.items(), key=lambda pair: pair[1], reverse=True)[:count]
+
+
+def _top_section(
+    emoji: str,
+    title: str,
+    counter: dict,
+    count: int,
+    *,
+    show_percent: bool = False,
+    total: int = 0,
+) -> Section | None:
+    pairs = _top_pairs(counter, count)
+    if not pairs:
+        return None
+    return section(
+        line(f"{emoji} ", Bold(title)),
+        _counter_rows(pairs, show_percent=show_percent, total=total),
+    )
+
+
+def _score_section(dist: dict) -> Section | None:
+    pairs = [(_safe_int(score), count) for score, count in dist.items() if _safe_int(score) > 0]
+    if not pairs:
+        return None
+    pairs.sort(key=lambda pair: pair[0], reverse=True)
+    return section(
+        line("📊 ", Bold("Оценки")),
+        _counter_rows([(f"★{score}", count) for score, count in pairs]),
+    )
+
+
+def _status_section(
+    aggregate: dict,
+    *,
+    completed_label: str,
+    watching_label: str,
+) -> Section | None:
+    pairs = [
+        (completed_label, aggregate.get("total_completed", 0)),
+        ("Брошено", aggregate.get("total_dropped", 0)),
+        (watching_label, aggregate.get("total_watching", 0)),
+        ("В планах", aggregate.get("total_planned", 0)),
+        ("Отложено", aggregate.get("total_on_hold", 0)),
+    ]
+    pairs = [(name, count) for name, count in pairs if count]
+    if not pairs:
+        return None
+    return section(line("📦 ", Bold("Статусы")), _counter_rows(pairs))
+
+
+def _kinds_section(kinds: dict, labels: dict) -> Section | None:
+    if not kinds:
+        return None
+    pairs = [(name, kinds.get(key, 0)) for key, name in labels.items() if kinds.get(key, 0)]
+    pairs.extend((str(key), count) for key, count in kinds.items() if key not in labels and count)
+    if not pairs:
+        return None
+    return section(line("🎞 ", Bold("Типы")), _counter_rows(pairs))
+
+
+def _title_inline(record: dict) -> Link | Text:
+    title = str(record.get("title") or "???")
+    relative_url = _rel_url(record.get("url"))
+    if relative_url:
+        return Link(title, f"{SHIKI_BASE_URL}{relative_url}")
+    return Text(title)
+
+
+def _build_quarter_sections(
+    records: list[dict],
+    media: str,
+) -> tuple[list[Line], list[Section]]:
+    """Логические sections статистики по завершённым тайтлам квартала."""
+    lead_lines: list[Line] = []
+    sections: list[Section] = []
     if not records:
-        return lines
+        return lead_lines, sections
 
-    # Оценки
-    scores = [r["score"] for r in records if _safe_int(r.get("score")) > 0]
+    scores = [record["score"] for record in records if _safe_int(record.get("score")) > 0]
     if scores:
-        avg_personal = round(sum(scores) / len(scores), 1)
-        # Средний рейтинг Shikimori по тем же тайтлам (у которых есть оценка)
-        shiki = [r["shiki_score"] for r in records
-                 if _safe_int(r.get("score")) > 0 and isinstance(r.get("shiki_score"), (int, float))]
-        score_line = f"⭐ Средняя оценка: <b>{avg_personal}</b>"
-        if shiki:
-            avg_shiki = round(sum(shiki) / len(shiki), 1)
-            diff = round(avg_personal - avg_shiki, 1)
-            sign = "+" if diff >= 0 else ""
-            score_line += f"  <i>(Shikimori: {avg_shiki}, {sign}{diff})</i>"
-        lines.append(score_line)
-        dist: dict = {}
-        for s in scores:
-            _bump(dist, s)
-        block = _score_dist_block(dist)
-        if block:
-            lines.append("")
-            lines.extend(block)
+        average = round(sum(scores) / len(scores), 1)
+        score_parts: list[Text | Bold | Italic] = [Text("⭐ Средняя оценка: "), Bold(str(average))]
+        shiki_scores = [
+            record["shiki_score"]
+            for record in records
+            if _safe_int(record.get("score")) > 0
+            and isinstance(record.get("shiki_score"), (int, float))
+        ]
+        if shiki_scores:
+            shiki_average = round(sum(shiki_scores) / len(shiki_scores), 1)
+            difference = round(average - shiki_average, 1)
+            sign = "+" if difference >= 0 else ""
+            score_parts.extend([
+                Text("  "),
+                Italic(f"(Shikimori: {shiki_average}, {sign}{difference})"),
+            ])
+        lead_lines.append(Line(tuple(score_parts)))
+        distribution: dict = {}
+        for score in scores:
+            _bump(distribution, score)
+        score_section = _score_section(distribution)
+        if score_section:
+            sections.append(score_section)
 
-    # Топ по оценке
     top = sorted(
-        [r for r in records if _safe_int(r.get("score")) > 0],
-        key=lambda r: r["score"], reverse=True,
+        [record for record in records if _safe_int(record.get("score")) > 0],
+        key=lambda record: record["score"],
+        reverse=True,
     )[:3]
     if top:
-        lines.append("")
-        lines.append("🏆 <b>Топ по оценке:</b>")
-        for i, r in enumerate(top, 1):
-            title = h(r.get("title") or "???")
-            url = _rel_url(r.get("url"))
-            link = f'<a href="{SHIKI_BASE_URL}{url}">{title}</a>' if url else title
-            lines.append(f"  {i}. {link} — ⭐{r['score']}")
+        top_lines = [line("🏆 ", Bold("Топ по оценке:"))]
+        for index, record in enumerate(top, 1):
+            top_lines.append(line(
+                f"  {index}. ",
+                _title_inline(record),
+                " — ⭐",
+                str(record["score"]),
+            ))
+        sections.append(section(*top_lines))
 
-    # Хронология по году
-    years = [(r["year"], r.get("title") or "???") for r in records
-             if isinstance(r.get("year"), int) and r["year"] > 1900]
+    years = [
+        (record["year"], str(record.get("title") or "???"))
+        for record in records
+        if isinstance(record.get("year"), int) and record["year"] > 1900
+    ]
     if years:
-        oldest = min(years, key=lambda x: x[0])
-        newest = max(years, key=lambda x: x[0])
-        avg_y = round(sum(y for y, _ in years) / len(years))
-        lines.append("")
+        oldest = min(years, key=lambda item: item[0])
+        newest = max(years, key=lambda item: item[0])
+        average_year = round(sum(year for year, _ in years) / len(years))
         if oldest[0] == newest[0]:
-            lines.append(f"🗓️ Год выпуска: <b>{oldest[0]}</b>")
+            chronology = line("🗓️ Год выпуска: ", Bold(str(oldest[0])))
         else:
-            lines.append(
-                f"🗓️ Хронология: <b>{oldest[0]}</b> ({h(oldest[1])}) → "
-                f"<b>{newest[0]}</b> ({h(newest[1])}),  ср. {avg_y}"
+            chronology = line(
+                "🗓️ Хронология: ",
+                Bold(str(oldest[0])),
+                " (",
+                oldest[1],
+                ") → ",
+                Bold(str(newest[0])),
+                " (",
+                newest[1],
+                f"),  ср. {average_year}",
             )
+        sections.append(section(chronology))
 
-    # Жанры/темы/аудитория из записей квартала
     genres: dict = {}
     themes: dict = {}
     demographic: dict = {}
-    for r in records:
-        for g in r.get("genres", []):
-            _bump(genres, g)
-        for t in r.get("themes", []):
-            _bump(themes, t)
-        for d in r.get("demographic", []):
-            _bump(demographic, d)
+    for record in records:
+        for genre in record.get("genres", []):
+            _bump(genres, genre)
+        for theme in record.get("themes", []):
+            _bump(themes, theme)
+        for audience in record.get("demographic", []):
+            _bump(demographic, audience)
 
-    n_comp = len(records)  # база для процентов
-
+    completed_count = len(records)
     if media == "anime":
         studios: dict = {}
         origins: dict = {}
-        total_eps = 0
-        total_min = 0
-        for r in records:
-            for s in r.get("studios", []):
-                _bump(studios, s)
-            _bump(origins, r.get("origin"))
-            eps = _safe_int(r.get("episodes_watched"))
-            total_eps += eps
-            dur = r.get("duration")
-            if isinstance(dur, int) and dur > 0 and eps > 0:
-                total_min += dur * eps
-        if total_eps:
-            lines.append(f"📺 Эпизодов: <b>{total_eps}</b>  (~{round(total_min / 60, 1)} ч.)")
-
-        for block in (
-            _top_block("🎭", "Жанры",     genres,      8, show_percent=True, total=n_comp),
-            _top_block("🏷", "Темы",      themes,      8, show_percent=True, total=n_comp),
-            _top_block("👥", "Аудитория", demographic, 99, show_percent=True, total=n_comp),
-            _top_block("🎨", "Студии",    studios,     6),
-            _top_block("📚", "Источники", origins,     99),
-        ):
-            if block:
-                lines.append("")
-                lines.extend(block)
+        total_episodes = 0
+        total_minutes = 0
+        for record in records:
+            for studio in record.get("studios", []):
+                _bump(studios, studio)
+            _bump(origins, record.get("origin"))
+            episodes = _safe_int(record.get("episodes_watched"))
+            total_episodes += episodes
+            duration = record.get("duration")
+            if isinstance(duration, int) and duration > 0 and episodes > 0:
+                total_minutes += duration * episodes
+        if total_episodes:
+            total_line = line(
+                "📺 Эпизодов: ",
+                Bold(str(total_episodes)),
+                f"  (~{round(total_minutes / 60, 1)} ч.)",
+            )
+            if sections:
+                sections[-1] = section(*sections[-1].items, total_line)
+            else:
+                lead_lines.append(total_line)
+        candidates = (
+            _top_section("🎭", "Жанры", genres, 8, show_percent=True, total=completed_count),
+            _top_section("🏷", "Темы", themes, 8, show_percent=True, total=completed_count),
+            _top_section("👥", "Аудитория", demographic, 99, show_percent=True, total=completed_count),
+            _top_section("🎨", "Студии", studios, 6),
+            _top_section("📚", "Источники", origins, 99),
+        )
     else:
         publishers: dict = {}
-        total_ch = 0
-        for r in records:
-            for p in r.get("publishers", []):
-                _bump(publishers, p)
-            total_ch += _safe_int(r.get("chapters_read"))
-        if total_ch:
-            lines.append(f"📖 Глав прочитано: <b>{total_ch}</b>")
-
-        for block in (
-            _top_block("🎭", "Жанры",     genres,      8, show_percent=True, total=n_comp),
-            _top_block("🏷", "Темы",      themes,      8, show_percent=True, total=n_comp),
-            _top_block("👥", "Аудитория", demographic, 99, show_percent=True, total=n_comp),
-            _top_block("🏢", "Издатели",  publishers,  6),
-        ):
-            if block:
-                lines.append("")
-                lines.extend(block)
-
-    return lines
-
-
-def _anime_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, header: str) -> str:
-    """Готовый текст блока АНИМЕ (одно сообщение)."""
-    lines: list[str] = [header, ""]
-    lines.append(f"✅ Завершено: <b>{len(comp)}</b>")
-    if drop:
-        lines.append(f"🗑 Брошено: {len(drop)}")
-    if plan:
-        lines.append(f"📋 В планируемое: {plan}")
-    section = _build_quarter_section(comp, "anime")
-    if section:
-        lines.extend(section)
-    elif not drop and not plan:
-        lines.append("<i>Пока ничего не завершено.</i>")
-    return "\n".join(lines)
+        total_chapters = 0
+        for record in records:
+            for publisher in record.get("publishers", []):
+                _bump(publishers, publisher)
+            total_chapters += _safe_int(record.get("chapters_read"))
+        if total_chapters:
+            total_line = line("📖 Глав прочитано: ", Bold(str(total_chapters)))
+            if sections:
+                sections[-1] = section(*sections[-1].items, total_line)
+            else:
+                lead_lines.append(total_line)
+        candidates = (
+            _top_section("🎭", "Жанры", genres, 8, show_percent=True, total=completed_count),
+            _top_section("🏷", "Темы", themes, 8, show_percent=True, total=completed_count),
+            _top_section("👥", "Аудитория", demographic, 99, show_percent=True, total=completed_count),
+            _top_section("🏢", "Издатели", publishers, 6),
+        )
+    sections.extend(candidate for candidate in candidates if candidate is not None)
+    return lead_lines, sections
 
 
-def _manga_block(cur: dict, comp: list[dict], drop: list[dict], plan: int, header: str) -> str:
-    """Готовый текст блока МАНГА (одно сообщение)."""
-    lines: list[str] = [header, ""]
-    lines.append(f"✅ Прочитано: <b>{len(comp)}</b>")
-    if drop:
-        lines.append(f"🗑 Брошено: {len(drop)}")
-    if plan:
-        lines.append(f"📋 В планируемое: {plan}")
-    section = _build_quarter_section(comp, "manga")
-    if section:
-        lines.extend(section)
-    elif not drop and not plan:
-        lines.append("<i>Пока ничего не завершено.</i>")
-    return "\n".join(lines)
+def _media_quarter_unit(
+    media: str,
+    completed: list[dict],
+    dropped: list[dict],
+    planned: int,
+    *prefix_sections: Section,
+) -> Unit:
+    """Собрать самостоятельную anime/manga тему квартального отчёта."""
+    if media == "anime":
+        header = _header_line("🎬", "АНИМЕ")
+        completed_label = "✅ Завершено: "
+    else:
+        header = _header_line("📚", "МАНГА")
+        completed_label = "✅ Прочитано: "
+    summary = [line(completed_label, Bold(str(len(completed))))]
+    if dropped:
+        summary.append(line(f"🗑 Брошено: {len(dropped)}"))
+    if planned:
+        summary.append(line(f"📋 В планируемое: {planned}"))
+    if not completed and not dropped and not planned:
+        summary.append(line(Italic("Пока ничего не завершено.")))
+    lead_lines, detail_sections = _build_quarter_sections(completed, media)
+    summary.extend(lead_lines)
+    return unit(
+        *prefix_sections,
+        section(header),
+        section(*summary),
+        *detail_sections,
+    )
 
 
-def build_favourites_messages(stats: dict) -> list[str]:
-    """
-    Сообщение со списком любимого: аниме, манга, персонажи, люди.
-    Пустые категории не показываются. Если избранного нет совсем —
-    короткое сообщение-заглушка.
-    """
-    fav = stats.get("favourites") or {}
+def build_favourites_messages(stats: dict) -> Report:
+    """Типизированный отчёт по всем непустым категориям любимого."""
+    favourites = stats.get("favourites") or {}
     blocks = [
-        ("🎬", "Аниме",          fav.get("anime") or []),
-        ("📚", "Манга",          fav.get("manga") or []),
-        ("📖", "Ранобэ",         fav.get("ranobe") or []),
-        ("👤", "Персонажи",      fav.get("characters") or []),
-        ("🎨", "Люди индустрии", fav.get("people") or []),
+        ("🎬", "Аниме", favourites.get("anime") or []),
+        ("📚", "Манга", favourites.get("manga") or []),
+        ("📖", "Ранобэ", favourites.get("ranobe") or []),
+        ("👤", "Персонажи", favourites.get("characters") or []),
+        ("🎨", "Люди индустрии", favourites.get("people") or []),
     ]
-
+    header = section(line("❤️ ", Bold("ЛЮБИМОЕ")))
     if not any(items for _, _, items in blocks):
-        return ["❤️ <b>ЛЮБИМОЕ</b>\n\n<i>Список любимого пока пуст.</i>"]
+        return Report((unit(header, section(line(Italic("Список любимого пока пуст.")))),))
 
-    out: list[str] = ["❤️ <b>ЛЮБИМОЕ</b>"]
+    sections = [header]
     for emoji, title, items in blocks:
         if not items:
             continue
-        out.append("")
-        out.append(f"{emoji} <b>{title}</b> ({len(items)})")
-        out.extend(_fav_lines(items))
+        item_lines = [line(f"{emoji} ", Bold(title), f" ({len(items)})")]
+        for item in items:
+            score = item.get("score")
+            parts = [Text("  • "), _title_inline(item)]
+            if isinstance(score, int) and score > 0:
+                parts.append(Text(f" — ⭐{score}"))
+            item_lines.append(Line(tuple(parts)))
+        sections.append(section(*item_lines))
+    return Report((Unit(tuple(sections)),))
 
-    return ["\n".join(out)]
 
-
-def build_stats_all_messages(stats: dict) -> list[str]:
-    """
-    Список сообщений для /stats all, разбитый по темам: [аниме], [манга].
-    Каждое самостоятельно проходит лимит Telegram.
-    """
+def build_stats_all_messages(stats: dict) -> Report:
+    """Типизированный отчёт за всё время с отдельными anime/manga units."""
     a_agg = (stats.get("anime") or {}).get("aggregates") or {}
     m_agg = (stats.get("manga") or {}).get("aggregates") or {}
 
@@ -1327,94 +1446,103 @@ def build_stats_all_messages(stats: dict) -> list[str]:
 
     # Пустая статистика — одно короткое сообщение
     if a_agg.get("total_completed", 0) == 0 and m_agg.get("total_completed", 0) == 0:
-        return ["📊 <b>СТАТИСТИКА ЗА ВСЁ ВРЕМЯ</b>\n\n"
-                "<i>Статистика ещё не собрана. Дай боту немного времени.</i>"]
+        return Report((unit(
+            section(line("📊 ", Bold("СТАТИСТИКА ЗА ВСЁ ВРЕМЯ"))),
+            section(line(Italic("Статистика ещё не собрана. Дай боту немного времени."))),
+        ),))
 
     a_total = a_agg.get("total_completed", 0)
     m_total = m_agg.get("total_completed", 0)
 
     # ── Аниме ───────────────────────────────────
-    a: list[str] = ["📊 <b>СТАТИСТИКА ЗА ВСЁ ВРЕМЯ</b>"]
+    anime_sections = [section(line("📊 ", Bold("СТАТИСТИКА ЗА ВСЁ ВРЕМЯ")))]
     if upd_str:
-        a.append(f"<i>актуально на {upd_str}</i>")
-    a.append("")
-    a.append(_section_header("🎬", "АНИМЕ"))
-    a.append("")
+        anime_sections[0] = section(
+            line("📊 ", Bold("СТАТИСТИКА ЗА ВСЁ ВРЕМЯ")),
+            line(Italic(f"актуально на {upd_str}")),
+        )
+    anime_sections.append(section(_header_line("🎬", "АНИМЕ")))
 
     # Акцент сверху: сколько посмотрено · эпизоды/время, средняя оценка
     eps = a_agg.get("total_episodes_watched", 0)
     hrs = a_agg.get("total_hours_watched", 0)
-    top_line = f"✅ Завершено: <b>{a_total}</b>"
+    anime_summary_parts = [Text("✅ Завершено: "), Bold(str(a_total))]
     if eps:
-        top_line += f"   ·   📺 {eps} эп (~{hrs} ч)"
-    a.append(top_line)
+        anime_summary_parts.append(Text(f"   ·   📺 {eps} эп (~{hrs} ч)"))
+    anime_summary = [Line(tuple(anime_summary_parts))]
     avg_a = _avg_score_from_dist(a_agg.get("score_dist", {}))
     if avg_a is not None:
-        line = f"⭐ Средняя: <b>{avg_a}</b>"
+        average_parts = [Text("⭐ Средняя: "), Bold(str(avg_a))]
         avg_shiki_a = a_agg.get("avg_shiki_completed")
         if isinstance(avg_shiki_a, (int, float)):
             diff = round(avg_a - avg_shiki_a, 1)
             sign = "+" if diff >= 0 else ""
-            line += f"   <i>Shikimori: {round(avg_shiki_a, 1)} ({sign}{diff})</i>"
-        a.append(line)
+            average_parts.extend([
+                Text("   "),
+                Italic(f"Shikimori: {round(avg_shiki_a, 1)} ({sign}{diff})"),
+            ])
+        anime_summary.append(Line(tuple(average_parts)))
+    anime_sections.append(section(*anime_summary))
 
     # Детализация блоками
     for block in (
-        _status_block(
+        _status_section(
             a_agg,
             completed_label="Завершено",
             watching_label="Смотрю",
         ),
-        _kinds_block(a_agg.get("kinds", {}), _KIND_RU_ANIME),
-        _score_dist_block(a_agg.get("score_dist", {})),
-        _top_block("🎭", "Жанры",      a_agg.get("genres", {}),      8, show_percent=True, total=a_total),
-        _top_block("🏷", "Темы",       a_agg.get("themes", {}),      8, show_percent=True, total=a_total),
-        _top_block("👥", "Аудитория",  a_agg.get("demographic", {}), 99, show_percent=True, total=a_total),
-        _top_block("🎨", "Студии",     a_agg.get("studios", {}),     6),
-        _top_block("📚", "Источники",  a_agg.get("origins", {}),     99),
-        _top_block("🔞", "Рейтинги",   a_agg.get("ratings", {}),     99),
+        _kinds_section(a_agg.get("kinds", {}), _KIND_RU_ANIME),
+        _score_section(a_agg.get("score_dist", {})),
+        _top_section("🎭", "Жанры", a_agg.get("genres", {}), 8, show_percent=True, total=a_total),
+        _top_section("🏷", "Темы", a_agg.get("themes", {}), 8, show_percent=True, total=a_total),
+        _top_section("👥", "Аудитория", a_agg.get("demographic", {}), 99, show_percent=True, total=a_total),
+        _top_section("🎨", "Студии", a_agg.get("studios", {}), 6),
+        _top_section("📚", "Источники", a_agg.get("origins", {}), 99),
+        _top_section("🔞", "Рейтинги", a_agg.get("ratings", {}), 99),
     ):
         if block:
-            a.append("")
-            a.extend(block)
+            anime_sections.append(block)
 
     # ── Манга ───────────────────────────────────
-    m: list[str] = [_section_header("📚", "МАНГА"), ""]
+    manga_sections = [section(_header_line("📚", "МАНГА"))]
 
     ch = m_agg.get("total_chapters_read", 0)
     vol = m_agg.get("total_volumes_read", 0)
-    top_line = f"✅ Прочитано: <b>{m_total}</b>"
+    manga_summary_parts = [Text("✅ Прочитано: "), Bold(str(m_total))]
     if ch:
-        top_line += f"   ·   📖 {ch} гл · {vol} томов"
-    m.append(top_line)
+        manga_summary_parts.append(Text(f"   ·   📖 {ch} гл · {vol} томов"))
+    manga_summary = [Line(tuple(manga_summary_parts))]
     avg_m = _avg_score_from_dist(m_agg.get("score_dist", {}))
     if avg_m is not None:
-        line = f"⭐ Средняя: <b>{avg_m}</b>"
+        average_parts = [Text("⭐ Средняя: "), Bold(str(avg_m))]
         avg_shiki_m = m_agg.get("avg_shiki_completed")
         if isinstance(avg_shiki_m, (int, float)):
             diff = round(avg_m - avg_shiki_m, 1)
             sign = "+" if diff >= 0 else ""
-            line += f"   <i>Shikimori: {round(avg_shiki_m, 1)} ({sign}{diff})</i>"
-        m.append(line)
+            average_parts.extend([
+                Text("   "),
+                Italic(f"Shikimori: {round(avg_shiki_m, 1)} ({sign}{diff})"),
+            ])
+        manga_summary.append(Line(tuple(average_parts)))
+    manga_sections.append(section(*manga_summary))
 
     for block in (
-        _status_block(
+        _status_section(
             m_agg,
             completed_label="Прочитано",
             watching_label="Читаю",
         ),
-        _kinds_block(m_agg.get("kinds", {}), _KIND_RU_MANGA),
-        _score_dist_block(m_agg.get("score_dist", {})),
-        _top_block("🎭", "Жанры",     m_agg.get("genres", {}),      8, show_percent=True, total=m_total),
-        _top_block("🏷", "Темы",      m_agg.get("themes", {}),      8, show_percent=True, total=m_total),
-        _top_block("👥", "Аудитория", m_agg.get("demographic", {}), 99, show_percent=True, total=m_total),
-        _top_block("🏢", "Издатели",  m_agg.get("publishers", {}),  6),
+        _kinds_section(m_agg.get("kinds", {}), _KIND_RU_MANGA),
+        _score_section(m_agg.get("score_dist", {})),
+        _top_section("🎭", "Жанры", m_agg.get("genres", {}), 8, show_percent=True, total=m_total),
+        _top_section("🏷", "Темы", m_agg.get("themes", {}), 8, show_percent=True, total=m_total),
+        _top_section("👥", "Аудитория", m_agg.get("demographic", {}), 99, show_percent=True, total=m_total),
+        _top_section("🏢", "Издатели", m_agg.get("publishers", {}), 6),
     ):
         if block:
-            m.append("")
-            m.extend(block)
+            manga_sections.append(block)
 
-    return ["\n".join(a), "\n".join(m)]
+    return Report((Unit(tuple(anime_sections)), Unit(tuple(manga_sections))))
 
 
 def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
@@ -1442,84 +1570,81 @@ def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
     }
 
 
-def build_current_stats_messages(cur: dict, stats_all: dict) -> list[str]:
-    """
-    Список сообщений для /stats (текущий квартал), разбитый по темам:
-      [0] аниме, [1] манга.
-    Каждое сообщение самостоятельное и проходит лимит Telegram отдельно.
-    """
+def build_current_stats_messages(cur: dict, stats_all: dict) -> Report:
+    """Типизированный текущий квартальный отчёт с двумя delivery units."""
     title_label = tracking_period_label(cur)
 
     report = _prepare_quarter_report(cur, stats_all)
     anime = report["anime"]
     manga = report["manga"]
 
-    header = f"📊 <b>Статистика {h(title_label)}</b>"
+    header_lines = [line("📊 ", Bold(f"Статистика {title_label}"))]
     if _is_partial_quarter(cur):
-        header += "\n<i>⚠️ Квартал отслеживается не с самого начала — данные неполные.</i>"
+        header_lines.append(line(Italic(
+            "⚠️ Квартал отслеживается не с самого начала — данные неполные."
+        )))
 
-    msgs: list[str] = []
-    msgs.append(header + "\n\n" + _anime_block(
-        cur,
+    anime_unit = _media_quarter_unit(
+        "anime",
         anime["completed"],
         anime["dropped"],
         anime["planned"],
-        _section_header("🎬", "АНИМЕ"),
-    ))
-    msgs.append(_manga_block(
-        cur,
+        section(*header_lines),
+    )
+    manga_unit = _media_quarter_unit(
+        "manga",
         manga["completed"],
         manga["dropped"],
         manga["planned"],
-        _section_header("📚", "МАНГА"),
-    ))
-    return msgs
+    )
+    return Report((anime_unit, manga_unit))
 
 
-def build_quarterly_report_messages(cur: dict, stats_all: dict, prev_quarter: dict | None) -> list[str]:
-    """
-    Список сообщений квартального отчёта для владельца, по темам:
-      [0] заголовок + аниме, [1] манга, [2] сравнение + достижения.
-    """
+def build_quarterly_report_messages(
+    cur: dict,
+    stats_all: dict,
+    prev_quarter: dict | None,
+) -> Report:
+    """Типизированный итог квартала для owner delivery."""
     title_label = tracking_period_label(cur)
 
     report = _prepare_quarter_report(cur, stats_all)
     anime = report["anime"]
     manga = report["manga"]
 
-    header = f"📊 <b>КВАРТАЛЬНЫЙ ОТЧЁТ</b>\n<b>{h(title_label)}</b>"
+    header_lines = [
+        line("📊 ", Bold("КВАРТАЛЬНЫЙ ОТЧЁТ")),
+        line(Bold(title_label)),
+    ]
     if _is_partial_quarter(cur):
-        header += "\n<i>⚠️ Квартал отслеживался не с самого начала — данные неполные.</i>"
+        header_lines.append(line(Italic(
+            "⚠️ Квартал отслеживался не с самого начала — данные неполные."
+        )))
 
-    msgs: list[str] = []
-
-    # Сообщение 1: заголовок + аниме
-    msgs.append(header + "\n\n" + _anime_block(
-        cur,
+    units = [_media_quarter_unit(
+        "anime",
         anime["completed"],
         anime["dropped"],
         anime["planned"],
-        _section_header("🎬", "АНИМЕ"),
-    ))
-
-    # Сообщение 2: манга
-    msgs.append(_manga_block(
-        cur,
+        section(*header_lines),
+    )]
+    units.append(_media_quarter_unit(
+        "manga",
         manga["completed"],
         manga["dropped"],
         manga["planned"],
-        _section_header("📚", "МАНГА"),
     ))
 
-    # Сообщение 3: сравнение + достижения
-    extra: list[str] = []
+    extra_sections: list[Section] = []
     if prev_quarter:
         prev_a = prev_quarter.get("anime_completed", 0)
         prev_m = prev_quarter.get("manga_completed", 0)
         prev_label = quarter_label(prev_quarter.get("period") or "прошлый квартал")
-        extra.append(f"📈 <b>Сравнение с {h(prev_label)}:</b>")
-        extra.append(f"🎬 Аниме: {_pct_diff(len(anime['completed']), prev_a)}")
-        extra.append(f"📚 Манга: {_pct_diff(len(manga['completed']), prev_m)}")
+        extra_sections.append(section(
+            line("📈 ", Bold(f"Сравнение с {prev_label}:")),
+            line(f"🎬 Аниме: {_pct_diff(len(anime['completed']), prev_a)}"),
+            line(f"📚 Манга: {_pct_diff(len(manga['completed']), prev_m)}"),
+        ))
 
     all_comp = anime["completed"] + manga["completed"]
     ach: list[str] = []
@@ -1539,15 +1664,15 @@ def build_quarterly_report_messages(cur: dict, stats_all: dict, prev_quarter: di
         ach.append(f"🧟 Домучил {n} тайтл{'а' if n < 5 else 'ов'} с оценкой ≤3 — стойкость.")
 
     if ach:
-        if extra:
-            extra.append("")
-        extra.append("🏆 <b>Достижения:</b>")
-        extra.extend(f"• {a}" for a in ach)
+        extra_sections.append(section(
+            line("🏆 ", Bold("Достижения:")),
+            *(line(f"• {achievement}") for achievement in ach),
+        ))
 
-    if extra:
-        msgs.append("\n".join(extra))
+    if extra_sections:
+        units.append(Unit(tuple(extra_sections)))
 
-    return msgs
+    return Report(tuple(units))
 
 
 def _load_prev_quarter_summary(period: str) -> dict | None:
