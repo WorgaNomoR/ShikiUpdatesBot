@@ -19,6 +19,7 @@ from unittest.mock import (
 import pytest
 
 import handlers
+from storage import QuarterDeliveryStateError
 
 # ─────────────────────────────────────────────────────────────
 #  Команда /backup и интеграция в под/отписку
@@ -326,10 +327,13 @@ async def test_backup_receive_download_failure(backup_env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
-    restore = AsyncMock(
-        side_effect=ValueError("битый <b>zip</b>-архив & мусор")
-    )
+@pytest.mark.parametrize("error", [
+    ValueError("битый <b>zip</b>-архив & мусор"),
+    QuarterDeliveryStateError("progress_index"),
+    QuarterDeliveryStateError("plan_integrity"),
+])
+async def test_backup_receive_restore_value_error(backup_env, monkeypatch, error, caplog):
+    restore = AsyncMock(side_effect=error)
     monkeypatch.setattr(handlers, "restore_backup_zip", restore)
     monkeypatch.setattr(handlers, "_safe_delete", AsyncMock())
     state = AsyncMock()
@@ -343,6 +347,7 @@ async def test_backup_receive_restore_value_error(backup_env, monkeypatch):
     msg.answer.assert_awaited_once()
     text = msg.answer.call_args.args[0]
     assert text == "❌ Архив не восстановлен. Проверь формат и целостность файла."
+    assert str(error) in caplog.text
 
 
 @pytest.mark.asyncio

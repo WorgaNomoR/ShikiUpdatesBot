@@ -435,7 +435,11 @@ async def _deliver_pending_quarter(bot: Bot, cur: dict) -> dict:
             return cur
     except _QuarterPlanChanged:
         log.warning("rotate_quarter: план изменился; текущая попытка остановлена.")
-        return load_stats_current(strict=True)
+        try:
+            return load_stats_current(strict=True)
+        except QuarterDeliveryStateError as error:
+            await _quarter_state_diagnostic(bot, error)
+            return cur
 
 
 async def _resume_pending_quarter(bot: Bot) -> dict:

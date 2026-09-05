@@ -1085,7 +1085,7 @@ def test_quarter_partial_plan_cannot_claim_full_report_completion(legacy):
         storage.validate_pending_quarter_delivery(cur)
 
 
-def test_strict_quarter_write_failure_preserves_previous_file(backup_env, monkeypatch):
+def test_strict_quarter_write_failure_preserves_previous_file(backup_env, monkeypatch, caplog):
     storage.save_stats_current(_quarter_state(), strict=True)
     original = storage.STATS_CURRENT_FILE.read_bytes()
 
@@ -1096,6 +1096,8 @@ def test_strict_quarter_write_failure_preserves_previous_file(backup_env, monkey
     with pytest.raises(storage.QuarterDeliveryStateError, match="^current_write$"):
         storage.save_stats_current({"other": "state"}, strict=True)
     assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    assert "save_stats_current: strict-запись не удалась: OSError" in caplog.text
+    assert "report content must not escape" not in caplog.text
 
 
 @pytest.mark.parametrize("raw,reason", [
@@ -1114,6 +1116,21 @@ def test_strict_quarter_load_does_not_recreate_disappeared_file(backup_env):
     with pytest.raises(storage.QuarterDeliveryStateError, match="^current_missing$"):
         storage.load_stats_current(strict=True)
     assert not storage.STATS_CURRENT_FILE.exists()
+
+
+@pytest.mark.parametrize("period", ["old", "2026-Q2 ", " 2026-Q2", "2026-Q0", "2026-Q5", "0000-Q1", "26-Q2", "２０２６-Q2", "2026-Q2\n"])
+def test_strict_quarter_load_rejects_invalid_period_without_pending(backup_env, period):
+    storage.save_stats_current({"period": period, "events": []})
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^period_format$"):
+        storage.load_stats_current(strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+
+
+@pytest.mark.parametrize("period", ["0001-Q1", "2026-Q2", "9999-Q4"])
+def test_strict_quarter_load_accepts_canonical_period_without_pending(backup_env, period):
+    storage.save_stats_current({"period": period, "events": []})
+    assert storage.load_stats_current(strict=True)["period"] == period
 
 
 # ── update_state.json ──

@@ -166,6 +166,9 @@ async def test_rendered_plan_rejects_invalid_units_without_reindexing(messages, 
     bot = MagicMock(send_message=AsyncMock())
     result = await deliver_rendered_report(bot, 7, messages, start_unit=start)
     assert result.delivered is False
+    assert isinstance(result.error, ValueError)
+    assert str(result.error) == "invalid_rendered_plan"
+    assert result.next_unit == 0
     bot.send_message.assert_not_awaited()
 
 

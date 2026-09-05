@@ -1048,6 +1048,16 @@ def new_quarter_delivery(old_period: str, new_period: str, messages: list[str]) 
     return pending
 
 
+def validate_quarter_period(period: object) -> None:
+    """Проверить календарный период до чтения снапшотов или публикации состояния."""
+    if (
+        not isinstance(period, str)
+        or re.fullmatch(r"[0-9]{4}-Q[1-4]", period) is None
+        or period.startswith("0000")
+    ):
+        raise QuarterDeliveryStateError("period_format")
+
+
 def validate_pending_quarter_delivery(cur: dict) -> dict | None:
     """Единый строгий контракт legacy/current pending для runtime и импорта.
 
@@ -1067,9 +1077,8 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
     if set(pending) != (legacy_keys if legacy else current_keys):
         raise QuarterDeliveryStateError("pending_fields")
     old, new = pending["old_period"], pending["new_period"]
-    if any(not isinstance(p, str) or re.fullmatch(r"[0-9]{4}-Q[1-4]", p) is None
-           or p.startswith("0000") for p in (old, new)):
-        raise QuarterDeliveryStateError("period_format")
+    validate_quarter_period(old)
+    validate_quarter_period(new)
     if old >= new or new != cur.get("period"):
         raise QuarterDeliveryStateError("period_lineage")
     messages = pending["report_messages"]
@@ -1151,6 +1160,8 @@ def load_stats_current(*, strict: bool = False) -> dict:
             if isinstance(data, dict) and "period" in data and "events" in data:
                 if strict and (not isinstance(data["period"], str) or not isinstance(data["events"], list)):
                     raise QuarterDeliveryStateError("current_structure")
+                if strict:
+                    validate_quarter_period(data["period"])
                 # Бэкофилл для файлов, созданных до появления поля tracking_since
                 if "tracking_since" not in data:
                     data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
@@ -1182,6 +1193,7 @@ def save_stats_current(data: dict, *, strict: bool = False) -> None:
         _atomic_write(STATS_CURRENT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception as e:
         if strict:
+            log.error("save_stats_current: strict-запись не удалась: %s", type(e).__name__)
             raise QuarterDeliveryStateError("current_write") from None
         log.error("save_stats_current: %s", e)
 

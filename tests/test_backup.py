@@ -58,7 +58,8 @@ async def test_import_roundtrips_supported_quarter_delivery_plans(backup_env, sc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["unknown_version", "progress", "messages", "lineage", "events", "legacy"])
-async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, damage):
+async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, damage, caplog):
+    caplog.set_level("INFO", logger="shikiupdatesbot")
     current = storage._empty_stats_current("2026-Q2")
     storage.save_stats_current(current, strict=True)
     cur = storage._empty_stats_current("2026-Q3")
@@ -80,10 +81,28 @@ async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, dam
             "report_messages": [None], "report_sent": False,
         }
     generation = storage.quarter_restore_generation()
-    with pytest.raises(storage.QuarterDeliveryStateError):
+    with pytest.raises(storage.QuarterDeliveryStateError) as excinfo:
         await backup.restore_backup_zip(_zip_bytes({
             "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
             "stats_current.json": json.dumps(cur),
+        }))
+    assert "private report" not in str(excinfo.value)
+    assert "private report" not in caplog.text
+    assert storage.load_stats_current() == current
+    assert not (backup_env / "quarters" / "2026-Q1.json").exists()
+    assert storage.quarter_restore_generation() == generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("period", ["old", "2026-Q2 "])
+async def test_import_rejects_invalid_period_without_pending_before_publication(backup_env, period):
+    current = storage._empty_stats_current("2026-Q2")
+    storage.save_stats_current(current)
+    generation = storage.quarter_restore_generation()
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^period_format$"):
+        await backup.restore_backup_zip(_zip_bytes({
+            "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
+            "stats_current.json": json.dumps({"period": period, "events": []}),
         }))
     assert storage.load_stats_current() == current
     assert not (backup_env / "quarters" / "2026-Q1.json").exists()
@@ -555,11 +574,11 @@ async def test_restore_rolls_back_first_file_when_second_publish_fails(
     )
     storage._atomic_write(
         backup_env / "stats_current.json",
-        '{"period": "old", "events": []}',
+        '{"period": "2026-Q1", "events": []}',
     )
     raw = _zip_bytes({
         "subscribers.json": '{"subscribers": {"2": "New"}}',
-        "stats_current.json": '{"period": "new", "events": []}',
+        "stats_current.json": '{"period": "2026-Q2", "events": []}',
     })
     real_publish = backup._publish_staged_file
     calls = 0
@@ -578,7 +597,7 @@ async def test_restore_rolls_back_first_file_when_second_publish_fails(
 
     assert storage.load_subscribers() == {1: "Old"}
     assert json.loads((backup_env / "stats_current.json").read_text(encoding="utf-8")) == {
-        "period": "old",
+        "period": "2026-Q1",
         "events": [],
     }
 
@@ -590,7 +609,7 @@ async def test_restore_removes_new_file_when_second_publish_fails(
 ):
     raw = _zip_bytes({
         "subscribers.json": '{"subscribers": {"2": "New"}}',
-        "stats_current.json": '{"period": "new", "events": []}',
+        "stats_current.json": '{"period": "2026-Q2", "events": []}',
     })
     real_publish = backup._publish_staged_file
     calls = 0
@@ -671,10 +690,10 @@ async def test_malformed_registry_restore_member_rejects_entire_candidate(
             )
         }
     )
-    storage._atomic_write(backup_env / "stats_current.json", '{"period": "old", "events": []}')
+    storage._atomic_write(backup_env / "stats_current.json", '{"period": "2026-Q1", "events": []}')
     raw = _zip_bytes(
         {
-            "stats_current.json": '{"period": "new", "events": []}',
+            "stats_current.json": '{"period": "2026-Q2", "events": []}',
             name: payload,
         }
     )
@@ -685,7 +704,7 @@ async def test_malformed_registry_restore_member_rejects_entire_candidate(
     assert storage.get_known_user(8) is not None
     assert json.loads(
         (backup_env / "stats_current.json").read_text(encoding="utf-8")
-    )["period"] == "old"
+    )["period"] == "2026-Q1"
 
 
 @pytest.mark.asyncio

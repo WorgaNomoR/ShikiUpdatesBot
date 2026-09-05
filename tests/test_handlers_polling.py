@@ -1329,6 +1329,48 @@ async def test_identical_restore_during_backup_does_not_clear_pending(quarter_de
 
 
 @pytest.mark.asyncio
+async def test_changed_plan_followup_read_failure_keeps_owner_diagnostic(quarter_delivery_env, monkeypatch):
+    cur = _frozen_quarter(["done"], next_unit=1)
+    cur["last_report_sent"] = "2026-Q3"
+    storage.save_stats_current(cur)
+
+    async def replace_during_backup(*args):
+        async with storage.restorable_state_transaction():
+            storage.mark_quarter_state_restored()
+        monkeypatch.setattr("handlers.load_stats_current", MagicMock(side_effect=[
+            deepcopy(cur), storage.QuarterDeliveryStateError("current_read"),
+        ]))
+        return True
+
+    quarter_delivery_env.side_effect = replace_during_backup
+    bot = AsyncMock()
+    result = await handlers._deliver_pending_quarter(bot, cur)
+    assert result == cur
+    assert storage.load_stats_current() == cur
+    assert storage.load_subscription_backup_state()["last_backup_at"] is None
+    bot.send_message.assert_awaited_once_with(chat_id=999, text=handlers._QUARTER_STATE_NOTICE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("period", ["old", "2026-Q2 "])
+async def test_invalid_rotation_period_cannot_publish_snapshot_or_aggregates(quarter_delivery_env, monkeypatch, period):
+    cur = {"period": period, "events": []}
+    storage.save_stats_current(cur)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    snapshot = MagicMock()
+    save_all = MagicMock()
+    monkeypatch.setattr("handlers._save_quarter_snapshot", snapshot)
+    monkeypatch.setattr("handlers.save_stats_all", save_all)
+    bot = AsyncMock()
+    await handlers.rotate_quarter_if_needed(bot, cur, storage._empty_stats_all(), resync=False)
+    snapshot.assert_not_called()
+    save_all.assert_not_called()
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    quarter_delivery_env.assert_not_awaited()
+    bot.send_message.assert_awaited_once_with(chat_id=999, text=handlers._QUARTER_STATE_NOTICE)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_quarter_attempts_do_not_repeat_acknowledged_report(quarter_delivery_env):
     cur = _frozen_quarter(["first", "last"])
     storage.save_stats_current(cur, strict=True)

@@ -57,6 +57,7 @@ from storage import (
     subscriber_state_from_payload,
     user_alerts_from_payload,
     validate_pending_quarter_delivery,
+    validate_quarter_period,
 )
 from storage import subscriber_state_json as storage_subscriber_state_json
 from telegram_delivery import send_with_retry
@@ -325,6 +326,8 @@ def _valid_import_payload(name: str, obj) -> bool:
         return True
     if name == "stats_current.json":
         if isinstance(obj, dict):
+            if "period" in obj:
+                validate_quarter_period(obj["period"])
             # Повреждённый pending отменяет весь импорт до публикации файлов.
             validate_pending_quarter_delivery(obj)
             if obj.get("pending_quarter_delivery") is not None and not isinstance(obj.get("events"), list):
