@@ -28,6 +28,67 @@ import fact_bank
 import handlers
 import storage
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema", ["legacy_pending", "legacy_complete", "current_partial", "current_complete", "empty"])
+async def test_import_roundtrips_supported_quarter_delivery_plans(backup_env, schema):
+    cur = storage._empty_stats_current("2026-Q3")
+    if schema.startswith("legacy"):
+        pending = {
+            "old_period": "2026-Q2", "new_period": "2026-Q3",
+            "report_messages": ["frozen first", "frozen second"],
+            "report_sent": schema == "legacy_complete",
+        }
+    else:
+        pending = storage.new_quarter_delivery(
+            "2026-Q2", "2026-Q3", [] if schema == "empty" else ["frozen first", "frozen second"],
+        )
+        pending["next_unit"] = {"current_partial": 1, "current_complete": 2, "empty": 0}[schema]
+    cur["pending_quarter_delivery"] = pending
+    generation = storage.quarter_restore_generation()
+    result = await backup.restore_backup_zip(_zip_bytes({"stats_current.json": json.dumps(cur)}))
+    assert result["restored"] == ["stats_current.json"]
+    assert storage.load_stats_current(strict=True) == cur
+    assert storage.quarter_restore_generation() == generation + 1
+    # Экспорт сохраняет ту же схему и frozen payload, не создаёт новый план.
+    payload = backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        assert json.loads(archive.read("stats_current.json")) == cur
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["unknown_version", "progress", "messages", "lineage", "events", "legacy"])
+async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, damage):
+    current = storage._empty_stats_current("2026-Q2")
+    storage.save_stats_current(current, strict=True)
+    cur = storage._empty_stats_current("2026-Q3")
+    cur["pending_quarter_delivery"] = storage.new_quarter_delivery("2026-Q2", "2026-Q3", ["private report"])
+    pending = cur["pending_quarter_delivery"]
+    if damage == "unknown_version":
+        pending["version"] = 99
+    elif damage == "progress":
+        pending["next_unit"] = True
+    elif damage == "messages":
+        pending["report_messages"] = [""]
+    elif damage == "lineage":
+        cur["period"] = "2026-Q4"
+    elif damage == "events":
+        cur.pop("events")
+    else:
+        cur["pending_quarter_delivery"] = {
+            "old_period": "2026-Q2", "new_period": "2026-Q3",
+            "report_messages": [None], "report_sent": False,
+        }
+    generation = storage.quarter_restore_generation()
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        await backup.restore_backup_zip(_zip_bytes({
+            "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
+            "stats_current.json": json.dumps(cur),
+        }))
+    assert storage.load_stats_current() == current
+    assert not (backup_env / "quarters" / "2026-Q1.json").exists()
+    assert storage.quarter_restore_generation() == generation
+
 # ─────────────────────────────────────────────────────────────
 #  Хелперы
 # ─────────────────────────────────────────────────────────────

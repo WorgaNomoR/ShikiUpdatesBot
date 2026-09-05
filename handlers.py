@@ -172,6 +172,7 @@ from storage import (
     STATS_ALL_VALID,
     BlockedUsersMutationError,
     BlockedUsersStateError,
+    QuarterDeliveryStateError,
     UserAlertsStateError,
     _empty_stats_current,
     add_blocked_user,
@@ -185,7 +186,10 @@ from storage import (
     load_subscribers,
     load_subscription_backup_state,
     load_update_state,
+    migrate_quarter_delivery,
     mutate_subscription,
+    new_quarter_delivery,
+    quarter_restore_generation,
     remove_blocked_user,
     restorable_state_transaction,
     save_seen_favourites,
@@ -196,6 +200,7 @@ from storage import (
     save_subscribers,
     set_user_alerts_enabled,
     subscriber_state_json,
+    validate_pending_quarter_delivery,
     validate_telegram_user_id,
 )
 from telegram_delivery import is_blocked_error as _is_blocked_error
@@ -386,137 +391,164 @@ _PENDING_QUARTER_DELIVERY = "pending_quarter_delivery"
 _QUARTER_ROTATION_ATTEMPTS = 3
 
 
+_QUARTER_STATE_NOTICE = (
+    "⚠️ Не удалось продолжить квартальный отчёт. Сохранённое состояние оставлено "
+    "для повторной попытки. Если ошибка повторяется, проверь журнал бота или "
+    "восстанови резервную копию через /backup."
+)
+_last_quarter_notice_at: float | None = None
+
+
+class _QuarterPlanChanged(RuntimeError):
+    """Текущая попытка больше не владеет опубликованным планом."""
+
+
 def _valid_pending_quarter_delivery(cur: dict) -> dict | None:
-    """Вернуть корректное состояние отложенной доставки квартала."""
-    pending = cur.get(_PENDING_QUARTER_DELIVERY)
-    if pending is None:
-        return None
-    if not isinstance(pending, dict) or set(pending) != {
-        "old_period",
-        "new_period",
-        "report_messages",
-        "report_sent",
-    }:
-        return None
-    messages = pending.get("report_messages")
-    if (
-        not isinstance(pending.get("old_period"), str)
-        or not pending["old_period"]
-        or not isinstance(pending.get("new_period"), str)
-        or pending["new_period"] != cur.get("period")
-        or not isinstance(messages, list)
-        or not all(isinstance(message, str) for message in messages)
-        or not isinstance(pending.get("report_sent"), bool)
-    ):
-        return None
-    return pending
+    """Проверить pending общим контрактом runtime/import без молчаливого сброса."""
+    return validate_pending_quarter_delivery(cur)
+
+
+async def _quarter_state_diagnostic(bot: Bot, error: QuarterDeliveryStateError) -> None:
+    """Стабильное уведомление с debounce; содержимое отчёта не попадает в лог."""
+    global _last_quarter_notice_at
+    log.error("rotate_quarter: состояние доставки недоступно: %s", error)
+    now = time.monotonic()
+    if _last_quarter_notice_at is not None and now - _last_quarter_notice_at < ERROR_NOTIFY_INTERVAL:
+        return
+    _last_quarter_notice_at = now
+    try:
+        await bot.send_message(chat_id=OWNER_ID, text=_QUARTER_STATE_NOTICE)
+    except Exception:
+        log.warning("rotate_quarter: уведомление об ошибке состояния не доставлено.")
 
 
 async def _deliver_pending_quarter(bot: Bot, cur: dict) -> dict:
-    """Дослать квартальный отчёт и бэкап, отмечая только успешные этапы."""
-    pending = _valid_pending_quarter_delivery(cur)
-    if pending is None:
-        if cur.get(_PENDING_QUARTER_DELIVERY) is None:
+    """Сериализовать попытки отчёта и backup, сохраняя lock состояния свободным."""
+    try:
+        async with automatic_backup_delivery():
+            return await _resume_pending_quarter(bot)
+    except QuarterDeliveryStateError as error:
+        await _quarter_state_diagnostic(bot, error)
+        try:
+            return load_stats_current(strict=True)
+        except QuarterDeliveryStateError:
             return cur
-        log.warning("rotate_quarter: повреждённое состояние доставки сброшено.")
-        async with restorable_state_transaction():
-            cur = load_stats_current()
-            if (
-                cur.get(_PENDING_QUARTER_DELIVERY) is not None
-                and _valid_pending_quarter_delivery(cur) is None
-            ):
-                cur[_PENDING_QUARTER_DELIVERY] = None
-                save_stats_current(cur)
-        return cur
+    except _QuarterPlanChanged:
+        log.warning("rotate_quarter: план изменился; текущая попытка остановлена.")
+        return load_stats_current(strict=True)
 
-    if not pending["report_sent"]:
-        result = await deliver_rendered_report(
-            bot,
-            OWNER_ID,
-            pending["report_messages"],
+
+async def _resume_pending_quarter(bot: Bot) -> dict:
+    """Дослать frozen plan через общий delivery loop и отдельно подтвердить backup."""
+    async with restorable_state_transaction():
+        cur = load_stats_current(strict=True)
+        pending = _valid_pending_quarter_delivery(cur)
+        if pending is None:
+            return cur
+        generation = quarter_restore_generation()
+        migrated = migrate_quarter_delivery(pending)
+        complete = migrated["next_unit"] == len(migrated["report_messages"])
+        if migrated != pending or (complete and cur.get("last_report_sent") != migrated["new_period"]):
+            cur[_PENDING_QUARTER_DELIVERY] = migrated
+            if complete:
+                cur["last_report_sent"] = migrated["new_period"]
+            save_stats_current(cur, strict=True)
+        pending = migrated
+
+    def read_expected(index: int) -> dict:
+        # Caller держит lock; перечитываем и сохраняем чужие независимые поля.
+        current = load_stats_current(strict=True)
+        actual = _valid_pending_quarter_delivery(current)
+        expected = dict(pending, next_unit=index)
+        if quarter_restore_generation() != generation or actual != expected:
+            raise _QuarterPlanChanged
+        return current
+
+    async def before_send(index: int) -> None:
+        async with restorable_state_transaction():
+            read_expected(index)
+
+    async def acknowledge(index: int) -> None:
+        async with restorable_state_transaction():
+            current = read_expected(index)
+            current[_PENDING_QUARTER_DELIVERY] = dict(pending, next_unit=index + 1)
+            if index + 1 == len(pending["report_messages"]):
+                current["last_report_sent"] = pending["new_period"]
+            save_stats_current(current, strict=True)
+
+    result = await deliver_rendered_report(
+        bot,
+        OWNER_ID,
+        pending["report_messages"],
+        start_unit=pending["next_unit"],
+        before_send=before_send,
+        acknowledge=acknowledge,
+        sleep=asyncio.sleep,
+    )
+    if not result.delivered:
+        # Исключения Telegram могут содержать весь запрос: логируем только тип.
+        log.warning(
+            "rotate_quarter: попытка остановлена, Telegram success=%d, next_unit=%d/%d, error=%s",
+            result.delivered_units, result.next_unit, result.total_units,
+            type(result.error).__name__,
         )
-        if not result.delivered:
-            log.error(
-                "rotate_quarter: отчёт остановлен после %d/%d сообщений: %s",
-                result.delivered_units,
-                result.total_units,
-                result.error,
-            )
-            return load_stats_current()
+        if isinstance(result.error, QuarterDeliveryStateError):
+            raise result.error
+        return load_stats_current(strict=True)
 
-        async with restorable_state_transaction():
-            cur = load_stats_current()
-            if cur.get(_PENDING_QUARTER_DELIVERY) != pending:
-                return cur
-            pending = dict(pending)
-            pending["report_sent"] = True
-            cur["last_report_sent"] = pending["new_period"]
-            cur[_PENDING_QUARTER_DELIVERY] = pending
-            save_stats_current(cur)
-        log.info(
-            "rotate_quarter: отчёт за %s отправлен владельцу (%d сообщ.).",
-            pending["old_period"],
-            len(pending["report_messages"]),
-        )
-
-    async with automatic_backup_delivery():
-        prepared_at = time.time()
-        async with restorable_state_transaction():
-            cur = load_stats_current()
-            if cur.get(_PENDING_QUARTER_DELIVERY) != pending:
-                return cur
-            subscriber_state = load_subscriber_state(strict_subscribers=True)
-            if prepare_backup_schedule(subscriber_state, prepared_at):
-                save_subscriber_state(subscriber_state)
-            expected_subscriber_state = subscriber_state_json(subscriber_state)
-
-        backup_sent = await send_backup(
-            bot,
-            f"🗓️ Ротация квартала: {h(quarter_label(pending['old_period']))} → "
-            f"{h(quarter_label(pending['new_period']))}.\n"
-            f"Снапшот состояния.\n\n{BACKUP_TAG}",
-        )
-        if not backup_sent:
-            return load_stats_current()
-
-        completed_at = time.time()
-        async with restorable_state_transaction():
-            cur = load_stats_current()
-            subscriber_state = load_subscriber_state(strict_subscribers=True)
-            if (
-                cur.get(_PENDING_QUARTER_DELIVERY) != pending
-                or subscriber_state_json(subscriber_state) != expected_subscriber_state
-            ):
-                log.warning(
-                    "rotate_quarter: состояние изменилось во время backup; "
-                    "доставка останется pending для безопасного retry."
-                )
-                return cur
-            subscriber_state.backup_schedule["last_backup_at"] = completed_at
+    prepared_at = time.time()
+    async with restorable_state_transaction():
+        cur = read_expected(len(pending["report_messages"]))
+        subscriber_state = load_subscriber_state(strict_subscribers=True)
+        if prepare_backup_schedule(subscriber_state, prepared_at):
             save_subscriber_state(subscriber_state)
-            cur[_PENDING_QUARTER_DELIVERY] = None
-            save_stats_current(cur)
+        expected_subscriber_state = subscriber_state_json(subscriber_state)
+
+    backup_sent = await send_backup(
+        bot,
+        f"🗓️ Ротация квартала: {h(quarter_label(pending['old_period']))} → "
+        f"{h(quarter_label(pending['new_period']))}.\n"
+        f"Снапшот состояния.\n\n{BACKUP_TAG}",
+    )
+    if not backup_sent:
+        return load_stats_current(strict=True)
+
+    completed_at = time.time()
+    async with restorable_state_transaction():
+        cur = read_expected(len(pending["report_messages"]))
+        subscriber_state = load_subscriber_state(strict_subscribers=True)
+        if subscriber_state_json(subscriber_state) != expected_subscriber_state:
+            raise _QuarterPlanChanged
+        subscriber_state.backup_schedule["last_backup_at"] = completed_at
+        save_subscriber_state(subscriber_state)
+        cur[_PENDING_QUARTER_DELIVERY] = None
+        save_stats_current(cur, strict=True)
     return cur
 
 
 async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
+    """Не сбрасывать недоступное состояние и сообщить владельцу о проблеме."""
+    try:
+        return await _rotate_quarter_if_needed(bot, cur, stats_all, resync)
+    except QuarterDeliveryStateError as error:
+        await _quarter_state_diagnostic(bot, error)
+        return cur
+
+
+async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
     """
-    Проверяем смену квартала. Если сменился:
-      1. Защита last_report_sent от двойной отправки.
-      2. Синхронизируем stats_all (чтобы метаданные завершённых были свежими);
-         на старте пропускаем — polling_loop уже синкнул (resync=False).
-      3. Строим отчёт, сохраняем снапшот quarters/<period>.json.
-      4. Обновляем by_quarter в агрегатах stats_all.
-      5. Отправляем отчёт владельцу.
-      6. Сбрасываем stats_current на новый период.
-    Возвращает (возможно новый) stats_current.
+    Сначала завершаем существующий pending, даже если наступил новый квартал.
+    При новой ротации синхронизируем метаданные (кроме startup), строим модель
+    и рендерим вне lock. После повторной проверки состояния сохраняем снапшот,
+    by_quarter и новый квартал с frozen plan до первого Telegram await.
+    Возвращаем опубликованный stats_current; report и backup подтверждаем отдельно.
     """
     now_period = current_quarter()
     async with restorable_state_transaction():
-        cur = load_stats_current()
+        cur = load_stats_current(strict=True)
         rotation_needed = cur.get("period") != now_period
 
-    if not rotation_needed:
+    if cur.get(_PENDING_QUARTER_DELIVERY) is not None or not rotation_needed:
         return await _deliver_pending_quarter(bot, cur)
 
     # Свежие метаданные перед отчётом. На старте (resync=False) пропускаем:
@@ -534,8 +566,8 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
 
     for attempt in range(1, _QUARTER_ROTATION_ATTEMPTS + 1):
         async with restorable_state_transaction():
-            cur = load_stats_current()
-            if cur.get("period") == now_period:
+            cur = load_stats_current(strict=True)
+            if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") == now_period:
                 return cur
 
             old_period = cur.get("period", "???")
@@ -544,7 +576,7 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
                 log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
                 fresh = _empty_stats_current(now_period)
                 fresh["last_report_sent"] = now_period
-                save_stats_current(fresh)
+                save_stats_current(fresh, strict=True)
                 return fresh
 
             log.info("rotate_quarter: квартал сменился %s → %s.", old_period, now_period)
@@ -573,7 +605,7 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
             ))
 
         async with restorable_state_transaction():
-            cur = load_stats_current()
+            cur = load_stats_current(strict=True)
             if cur != expected_cur:
                 # Новое квартальное событие могло успеть опубликоваться, пока
                 # renderer работал без lock. Перестраиваем модель без потери.
@@ -596,13 +628,10 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
                 log.error("rotate_quarter: обновление by_quarter: %s", e)
 
             fresh = _empty_stats_current(now_period)
-            fresh[_PENDING_QUARTER_DELIVERY] = {
-                "old_period": old_period,
-                "new_period": now_period,
-                "report_messages": report_messages,
-                "report_sent": False,
-            }
-            save_stats_current(fresh)
+            fresh[_PENDING_QUARTER_DELIVERY] = new_quarter_delivery(
+                old_period, now_period, report_messages,
+            )
+            save_stats_current(fresh, strict=True)
         break
 
     return await _deliver_pending_quarter(bot, fresh)

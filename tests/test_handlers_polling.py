@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
+import io
+import json
+import logging
+import zipfile
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import (
     AsyncMock,
     MagicMock,
@@ -9,12 +14,15 @@ from unittest.mock import (
 from uuid import uuid4
 
 import pytest
+from aiogram.exceptions import TelegramServerError
+from aiogram.methods import SendMessage
 
 import backup
 import config
 import handlers
 import shiki_api
 import storage
+import telegram_delivery
 from report_model import (
     Report,
     plain_report,
@@ -743,7 +751,7 @@ async def test_quarter_renderer_runs_without_restorable_state_lock(monkeypatch):
 
     old_cur = {"period": "2026-Q2", "events": []}
     monkeypatch.setattr(handlers, "restorable_state_transaction", transaction)
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: old_cur)
+    monkeypatch.setattr(handlers, "load_stats_current", lambda **kwargs: old_cur)
     monkeypatch.setattr(handlers, "current_quarter", lambda: "2026-Q3")
     monkeypatch.setattr(handlers, "_load_prev_quarter_summary", lambda *args: None)
     monkeypatch.setattr(handlers, "rendered_html", render)
@@ -777,7 +785,7 @@ async def test_quarter_rotation_defers_after_repeated_state_changes(monkeypatch)
     snapshot = MagicMock()
     save_current = MagicMock()
     deliver_pending = AsyncMock()
-    monkeypatch.setattr(handlers, "load_stats_current", lambda: state["cur"])
+    monkeypatch.setattr(handlers, "load_stats_current", lambda **kwargs: state["cur"])
     monkeypatch.setattr(handlers, "current_quarter", lambda: "2026-Q3")
     monkeypatch.setattr(handlers, "_load_prev_quarter_summary", lambda *args: None)
     monkeypatch.setattr(
@@ -1007,7 +1015,7 @@ async def test_rotation_retries_report_before_marking_delivery(
     assert first["period"] == "2026-Q3"
     assert first["last_report_sent"] is None
     assert storage.load_subscription_backup_state()["last_backup_at"] is None
-    assert first["pending_quarter_delivery"]["report_sent"] is False
+    assert first["pending_quarter_delivery"]["next_unit"] == 0
     backup_send.assert_not_awaited()
 
     second = await handlers.rotate_quarter_if_needed(
@@ -1025,6 +1033,431 @@ async def test_rotation_retries_report_before_marking_delivery(
         float,
     )
     assert second["pending_quarter_delivery"] is None
+
+
+def _frozen_quarter(messages=None, next_unit=0):
+    cur = storage._empty_stats_current("2026-Q3")
+    cur["pending_quarter_delivery"] = storage.new_quarter_delivery(
+        "2026-Q2", "2026-Q3",
+        ["unit-0", "unit-1", "unit-2", "unit-3"] if messages is None else messages,
+    )
+    cur["pending_quarter_delivery"]["next_unit"] = next_unit
+    return cur
+
+
+def _quarter_archive(cur):
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("stats_current.json", json.dumps(cur))
+    return stream.getvalue()
+
+
+@pytest.fixture
+def quarter_delivery_env(backup_env, monkeypatch):
+    monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
+    monkeypatch.setattr("handlers._last_quarter_notice_at", None)
+    monkeypatch.setattr(handlers.asyncio, "sleep", AsyncMock())
+    backup_send = AsyncMock(return_value=False)
+    monkeypatch.setattr("handlers.send_backup", backup_send)
+    return backup_send
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_index", [1, 2])
+async def test_quarter_failure_reload_resumes_exact_next_unit(quarter_delivery_env, failed_index):
+    cur = _frozen_quarter()
+    storage.save_stats_current(cur, strict=True)
+    bot = AsyncMock()
+    bot.send_message.side_effect = [None] * failed_index + [RuntimeError("failed")]
+    await handlers.rotate_quarter_if_needed(bot, cur, {}, resync=False)
+    reloaded = storage.load_stats_current(strict=True)
+    assert reloaded["pending_quarter_delivery"]["next_unit"] == failed_index
+    assert reloaded["pending_quarter_delivery"]["plan_id"] == cur["pending_quarter_delivery"]["plan_id"]
+    assert reloaded["last_report_sent"] is None
+    quarter_delivery_env.assert_not_awaited()
+    bot.send_message.reset_mock(side_effect=True)
+    await handlers.rotate_quarter_if_needed(bot, reloaded, {"changed": "data"}, resync=False)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == (
+        ["unit-1", "unit-2", "unit-3"] if failed_index == 1 else ["unit-2", "unit-3"]
+    )
+    final = storage.load_stats_current(strict=True)
+    assert final["pending_quarter_delivery"]["next_unit"] == 4
+    assert final["last_report_sent"] == "2026-Q3"
+    quarter_delivery_env.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_uses_persisted_plan_without_build_or_sync(quarter_delivery_env, monkeypatch):
+    cur = _frozen_quarter(next_unit=2)
+    storage.save_stats_current(cur, strict=True)
+    build = MagicMock(side_effect=AssertionError("rebuild"))
+    sync = AsyncMock(side_effect=AssertionError("sync"))
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", build)
+    monkeypatch.setattr("handlers.sync_stats_all", sync)
+    # Даже при следующей календарной ротации старый pending сначала завершается.
+    monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q4")
+    bot = AsyncMock()
+    await handlers.rotate_quarter_if_needed(bot, {"stale": "caller"}, {})
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ["unit-2", "unit-3"]
+    build.assert_not_called()
+    sync.assert_not_awaited()
+    assert storage.load_stats_current()["period"] == "2026-Q3"
+
+
+@pytest.mark.asyncio
+async def test_telegram_success_interrupted_before_ack_repeats_only_unacknowledged(quarter_delivery_env, monkeypatch):
+    cur = _frozen_quarter(next_unit=1)
+    storage.save_stats_current(cur, strict=True)
+    real_save = handlers.save_stats_current
+
+    def interrupt(data, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("handlers.save_stats_current", interrupt)
+    bot = AsyncMock()
+    with pytest.raises(asyncio.CancelledError):
+        await handlers._deliver_pending_quarter(bot, cur)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ["unit-1"]
+    assert storage.load_stats_current()["pending_quarter_delivery"]["next_unit"] == 1
+    quarter_delivery_env.assert_not_awaited()
+    monkeypatch.setattr("handlers.save_stats_current", real_save)
+    bot.send_message.reset_mock()
+    await handlers._deliver_pending_quarter(bot, storage.load_stats_current())
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ["unit-1", "unit-2", "unit-3"]
+
+
+@pytest.mark.asyncio
+async def test_ack_write_failure_retains_disk_progress_and_full_completion(quarter_delivery_env, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="shikiupdatesbot")
+    cur = _frozen_quarter(next_unit=2)
+    storage.save_stats_current(cur, strict=True)
+    original_write = storage._atomic_write
+
+    def fail_ack(path, data):
+        if path == storage.STATS_CURRENT_FILE:
+            raise OSError("PRIVATE REPORT CONTENT")
+        return original_write(path, data)
+
+    monkeypatch.setattr(storage, "_atomic_write", fail_ack)
+    bot = AsyncMock()
+    await handlers._deliver_pending_quarter(bot, cur)
+    persisted = storage.load_stats_current()
+    assert persisted["pending_quarter_delivery"]["next_unit"] == 2
+    assert persisted["last_report_sent"] is None
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ["unit-2", handlers._QUARTER_STATE_NOTICE]
+    assert "PRIVATE REPORT CONTENT" not in caplog.text
+    quarter_delivery_env.assert_not_awaited()
+    monkeypatch.setattr(storage, "_atomic_write", original_write)
+    bot.send_message.reset_mock()
+    await handlers._deliver_pending_quarter(bot, persisted)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ["unit-2", "unit-3"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["identical", "older", "newer", "conflicting"])
+async def test_restore_during_report_never_acknowledges_restored_state(quarter_delivery_env, replacement):
+    cur = _frozen_quarter(next_unit=1)
+    storage.save_stats_current(cur, strict=True)
+    restored = deepcopy(cur)
+    if replacement == "older":
+        restored["pending_quarter_delivery"]["next_unit"] = 0
+    elif replacement == "newer":
+        restored["pending_quarter_delivery"]["next_unit"] = 2
+    elif replacement == "conflicting":
+        restored = _frozen_quarter(["another", "report"])
+
+    async def send(**kwargs):
+        assert not storage._restorable_state_lock().locked()
+        await backup.restore_backup_zip(_quarter_archive(restored))
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await handlers._deliver_pending_quarter(bot, cur)
+    bot.send_message.assert_awaited_once()
+    assert storage.load_stats_current() == restored
+    quarter_delivery_env.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["progress", "plan", "period", "removed", "malformed"])
+async def test_concurrent_replacement_is_not_acknowledged(quarter_delivery_env, replacement):
+    cur = _frozen_quarter(next_unit=1)
+    storage.save_stats_current(cur, strict=True)
+    changed = deepcopy(cur)
+    if replacement == "progress":
+        changed["pending_quarter_delivery"]["next_unit"] = 2
+    elif replacement == "plan":
+        changed = _frozen_quarter()
+    elif replacement == "period":
+        changed["period"] = "2026-Q4"
+    elif replacement == "removed":
+        changed["pending_quarter_delivery"] = None
+    else:
+        changed["pending_quarter_delivery"]["plan_hash"] = "damaged"
+
+    async def send(**kwargs):
+        async with storage.restorable_state_transaction():
+            storage.save_stats_current(changed, strict=True)
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await handlers._deliver_pending_quarter(bot, cur)
+    assert storage.load_stats_current() == changed
+    assert bot.send_message.await_args_list[0].kwargs["text"] == "unit-1"
+    assert all(call.kwargs["text"] != "unit-2" for call in bot.send_message.await_args_list)
+    quarter_delivery_env.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent", [False, True])
+async def test_legacy_migration_published_before_delivery(quarter_delivery_env, sent):
+    cur = storage._empty_stats_current("2026-Q3")
+    cur["pending_quarter_delivery"] = {
+        "old_period": "2026-Q2", "new_period": "2026-Q3",
+        "report_messages": ["legacy-0", "legacy-1"], "report_sent": sent,
+    }
+    storage.save_stats_current(cur, strict=True)
+
+    async def send(**kwargs):
+        pending = storage.load_stats_current()["pending_quarter_delivery"]
+        assert pending["version"] == 1
+        assert "report_sent" not in pending
+        assert pending["report_messages"] == ["legacy-0", "legacy-1"]
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await handlers._deliver_pending_quarter(bot, cur)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ([] if sent else ["legacy-0", "legacy-1"])
+    pending = storage.load_stats_current()["pending_quarter_delivery"]
+    assert pending["next_unit"] == 2
+    assert storage.load_stats_current()["last_report_sent"] == "2026-Q3"
+    quarter_delivery_env.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("messages,next_unit", [([], 0), (["already", "sent"], 2)])
+async def test_complete_plan_retries_only_backup_and_clears_after_success(quarter_delivery_env, messages, next_unit):
+    cur = _frozen_quarter(messages, next_unit)
+    storage.save_stats_current(cur, strict=True)
+    bot = AsyncMock()
+    quarter_delivery_env.side_effect = [False, True]
+    await handlers._deliver_pending_quarter(bot, cur)
+    pending = storage.load_stats_current()
+    assert pending["last_report_sent"] == "2026-Q3"
+    assert pending["pending_quarter_delivery"]["next_unit"] == next_unit
+    await handlers._deliver_pending_quarter(bot, pending)
+    assert storage.load_stats_current()["pending_quarter_delivery"] is None
+    bot.send_message.assert_not_awaited()
+    assert quarter_delivery_env.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_malformed_recovery_preserves_data_and_debounces_safe_notice(quarter_delivery_env, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger="shikiupdatesbot")
+    cur = _frozen_quarter(["PRIVATE REPORT CONTENT"])
+    cur["pending_quarter_delivery"]["version"] = 99
+    storage.save_stats_current(cur, strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q4")
+    bot = AsyncMock()
+    await handlers.rotate_quarter_if_needed(bot, cur, {}, resync=False)
+    await handlers.rotate_quarter_if_needed(bot, cur, {}, resync=False)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    bot.send_message.assert_awaited_once_with(chat_id=999, text=handlers._QUARTER_STATE_NOTICE)
+    assert "unsupported_version" in caplog.text
+    assert "PRIVATE REPORT CONTENT" not in caplog.text
+    quarter_delivery_env.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_report_awaits_retry_and_backup_are_outside_state_lock(quarter_delivery_env, monkeypatch):
+    cur = _frozen_quarter(["first", "last"])
+    storage.save_stats_current(cur, strict=True)
+    sends = 0
+    retry_count = 0
+
+    async def send(**kwargs):
+        nonlocal sends
+        assert not storage._restorable_state_lock().locked()
+        current = storage.load_stats_current()
+        assert current["last_report_sent"] is None
+        sends += 1
+        if sends == 1:
+            raise TelegramServerError(method=SendMessage(chat_id=999, text="first"), message="transient")
+        if sends == 2:
+            # Независимое событие не должно теряться после acknowledgement.
+            current["events"].append({"id": "added-during-send"})
+            async with storage.restorable_state_transaction():
+                storage.save_stats_current(current, strict=True)
+
+    async def retry_sleep(delay):
+        nonlocal retry_count
+        assert not storage._restorable_state_lock().locked()
+        retry_count += 1
+
+    async def send_backup(*args):
+        assert not storage._restorable_state_lock().locked()
+        current = storage.load_stats_current()
+        assert current["pending_quarter_delivery"]["next_unit"] == 2
+        assert current["last_report_sent"] == "2026-Q3"
+        return True
+
+    monkeypatch.setattr(telegram_delivery, "_sleep", retry_sleep)
+    quarter_delivery_env.side_effect = send_backup
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await handlers._deliver_pending_quarter(bot, cur)
+    assert sends == 3
+    assert retry_count == 1
+    assert storage.load_stats_current()["events"] == [{"id": "added-during-send"}]
+
+
+@pytest.mark.asyncio
+async def test_identical_restore_during_backup_does_not_clear_pending(quarter_delivery_env):
+    cur = _frozen_quarter(["done"], next_unit=1)
+    cur["last_report_sent"] = "2026-Q3"
+    storage.save_stats_current(cur, strict=True)
+
+    async def restore_while_sending(*args):
+        await backup.restore_backup_zip(_quarter_archive(cur))
+        return True
+
+    quarter_delivery_env.side_effect = restore_while_sending
+    await handlers._deliver_pending_quarter(AsyncMock(), cur)
+    assert storage.load_stats_current() == cur
+    assert storage.load_subscription_backup_state()["last_backup_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_quarter_attempts_do_not_repeat_acknowledged_report(quarter_delivery_env):
+    cur = _frozen_quarter(["first", "last"])
+    storage.save_stats_current(cur, strict=True)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def send(**kwargs):
+        if kwargs["text"] == "first":
+            entered.set()
+            await release.wait()
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    first = asyncio.create_task(handlers._deliver_pending_quarter(bot, cur))
+    await entered.wait()
+    second = asyncio.create_task(handlers._deliver_pending_quarter(bot, cur))
+    release.set()
+    await asyncio.gather(first, second)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ["first", "last"]
+    assert storage.load_stats_current()["pending_quarter_delivery"]["next_unit"] == 2
+
+
+@pytest.mark.asyncio
+async def test_restore_during_inter_unit_sleep_stops_next_send(quarter_delivery_env, monkeypatch):
+    cur = _frozen_quarter(["first", "last"])
+    storage.save_stats_current(cur, strict=True)
+
+    async def gap(delay):
+        assert not storage._restorable_state_lock().locked()
+        assert storage.load_stats_current()["pending_quarter_delivery"]["next_unit"] == 1
+        await backup.restore_backup_zip(_quarter_archive(cur))
+
+    monkeypatch.setattr(handlers.asyncio, "sleep", gap)
+    bot = AsyncMock()
+    await handlers._deliver_pending_quarter(bot, cur)
+    bot.send_message.assert_awaited_once()
+    assert storage.load_stats_current() == cur
+    quarter_delivery_env.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_last_ack_write_failure_does_not_publish_last_report_sent(quarter_delivery_env, monkeypatch):
+    cur = _frozen_quarter(["first", "last"], next_unit=1)
+    storage.save_stats_current(cur, strict=True)
+
+    def fail(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(storage, "_atomic_write", fail)
+    await handlers._deliver_pending_quarter(AsyncMock(), cur)
+    assert storage.load_stats_current()["pending_quarter_delivery"]["next_unit"] == 1
+    assert storage.load_stats_current()["last_report_sent"] is None
+    quarter_delivery_env.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_migration_never_sends_report_or_backup(quarter_delivery_env, monkeypatch):
+    cur = storage._empty_stats_current("2026-Q3")
+    cur["pending_quarter_delivery"] = {
+        "old_period": "2026-Q2", "new_period": "2026-Q3",
+        "report_messages": ["legacy"], "report_sent": False,
+    }
+    storage.save_stats_current(cur, strict=True)
+
+    def fail(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(storage, "_atomic_write", fail)
+    bot = AsyncMock()
+    await handlers._deliver_pending_quarter(bot, cur)
+    assert storage.load_stats_current() == cur
+    bot.send_message.assert_awaited_once_with(chat_id=999, text=handlers._QUARTER_STATE_NOTICE)
+    quarter_delivery_env.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rotation_publishes_all_rendered_continuations_before_first_send(quarter_delivery_env, monkeypatch):
+    cur = storage._empty_stats_current("2026-Q2")
+    storage.save_stats_current(cur, strict=True)
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *args: plain_report("x" * 4096 + "tail"))
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *args: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *args: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *args: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *args: None)
+    plan_ids = []
+
+    async def send(**kwargs):
+        current = storage.load_stats_current(strict=True)
+        assert current["period"] == "2026-Q3"
+        pending = current["pending_quarter_delivery"]
+        assert pending["version"] == 1
+        assert pending["report_messages"] == ["x" * 4096, "tail"]
+        plan_ids.append(pending["plan_id"])
+        if kwargs["text"] == "tail":
+            assert pending["next_unit"] == 1
+            raise RuntimeError("stop")
+        assert pending["next_unit"] == 0
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await handlers.rotate_quarter_if_needed(bot, cur, {}, resync=False)
+    assert len(plan_ids) == 2
+    assert plan_ids[0] == plan_ids[1]
+    quarter_delivery_env.assert_not_awaited()
+    bot.send_message.reset_mock(side_effect=True)
+    await handlers.rotate_quarter_if_needed(bot, storage.load_stats_current(), {}, resync=False)
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs["text"] == "tail"
+
+
+@pytest.mark.asyncio
+async def test_rotation_plan_write_failure_never_sends_report(quarter_delivery_env, monkeypatch):
+    cur = storage._empty_stats_current("2026-Q2")
+    storage.save_stats_current(cur, strict=True)
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", lambda *args: plain_report("REPORT"))
+    monkeypatch.setattr("handlers._save_quarter_snapshot", lambda *args: None)
+    monkeypatch.setattr("handlers._update_by_quarter", lambda *args: None)
+    monkeypatch.setattr("handlers._load_prev_quarter_summary", lambda *args: None)
+    monkeypatch.setattr("handlers.save_stats_all", lambda *args: None)
+
+    def fail(*args):
+        raise OSError("disk")
+
+    monkeypatch.setattr(storage, "_atomic_write", fail)
+    bot = AsyncMock()
+    await handlers.rotate_quarter_if_needed(bot, cur, {}, resync=False)
+    assert storage.load_stats_current() == cur
+    bot.send_message.assert_awaited_once_with(chat_id=999, text=handlers._QUARTER_STATE_NOTICE)
+    quarter_delivery_env.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1058,7 +1491,7 @@ async def test_rotation_retries_backup_without_repeating_report(
 
     assert first["last_report_sent"] == "2026-Q3"
     assert storage.load_subscription_backup_state()["last_backup_at"] is None
-    assert first["pending_quarter_delivery"]["report_sent"] is True
+    assert first["pending_quarter_delivery"]["next_unit"] == 1
 
     second = await handlers.rotate_quarter_if_needed(
         bot,

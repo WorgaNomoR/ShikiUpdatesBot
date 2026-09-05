@@ -135,14 +135,14 @@ async def test_preview_policy_is_applied_to_every_report_unit(disable_preview):
 
 
 @pytest.mark.asyncio
-async def test_rendered_report_skips_empty_messages_and_propagates_preview_policy():
+async def test_rendered_report_propagates_preview_policy():
     bot = MagicMock()
     bot.send_message = AsyncMock(return_value=object())
 
     result = await deliver_rendered_report(
         bot,
         7,
-        ("", "first", "   ", "second"),
+        ("first", "second"),
         disable_preview=True,
         sleep=AsyncMock(),
     )
@@ -158,3 +158,60 @@ async def test_rendered_report_skips_empty_messages_and_propagates_preview_polic
         call.kwargs["disable_web_page_preview"] is True
         for call in bot.send_message.await_args_list
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("messages,start", [([""], 0), ([None], 0), (["x"], -1), (["x"], True), (["x"], 0.5), (["x"], 2)])
+async def test_rendered_plan_rejects_invalid_units_without_reindexing(messages, start):
+    bot = MagicMock(send_message=AsyncMock())
+    result = await deliver_rendered_report(bot, 7, messages, start_unit=start)
+    assert result.delivered is False
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_acknowledgement_failure_keeps_telegram_success_separate():
+    bot = MagicMock(send_message=AsyncMock())
+    before = AsyncMock()
+    ack = AsyncMock(side_effect=OSError("disk"))
+    result = await deliver_rendered_report(
+        bot, 7, ["zero", "one", "two"], start_unit=1,
+        before_send=before, acknowledge=ack, sleep=AsyncMock(),
+    )
+    assert result.delivered is False
+    assert result.delivered_units == 1
+    assert result.next_unit == 1
+    assert result.total_units == 3
+    assert isinstance(result.error, OSError)
+    before.assert_awaited_once_with(1)
+    ack.assert_awaited_once_with(1)
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs["text"] == "one"
+
+
+@pytest.mark.asyncio
+async def test_guard_runs_again_after_transport_retry_sleep(monkeypatch):
+    transient = TelegramServerError(method=_METHOD, message="temporary")
+    bot = MagicMock(send_message=AsyncMock(side_effect=transient))
+    guard = AsyncMock(side_effect=[None, RuntimeError("changed")])
+    ack = AsyncMock()
+    monkeypatch.setattr(telegram_delivery, "_sleep", AsyncMock())
+    result = await deliver_rendered_report(
+        bot, 7, ["one", "two"], before_send=guard, acknowledge=ack,
+    )
+    assert result.delivered is False
+    assert result.next_unit == result.delivered_units == 0
+    assert guard.await_count == 2
+    bot.send_message.assert_awaited_once()
+    ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("messages,start", [([], 0), (["done"], 1)])
+async def test_empty_or_completed_rendered_plan_has_no_send(messages, start):
+    bot = MagicMock(send_message=AsyncMock())
+    result = await deliver_rendered_report(bot, 7, messages, start_unit=start)
+    assert result.delivered is True
+    assert result.delivered_units == 0
+    assert result.next_unit == start
+    bot.send_message.assert_not_awaited()

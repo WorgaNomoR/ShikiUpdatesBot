@@ -41,6 +41,7 @@ from fact_bank import (
 from storage import (
     BlockedUsersStateError,
     KnownUsersStateError,
+    QuarterDeliveryStateError,
     SubscriberState,
     SubscriptionBackupStateError,
     UserAlertsStateError,
@@ -50,10 +51,12 @@ from storage import (
     known_users_from_payload,
     load_blocked_users,
     load_subscriber_state,
+    mark_quarter_state_restored,
     restorable_state_transaction,
     save_subscriber_state,
     subscriber_state_from_payload,
     user_alerts_from_payload,
+    validate_pending_quarter_delivery,
 )
 from storage import subscriber_state_json as storage_subscriber_state_json
 from telegram_delivery import send_with_retry
@@ -321,6 +324,11 @@ def _valid_import_payload(name: str, obj) -> bool:
             return False
         return True
     if name == "stats_current.json":
+        if isinstance(obj, dict):
+            # Повреждённый pending отменяет весь импорт до публикации файлов.
+            validate_pending_quarter_delivery(obj)
+            if obj.get("pending_quarter_delivery") is not None and not isinstance(obj.get("events"), list):
+                raise QuarterDeliveryStateError("current_structure")
         return (isinstance(obj, dict) and "period" in obj
                 and isinstance(obj.get("events"), list))
     if name == "update_state.json":
@@ -600,6 +608,8 @@ async def restore_backup_zip(raw: bytes) -> dict:
     async with restorable_state_transaction():
         pending = _prepare_access_restore_candidate(pending)
         restored = _publish_restore_files(pending)
+        if "stats_current.json" in restored:
+            mark_quarter_state_restored()
         if restored_fact_document is not None:
             activate_restored_fact_bank(restored_fact_document)
     log.info("restore_backup_zip: восстановлено %d, пропущено %d.",

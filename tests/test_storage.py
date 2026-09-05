@@ -998,6 +998,124 @@ def test_save_stats_current_swallows_write_error(monkeypatch, tmp_path):
     storage.save_stats_current({"period": "2026-Q2", "events": []})
 
 
+def _quarter_state():
+    return {
+        "period": "2026-Q3", "events": [],
+        "pending_quarter_delivery": storage.new_quarter_delivery(
+            "2026-Q2", "2026-Q3", ["first", "second"],
+        ),
+    }
+
+
+@pytest.mark.parametrize("key,value", [
+    ("version", 2), ("version", True), ("version", 1.0),
+    ("next_unit", -1), ("next_unit", True), ("next_unit", 0.5), ("next_unit", 3),
+    ("report_messages", [None]), ("report_messages", [12]),
+    ("report_messages", [""]), ("report_messages", [" \n"]),
+    ("report_messages", "secret"), ("report_messages", ["\ud800"]),
+    ("plan_id", "broken"), ("plan_hash", "broken"),
+    ("report_messages", ["changed"]),
+    ("old_period", "2026-Q3"), ("old_period", "2026-Q4"),
+    ("old_period", "bad"), ("new_period", "2026-Q4"),
+])
+def test_quarter_pending_schema_rejects_invalid_state(key, value):
+    cur = _quarter_state()
+    cur["pending_quarter_delivery"][key] = value
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        storage.validate_pending_quarter_delivery(cur)
+
+
+@pytest.mark.parametrize("pending", [False, [], {}, {"report_sent": True}])
+def test_quarter_pending_never_confuses_malformed_with_absent(pending):
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        storage.validate_pending_quarter_delivery({"pending_quarter_delivery": pending})
+
+
+@pytest.mark.parametrize("sent", [False, True])
+def test_legacy_quarter_migration_preserves_frozen_messages(sent):
+    pending = {
+        "old_period": "2026-Q2", "new_period": "2026-Q3",
+        "report_messages": ["first", "second"], "report_sent": sent,
+    }
+    assert storage.validate_pending_quarter_delivery({
+        "period": "2026-Q3", "pending_quarter_delivery": pending,
+    }) == pending
+    migrated = storage.migrate_quarter_delivery(pending)
+    assert migrated["version"] == 1
+    assert migrated["next_unit"] == (2 if sent else 0)
+    assert migrated["report_messages"] == ["first", "second"]
+    assert "report_sent" not in migrated
+    assert "version" not in pending
+    assert storage.migrate_quarter_delivery(migrated) == migrated
+
+
+@pytest.mark.parametrize("key,value", [("report_sent", 1), ("report_messages", [""]), ("new_period", "2026-Q4")])
+def test_legacy_quarter_schema_remains_strict(key, value):
+    pending = {
+        "old_period": "2026-Q2", "new_period": "2026-Q3",
+        "report_messages": ["frozen"], "report_sent": False,
+    }
+    pending[key] = value
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        storage.validate_pending_quarter_delivery({"period": "2026-Q3", "pending_quarter_delivery": pending})
+
+
+def test_quarter_plan_identity_is_unique_and_progress_does_not_change_it():
+    first = _quarter_state()
+    second = _quarter_state()
+    assert first["pending_quarter_delivery"]["plan_id"] != second["pending_quarter_delivery"]["plan_id"]
+    digest = first["pending_quarter_delivery"]["plan_hash"]
+    first["pending_quarter_delivery"]["next_unit"] = 2
+    assert storage.validate_pending_quarter_delivery(first)["plan_hash"] == digest
+    first["period"] = "2026-Q4"
+    with pytest.raises(storage.QuarterDeliveryStateError, match="period_lineage"):
+        storage.validate_pending_quarter_delivery(first)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_quarter_partial_plan_cannot_claim_full_report_completion(legacy):
+    cur = _quarter_state()
+    if legacy:
+        cur["pending_quarter_delivery"] = {
+            "old_period": "2026-Q2", "new_period": "2026-Q3",
+            "report_messages": ["first", "second"], "report_sent": False,
+        }
+    cur["last_report_sent"] = "2026-Q3"
+    with pytest.raises(storage.QuarterDeliveryStateError, match="premature_completion"):
+        storage.validate_pending_quarter_delivery(cur)
+
+
+def test_strict_quarter_write_failure_preserves_previous_file(backup_env, monkeypatch):
+    storage.save_stats_current(_quarter_state(), strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+
+    def fail(*args):
+        raise OSError("report content must not escape")
+
+    monkeypatch.setattr(storage, "_atomic_write", fail)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^current_write$"):
+        storage.save_stats_current({"other": "state"}, strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+
+
+@pytest.mark.parametrize("raw,reason", [
+    ('{broken', "current_read"),
+    ('{"events": []}', "current_structure"),
+    ('{"period": "2026-Q3", "events": false}', "current_structure"),
+])
+def test_strict_quarter_load_does_not_reset_unreadable_state(backup_env, raw, reason):
+    storage.STATS_CURRENT_FILE.write_text(raw, encoding="utf-8")
+    with pytest.raises(storage.QuarterDeliveryStateError, match=f"^{reason}$"):
+        storage.load_stats_current(strict=True)
+    assert storage.STATS_CURRENT_FILE.read_text(encoding="utf-8") == raw
+
+
+def test_strict_quarter_load_does_not_recreate_disappeared_file(backup_env):
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^current_missing$"):
+        storage.load_stats_current(strict=True)
+    assert not storage.STATS_CURRENT_FILE.exists()
+
+
 # ── update_state.json ──
 
 def test_update_state_roundtrip(monkeypatch, tmp_path):
