@@ -700,6 +700,7 @@ async def test_cmd_favs_sends_report_with_preview_disabled(monkeypatch):
     assert args[0] is msg.bot and args[1] == 777
     assert args[2] is report
     assert kwargs.get("disable_preview") is True
+    assert kwargs.get("notify_partial") is True
     msg.answer.assert_not_awaited()               # ошибок не было
 
 

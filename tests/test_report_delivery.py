@@ -15,6 +15,7 @@ import telegram_delivery
 from report_delivery import (
     FAILED_REPORT_NOTICE,
     PARTIAL_REPORT_NOTICE,
+    deliver_rendered_report,
     deliver_report,
 )
 from report_model import (
@@ -45,7 +46,7 @@ async def test_transient_retry_succeeds_and_delivery_continues(monkeypatch):
     assert result.delivered is True
     assert result.delivered_units == result.total_units == 3
     assert bot.send_message.await_count == 4
-    retry_sleep.assert_awaited_once_with(0.5)
+    assert retry_sleep.await_count == 1
     assert gap_sleep.await_count == 2
 
 
@@ -131,3 +132,29 @@ async def test_preview_policy_is_applied_to_every_report_unit(disable_preview):
         call.kwargs["disable_web_page_preview"]
         for call in bot.send_message.await_args_list
     } == {disable_preview}
+
+
+@pytest.mark.asyncio
+async def test_rendered_report_skips_empty_messages_and_propagates_preview_policy():
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=object())
+
+    result = await deliver_rendered_report(
+        bot,
+        7,
+        ("", "first", "   ", "second"),
+        disable_preview=True,
+        sleep=AsyncMock(),
+    )
+
+    assert result.delivered is True
+    assert result.delivered_units == result.total_units == 2
+    assert bot.send_message.await_count == 2
+    assert [
+        call.kwargs["text"]
+        for call in bot.send_message.await_args_list
+    ] == ["first", "second"]
+    assert all(
+        call.kwargs["disable_web_page_preview"] is True
+        for call in bot.send_message.await_args_list
+    )

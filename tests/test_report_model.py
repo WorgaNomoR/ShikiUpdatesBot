@@ -2,7 +2,9 @@
 # Copyright (C) 2026  WorgaNomoR
 """Авторитетные тесты типизированной модели и ordinary HTML chunk planner."""
 
-from xml.etree import ElementTree
+import re
+from html import unescape
+from html.parser import HTMLParser
 
 import pytest
 
@@ -19,17 +21,98 @@ from report_model import (
     unit,
 )
 
+_UNESCAPED_AMPERSAND = re.compile(
+    r"&(?!amp;|gt;|lt;|quot;|#(?:\d+|[xX][0-9A-Fa-f]+);)",
+)
+
+
+class _StrictTelegramHtmlParser(HTMLParser):
+    """Строго проверить ограниченное HTML-подмножество renderer."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.stack: list[str] = []
+        self.text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        raw = self.get_starttag_text()
+        if tag == "a":
+            if len(attrs) != 1 or attrs[0][0] != "href" or attrs[0][1] is None:
+                pytest.fail(f"Некорректные атрибуты ссылки: {raw}")
+            match = re.fullmatch(r'<a href="(.*)">', raw, flags=re.DOTALL)
+            if match is None:
+                pytest.fail(f"Некорректная разметка ссылки: {raw}")
+            escaped_href = match.group(1)
+            if (
+                any(symbol in escaped_href for symbol in '<>"')
+                or _UNESCAPED_AMPERSAND.search(escaped_href)
+            ):
+                pytest.fail(f"Неэкранированный URL ссылки: {raw}")
+        elif tag in {"b", "code", "i"}:
+            if attrs or raw != f"<{tag}>":
+                pytest.fail(f"Некорректный formatting tag: {raw}")
+        else:
+            pytest.fail(f"Неподдерживаемый Telegram HTML tag: {tag}")
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.stack or self.stack.pop() != tag:
+            pytest.fail(f"Несогласованный закрывающий tag: {tag}")
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        pytest.fail(f"Самозакрывающийся tag не поддерживается: {tag}")
+
+    def handle_data(self, data: str) -> None:
+        if "<" in data or "&" in data:
+            pytest.fail(f"Неэкранированный HTML text: {data!r}")
+        self.text.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if name not in {"amp", "gt", "lt", "quot"}:
+            pytest.fail(f"Неподдерживаемая HTML entity: &{name};")
+        self.text.append(unescape(f"&{name};"))
+
+    def handle_charref(self, name: str) -> None:
+        try:
+            base = 16 if name.startswith(("x", "X")) else 10
+            value = int(name[1:] if base == 16 else name, base)
+            if not 0 <= value <= 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+                raise ValueError
+        except ValueError:
+            pytest.fail(f"Некорректная HTML character reference: &#{name};")
+        self.text.append(chr(value))
+
+    def handle_comment(self, data: str) -> None:
+        pytest.fail("HTML-комментарии не поддерживаются")
+
+    def handle_decl(self, decl: str) -> None:
+        pytest.fail("HTML declarations не поддерживаются")
+
+    def handle_pi(self, data: str) -> None:
+        pytest.fail("HTML processing instructions не поддерживаются")
+
+
+def _parse_html(markup: str) -> _StrictTelegramHtmlParser:
+    parser = _StrictTelegramHtmlParser()
+    parser.feed(markup)
+    parser.close()
+    assert parser.stack == []
+    return parser
+
 
 def _visible_text(markup: str) -> str:
-    root = ElementTree.fromstring(f"<root>{markup}</root>")
-    return "".join(root.itertext())
+    return "".join(_parse_html(markup).text)
 
 
 def _assert_independent_html(report: Report, limit: int) -> list[str]:
     chunks = render_report(report, limit=limit)
     assert chunks
     for chunk in chunks:
-        ElementTree.fromstring(f"<root>{chunk.html}</root>")
+        _parse_html(chunk.html)
         assert chunk.visible_length <= limit
     return [chunk.html for chunk in chunks]
 

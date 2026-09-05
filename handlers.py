@@ -383,6 +383,7 @@ async def _send_broadcast_message(bot: Bot, chat_id: int, data: dict) -> list[Me
 # ═══════════════════════════════════════════════════════════════════
 
 _PENDING_QUARTER_DELIVERY = "pending_quarter_delivery"
+_QUARTER_ROTATION_ATTEMPTS = 3
 
 
 def _valid_pending_quarter_delivery(cur: dict) -> dict | None:
@@ -531,7 +532,7 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
         except Exception as e:
             log.error("rotate_quarter: sync_stats_all упал: %s", e)
 
-    while True:
+    for attempt in range(1, _QUARTER_ROTATION_ATTEMPTS + 1):
         async with restorable_state_transaction():
             cur = load_stats_current()
             if cur.get("period") == now_period:
@@ -576,6 +577,13 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
             if cur != expected_cur:
                 # Новое квартальное событие могло успеть опубликоваться, пока
                 # renderer работал без lock. Перестраиваем модель без потери.
+                if attempt == _QUARTER_ROTATION_ATTEMPTS:
+                    log.warning(
+                        "rotate_quarter: состояние менялось во время %d попыток; "
+                        "ротация отложена до следующего polling-цикла.",
+                        _QUARTER_ROTATION_ATTEMPTS,
+                    )
+                    return cur
                 continue
 
             # Снапшот квартала и новый текущий квартал публикуются под одним lock.

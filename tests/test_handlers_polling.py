@@ -756,6 +756,55 @@ async def test_quarter_renderer_runs_without_restorable_state_lock(monkeypatch):
             resync=False,
         )
 
+
+@pytest.mark.asyncio
+async def test_quarter_rotation_defers_after_repeated_state_changes(monkeypatch):
+    state = {"cur": {"period": "2026-Q2", "events": [], "generation": 0}}
+    render_calls = 0
+
+    def render(report):
+        nonlocal render_calls
+        render_calls += 1
+        if render_calls > 3:
+            pytest.fail("Ротация не остановилась после трёх попыток")
+        state["cur"] = {
+            "period": "2026-Q2",
+            "events": [],
+            "generation": render_calls,
+        }
+        return ["REPORT"]
+
+    snapshot = MagicMock()
+    save_current = MagicMock()
+    deliver_pending = AsyncMock()
+    monkeypatch.setattr(handlers, "load_stats_current", lambda: state["cur"])
+    monkeypatch.setattr(handlers, "current_quarter", lambda: "2026-Q3")
+    monkeypatch.setattr(handlers, "_load_prev_quarter_summary", lambda *args: None)
+    monkeypatch.setattr(
+        handlers,
+        "build_quarterly_report_messages",
+        lambda *args: plain_report("REPORT"),
+    )
+    monkeypatch.setattr(handlers, "rendered_html", render)
+    monkeypatch.setattr(handlers, "_save_quarter_snapshot", snapshot)
+    monkeypatch.setattr(handlers, "save_stats_current", save_current)
+    monkeypatch.setattr(handlers, "_deliver_pending_quarter", deliver_pending)
+
+    result = await handlers.rotate_quarter_if_needed(
+        AsyncMock(),
+        state["cur"],
+        {},
+        resync=False,
+    )
+
+    assert result is state["cur"]
+    assert result["generation"] == 3
+    assert render_calls == 3
+    snapshot.assert_not_called()
+    save_current.assert_not_called()
+    deliver_pending.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
     """Расхоловленный (#35): чистые хелперы _update_by_quarter и
