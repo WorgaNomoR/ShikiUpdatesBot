@@ -1703,12 +1703,17 @@ def build_quarterly_report_messages(
 
     extra_sections: list[Section] = []
     if prev_quarter:
-        prev_a = prev_quarter.get("anime_completed", 0)
+        prev_a = prev_quarter.get("anime_completed")
+        anime_diff = (
+            _pct_diff(len(anime["completed"]), prev_a)
+            if type(prev_a) is int and prev_a >= 0
+            else "сравнение недоступно"
+        )
         prev_m = prev_quarter.get("manga_completed")
         prev_label = quarter_label(prev_quarter.get("period") or "прошлый квартал")
         comparison = [
             line("📈 ", Bold(f"Сравнение с {prev_label}:")),
-            line(f"🎬 Аниме: {_pct_diff(len(anime['completed']), prev_a)}"),
+            line(f"🎬 Аниме: {anime_diff}"),
         ]
         previous_split = _snapshot_manga_counts(prev_quarter)
         if previous_split is None:
@@ -1790,7 +1795,7 @@ def _load_prev_quarter_summary(period: str) -> dict | None:
             data = json.loads(path.read_text(encoding="utf-8"))
             return {
                 "period": data.get("period"),
-                "anime_completed": data.get("anime_completed", 0),
+                "anime_completed": data.get("anime_completed"),
                 "manga_completed": data.get("manga_completed"),
                 "manga_titles": data.get("manga_titles"),
             }

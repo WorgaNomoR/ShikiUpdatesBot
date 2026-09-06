@@ -2200,3 +2200,39 @@ def test_split_reports_keep_typed_links_and_long_counter_chunks():
     for report in reports[1:]:
         hrefs = re.findall(r'href="([^"]*)"', "\n".join(rendered_html(report)))
         assert hrefs == [f"https://shikimori.io/mangas/{tid}?x=1&amp;y=2" for tid in ("10", "20", "30")]
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({}, "сравнение недоступно"),
+    ({"anime_completed": None}, "сравнение недоступно"),
+    ({"anime_completed": "2"}, "сравнение недоступно"),
+    ({"anime_completed": []}, "сравнение недоступно"),
+    ({"anime_completed": {}}, "сравнение недоступно"),
+    ({"anime_completed": True}, "сравнение недоступно"),
+    ({"anime_completed": False}, "сравнение недоступно"),
+    ({"anime_completed": -1}, "сравнение недоступно"),
+    ({"anime_completed": 1.5}, "сравнение недоступно"),
+    ({"anime_completed": 0}, "+1"),
+    ({"anime_completed": 1}, "→ без изменений (1)"),
+    ({"anime_completed": 2}, "↓ 50% (2 → 1)"),
+])
+def test_quarter_anime_comparison_validates_snapshot_count(tmp_path, monkeypatch, payload, expected):
+    monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
+    path = tmp_path / "2026-Q1.json"
+    path.write_text(json.dumps({"period": "2026-Q1", "manga_completed": 0, **payload}), encoding="utf-8")
+    before = path.read_bytes()
+    previous = smod._load_prev_quarter_summary("2026-Q1")
+    stats = _populated_stats()
+    stats["anime"]["titles"] = {"1": {**_anime_rec(), "title": "Anime title"}}
+    cur = {"period": "2026-Q2", "events": [
+        {"id": "1", "media": "anime", "event": "completed", "score": 10},
+    ]}
+
+    report = smod.build_quarterly_report_messages(cur, stats, previous)
+    text = "\n".join(rendered_html(report))
+
+    assert f"🎬 Аниме: {expected}" in text
+    assert "Anime title" in text
+    assert "Один безоговорочный шедевр" in text
+    assert "Манга и ранобэ (вместе, включая не определённое): ~" in text
+    assert path.read_bytes() == before
