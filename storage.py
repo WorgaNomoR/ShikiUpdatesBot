@@ -10,8 +10,10 @@
 """
 
 import asyncio
+import hashlib
 import json
 import math
+import re
 import time
 import uuid
 import weakref
@@ -1004,6 +1006,120 @@ def save_stats_all(data: dict) -> None:
 #  stats_current.json — ТЕКУЩИЙ КВАРТАЛ
 # ═══════════════════════════════════════════════════════════════════
 
+
+class QuarterDeliveryStateError(ValueError):
+    """Квартальная доставка не может безопасно прочитать или сохранить состояние."""
+
+
+_quarter_restore_generation = 0
+
+
+def quarter_restore_generation() -> int:
+    """Поколение восстановления: даже идентичный импорт отменяет текущую попытку."""
+    return _quarter_restore_generation
+
+
+def mark_quarter_state_restored() -> None:
+    """Вызывается импортом под общим lock после публикации stats_current.json."""
+    global _quarter_restore_generation
+    _quarter_restore_generation += 1
+
+
+def _quarter_plan_hash(pending: dict) -> str:
+    """Связать неизменяемые поля плана, исключив только acknowledgement."""
+    identity = {key: value for key, value in pending.items()
+                if key not in {"next_unit", "plan_hash"}}
+    raw = json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("ascii")).hexdigest()
+
+
+def new_quarter_delivery(old_period: str, new_period: str, messages: list[str]) -> dict:
+    """Заморозить уже отрендеренный план с новой независимой идентичностью."""
+    pending = {
+        "version": 1,
+        "plan_id": uuid.uuid4().hex,
+        "old_period": old_period,
+        "new_period": new_period,
+        "report_messages": list(messages),
+        "next_unit": 0,
+    }
+    pending["plan_hash"] = _quarter_plan_hash(pending)
+    validate_pending_quarter_delivery({"period": new_period, "pending_quarter_delivery": pending})
+    return pending
+
+
+def validate_quarter_period(period: object) -> None:
+    """Проверить календарный период до чтения снапшотов или публикации состояния."""
+    if (
+        not isinstance(period, str)
+        or re.fullmatch(r"[0-9]{4}-Q[1-4]", period) is None
+        or period.startswith("0000")
+    ):
+        raise QuarterDeliveryStateError("period_format")
+
+
+def validate_pending_quarter_delivery(cur: dict) -> dict | None:
+    """Единый строгий контракт legacy/current pending для runtime и импорта.
+
+    Ошибки содержат только фиксированную причину, никогда значения отчёта.
+    Legacy здесь не мигрируется: новая идентичность должна сначала сохраниться.
+    """
+    pending = cur.get("pending_quarter_delivery")
+    if pending is None:
+        return None
+    if not isinstance(pending, dict):
+        raise QuarterDeliveryStateError("pending_type")
+    legacy_keys = {"old_period", "new_period", "report_messages", "report_sent"}
+    current_keys = (legacy_keys - {"report_sent"}) | {"version", "plan_id", "plan_hash", "next_unit"}
+    legacy = "version" not in pending
+    if not legacy and (type(pending["version"]) is not int or pending["version"] != 1):
+        raise QuarterDeliveryStateError("unsupported_version")
+    if set(pending) != (legacy_keys if legacy else current_keys):
+        raise QuarterDeliveryStateError("pending_fields")
+    old, new = pending["old_period"], pending["new_period"]
+    validate_quarter_period(old)
+    validate_quarter_period(new)
+    if old >= new or new != cur.get("period"):
+        raise QuarterDeliveryStateError("period_lineage")
+    messages = pending["report_messages"]
+    if not isinstance(messages, list) or any(
+        not isinstance(message, str) or not message.strip() for message in messages
+    ):
+        raise QuarterDeliveryStateError("report_messages")
+    try:
+        for message in messages:
+            message.encode("utf-8")
+    except UnicodeError:
+        raise QuarterDeliveryStateError("report_encoding") from None
+    if legacy:
+        if type(pending["report_sent"]) is not bool:
+            raise QuarterDeliveryStateError("legacy_completion")
+        if messages and not pending["report_sent"] and cur.get("last_report_sent") == new:
+            raise QuarterDeliveryStateError("premature_completion")
+    else:
+        if type(pending["next_unit"]) is not int or not 0 <= pending["next_unit"] <= len(messages):
+            raise QuarterDeliveryStateError("progress_index")
+        if cur.get("last_report_sent") == new and pending["next_unit"] < len(messages):
+            raise QuarterDeliveryStateError("premature_completion")
+        if not isinstance(pending["plan_id"], str) or re.fullmatch(r"[0-9a-f]{32}", pending["plan_id"]) is None:
+            raise QuarterDeliveryStateError("plan_identity")
+        if pending["plan_hash"] != _quarter_plan_hash(pending):
+            raise QuarterDeliveryStateError("plan_integrity")
+    return pending
+
+
+def migrate_quarter_delivery(pending: dict) -> dict:
+    """Перенести проверенный legacy-план без рендеринга и выдуманного прогресса."""
+    if "version" in pending:
+        return pending
+    migrated = new_quarter_delivery(
+        pending["old_period"], pending["new_period"], pending["report_messages"],
+    )
+    if pending["report_sent"]:
+        migrated["next_unit"] = len(migrated["report_messages"])
+    return migrated
+
+
 def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict:
     """
     Пустая структура текущего квартала.
@@ -1024,9 +1140,12 @@ def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict
     }
 
 
-def load_stats_current() -> dict:
+def load_stats_current(*, strict: bool = False) -> dict:
     """
     Загружаем события текущего квартала. При ошибке/отсутствии — пустой квартал.
+
+    strict=True используется доставкой: отсутствие или повреждение файла
+    поднимает безопасную ошибку без сброса/создания состояния.
 
     Если файла ещё нет (истинно первый запуск), фиксируем tracking_since = max(
     начало квартала, сейчас). Это даёт честную дату «статистика собирается с …»,
@@ -1034,16 +1153,28 @@ def load_stats_current() -> dict:
     чтобы не сбрасывалась при последующих перезапусках.
     """
     try:
+        if strict and not STATS_CURRENT_FILE.exists():
+            raise QuarterDeliveryStateError("current_missing")
         if STATS_CURRENT_FILE.exists():
             data = json.loads(STATS_CURRENT_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict) and "period" in data and "events" in data:
+                if strict and (not isinstance(data["period"], str) or not isinstance(data["events"], list)):
+                    raise QuarterDeliveryStateError("current_structure")
+                if strict:
+                    validate_quarter_period(data["period"])
                 # Бэкофилл для файлов, созданных до появления поля tracking_since
                 if "tracking_since" not in data:
                     data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
                 data.setdefault("pending_quarter_delivery", None)
                 return data
+            if strict:
+                raise QuarterDeliveryStateError("current_structure")
             log.warning("load_stats_current: неожиданная структура, сбрасываем.")
+    except QuarterDeliveryStateError:
+        raise
     except (json.JSONDecodeError, OSError, ValueError) as e:
+        if strict:
+            raise QuarterDeliveryStateError("current_read") from None
         log.warning("load_stats_current: %s", e)
 
     # Истинно первый запуск (или сброс) — фиксируем фактическую дату старта
@@ -1051,15 +1182,19 @@ def load_stats_current() -> dict:
     qs = quarter_start(now)
     tracking_since = (now if now > qs else qs).isoformat()
     fresh = _empty_stats_current(current_quarter(now), tracking_since=tracking_since)
-    save_stats_current(fresh)
+    save_stats_current(fresh, strict=strict)
     log.info("load_stats_current: создан новый stats_current, отслеживание с %s.", tracking_since)
     return fresh
 
 
-def save_stats_current(data: dict) -> None:
+def save_stats_current(data: dict, *, strict: bool = False) -> None:
+    """Атомарно записать состояние; strict не скрывает ошибку acknowledgement."""
     try:
         _atomic_write(STATS_CURRENT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception as e:
+        if strict:
+            log.error("save_stats_current: strict-запись не удалась: %s", type(e).__name__)
+            raise QuarterDeliveryStateError("current_write") from None
         log.error("save_stats_current: %s", e)
 
 
