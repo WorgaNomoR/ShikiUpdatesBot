@@ -2266,3 +2266,41 @@ def test_all_time_malformed_titles_remain_visible_without_invented_stats(monkeyp
     assert f"Прочитано: <b>{1 if mixed else 0}</b>" in unknown_text
     assert "ещё не собрана" not in text and "999" not in text
     assert stats == before
+
+
+@pytest.mark.parametrize("field", ["genres", "themes", "demographic", "publishers"])
+@pytest.mark.parametrize("value", [None, 42, True, "corrupt", {"bad": 1}, ("bad",), "missing", [], ["Valid"]])
+def test_manga_reports_normalize_taxonomy_lists_without_mutating_source(field, value):
+    stats = storage._empty_stats_all()
+    for tid, kind in enumerate(("manga", "novel", "future"), 1):
+        record = _manga_record(f"Title {tid}", kind)
+        record.update(score=8, genres=["Genre"], themes=["Theme"],
+                      demographic=["Audience"], publishers=["Publisher"])
+        if value == "missing":
+            record.pop(field)
+        else:
+            record[field] = value
+        stats["manga"]["titles"][str(tid)] = record
+    before = copy.deepcopy(stats)
+    expected = value if isinstance(value, list) else []
+    split = smod.partition_manga_titles(stats["manga"]["titles"])
+    for tid, category in enumerate(("manga", "ranobe", "unknown"), 1):
+        record = split[category][str(tid)]
+        assert record.get(field, []) == expected
+        for other in ("genres", "themes", "demographic", "publishers"):
+            if other != field:
+                assert record[other] == stats["manga"]["titles"][str(tid)][other]
+        aggregate = smod.recompute_aggregates("manga", split[category])
+        assert aggregate[field] == ({"Valid": 1} if expected else {})
+        assert aggregate["total_completed"] == 1
+        assert aggregate["score_dist"] == {"8": 1}
+    cur = {"period": "2026-Q2", "events": [
+        {"id": str(tid), "media": "manga", "event": "completed", "score": 8}
+        for tid in (1, 2, 3)
+    ]}
+    for report in (smod.build_stats_all_messages(stats),
+                   smod.build_current_stats_messages(cur, stats),
+                   smod.build_quarterly_report_messages(cur, stats, None)):
+        text = "\n".join(rendered_html(report))
+        assert "МАНГА" in text and "РАНОБЭ" in text and "НЕ ОПРЕДЕЛЕНО" in text
+    assert stats == before

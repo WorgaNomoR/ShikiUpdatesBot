@@ -1132,6 +1132,14 @@ def partition_manga_titles(titles: dict) -> dict[str, dict]:
     subsets: dict[str, dict] = {"manga": {}, "ranobe": {}, "unknown": {}}
     for title_id, record in titles.items():
         safe_record = record if isinstance(record, dict) else {}
+        invalid_lists = {
+            field: []
+            for field in ("genres", "themes", "demographic", "publishers")
+            if not isinstance(safe_record.get(field, []), list)
+        }
+        if invalid_lists:
+            # Исправляем только presentation-копию, не исходную запись или кэш.
+            safe_record = {**safe_record, **invalid_lists}
         subsets[classify_manga_presentation_kind(safe_record.get("kind"))][title_id] = safe_record
     return subsets
 
