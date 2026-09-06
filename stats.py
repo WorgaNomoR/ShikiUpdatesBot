@@ -1128,11 +1128,11 @@ def _manga_event_id(value: object) -> str | None:
 
 
 def partition_manga_titles(titles: dict) -> dict[str, dict]:
-    """Разложить допустимые записи ровно по одной категории, сохранив raw kind."""
+    """Разложить записи; повреждённые значения представить пустыми unknown-записями."""
     subsets: dict[str, dict] = {"manga": {}, "ranobe": {}, "unknown": {}}
     for title_id, record in titles.items():
-        if isinstance(record, dict):
-            subsets[classify_manga_presentation_kind(record.get("kind"))][title_id] = record
+        safe_record = record if isinstance(record, dict) else {}
+        subsets[classify_manga_presentation_kind(safe_record.get("kind"))][title_id] = safe_record
     return subsets
 
 
@@ -1491,6 +1491,10 @@ def build_stats_all_messages(stats: dict) -> Report:
         category: recompute_aggregates("manga", titles)
         for category, titles in manga_subsets.items()
     }
+    # Только presentation-счётчик: повреждённым записям нельзя приписывать статус.
+    manga_aggregates["unknown"]["unreadable_titles"] = sum(
+        not isinstance(record, dict) for record in manga_titles.values()
+    )
 
     updated = _parse_iso_utc(stats.get("updated_at"))
     upd_str = ""
@@ -1572,6 +1576,11 @@ def _manga_all_unit(category: str, m_agg: dict) -> Unit:
     if ch or vol:
         manga_summary_parts.append(Text(f"   ·   📖 {ch} гл · {vol} томов"))
     manga_summary = [Line(tuple(manga_summary_parts))]
+    unreadable = m_agg.get("unreadable_titles", 0)
+    if unreadable:
+        manga_summary.append(line(
+            "⚠️ Не удалось прочитать данные тайтлов: ", Bold(str(unreadable)),
+        ))
     avg_m = _avg_score_from_dist(m_agg.get("score_dist", {}))
     if avg_m is not None:
         average_parts = [Text("⭐ Средняя: "), Bold(str(avg_m))]

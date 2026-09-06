@@ -2006,10 +2006,11 @@ def test_partition_manga_records_exactly_once_preserves_raw_values():
 
     assert list(split["manga"]) == ["0", "1", "2"]
     assert list(split["ranobe"]) == ["3", "4", "5"]
-    assert list(split["unknown"]) == ["6", "7", "8", "9", "10", "11", "missing"]
+    assert list(split["unknown"]) == ["6", "7", "8", "9", "10", "11", "missing", "broken"]
     ids = [key for records in split.values() for key in records]
-    assert len(ids) == len(set(ids)) == 13
-    assert all(record is titles[key] for records in split.values() for key, record in records.items())
+    assert len(ids) == len(set(ids)) == 14
+    assert all(record is titles[key] for records in split.values() for key, record in records.items() if key != "broken")
+    assert split["unknown"]["broken"] == {}
     assert titles == before
 
 
@@ -2236,3 +2237,32 @@ def test_quarter_anime_comparison_validates_snapshot_count(tmp_path, monkeypatch
     assert "Один безоговорочный шедевр" in text
     assert "Манга и ранобэ (вместе, включая не определённое): ~" in text
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("malformed", [None, [], ["manga"], "broken", 42])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_all_time_malformed_titles_remain_visible_without_invented_stats(monkeypatch, malformed, mixed):
+    stats = storage._empty_stats_all()
+    titles = {"1": malformed, "2": []}
+    if mixed:
+        titles.update({"3": _manga_record("Manga", "manga"),
+                       "4": _manga_record("Novel", "novel"),
+                       "5": _manga_record("Unknown", None)})
+    stats["manga"]["titles"] = titles
+    stats["manga"]["aggregates"] = {"total_completed": 999, "by_quarter": {"2025-Q1": {"completed": 7}}}
+    before = copy.deepcopy(stats)
+    for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
+                   "stats.fetch_list_export", "stats.fetch_favourites"):
+        monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
+
+    split = smod.partition_manga_titles(titles)
+    assert set(split["unknown"]) == ({"1", "2", "5"} if mixed else {"1", "2"})
+    assert split["unknown"]["1"] == {}
+    report = smod.build_stats_all_messages(stats)
+    text = "\n".join(rendered_html(report))
+    unknown_text = "\n".join(rendered_html(Report((report.units[3],))))
+    assert "МАНГА" in text and "НЕ ОПРЕДЕЛЕНО" in unknown_text
+    assert "Не удалось прочитать данные тайтлов: <b>2</b>" in unknown_text
+    assert f"Прочитано: <b>{1 if mixed else 0}</b>" in unknown_text
+    assert "ещё не собрана" not in text and "999" not in text
+    assert stats == before
