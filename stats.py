@@ -13,7 +13,10 @@ import json
 import random
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import (
+    datetime,
+    timedelta,
+)
 
 import aiohttp
 
@@ -84,6 +87,12 @@ _KIND_RU_MANGA: dict[str, str] = {
     "light_novel": "Ранобэ",
     "novel":       "Новеллы",
     "ranobe":      "Ранобэ",
+}
+
+_MANGA_REPORT_LABELS = {
+    "manga": "МАНГА",
+    "ranobe": "РАНОБЭ",
+    "unknown": "НЕ ОПРЕДЕЛЕНО",
 }
 
 PICK_CATEGORY_ANIME = "anime"
@@ -1096,13 +1105,35 @@ def _quarter_events(cur: dict) -> list[dict]:
         normalized = dict(event)
         if normalized.get("event") in ("completed", "dropped"):
             tid = normalized.get("id")
-            if isinstance(tid, bool) or not isinstance(tid, (str, int)):
+            if normalized.get("media") == "manga":
+                # Повреждённый ID нельзя соединять с тайтлом, но событие видимо.
+                normalized["id"] = _manga_event_id(tid)
+            elif isinstance(tid, bool) or not isinstance(tid, (str, int)):
                 continue
-            normalized["id"] = str(tid)
+            else:
+                normalized["id"] = str(tid)
         if normalized.get("score") is not None:
             normalized["score"] = _safe_int(normalized["score"])
         events.append(normalized)
     return events
+
+
+def _manga_event_id(value: object) -> str | None:
+    """ID для локального соединения; повреждённые значения не угадываем."""
+    if type(value) is int and value > 0:
+        return str(value)
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        return value.lstrip("0") or None
+    return None
+
+
+def partition_manga_titles(titles: dict) -> dict[str, dict]:
+    """Разложить допустимые записи ровно по одной категории, сохранив raw kind."""
+    subsets: dict[str, dict] = {"manga": {}, "ranobe": {}, "unknown": {}}
+    for title_id, record in titles.items():
+        if isinstance(record, dict):
+            subsets[classify_manga_presentation_kind(record.get("kind"))][title_id] = record
+    return subsets
 
 
 def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[dict]:
@@ -1118,11 +1149,12 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
         if ev.get("media") != media or ev.get("event") != event:
             continue
         tid = ev.get("id")
-        if not tid or tid in seen:
+        if tid in seen or (not tid and media != "manga"):
             continue
-        seen.add(tid)
-        rec = titles.get(tid)
-        if rec:
+        if tid:
+            seen.add(tid)
+        rec = titles.get(tid) if tid is not None else None
+        if isinstance(rec, dict) and rec:
             merged = dict(rec)
             # score события приоритетнее (актуально на момент завершения квартала)
             if event == "completed" and ev.get("score") is not None:
@@ -1199,6 +1231,7 @@ def _status_section(
     *,
     completed_label: str,
     watching_label: str,
+    rewatching_label: str | None = None,
 ) -> Section | None:
     pairs = [
         (completed_label, aggregate.get("total_completed", 0)),
@@ -1207,6 +1240,8 @@ def _status_section(
         ("В планах", aggregate.get("total_planned", 0)),
         ("Отложено", aggregate.get("total_on_hold", 0)),
     ]
+    if rewatching_label:
+        pairs.append((rewatching_label, aggregate.get("total_rewatching", 0)))
     pairs = [(name, count) for name, count in pairs if count]
     if not pairs:
         return None
@@ -1354,12 +1389,17 @@ def _build_quarter_sections(
     else:
         publishers: dict = {}
         total_chapters = 0
+        total_volumes = 0
         for record in records:
             for publisher in record.get("publishers", []):
                 _bump(publishers, publisher)
             total_chapters += _safe_int(record.get("chapters_read"))
-        if total_chapters:
-            total_line = line("📖 Глав прочитано: ", Bold(str(total_chapters)))
+            total_volumes += _safe_int(record.get("volumes_read"))
+        if total_chapters or total_volumes:
+            total_line = line(
+                "📖 Глав прочитано: ", Bold(str(total_chapters)),
+                " · Томов: ", Bold(str(total_volumes)),
+            )
             if sections:
                 sections[-1] = section(*sections[-1].items, total_line)
             else:
@@ -1386,7 +1426,7 @@ def _media_quarter_unit(
         header = _header_line("🎬", "АНИМЕ")
         completed_label = "✅ Завершено: "
     else:
-        header = _header_line("📚", "МАНГА")
+        header = _header_line("📚", _MANGA_REPORT_LABELS[media])
         completed_label = "✅ Прочитано: "
     summary = [line(completed_label, Bold(str(len(completed))))]
     if dropped:
@@ -1403,6 +1443,14 @@ def _media_quarter_unit(
         section(*summary),
         *detail_sections,
     )
+
+
+def _manga_quarter_units(report: dict) -> list[Unit]:
+    """Самостоятельные темы трёх непересекающихся категорий чтения."""
+    return [
+        _media_quarter_unit(category, data["completed"], data["dropped"], data["planned"])
+        for category, data in report["manga_split"].items()
+    ]
 
 
 def build_favourites_messages(stats: dict) -> Report:
@@ -1435,9 +1483,14 @@ def build_favourites_messages(stats: dict) -> Report:
 
 
 def build_stats_all_messages(stats: dict) -> Report:
-    """Типизированный отчёт за всё время с отдельными anime/manga units."""
+    """Аниме и три категории чтения; агрегаты чтения вычисляем только в памяти."""
     a_agg = (stats.get("anime") or {}).get("aggregates") or {}
-    m_agg = (stats.get("manga") or {}).get("aggregates") or {}
+    manga_titles = (stats.get("manga") or {}).get("titles") or {}
+    manga_subsets = partition_manga_titles(manga_titles)
+    manga_aggregates = {
+        category: recompute_aggregates("manga", titles)
+        for category, titles in manga_subsets.items()
+    }
 
     updated = _parse_iso_utc(stats.get("updated_at"))
     upd_str = ""
@@ -1445,14 +1498,13 @@ def build_stats_all_messages(stats: dict) -> Report:
         upd_str = updated.strftime("%d.%m.%Y")
 
     # Пустая статистика — одно короткое сообщение
-    if a_agg.get("total_completed", 0) == 0 and m_agg.get("total_completed", 0) == 0:
+    if a_agg.get("total_completed", 0) == 0 and not any(manga_subsets.values()):
         return Report((unit(
             section(line("📊 ", Bold("СТАТИСТИКА ЗА ВСЁ ВРЕМЯ"))),
             section(line(Italic("Статистика ещё не собрана. Дай боту немного времени."))),
         ),))
 
     a_total = a_agg.get("total_completed", 0)
-    m_total = m_agg.get("total_completed", 0)
 
     # ── Аниме ───────────────────────────────────
     anime_sections = [section(line("📊 ", Bold("СТАТИСТИКА ЗА ВСЁ ВРЕМЯ")))]
@@ -1503,13 +1555,21 @@ def build_stats_all_messages(stats: dict) -> Report:
         if block:
             anime_sections.append(block)
 
-    # ── Манга ───────────────────────────────────
-    manga_sections = [section(_header_line("📚", "МАНГА"))]
+    return Report((
+        Unit(tuple(anime_sections)),
+        *(_manga_all_unit(category, aggregate) for category, aggregate in manga_aggregates.items()),
+    ))
+
+
+def _manga_all_unit(category: str, m_agg: dict) -> Unit:
+    """Отобразить независимые агрегаты одной категории чтения."""
+    m_total = m_agg.get("total_completed", 0)
+    manga_sections = [section(_header_line("📚", _MANGA_REPORT_LABELS[category]))]
 
     ch = m_agg.get("total_chapters_read", 0)
     vol = m_agg.get("total_volumes_read", 0)
     manga_summary_parts = [Text("✅ Прочитано: "), Bold(str(m_total))]
-    if ch:
+    if ch or vol:
         manga_summary_parts.append(Text(f"   ·   📖 {ch} гл · {vol} томов"))
     manga_summary = [Line(tuple(manga_summary_parts))]
     avg_m = _avg_score_from_dist(m_agg.get("score_dist", {}))
@@ -1531,6 +1591,7 @@ def build_stats_all_messages(stats: dict) -> Report:
             m_agg,
             completed_label="Прочитано",
             watching_label="Читаю",
+            rewatching_label="Перечитываю",
         ),
         _kinds_section(m_agg.get("kinds", {}), _KIND_RU_MANGA),
         _score_section(m_agg.get("score_dist", {})),
@@ -1542,13 +1603,13 @@ def build_stats_all_messages(stats: dict) -> Report:
         if block:
             manga_sections.append(block)
 
-    return Report((Unit(tuple(anime_sections)), Unit(tuple(manga_sections))))
+    return Unit(tuple(manga_sections))
 
 
 def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
     """Общие входные данные текущего и итогового квартальных отчётов."""
     events = _quarter_events(cur)
-    return {
+    report = {
         "anime": {
             "completed": _quarter_titles(cur, stats_all, "anime", "completed"),
             "dropped": _quarter_titles(cur, stats_all, "anime", "dropped"),
@@ -1568,15 +1629,31 @@ def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
             ),
         },
     }
+    split = {
+        category: {"completed": [], "dropped": [], "planned": 0}
+        for category in _MANGA_REPORT_LABELS
+    }
+    for event_type in ("completed", "dropped"):
+        subsets = partition_manga_titles(dict(enumerate(report["manga"][event_type])))
+        for category, records in subsets.items():
+            split[category][event_type] = list(records.values())
+    titles = (stats_all.get("manga") or {}).get("titles") or {}
+    for event in events:
+        if event.get("media") == "manga" and event.get("event") == "planned":
+            title_id = _manga_event_id(event.get("id"))
+            record = titles.get(title_id) if title_id is not None else None
+            kind = record.get("kind") if isinstance(record, dict) else None
+            split[classify_manga_presentation_kind(kind)]["planned"] += 1
+    report["manga_split"] = split
+    return report
 
 
 def build_current_stats_messages(cur: dict, stats_all: dict) -> Report:
-    """Типизированный текущий квартальный отчёт с двумя delivery units."""
+    """Типизированный текущий квартал с отдельными категориями чтения."""
     title_label = tracking_period_label(cur)
 
     report = _prepare_quarter_report(cur, stats_all)
     anime = report["anime"]
-    manga = report["manga"]
 
     header_lines = [line("📊 ", Bold(f"Статистика {title_label}"))]
     if _is_partial_quarter(cur):
@@ -1591,13 +1668,7 @@ def build_current_stats_messages(cur: dict, stats_all: dict) -> Report:
         anime["planned"],
         section(*header_lines),
     )
-    manga_unit = _media_quarter_unit(
-        "manga",
-        manga["completed"],
-        manga["dropped"],
-        manga["planned"],
-    )
-    return Report((anime_unit, manga_unit))
+    return Report((anime_unit, *_manga_quarter_units(report)))
 
 
 def build_quarterly_report_messages(
@@ -1628,23 +1699,39 @@ def build_quarterly_report_messages(
         anime["planned"],
         section(*header_lines),
     )]
-    units.append(_media_quarter_unit(
-        "manga",
-        manga["completed"],
-        manga["dropped"],
-        manga["planned"],
-    ))
+    units.extend(_manga_quarter_units(report))
 
     extra_sections: list[Section] = []
     if prev_quarter:
         prev_a = prev_quarter.get("anime_completed", 0)
-        prev_m = prev_quarter.get("manga_completed", 0)
+        prev_m = prev_quarter.get("manga_completed")
         prev_label = quarter_label(prev_quarter.get("period") or "прошлый квартал")
-        extra_sections.append(section(
+        comparison = [
             line("📈 ", Bold(f"Сравнение с {prev_label}:")),
             line(f"🎬 Аниме: {_pct_diff(len(anime['completed']), prev_a)}"),
-            line(f"📚 Манга: {_pct_diff(len(manga['completed']), prev_m)}"),
-        ))
+        ]
+        previous_split = _snapshot_manga_counts(prev_quarter)
+        if previous_split is None:
+            combined_diff = (
+                _pct_diff(len(manga["completed"]), prev_m)
+                if type(prev_m) is int and prev_m >= 0
+                else "сравнение недоступно"
+            )
+            comparison.append(line(
+                "📚 Манга и ранобэ (вместе, включая не определённое): ",
+                combined_diff,
+            ))
+            comparison.append(line(Italic(
+                "Прошлый квартал: недостаточно данных для разделения."
+            )))
+        else:
+            for category, count in previous_split.items():
+                current_count = len(report["manga_split"][category]["completed"])
+                comparison.append(line(
+                    f"📚 {_MANGA_REPORT_LABELS[category].capitalize()}: ",
+                    _pct_diff(current_count, count),
+                ))
+        extra_sections.append(section(*comparison))
 
     all_comp = anime["completed"] + manga["completed"]
     ach: list[str] = []
@@ -1675,6 +1762,26 @@ def build_quarterly_report_messages(
     return Report(tuple(units))
 
 
+def _snapshot_manga_counts(snapshot: dict) -> dict[str, int] | None:
+    """Разделять историю только при полном согласованном наборе title-level kind."""
+    records = snapshot.get("manga_titles")
+    count = snapshot.get("manga_completed")
+    if (not isinstance(records, list) or type(count) is not int
+            or count < 0 or len(records) != count):
+        return None
+    if any(
+        not isinstance(record, dict)
+        or not isinstance(record.get("kind"), str)
+        or not record["kind"].strip()
+        for record in records
+    ):
+        return None
+    return {
+        category: len(titles)
+        for category, titles in partition_manga_titles(dict(enumerate(records))).items()
+    }
+
+
 def _load_prev_quarter_summary(period: str) -> dict | None:
     """Краткая сводка предыдущего квартала из снапшота для сравнения."""
     try:
@@ -1684,7 +1791,8 @@ def _load_prev_quarter_summary(period: str) -> dict | None:
             return {
                 "period": data.get("period"),
                 "anime_completed": data.get("anime_completed", 0),
-                "manga_completed": data.get("manga_completed", 0),
+                "manga_completed": data.get("manga_completed"),
+                "manga_titles": data.get("manga_titles"),
             }
     except Exception as e:
         log.warning("_load_prev_quarter_summary(%s): %s", period, e)
