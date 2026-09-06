@@ -2304,3 +2304,22 @@ def test_manga_reports_normalize_taxonomy_lists_without_mutating_source(field, v
         text = "\n".join(rendered_html(report))
         assert "МАНГА" in text and "РАНОБЭ" in text and "НЕ ОПРЕДЕЛЕНО" in text
     assert stats == before
+
+
+@pytest.mark.parametrize("titles", [[{"kind": "manga"}], "broken", 42, True, [], None])
+@pytest.mark.parametrize("anime_present", [False, True])
+def test_all_time_non_dict_manga_titles_does_not_abort_report(monkeypatch, titles, anime_present):
+    stats = _populated_stats() if anime_present else storage._empty_stats_all()
+    stats["manga"]["titles"] = titles
+    before = copy.deepcopy(stats)
+    for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
+                   "stats.fetch_list_export", "stats.fetch_favourites"):
+        monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
+
+    report = smod.build_stats_all_messages(stats)
+
+    assert isinstance(report, Report)
+    assert rendered_html(report)
+    assert stats == before
+    if anime_present:
+        assert report.units[0] == smod.build_stats_all_messages(_populated_stats()).units[0]

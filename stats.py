@@ -1493,7 +1493,9 @@ def build_favourites_messages(stats: dict) -> Report:
 def build_stats_all_messages(stats: dict) -> Report:
     """Аниме и три категории чтения; агрегаты чтения вычисляем только в памяти."""
     a_agg = (stats.get("anime") or {}).get("aggregates") or {}
-    manga_titles = (stats.get("manga") or {}).get("titles") or {}
+    manga_titles = (stats.get("manga") or {}).get("titles")
+    if not isinstance(manga_titles, dict):
+        manga_titles = {}
     manga_subsets = partition_manga_titles(manga_titles)
     manga_aggregates = {
         category: recompute_aggregates("manga", titles)
