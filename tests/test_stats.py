@@ -2336,3 +2336,114 @@ def test_absent_or_empty_manga_titles_is_not_reported_as_corrupt(manga):
     text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
     assert "Статистика ещё не собрана" in text
     assert "Не удалось прочитать" not in text
+
+
+@pytest.mark.parametrize("media", ["anime", "manga"])
+@pytest.mark.parametrize("level", ["domain", "titles"])
+@pytest.mark.parametrize("bad", [None, [], [1], "broken", 42, True])
+def test_report_domain_boundaries_are_visible_and_read_only(media, level, bad):
+    stats = _split_stats_fixture()
+    if level == "domain":
+        stats[media] = bad
+    else:
+        stats[media]["titles"] = bad
+    before = copy.deepcopy(stats)
+    cur = {"period": "2026-Q2", "events": [
+        {"id": "1", "media": media, "event": "completed", "score": 8},
+        {"id": "2", "media": media, "event": "dropped"},
+        {"id": "3", "media": media, "event": "planned"},
+    ]}
+    for index, report in enumerate((smod.build_stats_all_messages(stats),
+                                    smod.build_current_stats_messages(cur, stats),
+                                    smod.build_quarterly_report_messages(cur, stats, None))):
+        text = "\n".join(rendered_html(report))
+        # All-time аниме использует aggregates и не нуждается в titles.
+        if not (media == "anime" and level == "titles" and index == 0):
+            assert "Не удалось прочитать" in text
+        assert "Статистика ещё не собрана" not in text
+    assert stats == before
+
+
+@pytest.mark.parametrize("field", ["aggregates", "genres", "score_dist", "studios", "kinds",
+                                    "total_completed", "total_hours_watched", "avg_shiki_completed"])
+@pytest.mark.parametrize("bad", [None, [1], "broken", {"bad": "count"}, True, -1, float("inf")])
+def test_anime_aggregate_corruption_keeps_reading_report(field, bad):
+    stats = _split_stats_fixture()
+    if field == "aggregates":
+        stats["anime"]["aggregates"] = bad
+    else:
+        stats["anime"]["aggregates"][field] = bad
+    before = copy.deepcopy(stats)
+    report = smod.build_stats_all_messages(stats)
+    text = "\n".join(rendered_html(report))
+    assert stats == before
+    # None среднего рейтинга — штатное отсутствие оценки.
+    if not (field == "avg_shiki_completed" and bad is None):
+        assert "Не удалось прочитать" in text
+    assert "РАНОБЭ" in text and "Genre 2" in text
+
+
+@pytest.mark.parametrize("media", ["anime", "manga"])
+@pytest.mark.parametrize("field, value", [
+    ("genres", None), ("themes", 3), ("demographic", "bad"),
+    ("studios", None), ("publishers", [None, {}, "Valid"]),
+    ("status", []), ("score", "8"), ("score", float("inf")),
+    ("shiki_score", float("nan")), ("url", [1]),
+    ("episodes_watched", float("inf")), ("chapters_read", float("inf")),
+])
+def test_quarter_record_boundary_handles_corrupt_fields(media, field, value):
+    stats = storage._empty_stats_all()
+    record = {"title": "Kept", "kind": "manga" if media == "manga" else "tv",
+              "status": "completed", "score": 8, field: value}
+    stats[media]["titles"]["1"] = record
+    cur = {"period": "2026-Q2", "events": [{"id": "1", "media": media, "event": "completed"}]}
+    for report in (smod.build_current_stats_messages(cur, stats),
+                   smod.build_quarterly_report_messages(cur, stats, None)):
+        text = "\n".join(rendered_html(report))
+        assert "<b>1</b>" in text
+        assert "nan" not in text and "inf" not in text
+    assert stats[media]["titles"]["1"] is record
+
+
+@pytest.mark.parametrize("previous", [[1], "bad", True, {"period": [], "anime_completed": 2}])
+def test_quarter_bad_previous_summary_keeps_report(previous):
+    report = smod.build_quarterly_report_messages({"period": "2026-Q2", "events": []}, {}, previous)
+    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in "\n".join(rendered_html(report))
+
+
+@pytest.mark.parametrize("media", ["anime", "manga"])
+def test_unreadable_domain_without_other_statistics_stays_visible(media):
+    stats = storage._empty_stats_all()
+    stats[media] = [1]
+    text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
+    assert "Не удалось прочитать" in text
+    assert "Статистика ещё не собрана" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media", ["anime", "manga"])
+async def test_statistics_handlers_read_corrupt_domain_without_writes(tmp_path, monkeypatch, media):
+    stats = storage._empty_stats_all()
+    stats[media] = [1]
+    path = tmp_path / "stats_all.json"
+    path.write_text(json.dumps(stats), encoding="utf-8")
+    before = path.read_bytes()
+    monkeypatch.setattr("storage.STATS_ALL_FILE", path)
+    monkeypatch.setattr("storage._stats_all_cache", None)
+    monkeypatch.setattr("storage._atomic_write", lambda *a: pytest.fail("Запись при чтении отчёта"))
+    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(side_effect=AssertionError("network")))
+    for report in (await handlers._stats_report_all(), await handlers._stats_report_current()):
+        assert "Не удалось прочитать" in "\n".join(rendered_html(report))
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("value", [[], "broken", float("inf"), float("nan"), True])
+def test_manga_all_time_scalar_damage_keeps_completion(value):
+    stats = storage._empty_stats_all()
+    stats["manga"]["titles"] = {"1": {"kind": "manga", "status": "completed", "score": value,
+                                      "chapters_read": value, "volumes_read": value, "shiki_score": value}}
+    text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
+    assert "Прочитано: <b>1</b>" in text
+    assert "nan" not in text and "inf" not in text
+    assert "Средняя:" not in text

@@ -10,6 +10,7 @@ messages/report_model; знают о нём только хендлеры.
 """
 
 import json
+import math
 import random
 from copy import deepcopy
 from dataclasses import dataclass
@@ -1113,7 +1114,7 @@ def _quarter_events(cur: dict) -> list[dict]:
             else:
                 normalized["id"] = str(tid)
         if normalized.get("score") is not None:
-            normalized["score"] = _safe_int(normalized["score"])
+            normalized["score"] = _report_int(normalized["score"])
         events.append(normalized)
     return events
 
@@ -1127,19 +1128,92 @@ def _manga_event_id(value: object) -> str | None:
     return None
 
 
+def _report_media_mapping(stats: dict, media: str, field: str) -> tuple[dict, bool]:
+    """Прочитать контейнер отчёта, отличая отсутствие от повреждения."""
+    state = stats.get(media, {})
+    if not isinstance(state, dict):
+        return {}, True
+    value = state.get(field, {})
+    return (value, False) if isinstance(value, dict) else ({}, True)
+
+
+def _report_int(value: object) -> int:
+    """Неотрицательное целое для отображения без bool и бесконечности."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, _safe_int(value))
+    except OverflowError:
+        return 0
+
+
+def _report_title(record: object) -> dict:
+    """Подготовить поля отображения, не изменяя запись или raw kind."""
+    if not isinstance(record, dict):
+        return {}
+    updates = {}
+    for field in ("genres", "themes", "demographic", "publishers", "studios"):
+        value = record.get(field, [])
+        if not isinstance(value, list):
+            updates[field] = []
+        elif any(not isinstance(item, str) for item in value):
+            updates[field] = [item for item in value if isinstance(item, str)]
+    for field in ("status", "url", "origin", "rating"):
+        if field in record and not isinstance(record[field], str):
+            updates[field] = ""
+    for field in ("score", "episodes_watched", "chapters_read", "volumes_read"):
+        if field in record:
+            value = _report_int(record[field])
+            if field == "score" and value > 10:
+                value = 0
+            if type(record[field]) is not int or record[field] != value:
+                updates[field] = value
+    for field in ("year", "duration"):
+        if record.get(field) is not None and (
+            type(record[field]) is not int or record[field] < 0
+        ):
+            updates[field] = None
+    value = record.get("shiki_score")
+    if value is not None and (
+        type(value) not in (int, float) or not 0 <= value <= 10
+    ):
+        updates["shiki_score"] = None
+    return {**record, **updates} if updates else record
+
+
+def _report_anime_aggregates(stats: dict) -> tuple[dict, bool]:
+    """Проверить готовые anime-агрегаты; повреждённый блок явно недоступен."""
+    aggregate, unreadable = _report_media_mapping(stats, "anime", "aggregates")
+    counters = ("kinds", "score_dist", "genres", "themes", "demographic",
+                "studios", "origins", "ratings")
+    totals = ("total_completed", "total_dropped", "total_watching", "total_planned",
+              "total_on_hold", "total_rewatching", "total_episodes_watched")
+    for field in counters:
+        value = aggregate.get(field, {})
+        if not isinstance(value, dict) or any(
+            type(count) is not int or count < 0 for count in value.values()
+        ):
+            unreadable = True
+    for field in totals:
+        value = aggregate.get(field, 0)
+        if type(value) is not int or value < 0:
+            unreadable = True
+    hours = aggregate.get("total_hours_watched", 0)
+    if type(hours) not in (int, float) or not math.isfinite(hours) or hours < 0:
+        unreadable = True
+    score = aggregate.get("avg_shiki_completed")
+    if score is not None and (type(score) not in (int, float) or not 0 <= score <= 10):
+        unreadable = True
+    if aggregate and not any(field in aggregate for field in (*counters, *totals)):
+        unreadable = True
+    return ({}, True) if unreadable else (aggregate, False)
+
+
 def partition_manga_titles(titles: dict) -> dict[str, dict]:
     """Разложить записи; повреждённые значения представить пустыми unknown-записями."""
     subsets: dict[str, dict] = {"manga": {}, "ranobe": {}, "unknown": {}}
     for title_id, record in titles.items():
-        safe_record = record if isinstance(record, dict) else {}
-        invalid_lists = {
-            field: []
-            for field in ("genres", "themes", "demographic", "publishers")
-            if not isinstance(safe_record.get(field, []), list)
-        }
-        if invalid_lists:
-            # Исправляем только presentation-копию, не исходную запись или кэш.
-            safe_record = {**safe_record, **invalid_lists}
+        safe_record = _report_title(record)
         subsets[classify_manga_presentation_kind(safe_record.get("kind"))][title_id] = safe_record
     return subsets
 
@@ -1150,7 +1224,7 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
     было событие event ("completed"|"dropped"), джойня события с stats_all.
     Для completed подставляем score из события (на момент завершения).
     """
-    titles = (stats_all.get(media) or {}).get("titles") or {}
+    titles, _ = _report_media_mapping(stats_all, media, "titles")
     out = []
     seen = set()
     for ev in _quarter_events(cur):
@@ -1492,11 +1566,8 @@ def build_favourites_messages(stats: dict) -> Report:
 
 def build_stats_all_messages(stats: dict) -> Report:
     """Аниме и три категории чтения; агрегаты чтения вычисляем только в памяти."""
-    a_agg = (stats.get("anime") or {}).get("aggregates") or {}
-    manga_titles = (stats.get("manga") or {}).get("titles", {})
-    unreadable_collection = not isinstance(manga_titles, dict)
-    if unreadable_collection:
-        manga_titles = {}
+    a_agg, unreadable_anime = _report_anime_aggregates(stats)
+    manga_titles, unreadable_collection = _report_media_mapping(stats, "manga", "titles")
     manga_subsets = partition_manga_titles(manga_titles)
     manga_aggregates = {
         category: recompute_aggregates("manga", titles)
@@ -1515,7 +1586,8 @@ def build_stats_all_messages(stats: dict) -> Report:
 
     # Пустая статистика — одно короткое сообщение
     if (a_agg.get("total_completed", 0) == 0
-            and not any(manga_subsets.values()) and not unreadable_collection):
+            and not any(manga_subsets.values())
+            and not unreadable_collection and not unreadable_anime):
         return Report((unit(
             section(line("📊 ", Bold("СТАТИСТИКА ЗА ВСЁ ВРЕМЯ"))),
             section(line(Italic("Статистика ещё не собрана. Дай боту немного времени."))),
@@ -1538,7 +1610,10 @@ def build_stats_all_messages(stats: dict) -> Report:
     anime_summary_parts = [Text("✅ Завершено: "), Bold(str(a_total))]
     if eps:
         anime_summary_parts.append(Text(f"   ·   📺 {eps} эп (~{hrs} ч)"))
-    anime_summary = [Line(tuple(anime_summary_parts))]
+    anime_summary = [
+        line("⚠️ Не удалось прочитать статистику аниме.")
+        if unreadable_anime else Line(tuple(anime_summary_parts))
+    ]
     avg_a = _avg_score_from_dist(a_agg.get("score_dist", {}))
     if avg_a is not None:
         average_parts = [Text("⭐ Средняя: "), Bold(str(avg_a))]
@@ -1659,11 +1734,16 @@ def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
         category: {"completed": [], "dropped": [], "planned": 0}
         for category in _MANGA_REPORT_LABELS
     }
+    for media in ("anime", "manga"):
+        for event_type in ("completed", "dropped"):
+            report[media][event_type] = [
+                _report_title(record) for record in report[media][event_type]
+            ]
     for event_type in ("completed", "dropped"):
         subsets = partition_manga_titles(dict(enumerate(report["manga"][event_type])))
         for category, records in subsets.items():
             split[category][event_type] = list(records.values())
-    titles = (stats_all.get("manga") or {}).get("titles") or {}
+    titles, _ = _report_media_mapping(stats_all, "manga", "titles")
     for event in events:
         if event.get("media") == "manga" and event.get("event") == "planned":
             title_id = _manga_event_id(event.get("id"))
@@ -1682,6 +1762,7 @@ def build_current_stats_messages(cur: dict, stats_all: dict) -> Report:
     anime = report["anime"]
 
     header_lines = [line("📊 ", Bold(f"Статистика {title_label}"))]
+    header_lines.extend(_quarter_source_notices(stats_all))
     if _is_partial_quarter(cur):
         header_lines.append(line(Italic(
             "⚠️ Квартал отслеживается не с самого начала — данные неполные."
@@ -1695,6 +1776,15 @@ def build_current_stats_messages(cur: dict, stats_all: dict) -> Report:
         section(*header_lines),
     )
     return Report((anime_unit, *_manga_quarter_units(report)))
+
+
+def _quarter_source_notices(stats_all: dict) -> list[Line]:
+    """Не скрывать повреждение источника, сохраняя известные события квартала."""
+    return [
+        line(f"⚠️ Не удалось прочитать список {label}; показаны известные события.")
+        for media, label in (("anime", "аниме"), ("manga", "манги и ранобэ"))
+        if _report_media_mapping(stats_all, media, "titles")[1]
+    ]
 
 
 def build_quarterly_report_messages(
@@ -1713,6 +1803,7 @@ def build_quarterly_report_messages(
         line("📊 ", Bold("КВАРТАЛЬНЫЙ ОТЧЁТ")),
         line(Bold(title_label)),
     ]
+    header_lines.extend(_quarter_source_notices(stats_all))
     if _is_partial_quarter(cur):
         header_lines.append(line(Italic(
             "⚠️ Квартал отслеживался не с самого начала — данные неполные."
@@ -1728,6 +1819,8 @@ def build_quarterly_report_messages(
     units.extend(_manga_quarter_units(report))
 
     extra_sections: list[Section] = []
+    if prev_quarter is not None and not isinstance(prev_quarter, dict):
+        prev_quarter = {"anime_completed": None, "manga_completed": None}
     if prev_quarter:
         prev_a = prev_quarter.get("anime_completed")
         anime_diff = (
