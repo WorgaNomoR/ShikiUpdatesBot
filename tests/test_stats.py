@@ -2319,7 +2319,20 @@ def test_all_time_non_dict_manga_titles_does_not_abort_report(monkeypatch, title
     report = smod.build_stats_all_messages(stats)
 
     assert isinstance(report, Report)
-    assert rendered_html(report)
+    text = "\n".join(rendered_html(report))
+    assert "НЕ ОПРЕДЕЛЕНО" in text
+    assert "Не удалось прочитать список манги и ранобэ; число тайтлов неизвестно." in text
+    assert "Статистика ещё не собрана" not in text
+    assert "Не удалось прочитать данные тайтлов: <b>1</b>" not in text
     assert stats == before
     if anime_present:
         assert report.units[0] == smod.build_stats_all_messages(_populated_stats()).units[0]
+
+
+@pytest.mark.parametrize("manga", [{}, {"titles": {}}])
+def test_absent_or_empty_manga_titles_is_not_reported_as_corrupt(manga):
+    stats = storage._empty_stats_all()
+    stats["manga"] = manga
+    text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
+    assert "Статистика ещё не собрана" in text
+    assert "Не удалось прочитать" not in text

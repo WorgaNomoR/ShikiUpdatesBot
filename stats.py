@@ -1493,8 +1493,9 @@ def build_favourites_messages(stats: dict) -> Report:
 def build_stats_all_messages(stats: dict) -> Report:
     """Аниме и три категории чтения; агрегаты чтения вычисляем только в памяти."""
     a_agg = (stats.get("anime") or {}).get("aggregates") or {}
-    manga_titles = (stats.get("manga") or {}).get("titles")
-    if not isinstance(manga_titles, dict):
+    manga_titles = (stats.get("manga") or {}).get("titles", {})
+    unreadable_collection = not isinstance(manga_titles, dict)
+    if unreadable_collection:
         manga_titles = {}
     manga_subsets = partition_manga_titles(manga_titles)
     manga_aggregates = {
@@ -1505,6 +1506,7 @@ def build_stats_all_messages(stats: dict) -> Report:
     manga_aggregates["unknown"]["unreadable_titles"] = sum(
         not isinstance(record, dict) for record in manga_titles.values()
     )
+    manga_aggregates["unknown"]["unreadable_collection"] = unreadable_collection
 
     updated = _parse_iso_utc(stats.get("updated_at"))
     upd_str = ""
@@ -1512,7 +1514,8 @@ def build_stats_all_messages(stats: dict) -> Report:
         upd_str = updated.strftime("%d.%m.%Y")
 
     # Пустая статистика — одно короткое сообщение
-    if a_agg.get("total_completed", 0) == 0 and not any(manga_subsets.values()):
+    if (a_agg.get("total_completed", 0) == 0
+            and not any(manga_subsets.values()) and not unreadable_collection):
         return Report((unit(
             section(line("📊 ", Bold("СТАТИСТИКА ЗА ВСЁ ВРЕМЯ"))),
             section(line(Italic("Статистика ещё не собрана. Дай боту немного времени."))),
@@ -1586,6 +1589,10 @@ def _manga_all_unit(category: str, m_agg: dict) -> Unit:
     if ch or vol:
         manga_summary_parts.append(Text(f"   ·   📖 {ch} гл · {vol} томов"))
     manga_summary = [Line(tuple(manga_summary_parts))]
+    if m_agg.get("unreadable_collection"):
+        manga_summary.append(line(
+            "⚠️ Не удалось прочитать список манги и ранобэ; число тайтлов неизвестно."
+        ))
     unreadable = m_agg.get("unreadable_titles", 0)
     if unreadable:
         manga_summary.append(line(
