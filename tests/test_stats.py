@@ -34,6 +34,7 @@ from report_model import (
     Link,
     Report,
     Text,
+    render_report,
     rendered_html,
 )
 
@@ -583,14 +584,11 @@ def test_stats_all_normalizes_aware_updated_at_to_utc_date():
 @pytest.mark.parametrize("kind", ["light_novel", "ranobe"])
 def test_stats_all_translates_ranobe_kinds(kind):
     stats = _populated_stats()
-    stats["manga"]["aggregates"].update({
-        "total_completed": 4,
-        "kinds": {"manga": 1, kind: 3},
-    })
+    stats["manga"]["titles"] = {"1": _manga_record("Novel", kind)}
 
-    manga_message = rendered_html(smod.build_stats_all_messages(stats))[1]
+    manga_message = rendered_html(smod.build_stats_all_messages(stats))[2]
 
-    assert "Манга" in manga_message
+    assert "РАНОБЭ" in manga_message
     assert "Ранобэ" in manga_message
     assert "light_novel" not in manga_message
     assert "ranobe" not in manga_message
@@ -631,17 +629,17 @@ def test_current_and_quarterly_reports_keep_distinct_structure():
         {"period": "2026-Q1", "anime_completed": 1, "manga_completed": 0},
     )
 
-    assert len(current.units) == 2
+    assert len(current.units) == 4
     assert current.units[0].sections[0].items[0].parts == (
         Text("📊 "),
         Bold("Статистика с 01.04.2026 по 30.06.2026"),
     )
-    assert len(quarterly.units) == 3
+    assert len(quarterly.units) == 5
     assert quarterly.units[0].sections[0].items[0].parts == (
         Text("📊 "),
         Bold("КВАРТАЛЬНЫЙ ОТЧЁТ"),
     )
-    assert quarterly.units[2].sections[0].items[0].parts == (
+    assert quarterly.units[4].sections[0].items[0].parts == (
         Text("📈 "),
         Bold("Сравнение с январь — март 2026:"),
     )
@@ -691,16 +689,16 @@ def test_prepare_quarter_report_collects_each_media_and_event_type():
             "a-dropped": anime_dropped,
         }},
         "manga": {"titles": {
-            "m-completed": manga_completed,
-            "m-dropped": manga_dropped,
+            "101": manga_completed,
+            "102": manga_dropped,
         }},
     }
     cur = {"events": [
         {"id": "a-completed", "media": "anime", "event": "completed", "score": 9},
         {"id": "a-dropped", "media": "anime", "event": "dropped"},
         {"media": "anime", "event": "planned"},
-        {"id": "m-completed", "media": "manga", "event": "completed", "score": 8},
-        {"id": "m-dropped", "media": "manga", "event": "dropped"},
+        {"id": "101", "media": "manga", "event": "completed", "score": 8},
+        {"id": "102", "media": "manga", "event": "dropped"},
         {"media": "manga", "event": "planned"},
         None,
         "broken",
@@ -709,7 +707,7 @@ def test_prepare_quarter_report_collects_each_media_and_event_type():
 
     report = smod._prepare_quarter_report(cur, stats)
 
-    assert report == {
+    assert {key: report[key] for key in ("anime", "manga")} == {
         "anime": {
             "completed": [{"title": "Anime completed", "score": 9}],
             "dropped": [{"title": "Anime dropped", "score": 0}],
@@ -740,12 +738,12 @@ def test_quarter_reports_treat_non_list_events_as_empty(invalid_events):
         cur, _populated_stats(), prev_quarter=None,
     ))
 
-    assert prepared == {
+    assert {key: prepared[key] for key in ("anime", "manga")} == {
         "anime": {"completed": [], "dropped": [], "planned": 0},
         "manga": {"completed": [], "dropped": [], "planned": 0},
     }
-    assert len(current) == 2
-    assert len(quarterly) == 2
+    assert len(current) == 4
+    assert len(quarterly) == 4
 
 
 def test_quarter_reports_normalize_event_id_and_score_fields():
@@ -1993,3 +1991,459 @@ async def test_sync_stats_all_late_privacy_failure_preserves_process_cache(
         await smod.sync_stats_all(session=object())
 
     assert storage.load_stats_all() == initial
+
+
+# Разделение статистики использует матрицу классификатора /pick выше.
+def test_partition_manga_records_exactly_once_preserves_raw_values():
+    kinds = ["manga", "manhwa", "manhua", "light_novel", "novel", "ranobe",
+             None, 42, [], {}, "one_shot", "future_kind"]
+    titles = {str(i): _manga_record(str(i), kind) for i, kind in enumerate(kinds)}
+    titles["missing"] = {"status": "planned"}
+    titles["broken"] = None
+    before = copy.deepcopy(titles)
+
+    split = smod.partition_manga_titles(titles)
+
+    assert list(split["manga"]) == ["0", "1", "2"]
+    assert list(split["ranobe"]) == ["3", "4", "5"]
+    assert list(split["unknown"]) == ["6", "7", "8", "9", "10", "11", "missing", "broken"]
+    ids = [key for records in split.values() for key in records]
+    assert len(ids) == len(set(ids)) == 14
+    assert all(record is titles[key] for records in split.values() for key, record in records.items() if key != "broken")
+    assert split["unknown"]["broken"] == {}
+    assert titles == before
+
+
+def _split_stats_fixture():
+    stats = _populated_stats()
+    for index, kind in enumerate(("manhwa", "novel", "future_kind"), 1):
+        for offset, status in enumerate(("completed", "dropped", "planned", "watching", "on_hold", "rewatching")):
+            record = _manga_record(f"Title {index}-{offset}", kind, status)
+            record.update(score=index + 5, shiki_score=index + 4.5,
+                          chapters_read=index * 10, volumes_read=index,
+                          genres=["Shared", f"Genre {index}"], themes=[f"Theme {index}"],
+                          demographic=[f"Audience {index}"], publishers=[f"Publisher {index}"])
+            stats["manga"]["titles"][str(index * 10 + offset)] = record
+    stats["manga"]["aggregates"] = {"total_completed": 900, "genres": {"Stale": 900},
+                                    "by_quarter": {"2025-Q4": {"completed": 77}}}
+    return stats
+
+
+def test_split_all_time_aggregates_are_independent_and_read_only(monkeypatch):
+    stats = _split_stats_fixture()
+    before = copy.deepcopy(stats)
+    captured = []
+    real_builder = smod._manga_all_unit
+
+    def capture(category, aggregate):
+        captured.append((category, aggregate))
+        return real_builder(category, aggregate)
+
+    monkeypatch.setattr("stats._manga_all_unit", capture)
+    for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
+                   "stats.fetch_list_export", "stats.fetch_favourites"):
+        monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
+    report = smod.build_stats_all_messages(stats)
+
+    assert [category for category, _ in captured] == ["manga", "ranobe", "unknown"]
+    for index, (_, aggregate) in enumerate(captured, 1):
+        assert {key: aggregate[key] for key in (
+            "total_completed", "total_dropped", "total_planned", "total_watching",
+            "total_on_hold", "total_rewatching",
+        )} == dict.fromkeys(("total_completed", "total_dropped", "total_planned",
+                             "total_watching", "total_on_hold", "total_rewatching"), 1)
+        assert aggregate["score_dist"] == {str(index + 5): 1}
+        assert aggregate["avg_shiki_completed"] == index + 4.5
+        assert aggregate["total_chapters_read"] == index * 10
+        assert aggregate["total_volumes_read"] == index
+        assert aggregate["genres"] == {"Shared": 1, f"Genre {index}": 1}
+        assert aggregate["themes"] == {f"Theme {index}": 1}
+        assert aggregate["demographic"] == {f"Audience {index}": 1}
+        assert aggregate["publishers"] == {f"Publisher {index}": 1}
+        assert aggregate["by_quarter"] == {}
+        text = "\n".join(rendered_html(Report((report.units[index],))))
+        assert f"Genre {index}" in text and f"Publisher {index}" in text
+        assert "100%" in text and "Stale" not in text
+    assert stats == before
+    assert report.units[0] == smod.build_stats_all_messages(_populated_stats()).units[0]
+
+
+@pytest.mark.parametrize("status", ["planned", "dropped", "watching", "on_hold", "rewatching"])
+def test_all_time_reading_without_completed_is_visible(status):
+    stats = storage._empty_stats_all()
+    stats["manga"]["titles"] = {"1": _manga_record("Pending", None, status)}
+    text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
+    assert "НЕ ОПРЕДЕЛЕНО" in text
+    assert "ещё не собрана" not in text
+
+
+@pytest.mark.parametrize("event_type", ["completed", "dropped", "planned"])
+def test_current_split_keeps_missing_and_malformed_ids_visible(event_type, monkeypatch):
+    stats = _split_stats_fixture()
+    # Метаданные по повреждённому ключу не дают права угадывать категорию.
+    stats["manga"]["titles"].update({"bad": {"kind": "manga"}, "99": [], "100": {"kind": None}})
+    ids = [10, "20", "30", "missing", "99", "100", None, True, [], {}, 1.5, "0", "bad"]
+    cur = {"period": "2026-Q2", "events": [
+        {"id": tid, "media": "manga", "event": event_type, "score": 8} for tid in ids
+    ]}
+    before = copy.deepcopy((cur, stats))
+    for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
+                   "stats.fetch_list_export", "stats.fetch_favourites"):
+        monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
+
+    data = smod._prepare_quarter_report(cur, stats)
+    values = [data["manga_split"][category][event_type] for category in ("manga", "ranobe", "unknown")]
+    assert (values if event_type == "planned" else list(map(len, values))) == [1, 1, 11]
+    for report in (smod.build_current_stats_messages(cur, stats),
+                   smod.build_quarterly_report_messages(cur, stats, None)):
+        text = "\n".join(rendered_html(Report((report.units[3],))))
+        assert "НЕ ОПРЕДЕЛЕНО" in text
+        expected = {"completed": "Прочитано: <b>11</b>", "dropped": "Брошено: 11", "planned": "В планируемое: 11"}
+        assert expected[event_type] in text
+    assert (cur, stats) == before
+
+
+def test_quarter_completion_deduplication_achievements_and_progress():
+    stats = _split_stats_fixture()
+    cur = {"period": "2026-Q2", "events": [
+        {"id": tid, "media": "manga", "event": "completed", "score": 10}
+        for tid in (10, "10", "20", "30")
+    ]}
+    prepared = smod._prepare_quarter_report(cur, stats)
+    assert len(prepared["manga"]["completed"]) == 3
+    report = smod.build_quarterly_report_messages(cur, stats, None)
+    texts = rendered_html(report)
+    assert "Десятку поставил 3 раза" in texts[-1]
+    for index in (1, 2, 3):
+        assert f"Глав прочитано: <b>{index * 10}</b> · Томов: <b>{index}</b>" in texts[index]
+        assert "Прочитано: <b>1</b>" in texts[index]
+        assert f"Genre {index}" in texts[index]
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({"manga_completed": 3, "manga_titles": [{"kind": "manga"}, {"kind": "novel"}, {"kind": "future"}]}, {"manga": 1, "ranobe": 1, "unknown": 1}),
+    ({"manga_completed": 0, "manga_titles": []}, {"manga": 0, "ranobe": 0, "unknown": 0}),
+    ({"manga_completed": 3}, None),
+    ({"manga_completed": 2, "manga_titles": [{"kind": "manga"}]}, None),
+    ({"manga_completed": 1, "manga_titles": [{"kind": "manga"}, {"kind": "novel"}]}, None),
+    ({"manga_completed": 2, "manga_titles": [{"kind": "manga"}, {}]}, None),
+    ({"manga_completed": 1, "manga_titles": [None]}, None),
+    ({"manga_completed": 1, "manga_titles": [{"kind": None}]}, None),
+    ({"manga_completed": 1, "manga_titles": [{"kind": []}]}, None),
+    ({"manga_completed": 1, "manga_titles": [{"kind": " "}]}, None),
+    ({"manga_completed": 1, "manga_titles": {}}, None),
+    ({"manga_completed": True, "manga_titles": [{"kind": "manga"}]}, None),
+    ({"manga_completed": "1", "manga_titles": [{"kind": "manga"}]}, None),
+    ({"manga_completed": -1, "manga_titles": []}, None),
+    ({"manga_titles": []}, None),
+])
+def test_previous_snapshot_split_requires_complete_evidence(tmp_path, monkeypatch, payload, expected):
+    monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
+    path = tmp_path / "2026-Q1.json"
+    path.write_text(json.dumps({"period": "2026-Q1", **payload}), encoding="utf-8")
+    before = path.read_bytes()
+    summary = smod._load_prev_quarter_summary("2026-Q1")
+    assert smod._snapshot_manga_counts(summary) == expected
+    report = smod.build_quarterly_report_messages({"period": "2026-Q2", "events": []}, {}, summary)
+    text = rendered_html(report)[-1]
+    assert ("вместе, включая не определённое" in text) is (expected is None)
+    assert ("недостаточно данных" in text) is (expected is None)
+    if expected is not None:
+        assert "📚 Манга:" in text and "📚 Ранобэ:" in text and "📚 Не определено:" in text
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("body", ["{broken", "null", "[]", "42"])
+def test_malformed_snapshot_file_is_not_rewritten(tmp_path, monkeypatch, body):
+    monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
+    path = tmp_path / "2026-Q1.json"
+    path.write_text(body, encoding="utf-8")
+    assert smod._load_prev_quarter_summary("2026-Q1") is None
+    assert path.read_text(encoding="utf-8") == body
+
+
+def test_new_snapshot_roundtrip_keeps_raw_kinds_and_combined_schema(tmp_path, monkeypatch):
+    monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
+    stats = _split_stats_fixture()
+    before = copy.deepcopy(stats)
+    cur = {"period": "2026-Q2", "events": [
+        {"id": tid, "media": "manga", "event": "completed", "score": 10}
+        for tid in (10, 20, 30)
+    ]}
+    smod._save_quarter_snapshot("2026-Q2", cur, stats)
+    snapshot = json.loads((tmp_path / "2026-Q2.json").read_text(encoding="utf-8"))
+    assert set(snapshot) == {"period", "anime_completed", "manga_completed", "events", "anime_titles", "manga_titles"}
+    assert snapshot["manga_completed"] == 3
+    assert [record["kind"] for record in snapshot["manga_titles"]] == ["manhwa", "novel", "future_kind"]
+    summary = smod._load_prev_quarter_summary("2026-Q2")
+    assert smod._snapshot_manga_counts(summary) == {"manga": 1, "ranobe": 1, "unknown": 1}
+    assert stats == before
+
+
+def test_split_reports_keep_typed_links_and_long_counter_chunks():
+    stats = _split_stats_fixture()
+    for tid in ("10", "20", "30"):
+        stats["manga"]["titles"][tid].update(
+            title="A <B> & 😀", url=f"https://shikimori.io/mangas/{tid}?x=1&y=2",
+            genres=[f"{index} " + "Жанр & 😀" * 300 for index in range(8)],
+        )
+    cur = {"period": "2026-Q2", "events": [
+        {"id": tid, "media": "manga", "event": "completed", "score": 8}
+        for tid in ("10", "20", "30")
+    ]}
+    reports = [smod.build_stats_all_messages(stats), smod.build_current_stats_messages(cur, stats),
+               smod.build_quarterly_report_messages(cur, stats, None)]
+    for report in reports:
+        chunks = render_report(report)
+        assert len(chunks) > len(report.units)
+        assert all(chunk.visible_length <= 4096 for chunk in chunks)
+        assert all("<B>" not in chunk.html for chunk in chunks)
+    for report in reports[1:]:
+        hrefs = re.findall(r'href="([^"]*)"', "\n".join(rendered_html(report)))
+        assert hrefs == [f"https://shikimori.io/mangas/{tid}?x=1&amp;y=2" for tid in ("10", "20", "30")]
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({}, "сравнение недоступно"),
+    ({"anime_completed": None}, "сравнение недоступно"),
+    ({"anime_completed": "2"}, "сравнение недоступно"),
+    ({"anime_completed": []}, "сравнение недоступно"),
+    ({"anime_completed": {}}, "сравнение недоступно"),
+    ({"anime_completed": True}, "сравнение недоступно"),
+    ({"anime_completed": False}, "сравнение недоступно"),
+    ({"anime_completed": -1}, "сравнение недоступно"),
+    ({"anime_completed": 1.5}, "сравнение недоступно"),
+    ({"anime_completed": 0}, "+1"),
+    ({"anime_completed": 1}, "→ без изменений (1)"),
+    ({"anime_completed": 2}, "↓ 50% (2 → 1)"),
+])
+def test_quarter_anime_comparison_validates_snapshot_count(tmp_path, monkeypatch, payload, expected):
+    monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
+    path = tmp_path / "2026-Q1.json"
+    path.write_text(json.dumps({"period": "2026-Q1", "manga_completed": 0, **payload}), encoding="utf-8")
+    before = path.read_bytes()
+    previous = smod._load_prev_quarter_summary("2026-Q1")
+    stats = _populated_stats()
+    stats["anime"]["titles"] = {"1": {**_anime_rec(), "title": "Anime title"}}
+    cur = {"period": "2026-Q2", "events": [
+        {"id": "1", "media": "anime", "event": "completed", "score": 10},
+    ]}
+
+    report = smod.build_quarterly_report_messages(cur, stats, previous)
+    text = "\n".join(rendered_html(report))
+
+    assert f"🎬 Аниме: {expected}" in text
+    assert "Anime title" in text
+    assert "Один безоговорочный шедевр" in text
+    assert "Манга и ранобэ (вместе, включая не определённое): ~" in text
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("malformed", [None, [], ["manga"], "broken", 42])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_all_time_malformed_titles_remain_visible_without_invented_stats(monkeypatch, malformed, mixed):
+    stats = storage._empty_stats_all()
+    titles = {"1": malformed, "2": []}
+    if mixed:
+        titles.update({"3": _manga_record("Manga", "manga"),
+                       "4": _manga_record("Novel", "novel"),
+                       "5": _manga_record("Unknown", None)})
+    stats["manga"]["titles"] = titles
+    stats["manga"]["aggregates"] = {"total_completed": 999, "by_quarter": {"2025-Q1": {"completed": 7}}}
+    before = copy.deepcopy(stats)
+    for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
+                   "stats.fetch_list_export", "stats.fetch_favourites"):
+        monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
+
+    split = smod.partition_manga_titles(titles)
+    assert set(split["unknown"]) == ({"1", "2", "5"} if mixed else {"1", "2"})
+    assert split["unknown"]["1"] == {}
+    report = smod.build_stats_all_messages(stats)
+    text = "\n".join(rendered_html(report))
+    unknown_text = "\n".join(rendered_html(Report((report.units[3],))))
+    assert "МАНГА" in text and "НЕ ОПРЕДЕЛЕНО" in unknown_text
+    assert "Не удалось прочитать данные тайтлов: <b>2</b>" in unknown_text
+    assert f"Прочитано: <b>{1 if mixed else 0}</b>" in unknown_text
+    assert "ещё не собрана" not in text and "999" not in text
+    assert stats == before
+
+
+@pytest.mark.parametrize("field", ["genres", "themes", "demographic", "publishers"])
+@pytest.mark.parametrize("value", [None, 42, True, "corrupt", {"bad": 1}, ("bad",), "missing", [], ["Valid"]])
+def test_manga_reports_normalize_taxonomy_lists_without_mutating_source(field, value):
+    stats = storage._empty_stats_all()
+    for tid, kind in enumerate(("manga", "novel", "future"), 1):
+        record = _manga_record(f"Title {tid}", kind)
+        record.update(score=8, genres=["Genre"], themes=["Theme"],
+                      demographic=["Audience"], publishers=["Publisher"])
+        if value == "missing":
+            record.pop(field)
+        else:
+            record[field] = value
+        stats["manga"]["titles"][str(tid)] = record
+    before = copy.deepcopy(stats)
+    expected = value if isinstance(value, list) else []
+    split = smod.partition_manga_titles(stats["manga"]["titles"])
+    for tid, category in enumerate(("manga", "ranobe", "unknown"), 1):
+        record = split[category][str(tid)]
+        assert record.get(field, []) == expected
+        for other in ("genres", "themes", "demographic", "publishers"):
+            if other != field:
+                assert record[other] == stats["manga"]["titles"][str(tid)][other]
+        aggregate = smod.recompute_aggregates("manga", split[category])
+        assert aggregate[field] == ({"Valid": 1} if expected else {})
+        assert aggregate["total_completed"] == 1
+        assert aggregate["score_dist"] == {"8": 1}
+    cur = {"period": "2026-Q2", "events": [
+        {"id": str(tid), "media": "manga", "event": "completed", "score": 8}
+        for tid in (1, 2, 3)
+    ]}
+    for report in (smod.build_stats_all_messages(stats),
+                   smod.build_current_stats_messages(cur, stats),
+                   smod.build_quarterly_report_messages(cur, stats, None)):
+        text = "\n".join(rendered_html(report))
+        assert "МАНГА" in text and "РАНОБЭ" in text and "НЕ ОПРЕДЕЛЕНО" in text
+    assert stats == before
+
+
+@pytest.mark.parametrize("titles", [[{"kind": "manga"}], "broken", 42, True, [], None])
+@pytest.mark.parametrize("anime_present", [False, True])
+def test_all_time_non_dict_manga_titles_does_not_abort_report(monkeypatch, titles, anime_present):
+    stats = _populated_stats() if anime_present else storage._empty_stats_all()
+    stats["manga"]["titles"] = titles
+    before = copy.deepcopy(stats)
+    for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
+                   "stats.fetch_list_export", "stats.fetch_favourites"):
+        monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
+
+    report = smod.build_stats_all_messages(stats)
+
+    assert isinstance(report, Report)
+    text = "\n".join(rendered_html(report))
+    assert "НЕ ОПРЕДЕЛЕНО" in text
+    assert "Не удалось прочитать список манги и ранобэ; число тайтлов неизвестно." in text
+    assert "Статистика ещё не собрана" not in text
+    assert "Не удалось прочитать данные тайтлов: <b>1</b>" not in text
+    assert stats == before
+    if anime_present:
+        assert report.units[0] == smod.build_stats_all_messages(_populated_stats()).units[0]
+
+
+@pytest.mark.parametrize("manga", [{}, {"titles": {}}])
+def test_absent_or_empty_manga_titles_is_not_reported_as_corrupt(manga):
+    stats = storage._empty_stats_all()
+    stats["manga"] = manga
+    text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
+    assert "Статистика ещё не собрана" in text
+    assert "Не удалось прочитать" not in text
+
+
+@pytest.mark.parametrize("media", ["anime", "manga"])
+@pytest.mark.parametrize("level", ["domain", "titles"])
+@pytest.mark.parametrize("bad", [None, [], [1], "broken", 42, True])
+def test_report_domain_boundaries_are_visible_and_read_only(media, level, bad):
+    stats = _split_stats_fixture()
+    if level == "domain":
+        stats[media] = bad
+    else:
+        stats[media]["titles"] = bad
+    before = copy.deepcopy(stats)
+    cur = {"period": "2026-Q2", "events": [
+        {"id": "1", "media": media, "event": "completed", "score": 8},
+        {"id": "2", "media": media, "event": "dropped"},
+        {"id": "3", "media": media, "event": "planned"},
+    ]}
+    for index, report in enumerate((smod.build_stats_all_messages(stats),
+                                    smod.build_current_stats_messages(cur, stats),
+                                    smod.build_quarterly_report_messages(cur, stats, None))):
+        text = "\n".join(rendered_html(report))
+        # All-time аниме использует aggregates и не нуждается в titles.
+        if not (media == "anime" and level == "titles" and index == 0):
+            assert "Не удалось прочитать" in text
+        assert "Статистика ещё не собрана" not in text
+    assert stats == before
+
+
+@pytest.mark.parametrize("field", ["aggregates", "genres", "score_dist", "studios", "kinds",
+                                    "total_completed", "total_hours_watched", "avg_shiki_completed"])
+@pytest.mark.parametrize("bad", [None, [1], "broken", {"bad": "count"}, True, -1, float("inf")])
+def test_anime_aggregate_corruption_keeps_reading_report(field, bad):
+    stats = _split_stats_fixture()
+    if field == "aggregates":
+        stats["anime"]["aggregates"] = bad
+    else:
+        stats["anime"]["aggregates"][field] = bad
+    before = copy.deepcopy(stats)
+    report = smod.build_stats_all_messages(stats)
+    text = "\n".join(rendered_html(report))
+    assert stats == before
+    # None среднего рейтинга — штатное отсутствие оценки.
+    if not (field == "avg_shiki_completed" and bad is None):
+        assert "Не удалось прочитать" in text
+    assert "РАНОБЭ" in text and "Genre 2" in text
+
+
+@pytest.mark.parametrize("media", ["anime", "manga"])
+@pytest.mark.parametrize("field, value", [
+    ("genres", None), ("themes", 3), ("demographic", "bad"),
+    ("studios", None), ("publishers", [None, {}, "Valid"]),
+    ("status", []), ("score", "8"), ("score", float("inf")),
+    ("shiki_score", float("nan")), ("url", [1]),
+    ("episodes_watched", float("inf")), ("chapters_read", float("inf")),
+])
+def test_quarter_record_boundary_handles_corrupt_fields(media, field, value):
+    stats = storage._empty_stats_all()
+    record = {"title": "Kept", "kind": "manga" if media == "manga" else "tv",
+              "status": "completed", "score": 8, field: value}
+    stats[media]["titles"]["1"] = record
+    cur = {"period": "2026-Q2", "events": [{"id": "1", "media": media, "event": "completed"}]}
+    for report in (smod.build_current_stats_messages(cur, stats),
+                   smod.build_quarterly_report_messages(cur, stats, None)):
+        text = "\n".join(rendered_html(report))
+        assert "<b>1</b>" in text
+        assert "nan" not in text and "inf" not in text
+    assert stats[media]["titles"]["1"] is record
+
+
+@pytest.mark.parametrize("previous", [[1], "bad", True, {"period": [], "anime_completed": 2}])
+def test_quarter_bad_previous_summary_keeps_report(previous):
+    report = smod.build_quarterly_report_messages({"period": "2026-Q2", "events": []}, {}, previous)
+    assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in "\n".join(rendered_html(report))
+
+
+@pytest.mark.parametrize("media", ["anime", "manga"])
+def test_unreadable_domain_without_other_statistics_stays_visible(media):
+    stats = storage._empty_stats_all()
+    stats[media] = [1]
+    text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
+    assert "Не удалось прочитать" in text
+    assert "Статистика ещё не собрана" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media", ["anime", "manga"])
+async def test_statistics_handlers_read_corrupt_domain_without_writes(tmp_path, monkeypatch, media):
+    stats = storage._empty_stats_all()
+    stats[media] = [1]
+    path = tmp_path / "stats_all.json"
+    path.write_text(json.dumps(stats), encoding="utf-8")
+    before = path.read_bytes()
+    monkeypatch.setattr("storage.STATS_ALL_FILE", path)
+    monkeypatch.setattr("storage._stats_all_cache", None)
+    monkeypatch.setattr("storage._atomic_write", lambda *a: pytest.fail("Запись при чтении отчёта"))
+    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(side_effect=AssertionError("network")))
+    for report in (await handlers._stats_report_all(), await handlers._stats_report_current()):
+        assert "Не удалось прочитать" in "\n".join(rendered_html(report))
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("value", [[], "broken", float("inf"), float("nan"), True])
+def test_manga_all_time_scalar_damage_keeps_completion(value):
+    stats = storage._empty_stats_all()
+    stats["manga"]["titles"] = {"1": {"kind": "manga", "status": "completed", "score": value,
+                                      "chapters_read": value, "volumes_read": value, "shiki_score": value}}
+    text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
+    assert "Прочитано: <b>1</b>" in text
+    assert "nan" not in text and "inf" not in text
+    assert "Средняя:" not in text

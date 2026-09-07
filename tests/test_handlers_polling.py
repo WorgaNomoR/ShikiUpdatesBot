@@ -898,14 +898,14 @@ async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
     m_bq = saved["sa"]["manga"]["aggregates"]["by_quarter"]["2026-Q2"]
     assert m_bq == {"completed": 1, "avg_score": 9.0, "chapters_read": 100}
 
-    # 3. build_quarterly_report_messages реально собрал отчёт (3 темы),
+    # 3. build_quarterly_report_messages реально собрал отчёт (5 тем),
     #    с заголовком, реальными тайтлами и блоком сравнения (prev-summary дан).
     report = [call.kwargs["text"] for call in bot.send_message.await_args_list]
-    assert len(report) == 3
+    assert len(report) == 5
     assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in report[0]
     assert "Аниме-Один" in report[0]
-    assert "Сравнение" in report[2]
-    assert "январь — март 2026" in report[2]
+    assert "Сравнение" in report[4]
+    assert "январь — март 2026" in report[4]
 
 
 @pytest.mark.asyncio
@@ -1550,3 +1550,41 @@ async def test_rotation_retries_backup_without_repeating_report(
         float,
     )
     assert second["pending_quarter_delivery"] is None
+
+
+@pytest.mark.asyncio
+async def test_split_quarter_plan_resumes_frozen_ranobe_after_reload(quarter_delivery_env, monkeypatch):
+    old = {"period": "2026-Q2", "events": [
+        {"id": str(tid), "media": "manga", "event": "completed", "score": 8}
+        for tid in (1, 2, 3)
+    ]}
+    stats = storage._empty_stats_all()
+    stats["manga"]["titles"] = {
+        "1": {"kind": "manga", "title": "Manga", "score": 8},
+        "2": {"kind": "novel", "title": "Novel", "score": 8},
+        "3": {"kind": "future", "title": "Unknown", "score": 8},
+    }
+    storage.save_stats_current(old, strict=True)
+    sync = AsyncMock(side_effect=AssertionError("Лишний sync"))
+    monkeypatch.setattr("handlers.sync_stats_all", sync)
+    monkeypatch.setattr("handlers.save_stats_all", MagicMock())
+    bot = AsyncMock()
+    bot.send_message.side_effect = [None, None, RuntimeError("interrupted")]
+
+    await handlers.rotate_quarter_if_needed(bot, old, stats, resync=False)
+
+    reloaded = storage.load_stats_current(strict=True)
+    pending = reloaded["pending_quarter_delivery"]
+    frozen = pending["report_messages"]
+    assert pending["next_unit"] == 2
+    assert "МАНГА" in frozen[1] and "РАНОБЭ" in frozen[2] and "НЕ ОПРЕДЕЛЕНО" in frozen[3]
+    quarter_delivery_env.assert_not_awaited()
+    # Новые метаданные после рестарта не переклассифицируют уже замороженный отчёт.
+    stats["manga"]["titles"]["2"]["kind"] = "manga"
+    monkeypatch.setattr("handlers.build_quarterly_report_messages", MagicMock(side_effect=AssertionError("rebuild")))
+    bot.send_message.reset_mock(side_effect=True)
+    await handlers.rotate_quarter_if_needed(bot, reloaded, stats, resync=False)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == frozen[2:]
+    assert storage.load_stats_current(strict=True)["last_report_sent"] == "2026-Q3"
+    sync.assert_not_awaited()
+    quarter_delivery_env.assert_awaited_once()
