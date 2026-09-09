@@ -675,9 +675,8 @@ async def test_check_and_notify_favourites_explicit_none_skips_without_refetch(
 
 
 @pytest.mark.asyncio
-async def test_cmd_favs_sends_report_with_preview_disabled(monkeypatch):
-    """Успех: строит отчёт по избранному и шлёт его с disable_preview=True
-    (у избранного длинные списки — превью-ссылки только мусорят)."""
+async def test_cmd_favs_preserves_no_preview_policy(monkeypatch):
+    """Избранное замораживает запрет preview для ordinary fallback."""
     report = plain_report("fav")
     monkeypatch.setattr(
         handlers,

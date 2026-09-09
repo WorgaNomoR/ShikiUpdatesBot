@@ -31,9 +31,13 @@ import storage
 import utils
 from report_model import (
     Bold,
+    Heading,
+    Italic,
     Link,
+    Poster,
     Report,
     Text,
+    Title,
     render_report,
     rendered_html,
 )
@@ -586,15 +590,36 @@ def test_stats_all_translates_ranobe_kinds(kind):
     stats = _populated_stats()
     stats["manga"]["titles"] = {"1": _manga_record("Novel", kind)}
 
-    manga_message = rendered_html(smod.build_stats_all_messages(stats))[2]
+    manga_message = rendered_html(smod.build_stats_all_messages(stats))[1]
 
-    assert "РАНОБЭ" in manga_message
     assert "Ранобэ" in manga_message
     assert "light_novel" not in manga_message
     assert "ranobe" not in manga_message
 
 def test_smoke_build_favourites_returns_report():
     assert isinstance(smod.build_favourites_messages(_populated_stats()), Report)
+
+
+def test_favourites_use_dynamic_summary_category_counts_and_trailing_score():
+    stats = storage._empty_stats_all()
+    stats["favourites"]["anime"] = [
+        {"title": "Первое", "url": "", "score": 8},
+        {"title": "Второе", "url": ""},
+    ]
+    stats["favourites"]["ranobe"] = [{"title": "Третье", "url": ""}]
+
+    report = smod.build_favourites_messages(stats)
+
+    assert report.units[0].sections[0].items[1].parts == (
+        Italic("3 объекта  ·  2 категории"),
+    )
+    assert report.units[0].sections[1].items[0].parts == (
+        Text("🎬 "),
+        Bold("Аниме"),
+        Text(" · 2"),
+    )
+    assert "Первое — 8⭐" in rendered_html(report)[0]
+    assert "⭐8" not in rendered_html(report)[0]
 
 
 def test_favourites_keep_untrusted_values_plain_until_renderer_boundary():
@@ -629,17 +654,17 @@ def test_current_and_quarterly_reports_keep_distinct_structure():
         {"period": "2026-Q1", "anime_completed": 1, "manga_completed": 0},
     )
 
-    assert len(current.units) == 4
+    assert len(current.units) == 1
     assert current.units[0].sections[0].items[0].parts == (
         Text("📊 "),
-        Bold("Статистика с 01.04.2026 по 30.06.2026"),
+        Bold("СТАТИСТИКА С 01.04.2026 ПО 30.06.2026"),
     )
-    assert len(quarterly.units) == 5
+    assert len(quarterly.units) == 2
     assert quarterly.units[0].sections[0].items[0].parts == (
         Text("📊 "),
         Bold("КВАРТАЛЬНЫЙ ОТЧЁТ"),
     )
-    assert quarterly.units[4].sections[0].items[0].parts == (
+    assert quarterly.units[1].sections[0].items[0].parts == (
         Text("📈 "),
         Bold("Сравнение с январь — март 2026:"),
     )
@@ -676,6 +701,70 @@ def test_quarter_report_links_contain_canonical_domain_once():
         assert hrefs == [
             "https://shikimori.io/animes/790-ergo-proxy",
         ]
+
+
+def test_quarter_top_marks_ranked_titles_with_saved_poster_slots():
+    stats = _populated_stats()
+    stats["anime"]["titles"] = {
+        str(index): {
+            **_anime_rec(score=score),
+            "title": title,
+            "url": f"/animes/{index}",
+            "poster_url": poster_url,
+        }
+        for index, score, title, poster_url in (
+            (1, 8, "Eight", "https://cdn.example.test/eight.jpg"),
+            (2, 10, "Ten", "https://cdn.example.test/ten.jpg"),
+            (3, 9, "Nine", None),
+        )
+    }
+    cur = {
+        "period": "2026-Q2",
+        "events": [
+            {
+                "id": str(index),
+                "media": "anime",
+                "event": "completed",
+                "score": score,
+            }
+            for index, score in ((1, 8), (2, 10), (3, 9))
+        ],
+    }
+
+    report = smod.build_current_stats_messages(cur, stats)
+    titles = [
+        part
+        for logical_section in report.units[0].sections
+        for item in logical_section.items
+        if hasattr(item, "parts")
+        for part in item.parts
+        if isinstance(part, Title)
+    ]
+
+    assert titles == [
+        Title(
+            "Ten",
+            "https://shikimori.io/animes/2",
+            Poster("https://cdn.example.test/ten.jpg"),
+        ),
+        Title(
+            "Nine",
+            "https://shikimori.io/animes/3",
+            Poster(None),
+        ),
+        Title(
+            "Eight",
+            "https://shikimori.io/animes/1",
+            Poster("https://cdn.example.test/eight.jpg"),
+        ),
+    ]
+
+
+def test_title_poster_normalizes_empty_saved_url_to_missing_slot():
+    assert smod._title_inline(
+        {"title": "No poster", "poster_url": ""},
+        poster=True,
+    ) == Title("No poster", None, Poster(None))
 
 
 def test_prepare_quarter_report_collects_each_media_and_event_type():
@@ -742,8 +831,8 @@ def test_quarter_reports_treat_non_list_events_as_empty(invalid_events):
         "anime": {"completed": [], "dropped": [], "planned": 0},
         "manga": {"completed": [], "dropped": [], "planned": 0},
     }
-    assert len(current) == 4
-    assert len(quarterly) == 4
+    assert len(current) == 1
+    assert len(quarterly) == 1
 
 
 def test_quarter_reports_normalize_event_id_and_score_fields():
@@ -786,7 +875,7 @@ def test_quarter_reports_normalize_event_id_and_score_fields():
         "score": 9,
     }]
     for messages_list in reports:
-        assert "Средняя оценка: <b>9.0</b>" in messages_list[0]
+        assert "⭐ Средняя: <b>9.0</b>" in messages_list[0]
 
 def test_smoke_empty_stats_no_crash():
     # Пустая структура не должна ронять билдеры
@@ -2073,7 +2162,7 @@ def test_all_time_reading_without_completed_is_visible(status):
     stats = storage._empty_stats_all()
     stats["manga"]["titles"] = {"1": _manga_record("Pending", None, status)}
     text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
-    assert "НЕ ОПРЕДЕЛЕНО" in text
+    assert "Не определено" in text
     assert "ещё не собрана" not in text
 
 
@@ -2097,8 +2186,12 @@ def test_current_split_keeps_missing_and_malformed_ids_visible(event_type, monke
     for report in (smod.build_current_stats_messages(cur, stats),
                    smod.build_quarterly_report_messages(cur, stats, None)):
         text = "\n".join(rendered_html(Report((report.units[3],))))
-        assert "НЕ ОПРЕДЕЛЕНО" in text
-        expected = {"completed": "Прочитано: <b>11</b>", "dropped": "Брошено: 11", "planned": "В планируемое: 11"}
+        assert "Не определено" in text
+        expected = {
+            "completed": "✅ <b>11</b> прочитано",
+            "dropped": "🗑 <b>11</b> брошено",
+            "planned": "📌 Добавлено в планы: <b>11</b>",
+        }
         assert expected[event_type] in text
     assert (cur, stats) == before
 
@@ -2115,9 +2208,179 @@ def test_quarter_completion_deduplication_achievements_and_progress():
     texts = rendered_html(report)
     assert "Десятку поставил 3 раза" in texts[-1]
     for index in (1, 2, 3):
-        assert f"Глав прочитано: <b>{index * 10}</b> · Томов: <b>{index}</b>" in texts[index]
-        assert "Прочитано: <b>1</b>" in texts[index]
+        volume_word = "том" if index == 1 else "тома"
+        assert (
+            f"Прочитано: <b>{index * 10}</b> глав  ·  "
+            f"<b>{index}</b> {volume_word}"
+        ) in texts[index]
+        assert "✅ <b>1</b> прочитано" in texts[index]
         assert f"Genre {index}" in texts[index]
+
+
+def test_all_time_reading_progress_uses_russian_count_forms():
+    stats = storage._empty_stats_all()
+    record = _manga_record("Novel", "novel", chapters_read=11)
+    record["volumes_read"] = 4
+    stats["manga"]["titles"] = {"1": record}
+
+    report = smod.build_stats_all_messages(stats)
+    ranobe = rendered_html(Report((report.units[1],)))[0]
+
+    assert "📖 <b>11</b> глав  ·  <b>4</b> тома" in ranobe
+
+
+def test_all_time_headlines_keep_only_cumulative_completion_metrics():
+    report = smod.build_stats_all_messages(_split_stats_fixture())
+
+    anime_line = report.units[0].sections[2].items[0]
+    manga_line = report.units[1].sections[1].items[0]
+
+    assert anime_line.parts[0] == Text("✅ ")
+    assert anime_line.parts[2] == Text(" завершено")
+    assert len(anime_line.parts) == 3
+    assert manga_line.parts[0] == Text("✅ ")
+    assert manga_line.parts[2] == Text(" прочитано")
+    assert len(manga_line.parts) == 3
+
+
+def test_empty_reading_categories_are_omitted_from_all_report_variants():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {"1": _anime_rec()}
+    stats["anime"]["aggregates"] = smod.recompute_aggregates(
+        "anime",
+        stats["anime"]["titles"],
+    )
+    stats["manga"]["titles"] = {
+        "2": _manga_record("Manga", "manga"),
+        "3": _manga_record("Novel", "novel"),
+    }
+    cur = {"period": "2026-Q2", "events": [
+        {"id": "2", "media": "manga", "event": "completed"},
+        {"id": "3", "media": "manga", "event": "completed"},
+    ]}
+
+    reports = (
+        smod.build_stats_all_messages(stats),
+        smod.build_current_stats_messages(cur, stats),
+        smod.build_quarterly_report_messages(cur, stats, None),
+    )
+
+    for report, expected_units in zip(reports, (3, 3, 4), strict=True):
+        text = "\n".join(rendered_html(report))
+        assert "Манга" in text
+        assert "Ранобэ" in text
+        assert "Не определено" not in text
+        assert len(report.units) == expected_units
+
+
+def test_empty_detail_sections_are_not_built():
+    assert smod._top_section("🎭", "Жанры", {}, 8) is None
+    assert smod._score_section({}) is None
+    assert smod._kinds_section({}, smod._KIND_RU_MANGA) is None
+    assert smod._status_section(
+        {},
+        completed_label="Прочитано",
+        watching_label="Читаю",
+    ) is None
+
+
+def test_statistical_details_are_closed_but_top_titles_are_open():
+    assert smod._score_section({"8": 1}).items[0].open is False
+    assert smod._kinds_section({"manga": 1}, smod._KIND_RU_MANGA).items[0].open is False
+    assert smod._top_section("🎭", "Жанры", {"Драма": 1}, 8).items[0].open is False
+
+    details = smod._build_quarter_sections([{
+        "title": "Тайтл",
+        "url": "",
+        "score": 8,
+        "shiki_score": 7,
+    }], "anime")[1]
+    top_heading = next(
+        (
+            item
+            for detail in details
+            for item in detail.items
+            if isinstance(item, Heading) and item.parts[1] == Bold("Топ по оценке")
+        ),
+        None,
+    )
+    assert top_heading is not None, "Секция топа по оценке не построена"
+    assert top_heading.open is True
+
+
+def test_quarter_context_precedes_top_and_score_details():
+    lead_lines, details = smod._build_quarter_sections([{
+        "title": "Тайтл",
+        "url": "",
+        "score": 8,
+        "shiki_score": 7,
+        "year": 2020,
+        "episodes_watched": 12,
+        "duration": 24,
+    }], "anime")
+
+    assert lead_lines[0].parts[0] == Text("📺 ")
+    assert lead_lines[1].parts[:2] == (Text("⭐ Средняя: "), Bold("8.0"))
+    assert lead_lines[2].parts[0] == Text("📅 Год выпуска: ")
+    assert details[0].items[0].parts[1] == Bold("Топ по оценке")
+    assert details[1].items[0].parts[1] == Bold("Оценки")
+
+
+@pytest.mark.parametrize(("user_score", "shiki_score", "operator", "difference"), [
+    (6.57, 6.5, ">", "+0.1"),
+    (6.0, 6.8, "<", "-0.8"),
+    (7.0, 7.0, "=", "0.0"),
+])
+def test_average_line_distinguishes_user_and_shikimori_scores(
+    user_score,
+    shiki_score,
+    operator,
+    difference,
+):
+    assert smod._average_line(user_score, shiki_score).parts == (
+        Text("⭐ Средняя: "),
+        Bold(str(user_score)),
+        Text(f"  {operator}  "),
+        Bold(str(shiki_score)),
+        Text(" Shikimori"),
+        Italic(f" ({difference})"),
+    )
+
+
+def test_average_line_without_shikimori_score_keeps_user_average():
+    assert smod._average_line(8.0, None).parts == (
+        Text("⭐ Средняя: "),
+        Bold("8.0"),
+    )
+
+
+def test_stored_raw_mixed_media_origin_is_localized_and_merged():
+    stats = _populated_stats()
+    stats["anime"]["aggregates"]["origins"] = {
+        "mixed_media": 2,
+        "Более одного": 1,
+    }
+
+    text = rendered_html(smod.build_stats_all_messages(stats))[0]
+
+    assert "Более одного · 3" in text
+    assert "mixed_media" not in text
+
+
+@pytest.mark.parametrize(("episodes", "hours", "expected"), [
+    (1, 1, ("эпизод", "1", "час")),
+    (11, 23.5, ("эпизодов", "23,5", "часа")),
+])
+def test_episode_duration_line_uses_full_russian_forms(episodes, hours, expected):
+    episode_word, hours_text, hour_word = expected
+
+    assert smod._episode_duration_line(episodes, hours).parts == (
+        Text("📺 "),
+        Bold(str(episodes)),
+        Text(f" {episode_word}  ·  ⏱ ≈"),
+        Bold(hours_text),
+        Text(f" {hour_word}"),
+    )
 
 
 @pytest.mark.parametrize("payload, expected", [
@@ -2260,10 +2523,11 @@ def test_all_time_malformed_titles_remain_visible_without_invented_stats(monkeyp
     assert split["unknown"]["1"] == {}
     report = smod.build_stats_all_messages(stats)
     text = "\n".join(rendered_html(report))
-    unknown_text = "\n".join(rendered_html(Report((report.units[3],))))
-    assert "МАНГА" in text and "НЕ ОПРЕДЕЛЕНО" in unknown_text
+    unknown_text = "\n".join(rendered_html(Report((report.units[-1],))))
+    assert ("Манга" in text) is mixed
+    assert "Не определено" in unknown_text
     assert "Не удалось прочитать данные тайтлов: <b>2</b>" in unknown_text
-    assert f"Прочитано: <b>{1 if mixed else 0}</b>" in unknown_text
+    assert f"✅ <b>{1 if mixed else 0}</b> прочитано" in unknown_text
     assert "ещё не собрана" not in text and "999" not in text
     assert stats == before
 
@@ -2302,7 +2566,7 @@ def test_manga_reports_normalize_taxonomy_lists_without_mutating_source(field, v
                    smod.build_current_stats_messages(cur, stats),
                    smod.build_quarterly_report_messages(cur, stats, None)):
         text = "\n".join(rendered_html(report))
-        assert "МАНГА" in text and "РАНОБЭ" in text and "НЕ ОПРЕДЕЛЕНО" in text
+        assert "Манга" in text and "Ранобэ" in text and "Не определено" in text
     assert stats == before
 
 
@@ -2320,7 +2584,7 @@ def test_all_time_non_dict_manga_titles_does_not_abort_report(monkeypatch, title
 
     assert isinstance(report, Report)
     text = "\n".join(rendered_html(report))
-    assert "НЕ ОПРЕДЕЛЕНО" in text
+    assert "Не определено" in text
     assert "Не удалось прочитать список манги и ранобэ; число тайтлов неизвестно." in text
     assert "Статистика ещё не собрана" not in text
     assert "Не удалось прочитать данные тайтлов: <b>1</b>" not in text
@@ -2380,7 +2644,7 @@ def test_anime_aggregate_corruption_keeps_reading_report(field, bad):
     # None среднего рейтинга — штатное отсутствие оценки.
     if not (field == "avg_shiki_completed" and bad is None):
         assert "Не удалось прочитать" in text
-    assert "РАНОБЭ" in text and "Genre 2" in text
+    assert "Ранобэ" in text and "Genre 2" in text
 
 
 @pytest.mark.parametrize("media", ["anime", "manga"])
@@ -2444,6 +2708,6 @@ def test_manga_all_time_scalar_damage_keeps_completion(value):
     stats["manga"]["titles"] = {"1": {"kind": "manga", "status": "completed", "score": value,
                                       "chapters_read": value, "volumes_read": value, "shiki_score": value}}
     text = "\n".join(rendered_html(smod.build_stats_all_messages(stats)))
-    assert "Прочитано: <b>1</b>" in text
+    assert "✅ <b>1</b> прочитано" in text
     assert "nan" not in text and "inf" not in text
-    assert "Средняя:" not in text
+    assert "⭐ Средняя" not in text

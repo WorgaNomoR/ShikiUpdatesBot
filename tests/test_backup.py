@@ -30,7 +30,18 @@ import storage
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("schema", ["legacy_pending", "legacy_complete", "current_partial", "current_complete", "empty"])
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "legacy_pending",
+        "legacy_complete",
+        "current_partial",
+        "current_complete",
+        "rich_partial",
+        "rich_complete",
+        "empty",
+    ],
+)
 async def test_import_roundtrips_supported_quarter_delivery_plans(backup_env, schema):
     cur = storage._empty_stats_current("2026-Q3")
     if schema.startswith("legacy"):
@@ -39,6 +50,29 @@ async def test_import_roundtrips_supported_quarter_delivery_plans(backup_env, sc
             "report_messages": ["frozen first", "frozen second"],
             "report_sent": schema == "legacy_complete",
         }
+    elif schema.startswith("rich"):
+        units = [
+            {
+                "transport": "rich",
+                "content": {
+                    "blocks": [{"type": "paragraph", "text": "frozen rich"}],
+                    "skip_entity_detection": True,
+                },
+                "fallback_html": ["frozen HTML"],
+                "fallback_disable_preview": False,
+            },
+            {
+                "transport": "html",
+                "content": "frozen continuation",
+                "disable_preview": False,
+            },
+        ]
+        pending = storage.new_quarter_delivery_plan(
+            "2026-Q2",
+            "2026-Q3",
+            units,
+        )
+        pending["next_unit"] = 1 if schema == "rich_partial" else 2
     else:
         pending = storage.new_quarter_delivery(
             "2026-Q2", "2026-Q3", [] if schema == "empty" else ["frozen first", "frozen second"],

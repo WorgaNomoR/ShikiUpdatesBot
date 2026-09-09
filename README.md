@@ -767,7 +767,7 @@ Portable-версия для Windows пишет в консоль и `logs/bot.l
 
 ### Разработка и тестирование
 
-Проект использует Python 3.12, [aiogram 3.x](https://docs.aiogram.dev/) для Telegram,
+Проект использует Python 3.12, [aiogram 3.31+](https://docs.aiogram.dev/) для Telegram,
 [aiohttp](https://docs.aiohttp.org/) для HTTP, [Docker](https://www.docker.com/) для контейнерного
 развёртывания и публичные REST/GraphQL endpoints [Shikimori API](https://shikimori.io/api/doc).
 

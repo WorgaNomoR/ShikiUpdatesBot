@@ -12,9 +12,12 @@ from report_model import (
     Bold,
     Italic,
     Link,
+    Poster,
     Report,
     Row,
     Rows,
+    Title,
+    heading,
     line,
     render_report,
     section,
@@ -134,6 +137,49 @@ def test_renderer_escapes_untrusted_text_labels_and_url_only_at_boundary():
     assert "<i>italic &lt;&amp;&gt;</i>" in markup
     assert 'href="https://example.test/?a=1&amp;b=&quot;quoted&quot;"' in markup
     assert _visible_text(markup) == "plain <&> bold <&> italic <&> link <&>"
+
+
+def test_title_poster_metadata_does_not_change_ordinary_html_information():
+    report = Report((unit(section(line(
+        Title(
+            "title <&>",
+            'https://example.test/title?a=1&b="quoted"',
+            Poster("https://cdn.example.test/poster.jpg"),
+        ),
+    ))),))
+
+    markup = _assert_independent_html(report, 4096)[0]
+
+    assert _visible_text(markup) == "title <&>"
+    assert 'href="https://example.test/title?a=1&amp;b=&quot;quoted&quot;"' in markup
+    assert "poster.jpg" not in markup
+
+
+def test_semantic_heading_is_bold_in_ordinary_html_without_double_wrapping():
+    report = Report((unit(section(heading(
+        "plain ",
+        Bold("already bold"),
+        " ",
+        Link("linked", "https://example.test/heading"),
+    ))),))
+
+    markup = _assert_independent_html(report, 4096)[0]
+
+    assert "<b>plain </b>" in markup
+    assert "<b>already bold</b>" in markup
+    assert "<b><b>" not in markup
+    assert '<b><a href="https://example.test/heading">linked</a></b>' in markup
+
+
+def test_oversized_semantic_heading_keeps_bold_continuations():
+    value = "длинный-заголовок" * 20
+    report = Report((unit(section(heading(value))),))
+
+    chunks = _assert_independent_html(report, 31)
+
+    assert len(chunks) > 1
+    assert all(chunk.startswith("<b>") and chunk.endswith("</b>") for chunk in chunks)
+    assert "".join(_visible_text(chunk) for chunk in chunks) == value
 
 
 def test_chunk_boundary_keeps_rows_and_link_formatting_atomic():

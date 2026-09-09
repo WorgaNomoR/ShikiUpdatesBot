@@ -35,6 +35,13 @@ class Italic:
 
 
 @dataclass(frozen=True)
+class Poster:
+    """Необязательный недоверенный media source для визуализации тайтла."""
+
+    url: str | None
+
+
+@dataclass(frozen=True)
 class Link:
     """Недоверенные подпись и URL одной логической ссылки."""
 
@@ -42,7 +49,16 @@ class Link:
     url: str
 
 
-Inline = Text | Bold | Italic | Link
+@dataclass(frozen=True)
+class Title:
+    """Тайтл с необязательными ссылкой и presentation-only постером."""
+
+    text: str
+    url: str | None
+    poster: Poster | None = None
+
+
+Inline = Text | Bold | Italic | Link | Title
 
 
 @dataclass(frozen=True)
@@ -53,12 +69,23 @@ class Line:
 
 
 @dataclass(frozen=True)
+class Heading:
+    """Семантический заголовок без transport-specific разметки."""
+
+    parts: tuple[Inline, ...]
+    level: int = 2
+    collapsible: bool = False
+    open: bool = True
+
+
+@dataclass(frozen=True)
 class Row:
     """Одна логическая строка выровненного счётчика."""
 
     label: str
     value: str
     suffix: str = ""
+    table_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -68,7 +95,7 @@ class Rows:
     rows: tuple[Row, ...]
 
 
-ReportItem = Line | Rows
+ReportItem = Line | Heading | Rows
 
 
 @dataclass(frozen=True)
@@ -113,6 +140,23 @@ def line(*parts: Inline | str) -> Line:
     return Line(tuple(Text(part) if isinstance(part, str) else part for part in parts))
 
 
+def heading(
+    *parts: Inline | str,
+    level: int = 2,
+    collapsible: bool = False,
+    is_open: bool = True,
+) -> Heading:
+    """Собрать семантический заголовок из безопасных inline-узлов."""
+    if not 1 <= level <= 6:
+        raise ValueError("Уровень заголовка должен быть от 1 до 6")
+    return Heading(
+        tuple(Text(part) if isinstance(part, str) else part for part in parts),
+        level,
+        collapsible,
+        is_open,
+    )
+
+
 def section(*items: ReportItem) -> Section:
     """Удобно собрать логический блок отчёта."""
     return Section(tuple(items))
@@ -129,7 +173,7 @@ def plain_report(text: str) -> Report:
 
 
 def _inline_text(part: Inline) -> str:
-    if isinstance(part, Link):
+    if isinstance(part, (Link, Title)):
         return part.text
     return part.value
 
@@ -142,12 +186,24 @@ def _render_inline(part: Inline) -> str:
         return f"<i>{text}</i>"
     if isinstance(part, Link):
         return f'<a href="{escape(part.url, quote=True)}">{text}</a>'
+    if isinstance(part, Title) and part.url:
+        return f'<a href="{escape(part.url, quote=True)}">{text}</a>'
     return text
+
+
+def _render_heading_inline(part: Inline) -> str:
+    """Сохранить семантическое выделение заголовка без двойного bold-тега."""
+    rendered = _render_inline(part)
+    if isinstance(part, Bold):
+        return rendered
+    return f"<b>{rendered}</b>"
 
 
 def _clone_inline(part: Inline, value: str) -> Inline:
     if isinstance(part, Link):
         return Link(value, part.url)
+    if isinstance(part, Title):
+        return Title(value, part.url, part.poster)
     return type(part)(value)
 
 
@@ -221,6 +277,11 @@ def _row_texts(value: Rows) -> tuple[str, ...]:
 
 
 def _render_item(value: ReportItem | _CodeLines) -> tuple[str, int]:
+    if isinstance(value, Heading):
+        return (
+            "".join(_render_heading_inline(part) for part in value.parts),
+            sum(telegram_text_length(_inline_text(part)) for part in value.parts),
+        )
     if isinstance(value, Line):
         return (
             "".join(_render_inline(part) for part in value.parts),
@@ -272,7 +333,17 @@ def _split_item(value: ReportItem, limit: int) -> list[ReportItem | _CodeLines]:
     if visible <= limit:
         return [value]
     if isinstance(value, Line):
-        return _split_line(value, limit)
+        return _split_line(Line(value.parts), limit)
+    if isinstance(value, Heading):
+        return [
+            Heading(
+                fragment.parts,
+                value.level,
+                value.collapsible,
+                value.open,
+            )
+            for fragment in _split_line(Line(value.parts), limit)
+        ]
     return _split_rows(value, limit)
 
 

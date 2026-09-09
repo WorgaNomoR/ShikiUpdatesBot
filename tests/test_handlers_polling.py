@@ -14,8 +14,18 @@ from unittest.mock import (
 from uuid import uuid4
 
 import pytest
-from aiogram.exceptions import TelegramServerError
-from aiogram.methods import SendMessage
+from aiogram.exceptions import (
+    TelegramNotFound,
+    TelegramServerError,
+)
+from aiogram.methods import (
+    SendMessage,
+    SendRichMessage,
+)
+from aiogram.types import (
+    InputRichBlockParagraph,
+    InputRichMessage,
+)
 
 import backup
 import config
@@ -23,6 +33,7 @@ import handlers
 import shiki_api
 import storage
 import telegram_delivery
+from report_assets import ReportAssetError
 from report_model import (
     Report,
     plain_report,
@@ -735,6 +746,8 @@ async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
 @pytest.mark.asyncio
 async def test_quarter_renderer_runs_without_restorable_state_lock(monkeypatch):
     lock_depth = 0
+    render_calls = 0
+    render_lock_depths = []
 
     @asynccontextmanager
     async def transaction():
@@ -746,7 +759,9 @@ async def test_quarter_renderer_runs_without_restorable_state_lock(monkeypatch):
             lock_depth -= 1
 
     def render(report):
-        assert lock_depth == 0
+        nonlocal render_calls
+        render_calls += 1
+        render_lock_depths.append(lock_depth)
         raise _RendererReached
 
     old_cur = {"period": "2026-Q2", "events": []}
@@ -754,15 +769,26 @@ async def test_quarter_renderer_runs_without_restorable_state_lock(monkeypatch):
     monkeypatch.setattr(handlers, "load_stats_current", lambda **kwargs: old_cur)
     monkeypatch.setattr(handlers, "current_quarter", lambda: "2026-Q3")
     monkeypatch.setattr(handlers, "_load_prev_quarter_summary", lambda *args: None)
-    monkeypatch.setattr(handlers, "rendered_html", render)
+    monkeypatch.setattr(handlers, "freeze_report", render)
 
-    with pytest.raises(_RendererReached):
-        await handlers.rotate_quarter_if_needed(
-            AsyncMock(),
-            old_cur,
-            {},
-            resync=False,
-        )
+    monkeypatch.setattr(handlers, "_last_quarter_notice_at", None)
+    monkeypatch.setattr(handlers, "OWNER_ID", 999)
+    bot = AsyncMock()
+
+    result = await handlers.rotate_quarter_if_needed(
+        bot,
+        old_cur,
+        {},
+        resync=False,
+    )
+
+    assert result is old_cur
+    assert render_calls == 2
+    assert render_lock_depths == [0, 0]
+    bot.send_message.assert_awaited_once_with(
+        chat_id=999,
+        text=handlers._QUARTER_STATE_NOTICE,
+    )
 
 
 @pytest.mark.asyncio
@@ -780,7 +806,11 @@ async def test_quarter_rotation_defers_after_repeated_state_changes(monkeypatch)
             "events": [],
             "generation": render_calls,
         }
-        return ["REPORT"]
+        return [{
+            "transport": "html",
+            "content": "REPORT",
+            "disable_preview": False,
+        }]
 
     snapshot = MagicMock()
     save_current = MagicMock()
@@ -793,7 +823,7 @@ async def test_quarter_rotation_defers_after_repeated_state_changes(monkeypatch)
         "build_quarterly_report_messages",
         lambda *args: plain_report("REPORT"),
     )
-    monkeypatch.setattr(handlers, "rendered_html", render)
+    monkeypatch.setattr(handlers, "freeze_report", render)
     monkeypatch.setattr(handlers, "_save_quarter_snapshot", snapshot)
     monkeypatch.setattr(handlers, "save_stats_current", save_current)
     monkeypatch.setattr(handlers, "_deliver_pending_quarter", deliver_pending)
@@ -898,14 +928,20 @@ async def test_quarter_rotation_triggers_backup(backup_env, monkeypatch):
     m_bq = saved["sa"]["manga"]["aggregates"]["by_quarter"]["2026-Q2"]
     assert m_bq == {"completed": 1, "avg_score": 9.0, "chapters_read": 100}
 
-    # 3. build_quarterly_report_messages реально собрал отчёт (5 тем),
-    #    с заголовком, реальными тайтлами и блоком сравнения (prev-summary дан).
-    report = [call.kwargs["text"] for call in bot.send_message.await_args_list]
-    assert len(report) == 5
+    # 3. build_quarterly_report_messages собрал три непустые темы:
+    #    аниме, не определённую по отсутствующему kind мангу и сравнение.
+    report = [
+        json.dumps(
+            call.kwargs["rich_message"].model_dump(mode="json", exclude_none=True),
+            ensure_ascii=False,
+        )
+        for call in bot.send_rich_message.await_args_list
+    ]
+    assert len(report) == 3
     assert "КВАРТАЛЬНЫЙ ОТЧЁТ" in report[0]
     assert "Аниме-Один" in report[0]
-    assert "Сравнение" in report[4]
-    assert "январь — март 2026" in report[4]
+    assert "Сравнение" in report[2]
+    assert "январь — март 2026" in report[2]
 
 
 @pytest.mark.asyncio
@@ -934,7 +970,13 @@ async def test_quarter_rotation_without_preceding_snapshot_omits_comparison(
     storage.save_stats_current(cur)
     await handlers.rotate_quarter_if_needed(bot, cur, storage._empty_stats_all(), resync=False)
 
-    report = [call.kwargs["text"] for call in bot.send_message.await_args_list]
+    report = [
+        json.dumps(
+            call.kwargs["rich_message"].model_dump(mode="json", exclude_none=True),
+            ensure_ascii=False,
+        )
+        for call in bot.send_rich_message.await_args_list
+    ]
     assert report
     assert all("Сравнение" not in message for message in report)
 
@@ -1045,6 +1087,29 @@ def _frozen_quarter(messages=None, next_unit=0):
     return cur
 
 
+def _rich_quarter_unit(text):
+    return {
+        "transport": "rich",
+        "content": {
+            "blocks": [{"type": "paragraph", "text": text}],
+            "skip_entity_detection": True,
+        },
+        "fallback_html": [f"html-{text}"],
+        "fallback_disable_preview": False,
+    }
+
+
+def _frozen_rich_quarter(next_unit=0):
+    cur = storage._empty_stats_current("2026-Q3")
+    cur["pending_quarter_delivery"] = storage.new_quarter_delivery_plan(
+        "2026-Q2",
+        "2026-Q3",
+        [_rich_quarter_unit(f"unit-{index}") for index in range(3)],
+    )
+    cur["pending_quarter_delivery"]["next_unit"] = next_unit
+    return cur
+
+
 def _quarter_archive(cur):
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w") as archive:
@@ -1102,6 +1167,117 @@ async def test_restart_uses_persisted_plan_without_build_or_sync(quarter_deliver
     build.assert_not_called()
     sync.assert_not_awaited()
     assert storage.load_stats_current()["period"] == "2026-Q3"
+
+
+@pytest.mark.asyncio
+async def test_rich_unsupported_persists_html_plan_without_repeating_acknowledged(
+    quarter_delivery_env,
+):
+    cur = _frozen_rich_quarter(next_unit=1)
+    original_plan_id = cur["pending_quarter_delivery"]["plan_id"]
+    storage.save_stats_current(cur, strict=True)
+    unsupported = TelegramNotFound(
+        method=SendRichMessage(
+            chat_id=999,
+            rich_message=InputRichMessage(
+                blocks=[InputRichBlockParagraph(text="unit-1")],
+                skip_entity_detection=True,
+            ),
+        ),
+        message="Not Found",
+    )
+
+    async def rich_send(**kwargs):
+        assert not storage._restorable_state_lock().locked()
+        assert kwargs["rich_message"].blocks[0].text == "unit-1"
+        raise unsupported
+
+    async def html_send(**kwargs):
+        assert not storage._restorable_state_lock().locked()
+
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = rich_send
+    bot.send_message.side_effect = html_send
+    await handlers._deliver_pending_quarter(bot, cur)
+
+    pending = storage.load_stats_current(strict=True)["pending_quarter_delivery"]
+    assert pending["plan_id"] != original_plan_id
+    assert pending["next_unit"] == 3
+    assert pending["report_units"][0]["transport"] == "rich"
+    assert [unit["transport"] for unit in pending["report_units"][1:]] == [
+        "html",
+        "html",
+    ]
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [
+        "html-unit-1",
+        "html-unit-2",
+    ]
+    assert storage.load_stats_current(strict=True)["last_report_sent"] == "2026-Q3"
+    quarter_delivery_env.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_missing_local_asset_persists_html_plan_without_repeating_acknowledged(
+    quarter_delivery_env,
+    monkeypatch,
+    caplog,
+):
+    cur = _frozen_rich_quarter(next_unit=1)
+    original_plan_id = cur["pending_quarter_delivery"]["plan_id"]
+    storage.save_stats_current(cur, strict=True)
+    monkeypatch.setattr(
+        "report_delivery.materialize_rich_message",
+        MagicMock(side_effect=ReportAssetError("asset_unavailable")),
+    )
+    bot = AsyncMock()
+
+    caplog.set_level(logging.WARNING)
+    await handlers._deliver_pending_quarter(bot, cur)
+
+    pending = storage.load_stats_current(strict=True)["pending_quarter_delivery"]
+    assert pending["plan_id"] != original_plan_id
+    assert pending["next_unit"] == 3
+    assert pending["report_units"][0]["transport"] == "rich"
+    assert [unit["transport"] for unit in pending["report_units"][1:]] == [
+        "html",
+        "html",
+    ]
+    bot.send_rich_message.assert_not_awaited()
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [
+        "html-unit-1",
+        "html-unit-2",
+    ]
+    assert "ReportAssetError" in caplog.text
+    assert storage.load_stats_current(strict=True)["last_report_sent"] == "2026-Q3"
+    quarter_delivery_env.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rich_ambiguous_failure_never_changes_frozen_quarter_plan(
+    quarter_delivery_env,
+):
+    cur = _frozen_rich_quarter()
+    storage.save_stats_current(cur, strict=True)
+    original = deepcopy(cur["pending_quarter_delivery"])
+    failure = TelegramServerError(
+        method=SendRichMessage(
+            chat_id=999,
+            rich_message=InputRichMessage(
+                blocks=[InputRichBlockParagraph(text="unit-0")],
+                skip_entity_detection=True,
+            ),
+        ),
+        message="ambiguous",
+    )
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = failure
+
+    await handlers._deliver_pending_quarter(bot, cur)
+
+    assert bot.send_rich_message.await_count == 3
+    bot.send_message.assert_not_awaited()
+    assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == original
+    quarter_delivery_env.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1461,8 +1637,19 @@ async def test_rotation_publishes_all_rendered_continuations_before_first_send(q
         current = storage.load_stats_current(strict=True)
         assert current["period"] == "2026-Q3"
         pending = current["pending_quarter_delivery"]
-        assert pending["version"] == 1
-        assert pending["report_messages"] == ["x" * 4096, "tail"]
+        assert pending["version"] == 2
+        assert pending["report_units"] == [
+            {
+                "transport": "html",
+                "content": "x" * 4096,
+                "disable_preview": False,
+            },
+            {
+                "transport": "html",
+                "content": "tail",
+                "disable_preview": False,
+            },
+        ]
         plan_ids.append(pending["plan_id"])
         if kwargs["text"] == "tail":
             assert pending["next_unit"] == 1
@@ -1569,22 +1756,31 @@ async def test_split_quarter_plan_resumes_frozen_ranobe_after_reload(quarter_del
     monkeypatch.setattr("handlers.sync_stats_all", sync)
     monkeypatch.setattr("handlers.save_stats_all", MagicMock())
     bot = AsyncMock()
-    bot.send_message.side_effect = [None, None, RuntimeError("interrupted")]
+    bot.send_rich_message.side_effect = [object(), object(), RuntimeError("interrupted")]
 
     await handlers.rotate_quarter_if_needed(bot, old, stats, resync=False)
 
     reloaded = storage.load_stats_current(strict=True)
     pending = reloaded["pending_quarter_delivery"]
-    frozen = pending["report_messages"]
+    frozen = deepcopy(pending["report_units"])
     assert pending["next_unit"] == 2
-    assert "МАНГА" in frozen[1] and "РАНОБЭ" in frozen[2] and "НЕ ОПРЕДЕЛЕНО" in frozen[3]
+    assert len(frozen) == 5
+    frozen_text = [json.dumps(unit["content"], ensure_ascii=False) for unit in frozen]
+    assert (
+        "Манга" in frozen_text[1]
+        and "Ранобэ" in frozen_text[2]
+        and "Не определено" in frozen_text[3]
+    )
     quarter_delivery_env.assert_not_awaited()
     # Новые метаданные после рестарта не переклассифицируют уже замороженный отчёт.
     stats["manga"]["titles"]["2"]["kind"] = "manga"
     monkeypatch.setattr("handlers.build_quarterly_report_messages", MagicMock(side_effect=AssertionError("rebuild")))
-    bot.send_message.reset_mock(side_effect=True)
+    bot.send_rich_message.reset_mock(side_effect=True)
     await handlers.rotate_quarter_if_needed(bot, reloaded, stats, resync=False)
-    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == frozen[2:]
+    assert [
+        call.kwargs["rich_message"].model_dump(mode="json", exclude_none=True)
+        for call in bot.send_rich_message.await_args_list
+    ] == [unit["content"] for unit in frozen[2:]]
     assert storage.load_stats_current(strict=True)["last_report_sent"] == "2026-Q3"
     sync.assert_not_awaited()
     quarter_delivery_env.assert_awaited_once()

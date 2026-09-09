@@ -20,7 +20,17 @@ from shiki_api import (
     fetch_favourites,
     fetch_history,
     get_media_info,
+    translate_origin,
 )
+
+
+@pytest.mark.parametrize(("raw", "translated"), [
+    ("mixed_media", "Более одного"),
+    ("future_origin", "future_origin"),
+    (None, None),
+])
+def test_translate_origin_preserves_unknown_values(raw, translated):
+    assert translate_origin(raw) == translated
 
 
 # ── Мок сетевой границы: одна пара вместо копипасты в каждом тесте ──
@@ -719,6 +729,7 @@ async def test_inline_anime_translates_origin_rating_and_omits_unknown_values(
         "animes": [
             {"id": "1", "origin": "visual_novel", "rating": "r_plus"},
             {"id": "2", "origin": "unknown", "rating": "none"},
+            {"id": "3", "origin": "mixed_media", "rating": "pg_13"},
         ]
     })
     monkeypatch.setattr(shiki_api, "_gql_request", gql)
@@ -733,6 +744,7 @@ async def test_inline_anime_translates_origin_rating_and_omits_unknown_values(
     assert result == [
         {"id": "1", "origin": "Визуальная новелла", "rating": "R+"},
         {"id": "2"},
+        {"id": "3", "origin": "Более одного", "rating": "PG-13"},
     ]
 
 

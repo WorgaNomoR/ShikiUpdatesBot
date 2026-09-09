@@ -28,6 +28,7 @@ from utils import (
     previous_quarter,
     quarter_label,
     quarter_start,
+    russian_count_word,
     tracking_period_label,
 )
 
@@ -43,6 +44,35 @@ def test_h_coerces_non_str():
 
 def test_h_plain_text_unchanged():
     assert h("привет") == "привет"
+
+
+def test_russian_count_word_handles_one_few_many_and_teens():
+    expected = {
+        0: "томов",
+        1: "том",
+        2: "тома",
+        4: "тома",
+        5: "томов",
+        11: "томов",
+        14: "томов",
+        21: "том",
+        24: "тома",
+        25: "томов",
+        111: "томов",
+        -1: "том",
+        -3: "тома",
+        -11: "томов",
+    }
+
+    for count, word in expected.items():
+        assert russian_count_word(count, "том", "тома", "томов") == word
+
+
+def test_russian_count_word_uses_fractional_form_for_duration():
+    assert russian_count_word(23.5, "час", "часа", "часов") == "часа"
+    assert russian_count_word(1.0, "час", "часа", "часов") == "часа"
+    assert russian_count_word(21.0, "час", "часа", "часов") == "часа"
+    assert russian_count_word(21, "час", "часа", "часов") == "час"
 
 
 # ── _subscriber_link: безопасная ссылка на Telegram-профиль ───────
