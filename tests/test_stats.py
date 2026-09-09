@@ -509,6 +509,38 @@ def test_empty_or_non_string_export_text_removes_existing_comment(value):
     assert "comment" not in record
 
 
+@pytest.mark.parametrize("media", ["anime", "manga"])
+def test_quarter_projection_allowlist_covers_title_record_schema(media):
+    """Проекция квартала знает все поля title-record, кроме comment."""
+    row = {
+        "target_id": 1,
+        "target_title": "Title",
+        "target_title_ru": "Тайтл",
+        "score": 8,
+        "status": "completed",
+        "rewatches": 0,
+        "episodes": 1,
+        "chapters": 2,
+        "volumes": 3,
+        "text": "заметка",
+    }
+    record = smod._merge_title_record(
+        media,
+        row,
+        {},
+        meta_updated_at="2026-01-01T00:00:00",
+    )
+    denylist = {"comment"}
+
+    assert set(record) <= set(smod._QUARTER_TITLE_FIELDS) | denylist
+    assert denylist.isdisjoint(smod._QUARTER_TITLE_FIELDS)
+    assert smod._quarter_title_projection(record) == {
+        key: value
+        for key, value in record.items()
+        if key not in denylist
+    }
+
+
 @pytest.mark.asyncio
 async def test_comment_only_sync_saves_create_change_delete_and_repeated_noop(
     monkeypatch,
@@ -763,14 +795,14 @@ async def test_comment_is_excluded_from_derived_and_historical_consumers(
     monkeypatch,
     tmp_path,
 ):
-    secret = "COMMENT_SECRET_137 </script> & <b>hostile</b>"
+    comment_marker = "COMMENT_MARKER_137 </script> & <b>hostile</b>"
     stats = storage._empty_stats_all()
     stats["anime"]["titles"]["1"] = {
         **_anime_rec(),
         "title": "Аниме",
         "title_en": "Anime",
         "url": "/animes/1",
-        "comment": secret,
+        "comment": comment_marker,
     }
     stats["anime"]["aggregates"] = smod.recompute_aggregates(
         "anime",
@@ -791,8 +823,8 @@ async def test_comment_is_excluded_from_derived_and_historical_consumers(
         }],
     }
 
-    assert secret not in json.dumps(stats["anime"]["aggregates"], ensure_ascii=False)
-    assert secret not in json.dumps(stats["favourites"], ensure_ascii=False)
+    assert comment_marker not in json.dumps(stats["anime"]["aggregates"], ensure_ascii=False)
+    assert comment_marker not in json.dumps(stats["favourites"], ensure_ascii=False)
 
     reports = (
         smod.build_stats_all_messages(stats),
@@ -801,16 +833,16 @@ async def test_comment_is_excluded_from_derived_and_historical_consumers(
         smod.build_favourites_messages(stats),
     )
     for report in reports:
-        assert secret not in "".join(rendered_html(report))
+        assert comment_marker not in "".join(rendered_html(report))
 
     frozen = report_delivery.freeze_report(reports[2])
-    assert secret not in json.dumps(frozen, ensure_ascii=False)
+    assert comment_marker not in json.dumps(frozen, ensure_ascii=False)
 
     before = copy.deepcopy(stats)
     monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
     smod._save_quarter_snapshot("2026-Q3", cur, stats)
     snapshot = json.loads((tmp_path / "2026-Q3.json").read_text(encoding="utf-8"))
-    assert secret not in json.dumps(snapshot, ensure_ascii=False)
+    assert comment_marker not in json.dumps(snapshot, ensure_ascii=False)
     assert "comment" not in snapshot["anime_titles"][0]
     assert stats == before
 
@@ -821,7 +853,7 @@ async def test_comment_only_atomic_write_failure_preserves_file_cache_and_logs(
     tmp_path,
     caplog,
 ):
-    secret = "COMMENT_SECRET_137_ATOMIC"
+    comment_marker = "COMMENT_MARKER_137_ATOMIC"
     now = datetime(2026, 9, 9, 12, 0, 0)
     initial = storage._empty_stats_all()
     initial["anime"]["titles"]["1"] = {
@@ -840,7 +872,7 @@ async def test_comment_only_atomic_write_failure_preserves_file_cache_and_logs(
         "status": "completed",
         "rewatches": 0,
         "episodes": 24,
-        "text": secret,
+        "text": comment_marker,
     }
 
     async def fake_export(session, media):
@@ -865,10 +897,10 @@ async def test_comment_only_atomic_write_failure_preserves_file_cache_and_logs(
     result, ok = await smod.sync_stats_all(session=object())
 
     assert ok is True
-    assert result["anime"]["titles"]["1"]["comment"] == secret
+    assert result["anime"]["titles"]["1"]["comment"] == comment_marker
     assert stats_file.read_bytes() == before
     assert storage.load_stats_all()["anime"]["titles"]["1"]["comment"] == "previous"
-    assert secret not in caplog.text
+    assert comment_marker not in caplog.text
 
 
 # ════════════════════════════════════════════════════════════════
