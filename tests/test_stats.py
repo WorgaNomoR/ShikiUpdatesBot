@@ -25,6 +25,7 @@ import pytest
 
 import handlers
 import messages
+import report_delivery
 import shiki_api
 import stats as smod
 import storage
@@ -477,6 +478,397 @@ async def test_sync_stats_all_filters_special_before_aggregating(monkeypatch):
     assert result["anime"]["titles"]["2"]["meta_updated_at"] == now.isoformat()
     assert result["anime"]["aggregates"]["studios"] == {"Studio Deen": 2}
     assert saved == [result]
+
+
+# ════════════════════════════════════════════════════════════════
+#  Комментарии list_export: нормализация, sync и границы потребителей
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("  первая\r\nвторая\rтретья\n  ", "первая\nвторая\nтретья"),
+        ("строка\nс <b>hostile</b> & текстом", "строка\nс <b>hostile</b> & текстом"),
+        (" \r\n\t ", None),
+        ("", None),
+        (None, None),
+        (42, None),
+        (["не строка"], None),
+    ],
+)
+def test_normalize_list_comment(value, expected):
+    assert smod._normalize_list_comment(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", " \r\n\t ", None, 42, ["не строка"]])
+def test_empty_or_non_string_export_text_removes_existing_comment(value):
+    record = {"comment": "старый"}
+
+    assert smod._sync_list_comment(record, {"text": value}) is True
+    assert "comment" not in record
+
+
+@pytest.mark.asyncio
+async def test_comment_only_sync_saves_create_change_delete_and_repeated_noop(
+    monkeypatch,
+):
+    now = datetime(2026, 9, 9, 12, 0, 0)
+    state = storage._empty_stats_all()
+    state["anime"]["titles"]["1"] = {
+        **_anime_rec(status="completed"),
+        "meta_updated_at": now.isoformat(),
+    }
+    row = {
+        "target_id": 1,
+        "target_title": "Title",
+        "target_title_ru": "Тайтл",
+        "score": 8,
+        "status": "completed",
+        "rewatches": 0,
+        "episodes": 24,
+        "text": "  первая\rстрока  ",
+    }
+    saves = []
+
+    async def fake_export(session, media):
+        return [row] if media == "anime" else []
+
+    async def fake_collect(session, value, fav=None):
+        return value
+
+    def save(value):
+        nonlocal state
+        state = copy.deepcopy(value)
+        saves.append(copy.deepcopy(value))
+
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: copy.deepcopy(state))
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr(
+        "stats.fetch_meta_batch",
+        AsyncMock(side_effect=AssertionError("comment-only sync запросил GraphQL")),
+    )
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", save)
+
+    await smod.sync_stats_all(session=object())
+    await smod.sync_stats_all(session=object())
+    assert state["anime"]["titles"]["1"]["comment"] == "первая\nстрока"
+    assert len(saves) == 1
+
+    row["text"] = "изменено"
+    await smod.sync_stats_all(session=object())
+    await smod.sync_stats_all(session=object())
+    assert state["anime"]["titles"]["1"]["comment"] == "изменено"
+    assert len(saves) == 2
+
+    row.pop("text")
+    await smod.sync_stats_all(session=object())
+    await smod.sync_stats_all(session=object())
+    assert "comment" not in state["anime"]["titles"]["1"]
+    assert len(saves) == 3
+
+
+@pytest.mark.asyncio
+async def test_authoritative_export_removes_title_together_with_comment(monkeypatch):
+    state = storage._empty_stats_all()
+    state["anime"]["titles"]["1"] = {
+        **_anime_rec(),
+        "comment": "удаляется вместе с записью",
+    }
+    saved = []
+
+    async def fake_export(session, media):
+        return [] if media == "anime" else None
+
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: copy.deepcopy(state))
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(return_value={}))
+    monkeypatch.setattr("stats.save_stats_all", lambda value: saved.append(value))
+
+    result, ok = await smod.sync_stats_all(session=object(), fav={})
+
+    assert ok is True
+    assert result["anime"]["titles"] == {}
+    assert saved == [result]
+
+
+@pytest.mark.asyncio
+async def test_sync_keeps_export_comment_in_every_record_rebuild_path(monkeypatch):
+    now = datetime(2026, 9, 9, 12, 0, 0)
+    old = (now - timedelta(days=31)).isoformat()
+    state = storage._empty_stats_all()
+    state["anime"]["titles"] = {
+        "1": {**_anime_rec(), "meta_updated_at": now.isoformat(), "comment": "старый"},
+        "2": {**_anime_rec(kind=""), "comment": "старый"},
+        "3": ["повреждено"],
+        "4": {**_anime_rec(), "meta_updated_at": old, "comment": "старый"},
+    }
+    rows = []
+    for title_id, comment in enumerate(
+        ("обычный", "kind repair", "malformed", "metadata refresh", "новый"),
+        start=1,
+    ):
+        rows.append({
+            "target_id": title_id,
+            "target_title": f"Title {title_id}",
+            "target_title_ru": f"Тайтл {title_id}",
+            "score": 8,
+            "status": "completed",
+            "rewatches": 0,
+            "episodes": 24,
+            "text": f"  {comment}\r\n  ",
+        })
+    meta_calls = []
+
+    async def fake_export(session, media):
+        return rows if media == "anime" else []
+
+    async def fake_meta(media, ids, session=None):
+        meta_calls.append((media, list(ids)))
+        return {
+            title_id: {
+                "kind": "tv",
+                "url": f"/animes/{title_id}",
+                "studios": ["Studio"],
+            }
+            for title_id in ids
+        }
+
+    async def fake_collect(session, value, fav=None):
+        return value
+
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: copy.deepcopy(state))
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+
+    result, ok = await smod.sync_stats_all(session=object())
+
+    assert ok is True
+    assert meta_calls == [("anime", ["5", "2", "3"]), ("anime", ["4"])]
+    assert [
+        result["anime"]["titles"][str(title_id)]["comment"]
+        for title_id in range(1, 6)
+    ] == ["обычный", "kind repair", "malformed", "metadata refresh", "новый"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_media", ["anime", "manga"])
+async def test_comment_sync_preserves_failed_export_half(monkeypatch, failed_media):
+    now = datetime(2026, 9, 9, 12, 0, 0)
+    state = storage._empty_stats_all()
+    state["anime"]["titles"]["1"] = {
+        **_anime_rec(),
+        "meta_updated_at": now.isoformat(),
+        "comment": "anime old",
+    }
+    state["manga"]["titles"]["2"] = {
+        **_manga_record("Манга", "manga"),
+        "meta_updated_at": now.isoformat(),
+        "comment": "manga old",
+    }
+    exports = {
+        "anime": [{
+            "target_id": 1,
+            "target_title": "Anime",
+            "target_title_ru": "Аниме",
+            "score": 8,
+            "status": "completed",
+            "rewatches": 0,
+            "episodes": 24,
+            "text": "anime new",
+        }],
+        "manga": [{**_export_manga_row(2), "text": "manga new"}],
+    }
+
+    async def fake_export(session, media):
+        return None if media == failed_media else exports[media]
+
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: copy.deepcopy(state))
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(return_value={}))
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+
+    result, ok = await smod.sync_stats_all(session=object(), fav={})
+
+    assert ok is True
+    expected = {
+        "anime": "anime old" if failed_media == "anime" else "anime new",
+        "manga": "manga old" if failed_media == "manga" else "manga new",
+    }
+    assert result["anime"]["titles"]["1"]["comment"] == expected["anime"]
+    assert result["manga"]["titles"]["2"]["comment"] == expected["manga"]
+
+
+@pytest.mark.asyncio
+async def test_comment_sync_does_not_add_export_graphql_or_favourites_requests(
+    monkeypatch,
+):
+    exports = {
+        "anime": [{
+            "target_id": 1,
+            "target_title": "Anime",
+            "target_title_ru": "Аниме",
+            "score": 0,
+            "status": "planned",
+            "rewatches": 0,
+            "episodes": 0,
+            "text": "anime comment",
+        }],
+        "manga": [{**_export_manga_row(2, status="planned", chapters=0), "text": "manga comment"}],
+    }
+    export_calls = []
+    meta_calls = []
+    favourite_calls = []
+
+    async def fake_export(session, media):
+        export_calls.append(media)
+        return exports[media]
+
+    async def fake_meta(media, ids, session=None):
+        meta_calls.append((media, list(ids)))
+        return {
+            title_id: {"kind": "tv" if media == "anime" else "manga"}
+            for title_id in ids
+        }
+
+    async def fake_favourites(session):
+        favourite_calls.append(session)
+        return {}
+
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: storage._empty_stats_all())
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
+    monkeypatch.setattr("stats.fetch_favourites", fake_favourites)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+    session = object()
+
+    result, ok = await smod.sync_stats_all(session=session)
+
+    assert ok is True
+    assert export_calls == ["anime", "manga"]
+    assert meta_calls == [("anime", ["1"]), ("manga", ["2"])]
+    assert favourite_calls == [session]
+    assert result["anime"]["titles"]["1"]["comment"] == "anime comment"
+    assert result["manga"]["titles"]["2"]["comment"] == "manga comment"
+
+
+@pytest.mark.asyncio
+async def test_comment_is_excluded_from_derived_and_historical_consumers(
+    monkeypatch,
+    tmp_path,
+):
+    secret = "COMMENT_SECRET_137 </script> & <b>hostile</b>"
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"]["1"] = {
+        **_anime_rec(),
+        "title": "Аниме",
+        "title_en": "Anime",
+        "url": "/animes/1",
+        "comment": secret,
+    }
+    stats["anime"]["aggregates"] = smod.recompute_aggregates(
+        "anime",
+        stats["anime"]["titles"],
+    )
+    stats = await smod._collect_favourites(
+        None,
+        stats,
+        fav={"animes": [{"id": 1, "russian": "Аниме", "url": "/animes/1"}]},
+    )
+    cur = {
+        "period": "2026-Q3",
+        "events": [{
+            "id": "1",
+            "media": "anime",
+            "event": "completed",
+            "score": 8,
+        }],
+    }
+
+    assert secret not in json.dumps(stats["anime"]["aggregates"], ensure_ascii=False)
+    assert secret not in json.dumps(stats["favourites"], ensure_ascii=False)
+
+    reports = (
+        smod.build_stats_all_messages(stats),
+        smod.build_current_stats_messages(cur, stats),
+        smod.build_quarterly_report_messages(cur, stats, None),
+        smod.build_favourites_messages(stats),
+    )
+    for report in reports:
+        assert secret not in "".join(rendered_html(report))
+
+    frozen = report_delivery.freeze_report(reports[2])
+    assert secret not in json.dumps(frozen, ensure_ascii=False)
+
+    before = copy.deepcopy(stats)
+    monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
+    smod._save_quarter_snapshot("2026-Q3", cur, stats)
+    snapshot = json.loads((tmp_path / "2026-Q3.json").read_text(encoding="utf-8"))
+    assert secret not in json.dumps(snapshot, ensure_ascii=False)
+    assert "comment" not in snapshot["anime_titles"][0]
+    assert stats == before
+
+
+@pytest.mark.asyncio
+async def test_comment_only_atomic_write_failure_preserves_file_cache_and_logs(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    secret = "COMMENT_SECRET_137_ATOMIC"
+    now = datetime(2026, 9, 9, 12, 0, 0)
+    initial = storage._empty_stats_all()
+    initial["anime"]["titles"]["1"] = {
+        **_anime_rec(),
+        "meta_updated_at": now.isoformat(),
+        "comment": "previous",
+    }
+    stats_file = tmp_path / "stats_all.json"
+    stats_file.write_text(json.dumps(initial, ensure_ascii=False), encoding="utf-8")
+    before = stats_file.read_bytes()
+    row = {
+        "target_id": 1,
+        "target_title": "Anime",
+        "target_title_ru": "Аниме",
+        "score": 8,
+        "status": "completed",
+        "rewatches": 0,
+        "episodes": 24,
+        "text": secret,
+    }
+
+    async def fake_export(session, media):
+        return [row] if media == "anime" else []
+
+    async def fake_collect(session, value, fav=None):
+        return value
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(storage, "STATS_ALL_FILE", stats_file)
+    monkeypatch.setattr(storage, "_stats_all_cache", None)
+    monkeypatch.setattr(storage, "_stats_all_cache_ts", 0.0)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+    monkeypatch.setattr("stats.fetch_list_export", fake_export)
+    monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(return_value={}))
+    monkeypatch.setattr("stats._collect_favourites", fake_collect)
+    monkeypatch.setattr(storage, "_atomic_write", fail_write)
+    caplog.set_level(logging.ERROR)
+
+    result, ok = await smod.sync_stats_all(session=object())
+
+    assert ok is True
+    assert result["anime"]["titles"]["1"]["comment"] == secret
+    assert stats_file.read_bytes() == before
+    assert storage.load_stats_all()["anime"]["titles"]["1"]["comment"] == "previous"
+    assert secret not in caplog.text
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1967,7 +2359,12 @@ async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatc
     """Оба экспорта упали (429) ⇒ возвращаем ПРЕЖНИЙ stats_all нетронутым и ok=False,
     save не вызывается. Гарантия «429 не ломает stats_all»."""
     import stats as stats_mod
-    preserved = {"_sentinel": "keep-me"}
+    preserved = {
+        "_sentinel": "keep-me",
+        "anime": {"titles": {"1": {"comment": "anime preserved"}}},
+        "manga": {"titles": {"2": {"comment": "manga preserved"}}},
+    }
+    expected = copy.deepcopy(preserved)
     saved = []
 
     async def fake_export(session, media):
@@ -1981,6 +2378,7 @@ async def test_sync_stats_all_total_failure_preserves_and_flags_false(monkeypatc
 
     assert ok is False
     assert result_stats is preserved
+    assert preserved == expected
     assert saved == []
 
 
@@ -2037,6 +2435,7 @@ async def test_sync_stats_all_late_privacy_failure_preserves_process_cache(
                 "status": "completed",
                 "rewatches": 0,
                 "episodes": 23,
+                "text": "не публиковать anime comment",
             },
         ],
         "manga": [
@@ -2050,6 +2449,7 @@ async def test_sync_stats_all_late_privacy_failure_preserves_process_cache(
                 "rewatches": 0,
                 "chapters": 10,
                 "volumes": 2,
+                "text": "не публиковать manga comment",
             },
         ],
     }
