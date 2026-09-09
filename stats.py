@@ -1353,7 +1353,7 @@ def _top_section(
             Bold(title),
             level=3,
             collapsible=True,
-            open=False,
+            is_open=False,
         ),
         _counter_rows(pairs, show_percent=show_percent, total=total),
     )
@@ -1365,7 +1365,7 @@ def _score_section(dist: dict) -> Section | None:
         return None
     pairs.sort(key=lambda pair: pair[0], reverse=True)
     return section(
-        heading("⭐ ", Bold("Оценки"), level=3, collapsible=True, open=False),
+        heading("⭐ ", Bold("Оценки"), level=3, collapsible=True, is_open=False),
         Rows(tuple(
             Row(f"★{score}", str(count), table_label=f"{score}★")
             for score, count in pairs
@@ -1393,7 +1393,7 @@ def _status_section(
     if not pairs:
         return None
     return section(
-        heading("📦 ", Bold("Статусы"), level=3, collapsible=True, open=False),
+        heading("📦 ", Bold("Статусы"), level=3, collapsible=True, is_open=False),
         _counter_rows(pairs),
     )
 
@@ -1406,7 +1406,7 @@ def _kinds_section(kinds: dict, labels: dict) -> Section | None:
     if not pairs:
         return None
     return section(
-        heading("🎞 ", Bold("Типы"), level=3, collapsible=True, open=False),
+        heading("🎞 ", Bold("Типы"), level=3, collapsible=True, is_open=False),
         _counter_rows(pairs),
     )
 
@@ -1467,7 +1467,7 @@ def _build_quarter_sections(
             Bold("Топ по оценке"),
             level=3,
             collapsible=True,
-            open=True,
+            is_open=True,
         )]
         for index, record in enumerate(top, 1):
             top_lines.append(line(
@@ -1951,7 +1951,7 @@ def build_quarterly_report_messages(
                 Bold(f"Сравнение с {prev_label}:"),
                 level=3,
                 collapsible=True,
-                open=False,
+                is_open=False,
             ),
             line(f"🎬 Аниме: {anime_diff}"),
         ]
@@ -2002,7 +2002,7 @@ def build_quarterly_report_messages(
                 Bold("Достижения:"),
                 level=3,
                 collapsible=True,
-                open=False,
+                is_open=False,
             ),
             *(line("• ", achievement) for achievement in ach),
         ))

@@ -144,7 +144,7 @@ def heading(
     *parts: Inline | str,
     level: int = 2,
     collapsible: bool = False,
-    open: bool = True,
+    is_open: bool = True,
 ) -> Heading:
     """Собрать семантический заголовок из безопасных inline-узлов."""
     if not 1 <= level <= 6:
@@ -153,7 +153,7 @@ def heading(
         tuple(Text(part) if isinstance(part, str) else part for part in parts),
         level,
         collapsible,
-        open,
+        is_open,
     )
 
 

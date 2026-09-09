@@ -154,11 +154,11 @@ def test_plain_hostile_list_prefix_does_not_create_list_structure():
 def test_collapsible_policy_preserves_explicit_open_and_closed_states():
     report = Report((unit(
         section(
-            heading("open", collapsible=True, open=True),
+            heading("open", collapsible=True, is_open=True),
             line("visible"),
         ),
         section(
-            heading("closed", collapsible=True, open=False),
+            heading("closed", collapsible=True, is_open=False),
             line("hidden until opened"),
         ),
     ),))
