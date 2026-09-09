@@ -53,6 +53,7 @@ packaging/windows/
 release_security.py
 assets/*
 !assets/info-preview.png
+!assets/report-poster-placeholder-v1.png
 
 # Документация, не нужная во время выполнения контейнера
 README.md

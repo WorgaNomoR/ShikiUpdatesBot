@@ -2,11 +2,13 @@
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
 import json
+from copy import deepcopy
 from uuid import uuid4
 
 import pytest
 
 import storage
+from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
 from storage import (
     BlockedUsersMutationError,
     BlockedUsersStateError,
@@ -1007,6 +1009,39 @@ def _quarter_state():
     }
 
 
+def _rich_frozen_unit(label: str) -> dict:
+    return {
+        "transport": "rich",
+        "content": {
+            "blocks": [{"type": "paragraph", "text": label}],
+            "skip_entity_detection": True,
+        },
+        "fallback_html": [f"<b>{label}</b>"],
+        "fallback_disable_preview": False,
+    }
+
+
+def _quarter_state_v2():
+    return {
+        "period": "2026-Q3",
+        "events": [],
+        "pending_quarter_delivery": storage.new_quarter_delivery_plan(
+            "2026-Q2",
+            "2026-Q3",
+            [_rich_frozen_unit("first"), _rich_frozen_unit("second")],
+        ),
+    }
+
+
+def test_new_quarter_delivery_plan_normalizes_invalid_frozen_units():
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^report_units$"):
+        storage.new_quarter_delivery_plan(
+            "2026-Q2",
+            "2026-Q3",
+            [{"transport": "unknown"}],
+        )
+
+
 @pytest.mark.parametrize("key,value", [
     ("version", 2), ("version", True), ("version", 1.0),
     ("next_unit", -1), ("next_unit", True), ("next_unit", 0.5), ("next_unit", 3),
@@ -1070,6 +1105,162 @@ def test_quarter_plan_identity_is_unique_and_progress_does_not_change_it():
     first["period"] = "2026-Q4"
     with pytest.raises(storage.QuarterDeliveryStateError, match="period_lineage"):
         storage.validate_pending_quarter_delivery(first)
+
+
+def test_version2_quarter_plan_validates_exact_transport_content_and_progress():
+    cur = _quarter_state_v2()
+    pending = cur["pending_quarter_delivery"]
+    expected = deepcopy(pending)
+    digest = pending["plan_hash"]
+
+    assert storage.validate_pending_quarter_delivery(cur) == expected
+    assert pending["version"] == 2
+    assert storage.migrate_quarter_delivery(pending) == expected
+    pending["next_unit"] = 1
+    assert storage.validate_pending_quarter_delivery(cur)["plan_hash"] == digest
+
+
+def test_version2_quarter_plan_accepts_exact_versioned_local_media_reference():
+    media_unit = _rich_frozen_unit("media")
+    media_unit["content"]["blocks"] = [{
+        "type": "collage",
+        "blocks": [
+            {
+                "type": "photo",
+                "photo": {
+                    "type": "photo",
+                    "media": "https://cdn.example.test/first.jpg",
+                },
+            },
+            {
+                "type": "photo",
+                "photo": {
+                    "type": "photo",
+                    "media": REPORT_POSTER_PLACEHOLDER_MEDIA,
+                },
+            },
+        ],
+    }]
+    expected_media_unit = deepcopy(media_unit)
+    cur = {
+        "period": "2026-Q3",
+        "events": [],
+        "pending_quarter_delivery": storage.new_quarter_delivery_plan(
+            "2026-Q2",
+            "2026-Q3",
+            [media_unit],
+        ),
+    }
+    media_unit["content"]["blocks"].clear()
+
+    assert storage.validate_pending_quarter_delivery(cur)["report_units"] == [
+        expected_media_unit
+    ]
+
+
+@pytest.mark.parametrize("foreign_media", [
+    "attach://foreign",
+    REPORT_POSTER_PLACEHOLDER_MEDIA + "-foreign",
+])
+def test_version2_quarter_plan_rejects_foreign_local_media_reference(foreign_media):
+    cur = _quarter_state_v2()
+    media_unit = cur["pending_quarter_delivery"]["report_units"][0]
+    media_unit["content"]["blocks"] = [{
+        "type": "collage",
+        "blocks": [
+            {
+                "type": "photo",
+                "photo": {
+                    "type": "photo",
+                    "media": "https://cdn.example.test/first.jpg",
+                },
+            },
+            {
+                "type": "photo",
+                "photo": {
+                    "type": "photo",
+                    "media": foreign_media,
+                },
+            },
+        ],
+    }]
+
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^report_units$"):
+        storage.validate_pending_quarter_delivery(cur)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda unit: unit.update(transport="markdown"),
+        lambda unit: unit["content"].update(skip_entity_detection=False),
+        lambda unit: unit["content"]["blocks"].append({
+            "type": "anchor",
+            "name": "<hostile>",
+        }),
+        lambda unit: unit.update(fallback_html=[]),
+        lambda unit: unit.update(fallback_disable_preview="yes"),
+    ],
+)
+def test_version2_quarter_plan_rejects_invalid_frozen_payload(mutate):
+    cur = _quarter_state_v2()
+    mutate(cur["pending_quarter_delivery"]["report_units"][0])
+
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^report_units$"):
+        storage.validate_pending_quarter_delivery(cur)
+
+
+def test_exact_unsupported_downgrade_replaces_only_unacknowledged_rich_units():
+    cur = _quarter_state_v2()
+    pending = cur["pending_quarter_delivery"]
+    pending["next_unit"] = 1
+    pending["report_units"][1]["fallback_html"] = [
+        "<b>second-a</b>",
+        "<b>second-b</b>",
+    ]
+    expected_acknowledged = deepcopy(pending["report_units"][0])
+
+    downgraded = storage.downgrade_quarter_delivery(pending, 1)
+
+    assert downgraded["plan_id"] != pending["plan_id"]
+    assert downgraded["next_unit"] == 1
+    assert downgraded["report_units"] == [
+        expected_acknowledged,
+        {
+            "transport": "html",
+            "content": "<b>second-a</b>",
+            "disable_preview": False,
+        },
+        {
+            "transport": "html",
+            "content": "<b>second-b</b>",
+            "disable_preview": False,
+        },
+    ]
+    cur["pending_quarter_delivery"] = downgraded
+    assert storage.validate_pending_quarter_delivery(cur) == downgraded
+
+
+def test_unsupported_downgrade_validates_the_new_plan_before_returning():
+    pending = _quarter_state_v2()["pending_quarter_delivery"]
+    pending["new_period"] = "bad"
+    original = deepcopy(pending)
+
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^period_format$"):
+        storage.downgrade_quarter_delivery(pending, 0)
+
+    assert pending == original
+
+
+def test_unsupported_downgrade_rejects_missing_lineage_key():
+    pending = _quarter_state_v2()["pending_quarter_delivery"]
+    del pending["old_period"]
+
+    with pytest.raises(
+        storage.QuarterDeliveryStateError,
+        match="^unsupported_downgrade$",
+    ):
+        storage.downgrade_quarter_delivery(pending, 0)
 
 
 @pytest.mark.parametrize("legacy", [False, True])

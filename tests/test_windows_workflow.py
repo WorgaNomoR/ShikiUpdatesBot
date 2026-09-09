@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 import release_security
+from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
 
 WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "windows-exe.yml"
 WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -35,6 +36,18 @@ def test_pyinstaller_bundles_info_preview():
         'datas.append((str(root / "assets" / "info-preview.png"), "assets"))'
         in PYINSTALLER_SPEC
     )
+
+
+def test_pyinstaller_bundles_report_poster_placeholder():
+    asset_name = (
+        REPORT_POSTER_PLACEHOLDER_MEDIA.removeprefix("asset://").split("/", 1)[0]
+        + ".png"
+    )
+    assert (
+        f'datas.append((str(root / "assets" / "{asset_name}"), "assets"))'
+        in PYINSTALLER_SPEC
+    )
+    assert (ROOT / "assets" / asset_name).is_file()
 
 
 def test_pyinstaller_bundles_fact_bank_example():

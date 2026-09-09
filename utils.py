@@ -12,7 +12,8 @@
   • _subscriber_link        — безопасная Telegram-ссылка на подписчика;
   • _utcnow / _parse_iso_utc — безопасная нормализация времени UTC;
   • quarter_*                — работа с кварталами;
-  • _safe_int / _safe_float  — аккуратное приведение типов из API.
+  • _safe_int / _safe_float  — аккуратное приведение типов из API;
+  • russian_count_word       — русская форма существительного после числа.
 """
 
 import html
@@ -30,6 +31,26 @@ def h(text: str) -> str:
     Применять ко всем пользовательским данным из API перед вставкой в сообщение.
     """
     return html.escape(str(text))
+
+
+def russian_count_word(count: int | float, one: str, few: str, many: str) -> str:
+    """Выбрать русскую форму существительного после количества.
+
+    Float означает отображаемую дробь и всегда использует форму ``few``.
+    """
+    absolute = abs(count)
+    if isinstance(absolute, float):
+        return few
+    integer = int(absolute)
+    remainder = integer % 100
+    if 11 <= remainder <= 14:
+        return many
+    last_digit = integer % 10
+    if last_digit == 1:
+        return one
+    if 2 <= last_digit <= 4:
+        return few
+    return many
 
 
 def _subscriber_link(chat_id: int, name: str) -> str:

@@ -120,9 +120,15 @@ _ORIGIN_RU: dict[str, str] = {
     "four_koma_manga":  "Ёнкома",
     "picture_book":     "Иллюстрированная книга",
     "radio":            "Радио",
+    "mixed_media":      "Более одного",
     "other":            "Другое",
     "unknown":          "Неизвестно",
 }
+
+
+def translate_origin(value: str | None) -> str | None:
+    """Перевести GraphQL origin, сохранив неизвестное значение без потерь."""
+    return _ORIGIN_RU.get(value, value)
 
 _RATING_RU: dict[str, str] = {
     "none":   "Без рейтинга",
@@ -576,7 +582,7 @@ async def fetch_inline_search(
             origin = str(item.get("origin") or "").strip()
             rating = str(item.get("rating") or "").strip()
             if origin and origin != "unknown":
-                item["origin"] = _ORIGIN_RU.get(origin, origin)
+                item["origin"] = translate_origin(origin)
             else:
                 item.pop("origin", None)
             if rating and rating != "none":
@@ -659,7 +665,7 @@ async def fetch_meta_batch(media: str, ids: list[str],
                         "duration":       item.get("duration"),   # мин/эп
                         "episodes_total": item.get("episodes"),
                         "rating":         _RATING_RU.get(rating_raw, rating_raw or None),
-                        "origin":         _ORIGIN_RU.get(origin_raw, origin_raw or None),
+                        "origin":         translate_origin(origin_raw or None),
                         "studios":        [s["name"] for s in (item.get("studios") or []) if s.get("name")],
                     })
                 else:

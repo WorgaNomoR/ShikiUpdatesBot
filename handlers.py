@@ -120,13 +120,16 @@ from messages import (
     format_rate_entry,
 )
 from report_delivery import (
+    deliver_frozen_report,
     deliver_rendered_report,
     deliver_report,
+    freeze_report,
+    is_local_rich_asset_error,
+    is_rich_method_unsupported,
 )
 from report_model import (
     Report,
     plain_report,
-    rendered_html,
 )
 from runtime import RESOURCE_ROOT
 from runtime_status import (
@@ -176,6 +179,7 @@ from storage import (
     UserAlertsStateError,
     _empty_stats_current,
     add_blocked_user,
+    downgrade_quarter_delivery,
     list_blocked_users,
     load_seen_favourites,
     load_seen_ids,
@@ -188,7 +192,7 @@ from storage import (
     load_update_state,
     migrate_quarter_delivery,
     mutate_subscription,
-    new_quarter_delivery,
+    new_quarter_delivery_plan,
     quarter_restore_generation,
     remove_blocked_user,
     restorable_state_transaction,
@@ -218,6 +222,7 @@ from utils import (
     h,
     previous_quarter,
     quarter_label,
+    russian_count_word,
 )
 
 # Фиксированная пауза между фазами стартовых фетчей (анти-429, boot-throttle).
@@ -451,7 +456,11 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
             return cur
         generation = quarter_restore_generation()
         migrated = migrate_quarter_delivery(pending)
-        complete = migrated["next_unit"] == len(migrated["report_messages"])
+        units_key = (
+            "report_units" if migrated.get("version") == 2 else "report_messages"
+        )
+        total_units = len(migrated[units_key])
+        complete = migrated["next_unit"] == total_units
         if migrated != pending or (complete and cur.get("last_report_sent") != migrated["new_period"]):
             cur[_PENDING_QUARTER_DELIVERY] = migrated
             if complete:
@@ -476,20 +485,42 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         async with restorable_state_transaction():
             current = read_expected(index)
             current[_PENDING_QUARTER_DELIVERY] = dict(pending, next_unit=index + 1)
-            if index + 1 == len(pending["report_messages"]):
+            if index + 1 == total_units:
                 current["last_report_sent"] = pending["new_period"]
             save_stats_current(current, strict=True)
 
-    result = await deliver_rendered_report(
+    delivery = (
+        deliver_frozen_report
+        if pending.get("version") == 2
+        else deliver_rendered_report
+    )
+    result = await delivery(
         bot,
         OWNER_ID,
-        pending["report_messages"],
+        pending[units_key],
         start_unit=pending["next_unit"],
         before_send=before_send,
         acknowledge=acknowledge,
         sleep=asyncio.sleep,
     )
     if not result.delivered:
+        safe_rich_fallback = (
+            is_rich_method_unsupported(result.error)
+            or is_local_rich_asset_error(result.error)
+        )
+        if pending.get("version") == 2 and safe_rich_fallback:
+            log.warning(
+                "rotate_quarter: rich transport заменён frozen HTML (%s)",
+                type(result.error).__name__,
+            )
+            async with restorable_state_transaction():
+                current = read_expected(result.next_unit)
+                current[_PENDING_QUARTER_DELIVERY] = downgrade_quarter_delivery(
+                    pending,
+                    result.next_unit,
+                )
+                save_stats_current(current, strict=True)
+            return await _resume_pending_quarter(bot)
         # Исключения Telegram могут содержать весь запрос: логируем только тип.
         log.warning(
             "rotate_quarter: попытка остановлена, Telegram success=%d, next_unit=%d/%d, error=%s",
@@ -502,7 +533,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
 
     prepared_at = time.time()
     async with restorable_state_transaction():
-        cur = read_expected(len(pending["report_messages"]))
+        cur = read_expected(total_units)
         subscriber_state = load_subscriber_state(strict_subscribers=True)
         if prepare_backup_schedule(subscriber_state, prepared_at):
             save_subscriber_state(subscriber_state)
@@ -519,7 +550,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
 
     completed_at = time.time()
     async with restorable_state_transaction():
-        cur = read_expected(len(pending["report_messages"]))
+        cur = read_expected(total_units)
         subscriber_state = load_subscriber_state(strict_subscribers=True)
         if subscriber_state_json(subscriber_state) != expected_subscriber_state:
             raise _QuarterPlanChanged
@@ -600,13 +631,17 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
             expected_cur = cur
 
         try:
-            report_messages = rendered_html(report)
+            report_units = freeze_report(report)
         except Exception as e:
             log.error("rotate_quarter: report renderer упал: %s", e)
-            report_messages = rendered_html(plain_report(
-                f"⚠️ Отчёт за {quarter_label(old_period)} "
-                f"не удалось отобразить: {e}"
-            ))
+            try:
+                report_units = freeze_report(plain_report(
+                    f"⚠️ Отчёт за {quarter_label(old_period)} "
+                    f"не удалось отобразить: {e}"
+                ))
+            except Exception:
+                log.error("rotate_quarter: fallback renderer тоже недоступен.")
+                raise QuarterDeliveryStateError("frozen_plan_unavailable") from None
 
         async with restorable_state_transaction():
             cur = load_stats_current(strict=True)
@@ -632,8 +667,10 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
                 log.error("rotate_quarter: обновление by_quarter: %s", e)
 
             fresh = _empty_stats_current(now_period)
-            fresh[_PENDING_QUARTER_DELIVERY] = new_quarter_delivery(
-                old_period, now_period, report_messages,
+            fresh[_PENDING_QUARTER_DELIVERY] = new_quarter_delivery_plan(
+                old_period,
+                now_period,
+                report_units,
             )
             save_stats_current(fresh, strict=True)
         break
@@ -2708,15 +2745,7 @@ async def facts_example_cb(callback: CallbackQuery) -> None:
 
 def _fact_count_word(count: int) -> str:
     """Выбрать русскую форму слова «факт» для указанного количества."""
-    remainder = count % 100
-    if 11 <= remainder <= 14:
-        return "фактов"
-    last_digit = count % 10
-    if last_digit == 1:
-        return "факт"
-    if 2 <= last_digit <= 4:
-        return "факта"
-    return "фактов"
+    return russian_count_word(count, "факт", "факта", "фактов")
 
 
 async def facts_ask_clear_cb(callback: CallbackQuery, state: FSMContext) -> None:

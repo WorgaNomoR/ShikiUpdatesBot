@@ -34,6 +34,11 @@ from config import (
     USER_ALERTS_FILE,
     log,
 )
+from report_plan import (
+    FrozenReportPlanError,
+    downgrade_rich_units,
+    validate_frozen_report_units,
+)
 from utils import (
     _parse_iso_utc,
     _utcnow,
@@ -1034,7 +1039,7 @@ def _quarter_plan_hash(pending: dict) -> str:
 
 
 def new_quarter_delivery(old_period: str, new_period: str, messages: list[str]) -> dict:
-    """Заморозить уже отрендеренный план с новой независимой идентичностью."""
+    """Заморозить legacy-compatible version-1 HTML plan."""
     pending = {
         "version": 1,
         "plan_id": uuid.uuid4().hex,
@@ -1046,6 +1051,58 @@ def new_quarter_delivery(old_period: str, new_period: str, messages: list[str]) 
     pending["plan_hash"] = _quarter_plan_hash(pending)
     validate_pending_quarter_delivery({"period": new_period, "pending_quarter_delivery": pending})
     return pending
+
+
+def new_quarter_delivery_plan(
+    old_period: str,
+    new_period: str,
+    units: list[dict],
+) -> dict:
+    """Заморозить version-2 plan с точными transport и content."""
+    try:
+        validate_frozen_report_units(units)
+    except FrozenReportPlanError:
+        raise QuarterDeliveryStateError("report_units") from None
+    pending = {
+        "version": 2,
+        "plan_id": uuid.uuid4().hex,
+        "old_period": old_period,
+        "new_period": new_period,
+        "report_units": json.loads(json.dumps(units, ensure_ascii=False)),
+        "next_unit": 0,
+    }
+    pending["plan_hash"] = _quarter_plan_hash(pending)
+    validate_pending_quarter_delivery({
+        "period": new_period,
+        "pending_quarter_delivery": pending,
+    })
+    return pending
+
+
+def downgrade_quarter_delivery(pending: dict, start_unit: int) -> dict:
+    """После точного unsupported-ответа заморозить remaining HTML plan."""
+    if pending.get("version") != 2:
+        raise QuarterDeliveryStateError("unsupported_downgrade")
+    try:
+        units = downgrade_rich_units(pending["report_units"], start_unit)
+        old_period = pending["old_period"]
+        new_period = pending["new_period"]
+    except (KeyError, FrozenReportPlanError):
+        raise QuarterDeliveryStateError("unsupported_downgrade") from None
+    downgraded = {
+        "version": 2,
+        "plan_id": uuid.uuid4().hex,
+        "old_period": old_period,
+        "new_period": new_period,
+        "report_units": units,
+        "next_unit": start_unit,
+    }
+    downgraded["plan_hash"] = _quarter_plan_hash(downgraded)
+    validate_pending_quarter_delivery({
+        "period": downgraded["new_period"],
+        "pending_quarter_delivery": downgraded,
+    })
+    return downgraded
 
 
 def validate_quarter_period(period: object) -> None:
@@ -1070,36 +1127,69 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
     if not isinstance(pending, dict):
         raise QuarterDeliveryStateError("pending_type")
     legacy_keys = {"old_period", "new_period", "report_messages", "report_sent"}
-    current_keys = (legacy_keys - {"report_sent"}) | {"version", "plan_id", "plan_hash", "next_unit"}
+    version1_keys = (
+        (legacy_keys - {"report_sent"})
+        | {"version", "plan_id", "plan_hash", "next_unit"}
+    )
+    version2_keys = {
+        "version",
+        "plan_id",
+        "plan_hash",
+        "old_period",
+        "new_period",
+        "report_units",
+        "next_unit",
+    }
     legacy = "version" not in pending
-    if not legacy and (type(pending["version"]) is not int or pending["version"] != 1):
+    if not legacy and (
+        type(pending.get("version")) is not int
+        or pending["version"] not in {1, 2}
+    ):
         raise QuarterDeliveryStateError("unsupported_version")
-    if set(pending) != (legacy_keys if legacy else current_keys):
+    expected_keys = (
+        legacy_keys
+        if legacy
+        else version1_keys if pending["version"] == 1 else version2_keys
+    )
+    if set(pending) != expected_keys:
         raise QuarterDeliveryStateError("pending_fields")
     old, new = pending["old_period"], pending["new_period"]
     validate_quarter_period(old)
     validate_quarter_period(new)
     if old >= new or new != cur.get("period"):
         raise QuarterDeliveryStateError("period_lineage")
-    messages = pending["report_messages"]
-    if not isinstance(messages, list) or any(
-        not isinstance(message, str) or not message.strip() for message in messages
-    ):
-        raise QuarterDeliveryStateError("report_messages")
-    try:
-        for message in messages:
-            message.encode("utf-8")
-    except UnicodeError:
-        raise QuarterDeliveryStateError("report_encoding") from None
+    messages = pending.get("report_messages")
+    units = pending.get("report_units")
+    if legacy or pending.get("version") == 1:
+        if not isinstance(messages, list) or any(
+            not isinstance(message, str) or not message.strip()
+            for message in messages
+        ):
+            raise QuarterDeliveryStateError("report_messages")
+        try:
+            for message in messages:
+                message.encode("utf-8")
+        except UnicodeError:
+            raise QuarterDeliveryStateError("report_encoding") from None
+        total_units = len(messages)
+    else:
+        try:
+            validate_frozen_report_units(units)
+        except FrozenReportPlanError:
+            raise QuarterDeliveryStateError("report_units") from None
+        total_units = len(units)
     if legacy:
         if type(pending["report_sent"]) is not bool:
             raise QuarterDeliveryStateError("legacy_completion")
         if messages and not pending["report_sent"] and cur.get("last_report_sent") == new:
             raise QuarterDeliveryStateError("premature_completion")
     else:
-        if type(pending["next_unit"]) is not int or not 0 <= pending["next_unit"] <= len(messages):
+        if (
+            type(pending["next_unit"]) is not int
+            or not 0 <= pending["next_unit"] <= total_units
+        ):
             raise QuarterDeliveryStateError("progress_index")
-        if cur.get("last_report_sent") == new and pending["next_unit"] < len(messages):
+        if cur.get("last_report_sent") == new and pending["next_unit"] < total_units:
             raise QuarterDeliveryStateError("premature_completion")
         if not isinstance(pending["plan_id"], str) or re.fullmatch(r"[0-9a-f]{32}", pending["plan_id"]) is None:
             raise QuarterDeliveryStateError("plan_identity")
