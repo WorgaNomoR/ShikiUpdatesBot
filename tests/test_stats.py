@@ -531,12 +531,16 @@ def test_quarter_projection_allowlist_covers_title_record_schema(media):
         meta_updated_at="2026-01-01T00:00:00",
     )
     denylist = {"comment"}
+    record_before = copy.deepcopy(record)
 
     assert set(record) <= set(smod._QUARTER_TITLE_FIELDS) | denylist
     assert denylist.isdisjoint(smod._QUARTER_TITLE_FIELDS)
-    assert smod._quarter_title_projection(record) == {
+    projection = smod._quarter_title_projection(record)
+
+    assert record == record_before
+    assert projection == {
         key: value
-        for key, value in record.items()
+        for key, value in record_before.items()
         if key not in denylist
     }
 
@@ -833,10 +837,10 @@ async def test_comment_is_excluded_from_derived_and_historical_consumers(
         smod.build_favourites_messages(stats),
     )
     for report in reports:
-        assert comment_marker not in "".join(rendered_html(report))
+        assert "COMMENT_MARKER_137" not in "".join(rendered_html(report))
 
     frozen = report_delivery.freeze_report(reports[2])
-    assert comment_marker not in json.dumps(frozen, ensure_ascii=False)
+    assert "COMMENT_MARKER_137" not in json.dumps(frozen, ensure_ascii=False)
 
     before = copy.deepcopy(stats)
     monkeypatch.setattr("stats.QUARTERS_DIR", tmp_path)
@@ -892,7 +896,7 @@ async def test_comment_only_atomic_write_failure_preserves_file_cache_and_logs(
     monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(return_value={}))
     monkeypatch.setattr("stats._collect_favourites", fake_collect)
     monkeypatch.setattr(storage, "_atomic_write", fail_write)
-    caplog.set_level(logging.ERROR)
+    caplog.set_level(logging.DEBUG)
 
     result, ok = await smod.sync_stats_all(session=object())
 
