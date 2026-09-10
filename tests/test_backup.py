@@ -233,6 +233,10 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
         encoding="utf-8",
     )
     (backup_env / "stats_current.json").write_text('{"period": "2026-Q2"}', encoding="utf-8")
+    (backup_env / "stats_all.json").write_text(
+        '{"anime": {"titles": {"1": {"comment": "заметка"}}}, "manga": {}}',
+        encoding="utf-8",
+    )
     (backup_env / "known_users.json").write_text(
         _known_users_payload(),
         encoding="utf-8",
@@ -249,6 +253,7 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     assert "subscribers.json" in names
     assert "blocked_users.json" in names
     assert "stats_current.json" in names
+    assert "stats_all.json" in names
     assert "known_users.json" in names
     assert "user_alerts.json" in names
     assert "quarters/2026-Q1.json" in names          # вложенность сохранена
@@ -289,6 +294,22 @@ def test_is_allowed_import_member_accepts_whitelist(name):
 ])
 def test_is_allowed_import_member_rejects_junk_and_zip_slip(name):
     assert backup._is_allowed_import_member(name) is False
+
+
+@pytest.mark.asyncio
+async def test_restore_skips_exported_stats_all_and_keeps_current_file(backup_env):
+    current = '{"anime": {"titles": {"1": {"comment": "текущий"}}}, "manga": {}}'
+    (backup_env / "stats_all.json").write_text(current, encoding="utf-8")
+    raw = _zip_bytes({
+        "stats_all.json": '{"anime": {"titles": {"1": {"comment": "архив"}}}}',
+        "stats_current.json": '{"period": "2026-Q2", "events": []}',
+    })
+
+    result = await backup.restore_backup_zip(raw)
+
+    assert result["restored"] == ["stats_current.json"]
+    assert result["skipped"] == ["stats_all.json"]
+    assert (backup_env / "stats_all.json").read_text(encoding="utf-8") == current
 
 
 @pytest.mark.asyncio

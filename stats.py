@@ -126,6 +126,35 @@ _META_ACTIVE_MAX_AGE = timedelta(days=7)
 _META_TERMINAL_MAX_AGE = timedelta(days=30)
 _META_MAINTENANCE_LIMIT = 50
 
+_QUARTER_TITLE_FIELDS: tuple[str, ...] = (
+    "title",
+    "title_en",
+    "score",
+    "status",
+    "rewatches",
+    "url",
+    "poster_url",
+    "kind",
+    "release_status",
+    "year",
+    "shiki_score",
+    "genres",
+    "themes",
+    "demographic",
+    "meta_updated_at",
+    "episodes_watched",
+    "episodes_total",
+    "duration",
+    "rating",
+    "origin",
+    "studios",
+    "chapters_read",
+    "volumes_read",
+    "chapters_total",
+    "volumes_total",
+    "publishers",
+)
+
 
 @dataclass(frozen=True)
 class PickCandidate:
@@ -464,7 +493,32 @@ def _merge_title_record(
         })
     if meta_updated_at is not None:
         record["meta_updated_at"] = meta_updated_at
+    comment = _normalize_list_comment(export_row.get("text"))
+    if comment is not None:
+        record["comment"] = comment
     return record
+
+
+def _normalize_list_comment(value: object) -> str | None:
+    """Нормализовать комментарий list_export или вернуть отсутствие значения."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return normalized or None
+
+
+def _sync_list_comment(record: dict, export_row: dict) -> bool:
+    """Применить authoritative comment export-строки и вернуть факт изменения."""
+    comment = _normalize_list_comment(export_row.get("text"))
+    if comment is None:
+        if "comment" not in record:
+            return False
+        del record["comment"]
+        return True
+    if record.get("comment") == comment:
+        return False
+    record["comment"] = comment
+    return True
 
 
 def _metadata_id_sort_key(title_id: str) -> tuple[int, int, str]:
@@ -735,7 +789,7 @@ async def sync_stats_all(
 
     1. Скачиваем list_export для аниме и манги.
     2. Сверяем с titles{} в stats_all — находим новые/изменившиеся записи
-       (новый id, либо изменился score/status/episodes/chapters).
+       (новый id, либо изменился пользовательский стейт или comment).
     3. Новые, безвидовые и повреждённые записи обогащаем одним correctness-
        батчем GraphQL. Для остальных обновляем пользовательский стейт из экспорта.
     4. Отдельно обновляем до 50 самых старых метаданных каждого media-домена.
@@ -883,6 +937,9 @@ async def sync_stats_all(
                     )
                     changed = True
                     continue
+
+                if _sync_list_comment(rec, row):
+                    changed = True
 
                 # Ремонт битой меты: запись с пустым kind, и сейчас GraphQL
                 # вернул непустой kind → пересобираем ЦЕЛИКОМ (url/year/жанры/
@@ -1243,7 +1300,7 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
             seen.add(tid)
         rec = titles.get(tid) if tid is not None else None
         if isinstance(rec, dict) and rec:
-            merged = dict(rec)
+            merged = _quarter_title_projection(rec)
             # score события приоритетнее (актуально на момент завершения квартала)
             if event == "completed" and ev.get("score") is not None:
                 merged["score"] = ev["score"]
@@ -1255,6 +1312,15 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
                 "genres": [], "themes": [], "demographic": [],
             })
     return out
+
+
+def _quarter_title_projection(record: dict) -> dict:
+    """Скопировать только поля presentation/history для квартальной истории."""
+    return deepcopy({
+        field: record[field]
+        for field in _QUARTER_TITLE_FIELDS
+        if field in record
+    })
 
 
 def _header_line(emoji: str, title: str) -> Heading:
