@@ -31,6 +31,11 @@ from report_model import (
     Report,
     Row,
     Rows,
+    Table,
+    TableCell,
+    TableGroup,
+    TableRow,
+    Text,
     Title,
     heading,
     line,
@@ -128,6 +133,99 @@ def test_mixed_table_tolerates_missing_suffix_in_defensive_rich_boundary():
     table = render_rich_report(report)[0].message.blocks[0]
 
     assert [row[2].text for row in table.cells] == ["50%", ""]
+
+
+def test_grouped_table_maps_links_colspan_and_hostile_text_without_parsing():
+    report = Report((unit(section(Table(
+        columns=4,
+        header=TableRow((
+            TableCell((Bold("Название"),)),
+            TableCell((Bold("Оценка"),)),
+            TableCell((Bold("Год"),)),
+            TableCell((Bold("Тип"),)),
+        )),
+        groups=(TableGroup(
+            rows=(
+                TableRow((
+                    TableCell((Title(
+                        "Linked <title>",
+                        "https://example.test/title?a=1&b=2",
+                    ),)),
+                    TableCell((Text("9⭐"),), align="center"),
+                    TableCell((Text("2024"),), align="center"),
+                    TableCell((Text("TV-сериал"),), align="center"),
+                )),
+                TableRow((TableCell((
+                    Bold("Комментарий:\n"),
+                    Text("<b>plain</b>\n• not a list"),
+                ), colspan=4),)),
+            ),
+            fallback=(line("fallback"),),
+        ),),
+    ))),))
+
+    table = render_rich_report(report)[0].message.blocks[0]
+
+    assert isinstance(table, InputRichBlockTable)
+    assert len(table.cells) == 3
+    assert isinstance(table.cells[1][0].text, RichTextUrl)
+    assert table.cells[1][0].text.text == "Linked <title>"
+    assert table.cells[1][0].text.url == "https://example.test/title?a=1&b=2"
+    assert table.cells[2][0].colspan == 4
+    assert isinstance(table.cells[2][0].text[0], RichTextBold)
+    assert table.cells[2][0].text[1] == "<b>plain</b>\n• not a list"
+
+
+def test_separate_table_groups_render_as_cards_with_external_italic_comment():
+    hostile = "<b>plain</b>\n* not Markdown"
+    report = Report((unit(section(Table(
+        columns=3,
+        groups=(
+            TableGroup(
+                rows=(
+                    TableRow((
+                        TableCell((Text("1"),)),
+                        TableCell((Title(
+                            "First",
+                            "https://example.test/first",
+                        ),)),
+                        TableCell((Text("9⭐"),)),
+                    )),
+                    TableRow((TableCell((
+                        Bold("Год: "),
+                        Text("2024"),
+                    ), colspan=3),)),
+                ),
+                fallback=(line("1. First"), line("Год: 2024")),
+                after=(line("💬 ", Italic(hostile)),),
+            ),
+            TableGroup(
+                rows=(TableRow((
+                    TableCell((Text("2"),)),
+                    TableCell((Title("Second", None),)),
+                    TableCell((Text("—"),)),
+                )),),
+                fallback=(line("2. Second"),),
+            ),
+        ),
+        separate_groups=True,
+    ))),))
+
+    ordinary = unescape(rendered_html(report)[0])
+    blocks = render_rich_report(report)[0].message.blocks
+
+    assert [type(block) for block in blocks] == [
+        InputRichBlockTable,
+        InputRichBlockParagraph,
+        InputRichBlockTable,
+    ]
+    assert len(blocks[0].cells[0]) == 3
+    assert blocks[0].cells[1][0].colspan == 3
+    assert isinstance(blocks[1].text, list)
+    assert blocks[1].text[0] == "💬 "
+    assert isinstance(blocks[1].text[1], RichTextItalic)
+    assert blocks[1].text[1].text == hostile
+    assert ordinary.index("First") < ordinary.index(hostile) < ordinary.index("Second")
 
 
 def test_renderer_is_deterministic_and_anchor_names_ignore_hostile_text():

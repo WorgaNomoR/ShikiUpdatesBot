@@ -101,6 +101,11 @@ _MANGA_REPORT_LABELS = {
     "ranobe": "РАНОБЭ",
     "unknown": "НЕ ОПРЕДЕЛЕНО",
 }
+_MANGA_REPORT_EMOJIS = {
+    "manga": "📚",
+    "ranobe": "📖",
+    "unknown": "⚠️",
+}
 
 PICK_CATEGORY_ANIME = "anime"
 PICK_CATEGORY_MANGA = "manga"
@@ -1668,7 +1673,7 @@ def _media_quarter_unit(
     return unit(
         *prefix_sections,
         section(_header_line(
-            "🎬" if media == "anime" else "📚",
+            "🎬" if media == "anime" else _MANGA_REPORT_EMOJIS[media],
             "АНИМЕ" if media == "anime" else _MANGA_REPORT_LABELS[media],
         )),
         section(*summary),
@@ -1831,7 +1836,10 @@ def build_stats_all_messages(stats: dict) -> Report:
 def _manga_all_unit(category: str, m_agg: dict) -> Unit:
     """Отобразить независимые агрегаты одной категории чтения."""
     m_total = m_agg.get("total_completed", 0)
-    manga_sections = [section(_header_line("📚", _MANGA_REPORT_LABELS[category]))]
+    manga_sections = [section(_header_line(
+        _MANGA_REPORT_EMOJIS[category],
+        _MANGA_REPORT_LABELS[category],
+    ))]
 
     ch = m_agg.get("total_chapters_read", 0)
     vol = m_agg.get("total_volumes_read", 0)
@@ -2039,7 +2047,8 @@ def build_quarterly_report_messages(
             for category, count in previous_split.items():
                 current_count = len(report["manga_split"][category]["completed"])
                 comparison.append(line(
-                    f"📚 {_MANGA_REPORT_LABELS[category].capitalize()}: ",
+                    f"{_MANGA_REPORT_EMOJIS[category]} "
+                    f"{_MANGA_REPORT_LABELS[category].capitalize()}: ",
                     _pct_diff(current_count, count),
                 ))
         extra_sections.append(section(*comparison))

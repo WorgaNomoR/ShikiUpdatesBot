@@ -101,7 +101,9 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     }
     assert "info" in public_commands
     assert "fact" in public_commands
+    assert "lists" in public_commands
     assert public_descriptions["fact"] == "Интересный факт 💡"
+    assert public_descriptions["lists"] == "Списки аниме, манги и ранобэ 📋"
     assert "version" not in public_commands
     registered_messages = [
         call.args[0]
@@ -109,11 +111,21 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     ]
     assert main.cmd_info in registered_messages
     assert main.cmd_fact in registered_messages
+    assert main.cmd_lists in registered_messages
     assert main.cmd_facts in registered_messages
     assert main.cmd_pick in registered_messages
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
     assert main.cmd_useralerts in registered_messages
+    lists_registrations = [
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.cmd_lists
+    ]
+    assert len(lists_registrations) == 1
+    lists_filter = lists_registrations[0].args[1]
+    assert isinstance(lists_filter, main.Command)
+    assert lists_filter.commands == ("lists",)
     app.dispatcher.inline_query.register.assert_called_once_with(
         main.cmd_inline_search
     )
@@ -189,6 +201,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.facts_cancel_cb in registered_callbacks
     assert main.facts_close_cb in registered_callbacks
     assert main.pick_menu_cb in registered_callbacks
+    assert main.lists_menu_cb in registered_callbacks
     facts_apply_registration = next(
         call
         for call in app.dispatcher.callback_query.register.call_args_list
@@ -216,6 +229,14 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     pick_filter = pick_registration.args[1]
     assert pick_filter.resolve(SimpleNamespace(data="pick:anime")) is True
     assert pick_filter.resolve(SimpleNamespace(data="fact:next:777:anime-word")) is False
+    lists_registration = next(
+        call
+        for call in app.dispatcher.callback_query.register.call_args_list
+        if call.args[0] is main.lists_menu_cb
+    )
+    lists_filter = lists_registration.args[1]
+    assert lists_filter.resolve(SimpleNamespace(data="lists:media:anime")) is True
+    assert lists_filter.resolve(SimpleNamespace(data="stats:all")) is False
     useralerts_registration = next(
         call
         for call in app.dispatcher.message.register.call_args_list
