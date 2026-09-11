@@ -4,8 +4,8 @@
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
 Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock, /blocklist,
-/useralerts, /broadcast, /backup, /facts, /pick, /status, /stats, /favs, /fact,
-/info, /version), inline-меню, рассылка, цикл уведомлений (check_and_notify*,
+/useralerts, /broadcast, /backup, /facts, /pick, /status, /stats, /lists, /favs,
+/fact, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_notify*,
 polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
 """
@@ -106,6 +106,15 @@ from inline_search import (
     InlineSearchLimitExceeded,
     InlineSearchService,
     parse_inline_query,
+)
+from lists import (
+    LIST_MEDIA_BY_KEY,
+    LIST_MEDIA_DEFINITIONS,
+    LIST_VIEW_BY_KEY,
+    LIST_VIEW_DEFINITIONS,
+    MEDIA_COMBINED,
+    VIEW_ALL,
+    build_list_report,
 )
 from messages import (
     BROADCAST_HEADER,
@@ -248,6 +257,7 @@ _PICK_CATEGORY_ICONS = {
 }
 _PICK_MENU_TEXT = "text"
 _PICK_MENU_PHOTO = "photo"
+_LISTS_CALLBACK_PREFIX = "lists:"
 _FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
 FACTS_APPLY_CALLBACK_PREFIX = "facts:apply:"
 FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
@@ -329,6 +339,10 @@ class BroadcastStates(StatesGroup):
 
 class PickStates(StatesGroup):
     active = State()  # одно текущее owner-menu и его неповторяющийся цикл
+
+
+class ListsStates(StatesGroup):
+    active = State()  # одно публичное меню, привязанное к инициатору и сообщению
 
 
 def _confirm_kb() -> InlineKeyboardMarkup:
@@ -786,19 +800,25 @@ async def cmd_stats(message: Message) -> None:
     )
 
 
-async def _cleanup_inline_menu(message: Message | None) -> None:
-    """Удалить inline-меню и команду, на которую оно отвечает, если возможно."""
+async def _cleanup_inline_control(message: Message | None) -> None:
+    """Удалить только control message, сохранив исходную команду."""
     if message is None:
         return
     try:
         await message.delete()
     except Exception as e:
-        log.debug("_cleanup_inline_menu: не удалось удалить меню: %s", e)
+        log.debug("_cleanup_inline_control: не удалось удалить меню: %s", e)
         try:
             await message.edit_reply_markup(reply_markup=None)
         except Exception as e:
-            log.debug("_cleanup_inline_menu: не удалось убрать кнопки меню: %s", e)
+            log.debug("_cleanup_inline_control: не удалось убрать кнопки меню: %s", e)
 
+
+async def _cleanup_inline_menu(message: Message | None) -> None:
+    """Удалить inline-меню и команду, на которую оно отвечает, если возможно."""
+    if message is None:
+        return
+    await _cleanup_inline_control(message)
     command = getattr(message, "reply_to_message", None)
     if command is not None:
         try:
@@ -875,6 +895,274 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
             result.total_units,
             result.error,
         )
+
+
+def _lists_root_keyboard() -> InlineKeyboardMarkup:
+    """Собрать корневое меню из декларативного media-реестра."""
+    rows = []
+    for definition in LIST_MEDIA_DEFINITIONS:
+        action = (
+            MEDIA_COMBINED
+            if definition.terminal
+            else f"media:{definition.key}"
+        )
+        rows.append([InlineKeyboardButton(
+            text=definition.label,
+            callback_data=f"{_LISTS_CALLBACK_PREFIX}{action}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="❌ Закрыть",
+        callback_data=f"{_LISTS_CALLBACK_PREFIX}close",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _lists_media_keyboard() -> InlineKeyboardMarkup:
+    """Собрать общее media-подменю из декларативного реестра видов."""
+    rows = [
+        [InlineKeyboardButton(
+            text=definition.label,
+            callback_data=f"{_LISTS_CALLBACK_PREFIX}view:{definition.key}",
+        )]
+        for definition in LIST_VIEW_DEFINITIONS
+    ]
+    rows.extend([
+        [InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"{_LISTS_CALLBACK_PREFIX}back",
+        )],
+        [InlineKeyboardButton(
+            text="❌ Закрыть",
+            callback_data=f"{_LISTS_CALLBACK_PREFIX}close",
+        )],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _lists_root_text() -> str:
+    """Текст корневого меню без чтения локального состояния."""
+    return (
+        "📋 <b>Какие списки показать?</b>\n\n"
+        "Данные берутся из последнего сохранённого обновления профиля."
+    )
+
+
+def _lists_media_text(media_key: str) -> str:
+    """Текст единого подменю выбранной media-категории."""
+    definition = LIST_MEDIA_BY_KEY[media_key]
+    return f"{definition.emoji} <b>{definition.label.removeprefix(f'{definition.emoji} ')}</b>\n\nЧто показать?"
+
+
+def _lists_state_is_active(value: object) -> bool:
+    """Учесть объект State и строковое значение реального FSM storage."""
+    return value == ListsStates.active or value == ListsStates.active.state
+
+
+async def _discard_previous_lists_menu(message: Message, state: FSMContext) -> None:
+    """Инвалидировать прежнее /lists и удалить только его control message."""
+    previous = await state.get_data()
+    await state.clear()
+    if previous.get("lists_menu_chat_id") != message.chat.id:
+        return
+    menu_id = previous.get("lists_menu_message_id")
+    if type(menu_id) is int:
+        await _safe_delete(message.bot, message.chat.id, menu_id)
+
+
+async def cmd_lists(message: Message, state: FSMContext) -> None:
+    """Открыть публичный read-only браузер локальных списков Shikimori."""
+    if message.from_user is None:
+        await message.answer("⚠️ Не удалось определить отправителя команды.")
+        return
+    current_state = await state.get_state()
+    if current_state is not None and not _lists_state_is_active(current_state):
+        await message.answer(
+            "⚠️ Сначала заверши текущую операцию или отправь /cancel."
+        )
+        return
+    if _lists_state_is_active(current_state):
+        await _discard_previous_lists_menu(message, state)
+    else:
+        await state.clear()
+    try:
+        menu = await message.reply(
+            _lists_root_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_lists_root_keyboard(),
+        )
+    except Exception as e:
+        log.warning("cmd_lists: не удалось открыть меню: %s", e)
+        return
+    await state.set_state(ListsStates.active)
+    await state.update_data(
+        lists_user_id=message.from_user.id,
+        lists_menu_chat_id=message.chat.id,
+        lists_menu_message_id=menu.message_id,
+        lists_media=None,
+    )
+
+
+async def _lists_callback_session(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> dict | None:
+    """Проверить инициатора, сообщение и принадлежность активной /lists-сессии."""
+    if callback.message is None:
+        await callback.answer("Меню устарело. Отправь /lists ещё раз.", show_alert=True)
+        return None
+    if not _lists_state_is_active(await state.get_state()):
+        await callback.answer("Меню устарело. Отправь /lists ещё раз.", show_alert=True)
+        return None
+    data = await state.get_data()
+    sender_id = getattr(callback.from_user, "id", None)
+    if sender_id != data.get("lists_user_id"):
+        await callback.answer("Это меню открыто другим пользователем.", show_alert=True)
+        return None
+    if (
+        data.get("lists_menu_chat_id") != callback.message.chat.id
+        or data.get("lists_menu_message_id") != callback.message.message_id
+    ):
+        await callback.answer("Это меню уже неактивно.", show_alert=True)
+        return None
+    return data
+
+
+async def _lists_edit_menu(
+    callback: CallbackQuery,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> bool:
+    """Безопасно обновить control message, не инвалидируя сессию при ошибке."""
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        log.debug("lists: не удалось обновить меню: %s", e)
+        await callback.answer(
+            "Не удалось обновить меню. Попробуй ещё раз.",
+            show_alert=True,
+        )
+        return False
+    await callback.answer()
+    return True
+
+
+def _lists_snapshot_report(media_key: str, view_key: str) -> Report:
+    """Построить отчёт из одного локального snapshot с честной деградацией."""
+    snapshot = load_stats_all_snapshot()
+    if snapshot.state == STATS_ALL_MISSING:
+        return plain_report(
+            "📭 Списки ещё не готовы. Попробуй снова после следующего обновления данных."
+        )
+    if snapshot.state == STATS_ALL_INVALID:
+        return plain_report(
+            "⚠️ Не получилось прочитать сохранённые списки. "
+            "Попробуй снова после следующего обновления данных."
+        )
+    return build_list_report(
+        snapshot.data,
+        media_key,
+        view_key,
+        base_url=SHIKI_BASE_URL,
+    )
+
+
+async def _lists_deliver(
+    callback: CallbackQuery,
+    state: FSMContext,
+    media_key: str,
+    view_key: str,
+) -> None:
+    """Завершить меню перед Rich-first доставкой выбранного отчёта."""
+    bot = callback.message.bot
+    chat_id = callback.message.chat.id
+    await state.clear()
+    await callback.answer()
+    await _cleanup_inline_control(callback.message)
+    try:
+        report = _lists_snapshot_report(media_key, view_key)
+    except Exception as e:
+        log.error("lists: формирование (%s/%s): %s", media_key, view_key, e)
+        await callback.message.answer(
+            "⚠️ Не удалось сформировать список, попробуй позже."
+        )
+        return
+    result = await deliver_report(
+        bot,
+        chat_id,
+        report,
+        disable_preview=True,
+        notify_partial=True,
+    )
+    if not result.delivered:
+        log.error(
+            "lists: доставка (%s/%s) остановлена после %d/%d частей: %s",
+            media_key,
+            view_key,
+            result.delivered_units,
+            result.total_units,
+            result.error,
+        )
+
+
+async def lists_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Оркестрировать декларативные пути текущего публичного меню /lists."""
+    data = await _lists_callback_session(callback, state)
+    if data is None:
+        return
+    raw_data = callback.data or ""
+    parts = raw_data.split(":")
+
+    if parts == ["lists", "close"]:
+        await state.clear()
+        await callback.answer()
+        await _cleanup_inline_menu(callback.message)
+        return
+
+    selected_media = data.get("lists_media")
+    if parts == ["lists", "back"]:
+        if selected_media not in LIST_MEDIA_BY_KEY or selected_media == MEDIA_COMBINED:
+            await callback.answer("Неизвестное действие.", show_alert=True)
+            return
+        if await _lists_edit_menu(callback, _lists_root_text(), _lists_root_keyboard()):
+            await state.update_data(lists_media=None)
+        return
+
+    if len(parts) == 3 and parts[:2] == ["lists", "media"]:
+        media = LIST_MEDIA_BY_KEY.get(parts[2])
+        if selected_media is not None or media is None or media.terminal:
+            await callback.answer("Неизвестное действие.", show_alert=True)
+            return
+        if await _lists_edit_menu(
+            callback,
+            _lists_media_text(media.key),
+            _lists_media_keyboard(),
+        ):
+            await state.update_data(lists_media=media.key)
+        return
+
+    if parts == ["lists", MEDIA_COMBINED]:
+        if selected_media is not None:
+            await callback.answer("Неизвестное действие.", show_alert=True)
+            return
+        await _lists_deliver(callback, state, MEDIA_COMBINED, VIEW_ALL)
+        return
+
+    if len(parts) == 3 and parts[:2] == ["lists", "view"]:
+        if (
+            selected_media not in LIST_MEDIA_BY_KEY
+            or selected_media == MEDIA_COMBINED
+            or parts[2] not in LIST_VIEW_BY_KEY
+        ):
+            await callback.answer("Неизвестное действие.", show_alert=True)
+            return
+        await _lists_deliver(callback, state, selected_media, parts[2])
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
 
 
 def _pick_root_keyboard() -> InlineKeyboardMarkup:
@@ -3459,8 +3747,8 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     await state.clear()
-    # /pick хранит только ID текущего локального control message и команды.
-    # Удаляем их тем же best-effort контрактом, что использует Close.
+    # /pick хранит только ID текущего control message и команды. Удаляем их
+    # тем же best-effort контрактом, что использует Close.
     if (
         data.get("pick_menu_chat_id") == message.chat.id
         and type(data.get("pick_menu_message_id")) is int

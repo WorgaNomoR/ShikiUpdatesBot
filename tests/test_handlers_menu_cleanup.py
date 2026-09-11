@@ -13,6 +13,20 @@ import handlers
 
 
 @pytest.mark.asyncio
+async def test_cleanup_inline_control_keeps_original_command():
+    command = MagicMock()
+    command.delete = AsyncMock()
+    menu = MagicMock()
+    menu.delete = AsyncMock()
+    menu.reply_to_message = command
+
+    await handlers._cleanup_inline_control(menu)
+
+    menu.delete.assert_awaited_once_with()
+    command.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_inline_menu_deletes_menu_and_command():
     command = MagicMock()
     command.delete = AsyncMock()

@@ -95,7 +95,43 @@ class Rows:
     rows: tuple[Row, ...]
 
 
-ReportItem = Line | Heading | Rows
+@dataclass(frozen=True)
+class TableCell:
+    """Одна типизированная ячейка произвольной Rich-таблицы."""
+
+    parts: tuple[Inline, ...]
+    colspan: int = 1
+    align: str = "left"
+    valign: str = "top"
+
+
+@dataclass(frozen=True)
+class TableRow:
+    """Один ряд таблицы с явно заданной геометрией ячеек."""
+
+    cells: tuple[TableCell, ...]
+
+
+@dataclass(frozen=True)
+class TableGroup:
+    """Неделимая группа строк, ordinary-проекция и внешние Rich-строки."""
+
+    rows: tuple[TableRow, ...]
+    fallback: tuple[Line, ...]
+    after: tuple[Line, ...] = ()
+
+
+@dataclass(frozen=True)
+class Table:
+    """Произвольная таблица с логическими группами для безопасного chunking."""
+
+    columns: int
+    groups: tuple[TableGroup, ...]
+    header: TableRow | None = None
+    separate_groups: bool = False
+
+
+ReportItem = Line | Heading | Rows | Table
 
 
 @dataclass(frozen=True)
@@ -103,6 +139,13 @@ class _CodeLines:
     """Уже выровненные строки одного continuation-фрагмента Rows."""
 
     lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TableLines:
+    """Ordinary continuation одной логической группы таблицы."""
+
+    lines: tuple[Line, ...]
 
 
 @dataclass(frozen=True)
@@ -221,7 +264,7 @@ def _take_utf16_prefix(value: str, limit: int) -> tuple[str, str]:
 
 
 def _split_line(value: Line, limit: int) -> list[Line]:
-    """Продолжить только plain text, сохраняя formatting nodes атомарными."""
+    """Продолжить текстовые стили, сохраняя ссылки и тайтлы атомарными."""
     fragments: list[Line] = []
     current: list[Inline] = []
     current_length = 0
@@ -232,7 +275,7 @@ def _split_line(value: Line, limit: int) -> list[Line]:
             current.append(part)
             continue
         part_length = telegram_text_length(remaining_text)
-        if not isinstance(part, Text):
+        if isinstance(part, (Link, Title)):
             if part_length > limit:
                 raise ValueError("Formatting node превышает лимит Telegram")
             if current and current_length + part_length > limit:
@@ -276,7 +319,33 @@ def _row_texts(value: Rows) -> tuple[str, ...]:
     return tuple(rendered)
 
 
-def _render_item(value: ReportItem | _CodeLines) -> tuple[str, int]:
+def _render_line_group(lines: tuple[Line, ...]) -> tuple[str, int]:
+    """Отобразить вертикальную группу строк без transport-specific источника."""
+    rendered = [_render_item(item) for item in lines]
+    return (
+        "\n".join(html for html, _ in rendered),
+        sum(length for _, length in rendered) + max(0, len(rendered) - 1),
+    )
+
+
+def _render_table_fallback(value: Table) -> tuple[str, int]:
+    """Отобразить полную вертикальную проекцию таблицы для Telegram HTML."""
+    if any(group.rows and not group.fallback for group in value.groups):
+        raise ValueError("TableGroup с Rich-строками требует ordinary fallback")
+    rendered = [
+        _render_line_group((*group.fallback, *group.after))
+        for group in value.groups
+        if group.fallback or group.after
+    ]
+    return (
+        "\n\n".join(html for html, _ in rendered),
+        sum(length for _, length in rendered) + max(0, len(rendered) - 1) * 2,
+    )
+
+
+def _render_item(
+    value: ReportItem | _CodeLines | _TableLines,
+) -> tuple[str, int]:
     if isinstance(value, Heading):
         return (
             "".join(_render_heading_inline(part) for part in value.parts),
@@ -287,6 +356,10 @@ def _render_item(value: ReportItem | _CodeLines) -> tuple[str, int]:
             "".join(_render_inline(part) for part in value.parts),
             sum(telegram_text_length(_inline_text(part)) for part in value.parts),
         )
+    if isinstance(value, Table):
+        return _render_table_fallback(value)
+    if isinstance(value, _TableLines):
+        return _render_line_group(value.lines)
     rows = value.lines if isinstance(value, _CodeLines) else _row_texts(value)
     plain = "\n".join(rows)
     return f"<code>{escape(plain, quote=True)}</code>", telegram_text_length(plain)
@@ -328,7 +401,29 @@ def _split_rows(value: Rows, limit: int) -> list[_CodeLines]:
     return fragments
 
 
-def _split_item(value: ReportItem, limit: int) -> list[ReportItem | _CodeLines]:
+def _split_table(value: Table, limit: int) -> list[_TableLines]:
+    """Делить таблицу между группами, а oversized-группу — между строками."""
+    fragments: list[_TableLines] = []
+    for group in value.groups:
+        group_lines = (*group.fallback, *group.after)
+        if not group_lines:
+            continue
+        rendered_group = _TableLines(group_lines)
+        if _render_item(rendered_group)[1] <= limit:
+            fragments.append(rendered_group)
+            continue
+        for fallback_line in group_lines:
+            fragments.extend(
+                _TableLines((line_fragment,))
+                for line_fragment in _split_line(fallback_line, limit)
+            )
+    return fragments
+
+
+def _split_item(
+    value: ReportItem,
+    limit: int,
+) -> list[ReportItem | _CodeLines | _TableLines]:
     html, visible = _render_item(value)
     if visible <= limit:
         return [value]
@@ -344,6 +439,8 @@ def _split_item(value: ReportItem, limit: int) -> list[ReportItem | _CodeLines]:
             )
             for fragment in _split_line(Line(value.parts), limit)
         ]
+    if isinstance(value, Table):
+        return _split_table(value, limit)
     return _split_rows(value, limit)
 
 

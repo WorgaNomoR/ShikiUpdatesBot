@@ -2709,6 +2709,18 @@ def test_empty_reading_categories_are_omitted_from_all_report_variants():
         assert len(report.units) == expected_units
 
 
+def test_reading_report_units_use_distinct_category_emojis():
+    report = smod.build_stats_all_messages(_split_stats_fixture())
+
+    manga = rendered_html(Report((report.units[1],)))[0]
+    ranobe = rendered_html(Report((report.units[2],)))[0]
+    unknown = rendered_html(Report((report.units[3],)))[0]
+
+    assert "<b>📚 </b><b>Манга</b>" in manga
+    assert "<b>📖 </b><b>Ранобэ</b>" in ranobe
+    assert "<b>⚠️ </b><b>Не определено</b>" in unknown
+
+
 def test_empty_detail_sections_are_not_built():
     assert smod._top_section("🎭", "Жанры", {}, 8) is None
     assert smod._score_section({}) is None
@@ -2848,7 +2860,9 @@ def test_previous_snapshot_split_requires_complete_evidence(tmp_path, monkeypatc
     assert ("вместе, включая не определённое" in text) is (expected is None)
     assert ("недостаточно данных" in text) is (expected is None)
     if expected is not None:
-        assert "📚 Манга:" in text and "📚 Ранобэ:" in text and "📚 Не определено:" in text
+        assert "📚 Манга:" in text
+        assert "📖 Ранобэ:" in text
+        assert "⚠️ Не определено:" in text
     assert path.read_bytes() == before
 
 

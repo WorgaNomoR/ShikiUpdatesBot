@@ -38,6 +38,9 @@ from report_model import (
     ReportItem,
     Rows,
     Section,
+    Table,
+    TableCell,
+    TableGroup,
     Text,
     Title,
     Unit,
@@ -104,7 +107,7 @@ def _line_list_marker(value: Line) -> tuple[bool, int | None, tuple[Inline, ...]
 def report_has_rich_features(report: Report) -> bool:
     """Есть ли в отчёте структура, которую rich transport реально улучшит."""
     return any(
-        isinstance(item, (Heading, Rows))
+        isinstance(item, (Heading, Rows, Table))
         or isinstance(item, Line) and _line_list_marker(item) is not None
         for logical_unit in report.units
         for logical_section in logical_unit.sections
@@ -116,7 +119,7 @@ def _paragraph(value: Line) -> InputRichBlockParagraph:
     return InputRichBlockParagraph(text=_rich_parts(value.parts))
 
 
-def _table(value: Rows) -> InputRichBlockTable | None:
+def _counter_table(value: Rows) -> InputRichBlockTable | None:
     if not value.rows:
         return None
     has_suffix = any(row.suffix for row in value.rows)
@@ -151,6 +154,74 @@ def _table(value: Rows) -> InputRichBlockTable | None:
         is_striped=True,
         is_compact=True,
     )
+
+
+def _rich_table_cell(value: TableCell) -> RichBlockTableCell:
+    """Проверить геометрию и собрать одну ячейку общей Rich-таблицы."""
+    if type(value.colspan) is not int or value.colspan < 1:
+        raise RichReportRenderError("table_colspan")
+    if value.align not in {"left", "center", "right"}:
+        raise RichReportRenderError("table_align")
+    if value.valign not in {"top", "middle", "bottom"}:
+        raise RichReportRenderError("table_valign")
+    return RichBlockTableCell(
+        align=value.align,
+        valign=value.valign,
+        text=_rich_parts(value.parts) if value.parts else None,
+        colspan=value.colspan if value.colspan > 1 else None,
+    )
+
+
+def _catalog_table(value: Table) -> InputRichBlockTable | None:
+    """Отобразить произвольную таблицу, не используя ordinary-проекцию."""
+    if type(value.columns) is not int or not 1 <= value.columns <= 20:
+        raise RichReportRenderError("table_columns")
+    logical_rows = []
+    if value.header is not None:
+        logical_rows.append(value.header)
+    logical_rows.extend(
+        row
+        for group in value.groups
+        for row in group.rows
+    )
+    if not logical_rows:
+        return None
+
+    cells = []
+    for row in logical_rows:
+        if not row.cells:
+            raise RichReportRenderError("table_row_columns")
+        rendered_cells = [_rich_table_cell(cell) for cell in row.cells]
+        if sum(cell.colspan for cell in row.cells) != value.columns:
+            raise RichReportRenderError("table_row_columns")
+        cells.append(rendered_cells)
+    return InputRichBlockTable(
+        cells=cells,
+        is_bordered=True,
+        is_striped=True,
+        is_compact=True,
+    )
+
+
+def _catalog_table_blocks(value: Table) -> list:
+    """Разделить карточки, чтобы внешние строки не попадали внутрь таблицы."""
+    if not value.separate_groups:
+        if any(group.after for group in value.groups):
+            raise RichReportRenderError("table_after_requires_separate_groups")
+        table = _catalog_table(value)
+        return [table] if table is not None else []
+
+    blocks = []
+    for group in value.groups:
+        table = _catalog_table(Table(
+            columns=value.columns,
+            groups=(TableGroup(group.rows, group.fallback),),
+            header=value.header,
+        ))
+        if table is not None:
+            blocks.append(table)
+        blocks.extend(_paragraph(after) for after in group.after)
+    return blocks
 
 
 def _safe_poster_url(value: object) -> str | None:
@@ -206,9 +277,13 @@ def _render_items(items: tuple[ReportItem, ...]) -> list:
             index += 1
             continue
         if isinstance(item, Rows):
-            table = _table(item)
+            table = _counter_table(item)
             if table is not None:
                 blocks.append(table)
+            index += 1
+            continue
+        if isinstance(item, Table):
+            blocks.extend(_catalog_table_blocks(item))
             index += 1
             continue
         if not isinstance(item, Line):

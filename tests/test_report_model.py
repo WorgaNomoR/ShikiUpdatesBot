@@ -16,6 +16,11 @@ from report_model import (
     Report,
     Row,
     Rows,
+    Table,
+    TableCell,
+    TableGroup,
+    TableRow,
+    Text,
     Title,
     heading,
     line,
@@ -254,3 +259,58 @@ def test_ordinary_logical_items_are_kept_whole_and_present_exactly_once():
     for token in tokens:
         assert sum(token in chunk for chunk in visible_chunks) == 1
         assert sum(chunk.count(token) for chunk in visible_chunks) == 1
+
+
+def test_table_fallback_keeps_groups_and_splits_oversized_plain_comment_losslessly():
+    hostile = "<b>not markup</b> & " + "😀line\n" * 80
+    first = TableGroup(
+        rows=(TableRow((
+            TableCell((Title("First", "https://example.test/first"),)),
+            TableCell((Text("9⭐"),)),
+        )),),
+        fallback=(line("• ", Title("First", "https://example.test/first")),),
+        after=(line("💬 ", Italic(hostile)),),
+    )
+    second = TableGroup(
+        rows=(TableRow((
+            TableCell((Title("Second", "https://example.test/second"),)),
+            TableCell((Text("—"),)),
+        )),),
+        fallback=(line("• ", Title("Second", "https://example.test/second")),),
+    )
+    report = Report((unit(section(Table(
+        columns=2,
+        header=TableRow((
+            TableCell((Bold("Название"),)),
+            TableCell((Bold("Оценка"),)),
+        )),
+        groups=(first, second),
+        separate_groups=True,
+    ))),))
+
+    chunks = _assert_independent_html(report, 127)
+    visible = "".join(_visible_text(chunk) for chunk in chunks)
+    markup = "".join(chunks)
+
+    assert visible.count("First") == 1
+    assert visible.count("Second") == 1
+    assert hostile in visible
+    assert visible.index("First") < visible.index(hostile) < visible.index("Second")
+    assert "&lt;b&gt;not markup&lt;/b&gt;" in markup
+    assert all(chunk.count("<a ") == chunk.count("</a>") for chunk in chunks)
+    assert markup.count('href="https://example.test/first"') == 1
+    assert markup.count('href="https://example.test/second"') == 1
+    assert all(chunk.count("<i>") == chunk.count("</i>") for chunk in chunks)
+
+
+def test_table_rejects_rich_rows_without_complete_ordinary_projection():
+    report = Report((unit(section(Table(
+        columns=1,
+        groups=(TableGroup(
+            rows=(TableRow((TableCell((Text("Rich only"),)),)),),
+            fallback=(),
+        ),),
+    ))),))
+
+    with pytest.raises(ValueError, match="требует ordinary fallback"):
+        render_report(report)

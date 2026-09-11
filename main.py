@@ -53,6 +53,7 @@ from handlers import (
     cmd_favs,
     cmd_info,
     cmd_inline_search,
+    cmd_lists,
     cmd_pick,
     cmd_start,
     cmd_stats,
@@ -72,6 +73,7 @@ from handlers import (
     facts_example_cb,
     facts_receive,
     facts_upload_cb,
+    lists_menu_cb,
     pick_menu_cb,
     probe_owner_and_start,
     stats_menu_cb,
@@ -127,6 +129,7 @@ async def main() -> None:
     dp.message.register(cmd_broadcast, Command("broadcast"))
     dp.message.register(cmd_cancel,    Command("cancel"))
     dp.message.register(cmd_stats,     Command("stats"))
+    dp.message.register(cmd_lists,     Command("lists"))
     dp.message.register(cmd_favs,      Command("favs"))
     dp.message.register(cmd_fact,      Command("fact"))
     dp.message.register(cmd_facts,     Command("facts"))
@@ -179,6 +182,9 @@ async def main() -> None:
     # Кнопки меню /stats (callback_data вида "stats:<ключ>")
     dp.callback_query.register(stats_menu_cb, F.data.startswith("stats:"))
 
+    # Публичный локальный браузер списков
+    dp.callback_query.register(lists_menu_cb, F.data.startswith("lists:"))
+
     # Кнопка обновления сведений о версиях
     dp.callback_query.register(version_refresh_cb, F.data == "version:refresh")
 
@@ -196,6 +202,7 @@ async def main() -> None:
         BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
         BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
         BotCommand(command="stats",  description="Статистика: квартал или всё время 📊"),
+        BotCommand(command="lists",  description="Списки аниме, манги и ранобэ 📋"),
         BotCommand(command="favs",   description="Избранное ❤️"),
         BotCommand(command="fact",   description="Интересный факт 💡"),
         BotCommand(command="info",   description="О боте ℹ️"),
