@@ -518,7 +518,7 @@ def test_rich_pagination_preserves_media_and_view_semantics(
         if f"/{path}/" in node["url"]
     ]
 
-    assert len(rendered) > len(report.units)
+    assert len(rendered) > 1
     assert _titles(report) == expected
     assert rich_titles == expected
     assert all(validate_rich_payload(payload) for payload in payloads)

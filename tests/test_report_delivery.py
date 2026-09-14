@@ -53,8 +53,10 @@ from report_model import (
     unit,
 )
 from report_plan import FrozenReportPlanError
-from rich_message_schema import RICH_TEXT_LIMIT
-from rich_report import RichReportRenderError
+from rich_message_schema import (
+    RICH_BLOCK_LIMIT,
+    RICH_TEXT_LIMIT,
+)
 
 _METHOD = SendMessage(chat_id=1, text="test")
 _RICH_METHOD = SendRichMessage(
@@ -103,6 +105,34 @@ def _oversized_rich_report() -> Report:
             Table(columns=1, groups=groups, separate_groups=True),
         ),
     ),))
+
+
+def _rich_render_failure_report(reason: str, marker: str) -> Report:
+    if reason == "blocks":
+        return Report((unit(section(
+            heading(Bold("Rich"), level=1),
+            *(
+                line(marker if index == 0 else f"line-{index}")
+                for index in range(RICH_BLOCK_LIMIT)
+            ),
+        )),))
+    if reason == "characters":
+        return Report((unit(section(
+            heading(Bold("Rich"), level=1),
+            line(marker + "x" * RICH_TEXT_LIMIT),
+        )),))
+    if reason == "table_columns":
+        return Report((unit(section(
+            heading(Bold("Rich"), level=1),
+            Table(
+                columns=21,
+                groups=(TableGroup(
+                    rows=(TableRow((TableCell((Text(marker),)),)),),
+                    fallback=(line(marker),),
+                ),),
+            ),
+        )),))
+    raise AssertionError(f"Неизвестная причина ошибки renderer: {reason}")
 
 
 @pytest.mark.asyncio
@@ -414,37 +444,33 @@ async def test_unsupported_method_downgrades_paginated_report_without_duplicatio
 
 
 @pytest.mark.parametrize(
-    ("exc", "reason"),
+    ("failure", "reason"),
     [
-        (RichReportRenderError("blocks"), "blocks"),
-        (RichReportRenderError("characters"), "characters"),
-        (RichReportRenderError("table_columns"), "render"),
-        (ReportAssetError("asset_hash"), "materialization"),
+        ("blocks", "blocks"),
+        ("characters", "characters"),
+        ("table_columns", "render"),
+        ("materialization", "materialization"),
     ],
 )
 def test_freeze_warning_uses_safe_reason_without_report_content(
     monkeypatch,
     caplog,
-    exc,
+    failure,
     reason,
 ):
     comment_marker = "COMMENT_MARKER_147"
-    report = Report((unit(section(
-        heading(Bold("Rich"), level=1),
-        line(comment_marker),
-    )),))
-    if isinstance(exc, ReportAssetError):
+    if failure == "materialization":
+        report = Report((unit(section(
+            heading(Bold("Rich"), level=1),
+            line(comment_marker),
+        )),))
         monkeypatch.setattr(
             report_delivery,
             "materialize_rich_message",
-            MagicMock(side_effect=exc),
+            MagicMock(side_effect=ReportAssetError("asset_hash")),
         )
     else:
-        monkeypatch.setattr(
-            report_delivery,
-            "render_rich_report",
-            MagicMock(side_effect=exc),
-        )
+        report = _rich_render_failure_report(failure, comment_marker)
 
     frozen = freeze_report(report)
 
