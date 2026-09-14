@@ -34,6 +34,7 @@ from report_plan import (
 )
 from rich_report import (
     RenderedRichUnit,
+    RichReportRenderError,
     render_rich_report,
     report_has_rich_features,
 )
@@ -82,14 +83,23 @@ def _freeze_rich_plan(
     *,
     disable_preview: bool,
 ) -> list[dict]:
-    """Сопоставить Rich units с обязательным полным HTML fallback."""
+    """Сопоставить каждый Rich fragment с его полным HTML fallback."""
     ordinary_by_unit: dict[int, list[str]] = defaultdict(list)
     for chunk in ordinary:
         ordinary_by_unit[chunk.unit_index].append(chunk.html)
-    rich_by_unit = {unit.unit_index: unit for unit in rendered_rich}
+    rich_by_unit: dict[int, list[RenderedRichUnit]] = defaultdict(list)
+    seen_fragments = set()
+    previous_position = (-1, -1)
+    for rich in rendered_rich:
+        position = (rich.unit_index, rich.fragment_index)
+        if position in seen_fragments:
+            raise ValueError("rich_unit_index_duplicate")
+        if position <= previous_position:
+            raise ValueError("rich_unit_order")
+        seen_fragments.add(position)
+        previous_position = position
+        rich_by_unit[rich.unit_index].append(rich)
     valid_indices = set(range(len(report.units)))
-    if len(rich_by_unit) != len(rendered_rich):
-        raise ValueError("rich_unit_index_duplicate")
     if not set(rich_by_unit) <= valid_indices:
         raise ValueError("rich_unit_index_out_of_range")
     if not set(ordinary_by_unit) <= valid_indices:
@@ -97,15 +107,32 @@ def _freeze_rich_plan(
     frozen = []
     for unit_index in range(len(report.units)):
         fallbacks = ordinary_by_unit.get(unit_index, [])
-        rich = rich_by_unit.get(unit_index)
-        if rich is not None:
+        rich_fragments = rich_by_unit.get(unit_index, [])
+        if rich_fragments:
             if not fallbacks:
                 raise ValueError("rich_unit_without_html_fallback")
-            frozen.append(rich_transport_unit(
-                rich.payload,
-                fallbacks,
-                fallback_disable_preview=disable_preview,
-            ))
+            if [fragment.fragment_index for fragment in rich_fragments] != list(
+                range(len(rich_fragments))
+            ):
+                raise ValueError("rich_unit_fragment_index")
+            for rich in rich_fragments:
+                fallback_unit = rich.fallback_unit
+                if fallback_unit is None:
+                    if len(rich_fragments) != 1:
+                        raise ValueError("rich_fragment_without_fallback")
+                    fallback_messages = fallbacks
+                else:
+                    fallback_messages = [
+                        chunk.html
+                        for chunk in render_report(Report((fallback_unit,)))
+                    ]
+                if not fallback_messages:
+                    raise ValueError("rich_unit_without_html_fallback")
+                frozen.append(rich_transport_unit(
+                    rich.payload,
+                    fallback_messages,
+                    fallback_disable_preview=disable_preview,
+                ))
         else:
             frozen.extend(
                 html_transport_unit(
@@ -116,6 +143,17 @@ def _freeze_rich_plan(
             )
     validate_frozen_report_units(frozen)
     return frozen
+
+
+def _rich_failure_reason(exc: Exception, stage: str) -> str:
+    """Свести локальную ошибку к фиксированному безопасному reason code."""
+    if stage == "materialization" or isinstance(exc, ReportAssetError):
+        return "materialization"
+    if isinstance(exc, RichReportRenderError):
+        if exc.reason in {"blocks", "characters"}:
+            return exc.reason
+        return "render"
+    return "render"
 
 
 def freeze_report(
@@ -132,11 +170,14 @@ def freeze_report(
             for chunk in ordinary
         ]
 
+    stage = "render"
     try:
         rendered_rich = render_rich_report(report)
+        stage = "materialization"
         for unit in rendered_rich:
             # Проверяем доступность versioned assets до первого Telegram await.
             materialize_rich_message(unit.payload)
+        stage = "freeze"
         return _freeze_rich_plan(
             report,
             ordinary,
@@ -145,7 +186,9 @@ def freeze_report(
         )
     except Exception as exc:
         log.warning(
-            "freeze_report: rich-представление недоступно, откат на HTML (%s)",
+            "freeze_report: rich-представление недоступно, откат на HTML "
+            "(reason=%s, type=%s)",
+            _rich_failure_reason(exc, stage),
             type(exc).__name__,
         )
         return [

@@ -314,3 +314,38 @@ def test_table_rejects_rich_rows_without_complete_ordinary_projection():
 
     with pytest.raises(ValueError, match="требует ordinary fallback"):
         render_report(report)
+
+
+def test_oversized_grouped_table_keeps_blank_line_between_adjacent_cards():
+    tokens = [f"card-{index:02d}-xxxxxxxx" for index in range(8)]
+    report = Report((unit(section(Table(
+        columns=1,
+        groups=tuple(
+            TableGroup(
+                rows=(TableRow((TableCell((Text(token),)),)),),
+                fallback=(line(token),),
+            )
+            for token in tokens
+        ),
+        separate_groups=True,
+    ))),))
+
+    chunks = _assert_independent_html(report, 45)
+    visible_chunks = [_visible_text(chunk) for chunk in chunks]
+
+    assert len(chunks) > 1
+    assert [
+        token
+        for chunk in visible_chunks
+        for token in tokens
+        if token in chunk
+    ] == tokens
+    assert all(
+        "\n\n" in chunk
+        for chunk in visible_chunks
+        if sum(token in chunk for token in tokens) > 1
+    )
+    assert all(
+        sum(chunk.count(token) for chunk in visible_chunks) == 1
+        for token in tokens
+    )

@@ -18,6 +18,7 @@ from report_model import (
     render_report,
     rendered_html,
 )
+from rich_message_schema import validate_rich_payload
 from rich_report import render_rich_report
 
 
@@ -97,6 +98,26 @@ def _visible(markup: str) -> str:
     parser.feed(markup)
     parser.close()
     return "".join(parser.parts)
+
+
+def _rich_nodes(payloads: tuple[dict, ...], node_type: str) -> list[dict]:
+    result = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        if value.get("type") == node_type:
+            result.append(value)
+        for item in value.values():
+            visit(item)
+
+    for payload in payloads:
+        visit(payload)
+    return result
 
 
 def test_declarative_registries_define_the_complete_public_surface():
@@ -400,6 +421,150 @@ def test_links_scores_and_hostile_multiline_comments_stay_safe_and_lossless():
     assert hostile in visible
     assert visible.index("Commented") < visible.index(hostile)
     assert visible.index(hostile) < visible.index("Last & title")
+
+
+def test_production_shaped_162_title_list_is_paginated_without_loss():
+    stats = _stats()
+    expected = [f"Title {index:03d}" for index in range(1, 163)]
+    stats["anime"]["titles"] = {
+        str(index): _record(
+            title,
+            url=f"/animes/{index}",
+            year=2024,
+            shiki_score=8.5,
+            episodes_watched=12,
+            episodes_total=12,
+            demographic=["Сэйнэн"],
+            genres=["Драма", "Фантастика"],
+            themes=["Школа"],
+            studios=["Studio"],
+            duration=24,
+            origin="Манга",
+            rating="R-17",
+        )
+        for index, title in enumerate(expected, 1)
+    }
+
+    report = lists.build_list_report(
+        stats,
+        "anime",
+        "completed",
+        base_url="https://shikimori.io",
+    )
+    rendered = render_rich_report(report)
+    payloads = tuple(fragment.payload for fragment in rendered)
+    rich_titles = [
+        node["text"]
+        for node in _rich_nodes(payloads, "url")
+        if "/animes/" in node["url"]
+    ]
+    numbers = [
+        row[0]["text"]
+        for table in _rich_nodes(payloads, "table")
+        for row in table["cells"]
+        if (
+            len(row) == 3
+            and isinstance(row[0].get("text"), str)
+            and row[0]["text"].isdigit()
+        )
+    ]
+
+    assert len(rendered) > 1
+    assert _titles(report) == expected
+    assert rich_titles == expected
+    assert numbers == [str(index) for index in range(1, 163)]
+    assert len(rich_titles) == len(set(rich_titles)) == 162
+    assert all(validate_rich_payload(payload) for payload in payloads)
+
+
+@pytest.mark.parametrize(
+    ("media_key", "view_key", "domain", "kind", "path"),
+    [
+        ("anime", "completed", "anime", "tv", "animes"),
+        ("manga", "completed", "manga", "manga", "mangas"),
+        ("ranobe", "all", "manga", "novel", "mangas"),
+        ("combined", "all", "anime", "tv", "animes"),
+    ],
+)
+def test_rich_pagination_preserves_media_and_view_semantics(
+    media_key,
+    view_key,
+    domain,
+    kind,
+    path,
+):
+    stats = _stats()
+    expected = [f"Title {index:03d}" for index in range(170)]
+    stats[domain]["titles"] = {
+        str(index): _record(
+            title,
+            kind=kind,
+            url=f"/{path}/{index}",
+        )
+        for index, title in enumerate(expected)
+    }
+
+    report = lists.build_list_report(
+        stats,
+        media_key,
+        view_key,
+        base_url="https://shikimori.io",
+    )
+    rendered = render_rich_report(report)
+    payloads = tuple(fragment.payload for fragment in rendered)
+    rich_titles = [
+        node["text"]
+        for node in _rich_nodes(payloads, "url")
+        if f"/{path}/" in node["url"]
+    ]
+
+    assert len(rendered) > 1
+    assert _titles(report) == expected
+    assert rich_titles == expected
+    assert all(validate_rich_payload(payload) for payload in payloads)
+
+
+def test_oversized_hostile_comment_continues_losslessly_between_neighbours():
+    stats = _stats()
+    hostile = (
+        "<b>plain</b>\n* not Markdown\n"
+        + "Ж😀<&>\n" * 7000
+        + "END"
+    )
+    stats["anime"]["titles"] = {
+        "1": _record("First", score=10, url="/animes/1"),
+        "2": _record(
+            "Commented",
+            score=9,
+            url="/animes/2",
+            comment=hostile,
+        ),
+        "3": _record("Last", score=8, url="/animes/3"),
+    }
+
+    report = lists.build_list_report(
+        stats,
+        "anime",
+        "completed",
+        base_url="https://shikimori.io",
+    )
+    rendered = render_rich_report(report)
+    payloads = tuple(fragment.payload for fragment in rendered)
+    rich_titles = [
+        node["text"]
+        for node in _rich_nodes(payloads, "url")
+        if "/animes/" in node["url"]
+    ]
+    comment = "".join(
+        node["text"]
+        for node in _rich_nodes(payloads, "italic")
+        if "тайтла" not in node["text"]
+    )
+
+    assert len(rendered) > 1
+    assert rich_titles == ["First", "Commented", "Last"]
+    assert comment == hostile
+    assert all(validate_rich_payload(payload) for payload in payloads)
 
 
 def test_unknown_registry_keys_are_rejected_without_guessing():
