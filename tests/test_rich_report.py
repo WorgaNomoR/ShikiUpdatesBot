@@ -43,6 +43,10 @@ from report_model import (
     section,
     unit,
 )
+from rich_message_schema import (
+    RICH_TEXT_LIMIT,
+    validate_rich_payload,
+)
 from rich_report import render_rich_report
 
 
@@ -382,3 +386,114 @@ def test_partial_poster_hints_never_create_a_misaligned_collage():
     assert [type(block) for block in details.blocks] == [
         InputRichBlockList,
     ]
+
+
+def _catalog_report(count: int, *, padding: int = 0) -> Report:
+    groups = tuple(
+        TableGroup(
+            rows=(TableRow((TableCell((Text(
+                f"card-{index:03d}-{'x' * padding}"
+            ),)),)),),
+            fallback=(line(f"card-{index:03d}-{'x' * padding}"),),
+        )
+        for index in range(count)
+    )
+    return Report((unit(
+        section(heading("📺 ", Bold("АНИМЕ"), level=1)),
+        section(
+            heading(
+                "✅ ",
+                Bold(f"Просмотрено · {count}"),
+                collapsible=True,
+            ),
+            Table(columns=1, groups=groups, separate_groups=True),
+        ),
+    ),))
+
+
+def _catalog_tokens(payloads: tuple[dict, ...]) -> list[str]:
+    result = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, str):
+            if value.startswith("card-"):
+                result.append(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+
+    for payload in payloads:
+        visit(payload)
+    return result
+
+
+def test_grouped_cards_paginate_immediately_after_exact_block_boundary():
+    before = render_rich_report(_catalog_report(248))
+    after = render_rich_report(_catalog_report(249))
+
+    assert len(before) == 1
+    assert len(after) == 2
+    assert all(validate_rich_payload(fragment.payload) for fragment in after)
+    assert _catalog_tokens(tuple(fragment.payload for fragment in after)) == [
+        f"card-{index:03d}-"
+        for index in range(249)
+    ]
+    assert all(fragment.fallback_unit is not None for fragment in after)
+
+
+def test_oversized_comment_paginates_immediately_after_character_boundary():
+    fixed_text = len("H") + len("S") + len("card") + len("↑ К началу")
+
+    def report(comment_length: int) -> Report:
+        group = TableGroup(
+            rows=(TableRow((TableCell((Text("card"),)),)),),
+            fallback=(line("card"),),
+            after=(line(Italic("x" * comment_length)),),
+        )
+        return Report((unit(
+            section(heading("H", level=1)),
+            section(
+                heading("S", collapsible=True),
+                Table(columns=1, groups=(group,), separate_groups=True),
+            ),
+        ),))
+
+    before = render_rich_report(report(RICH_TEXT_LIMIT - fixed_text))
+    after = render_rich_report(report(RICH_TEXT_LIMIT - fixed_text + 1))
+
+    assert len(before) == 1
+    assert len(after) == 2
+    assert all(validate_rich_payload(fragment.payload) for fragment in after)
+    assert "".join(
+        value["text"]["text"]
+        for fragment in after
+        for block in fragment.payload["blocks"]
+        if block["type"] == "details"
+        for value in block["blocks"]
+        if value["type"] == "paragraph"
+    ) == "x" * (RICH_TEXT_LIMIT - fixed_text + 1)
+
+
+def test_grouped_cards_pack_against_simultaneous_block_and_character_pressure():
+    rendered = render_rich_report(_catalog_report(260, padding=140))
+    payloads = tuple(fragment.payload for fragment in rendered)
+
+    assert len(rendered) > 1
+    assert all(validate_rich_payload(payload) for payload in payloads)
+    assert _catalog_tokens(payloads) == [
+        f"card-{index:03d}-{'x' * 140}"
+        for index in range(260)
+    ]
+    for fragment in rendered:
+        assert fragment.message.blocks[0].name == "unit-0-top"
+        assert fragment.message.blocks[-1].text.text.text == "↑ К началу"
+        assert isinstance(fragment.message.blocks[1], InputRichBlockSectionHeading)
+        assert any(
+            isinstance(block, InputRichBlockDetails)
+            for block in fragment.message.blocks
+        )

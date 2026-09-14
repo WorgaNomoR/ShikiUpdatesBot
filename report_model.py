@@ -146,6 +146,7 @@ class _TableLines:
     """Ordinary continuation одной логической группы таблицы."""
 
     lines: tuple[Line, ...]
+    separate_before: bool = False
 
 
 @dataclass(frozen=True)
@@ -404,19 +405,25 @@ def _split_rows(value: Rows, limit: int) -> list[_CodeLines]:
 def _split_table(value: Table, limit: int) -> list[_TableLines]:
     """Делить таблицу между группами, а oversized-группу — между строками."""
     fragments: list[_TableLines] = []
-    for group in value.groups:
+    for group_index, group in enumerate(value.groups):
         group_lines = (*group.fallback, *group.after)
         if not group_lines:
             continue
         rendered_group = _TableLines(group_lines)
         if _render_item(rendered_group)[1] <= limit:
-            fragments.append(rendered_group)
+            fragments.append(_TableLines(
+                group_lines,
+                separate_before=group_index > 0,
+            ))
             continue
+        first_fragment = True
         for fallback_line in group_lines:
-            fragments.extend(
-                _TableLines((line_fragment,))
-                for line_fragment in _split_line(fallback_line, limit)
-            )
+            for line_fragment in _split_line(fallback_line, limit):
+                fragments.append(_TableLines(
+                    (line_fragment,),
+                    separate_before=group_index > 0 and first_fragment,
+                ))
+                first_fragment = False
     return fragments
 
 
@@ -483,11 +490,19 @@ def _render_unit(value: Unit, limit: int, unit_index: int) -> list[RenderedChunk
         for item in logical_section.items:
             for item_fragment in _split_item(item, limit):
                 item_html, item_length = _render_item(item_fragment)
-                item_separator = 1 if current_html else 0
+                item_separator = (
+                    2
+                    if (
+                        current_html
+                        and isinstance(item_fragment, _TableLines)
+                        and item_fragment.separate_before
+                    )
+                    else 1 if current_html else 0
+                )
                 if item_length > limit - current_length - item_separator:
                     flush()
                     item_separator = 0
-                current_html += ("\n" if item_separator else "") + item_html
+                current_html += ("\n" * item_separator) + item_html
                 current_length += item_separator + item_length
         flush()
 

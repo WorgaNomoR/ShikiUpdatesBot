@@ -41,6 +41,11 @@ from report_model import (
     Bold,
     Poster,
     Report,
+    Table,
+    TableCell,
+    TableGroup,
+    TableRow,
+    Text,
     Title,
     heading,
     line,
@@ -49,6 +54,7 @@ from report_model import (
 )
 from report_plan import FrozenReportPlanError
 from rich_message_schema import RICH_TEXT_LIMIT
+from rich_report import RichReportRenderError
 
 _METHOD = SendMessage(chat_id=1, text="test")
 _RICH_METHOD = SendRichMessage(
@@ -80,6 +86,23 @@ def _poster_report() -> Report:
         ),
         line("  2. ", Title("second", None, Poster(None))),
     )),))
+
+
+def _oversized_rich_report() -> Report:
+    groups = tuple(
+        TableGroup(
+            rows=(TableRow((TableCell((Text(f"card-{index:03d}"),)),)),),
+            fallback=(line(f"card-{index:03d}"),),
+        )
+        for index in range(249)
+    )
+    return Report((unit(
+        section(heading(Bold("ANIME"), level=1)),
+        section(
+            heading(Bold("Completed"), collapsible=True),
+            Table(columns=1, groups=groups, separate_groups=True),
+        ),
+    ),))
 
 
 @pytest.mark.asyncio
@@ -316,6 +339,118 @@ async def test_structured_report_uses_rich_transport_successfully():
         call.kwargs["rich_message"].skip_entity_detection is True
         for call in bot.send_rich_message.await_args_list
     )
+
+
+def test_multiple_rich_fragments_freeze_with_exact_per_fragment_html_fallback():
+    frozen = freeze_report(_oversized_rich_report(), disable_preview=True)
+    fallback = "\n".join(
+        message
+        for transport_unit in frozen
+        for message in transport_unit["fallback_html"]
+    )
+
+    assert len(frozen) == 2
+    assert all(unit["transport"] == "rich" for unit in frozen)
+    assert all(unit["fallback_disable_preview"] is True for unit in frozen)
+    assert all(
+        fallback.count(f"card-{index:03d}") == 1
+        for index in range(249)
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiple_rich_fragments_of_one_unit_are_delivered_sequentially():
+    bot = MagicMock()
+    bot.send_rich_message = AsyncMock(return_value=object())
+    bot.send_message = AsyncMock(return_value=object())
+    gap_sleep = AsyncMock()
+
+    result = await deliver_report(
+        bot,
+        7,
+        _oversized_rich_report(),
+        sleep=gap_sleep,
+    )
+
+    assert result.delivered is True
+    assert result.delivered_units == result.total_units == 2
+    assert bot.send_rich_message.await_count == 2
+    assert gap_sleep.await_count == 1
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_method_downgrades_paginated_report_without_duplication():
+    unsupported = TelegramNotFound(
+        method=_RICH_METHOD,
+        message="Not Found",
+    )
+    bot = MagicMock()
+    bot.send_rich_message = AsyncMock(side_effect=unsupported)
+    bot.send_message = AsyncMock(return_value=object())
+
+    result = await deliver_report(
+        bot,
+        7,
+        _oversized_rich_report(),
+        disable_preview=True,
+        sleep=AsyncMock(),
+    )
+    fallback = "\n".join(
+        call.kwargs["text"]
+        for call in bot.send_message.await_args_list
+    )
+
+    assert result.delivered is True
+    bot.send_rich_message.assert_awaited_once()
+    assert all(
+        fallback.count(f"card-{index:03d}") == 1
+        for index in range(249)
+    )
+    assert all(
+        call.kwargs["disable_web_page_preview"] is True
+        for call in bot.send_message.await_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    ("exc", "reason"),
+    [
+        (RichReportRenderError("blocks"), "blocks"),
+        (RichReportRenderError("characters"), "characters"),
+        (RichReportRenderError("table_columns"), "render"),
+        (ReportAssetError("asset_hash"), "materialization"),
+    ],
+)
+def test_freeze_warning_uses_safe_reason_without_report_content(
+    monkeypatch,
+    caplog,
+    exc,
+    reason,
+):
+    comment_marker = "COMMENT_MARKER_147"
+    report = Report((unit(section(
+        heading(Bold("Rich"), level=1),
+        line(comment_marker),
+    )),))
+    if isinstance(exc, ReportAssetError):
+        monkeypatch.setattr(
+            report_delivery,
+            "materialize_rich_message",
+            MagicMock(side_effect=exc),
+        )
+    else:
+        monkeypatch.setattr(
+            report_delivery,
+            "render_rich_report",
+            MagicMock(side_effect=exc),
+        )
+
+    frozen = freeze_report(report)
+
+    assert frozen[0]["transport"] == "html"
+    assert f"reason={reason}" in caplog.text
+    assert comment_marker not in caplog.text
 
 
 @pytest.mark.asyncio
