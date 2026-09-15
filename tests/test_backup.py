@@ -11,6 +11,7 @@ import asyncio
 import io
 import json
 import lzma
+import threading
 import time
 import zipfile
 import zlib
@@ -79,13 +80,13 @@ async def test_import_roundtrips_supported_quarter_delivery_plans(backup_env, sc
         )
         pending["next_unit"] = {"current_partial": 1, "current_complete": 2, "empty": 0}[schema]
     cur["pending_quarter_delivery"] = pending
-    generation = storage.quarter_restore_generation()
+    generation = storage.restorable_restore_generation()
     result = await backup.restore_backup_zip(_zip_bytes({"stats_current.json": json.dumps(cur)}))
     assert result["restored"] == ["stats_current.json"]
     assert storage.load_stats_current(strict=True) == cur
-    assert storage.quarter_restore_generation() == generation + 1
+    assert storage.restorable_restore_generation() == generation + 1
     # Экспорт сохраняет ту же схему и frozen payload, не создаёт новый план.
-    payload = backup._build_backup_zip()
+    payload, _ = await backup._build_backup_zip()
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         assert json.loads(archive.read("stats_current.json")) == cur
 
@@ -114,7 +115,7 @@ async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, dam
             "old_period": "2026-Q2", "new_period": "2026-Q3",
             "report_messages": [None], "report_sent": False,
         }
-    generation = storage.quarter_restore_generation()
+    generation = storage.restorable_restore_generation()
     with pytest.raises(storage.QuarterDeliveryStateError) as excinfo:
         await backup.restore_backup_zip(_zip_bytes({
             "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
@@ -124,7 +125,7 @@ async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, dam
     assert "private report" not in caplog.text
     assert storage.load_stats_current() == current
     assert not (backup_env / "quarters" / "2026-Q1.json").exists()
-    assert storage.quarter_restore_generation() == generation
+    assert storage.restorable_restore_generation() == generation
 
 
 @pytest.mark.asyncio
@@ -132,7 +133,7 @@ async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, dam
 async def test_import_rejects_invalid_period_without_pending_before_publication(backup_env, period):
     current = storage._empty_stats_current("2026-Q2")
     storage.save_stats_current(current)
-    generation = storage.quarter_restore_generation()
+    generation = storage.restorable_restore_generation()
     with pytest.raises(storage.QuarterDeliveryStateError, match="^period_format$"):
         await backup.restore_backup_zip(_zip_bytes({
             "quarters/2026-Q1.json": '{"period": "2026-Q1"}',
@@ -140,7 +141,7 @@ async def test_import_rejects_invalid_period_without_pending_before_publication(
         }))
     assert storage.load_stats_current() == current
     assert not (backup_env / "quarters" / "2026-Q1.json").exists()
-    assert storage.quarter_restore_generation() == generation
+    assert storage.restorable_restore_generation() == generation
 
 # ─────────────────────────────────────────────────────────────
 #  Хелперы
@@ -209,6 +210,15 @@ async def _cancel_after_started(awaitable, started: asyncio.Event) -> None:
         await task
 
 
+def _backup_worker_threads() -> list[threading.Thread]:
+    """Вернуть только worker-потоки текущего backup pipeline."""
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("shikibot-backup")
+    ]
+
+
 def _corrupt_stored_member(raw: bytes, name: str) -> bytes:
     """Повредить данные ZIP-члена, сохранив центральный каталог и старый CRC."""
     damaged = bytearray(raw)
@@ -226,7 +236,8 @@ def _corrupt_stored_member(raw: bytes, name: str) -> bytes:
 #  Сборка архива
 # ─────────────────────────────────────────────────────────────
 
-def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
+@pytest.mark.asyncio
+async def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
     (backup_env / "blocked_users.json").write_text(
         '{"blocked_user_ids": [7]}',
@@ -247,7 +258,7 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     storage._atomic_write(restore_stage / "subscribers.json", "staged")
     (backup_env / "quarters" / "2026-Q1.json").write_text('{"period": "2026-Q1"}', encoding="utf-8")
 
-    raw = backup._build_backup_zip()
+    raw, _ = await backup._build_backup_zip()
     names = set(zipfile.ZipFile(io.BytesIO(raw)).namelist())
 
     assert "subscribers.json" in names
@@ -259,6 +270,263 @@ def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     assert "quarters/2026-Q1.json" in names          # вложенность сохранена
     assert "subscribers.json.tmp" not in names       # *.tmp исключён
     assert not any(name.startswith(".restore-") for name in names)
+
+
+@pytest.mark.asyncio
+async def test_slow_restorable_capture_keeps_event_loop_live_and_blocks_writer(
+    backup_env,
+    monkeypatch,
+):
+    old = b'{"period":"2026-Q2","events":[]}'
+    new = '{"period":"2026-Q2","events":[{"id":"new"}]}'
+    (backup_env / "stats_current.json").write_bytes(old)
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_read = backup._read_backup_members
+
+    def slow_read(cancelled, manifest, initial_total):
+        if any(member.restorable for member in manifest):
+            loop.call_soon_threadsafe(started.set)
+            while not release.wait(0.005):
+                backup._raise_if_backup_cancelled(cancelled)
+        return real_read(cancelled, manifest, initial_total)
+
+    monkeypatch.setattr(backup, "_read_backup_members", slow_read)
+    build_task = asyncio.create_task(backup._build_backup_zip())
+    await started.wait()
+
+    ticks = 0
+    for _ in range(5):
+        await asyncio.sleep(0)
+        ticks += 1
+
+    async def publish_new_state():
+        async with storage.restorable_state_transaction():
+            storage._atomic_write(backup_env / "stats_current.json", new)
+
+    writer = asyncio.create_task(publish_new_state())
+    await asyncio.sleep(0.02)
+    assert ticks == 5
+    assert writer.done() is False
+
+    release.set()
+    raw, _ = await build_task
+    await writer
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert archive.read("stats_current.json") == old
+    assert (backup_env / "stats_current.json").read_text(encoding="utf-8") == new
+
+
+@pytest.mark.asyncio
+async def test_first_run_stats_current_waits_for_snapshot_transaction(
+    backup_env,
+    monkeypatch,
+):
+    (backup_env / "blocked_users.json").write_text(
+        '{"blocked_user_ids":[]}',
+        encoding="utf-8",
+    )
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_read = backup._read_backup_members
+
+    def slow_read(cancelled, manifest, initial_total):
+        if any(member.restorable for member in manifest):
+            loop.call_soon_threadsafe(started.set)
+            while not release.wait(0.005):
+                backup._raise_if_backup_cancelled(cancelled)
+        return real_read(cancelled, manifest, initial_total)
+
+    monkeypatch.setattr(backup, "_read_backup_members", slow_read)
+    build_task = asyncio.create_task(backup._build_backup_zip())
+    await started.wait()
+    initialization = asyncio.create_task(
+        handlers._load_stats_current_transactional()
+    )
+    await asyncio.sleep(0.02)
+
+    assert initialization.done() is False
+    assert (backup_env / "stats_current.json").exists() is False
+
+    release.set()
+    await build_task
+    current = await initialization
+
+    assert current["period"]
+    assert (backup_env / "stats_current.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_slow_compression_releases_lock_and_keeps_coherent_snapshot(
+    backup_env,
+    monkeypatch,
+):
+    old = b'{"period":"2026-Q2","events":[]}'
+    new = '{"period":"2026-Q2","events":[{"id":"new"}]}'
+    (backup_env / "stats_current.json").write_bytes(old)
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_compress = backup._compress_backup_zip
+
+    def slow_compress(cancelled, members):
+        loop.call_soon_threadsafe(started.set)
+        while not release.wait(0.005):
+            backup._raise_if_backup_cancelled(cancelled)
+        return real_compress(cancelled, members)
+
+    monkeypatch.setattr(backup, "_compress_backup_zip", slow_compress)
+    build_task = asyncio.create_task(backup._build_backup_zip())
+    await started.wait()
+
+    async with storage.restorable_state_transaction():
+        storage._atomic_write(backup_env / "stats_current.json", new)
+    await asyncio.sleep(0)
+    assert build_task.done() is False
+
+    release.set()
+    raw, _ = await build_task
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert archive.read("stats_current.json") == old
+    assert (backup_env / "stats_current.json").read_text(encoding="utf-8") == new
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["capture", "compression"])
+async def test_backup_cancellation_drains_worker(
+    backup_env,
+    monkeypatch,
+    stage,
+):
+    (backup_env / "stats_current.json").write_text(
+        '{"period":"2026-Q2","events":[]}',
+        encoding="utf-8",
+    )
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def wait_for_cancel(cancelled, *args):
+        loop.call_soon_threadsafe(started.set)
+        while not cancelled.wait(0.005):
+            pass
+        backup._raise_if_backup_cancelled(cancelled)
+
+    target = "_read_backup_members" if stage == "capture" else "_compress_backup_zip"
+    monkeypatch.setattr(backup, target, wait_for_cancel)
+    task = asyncio.create_task(backup._build_backup_zip())
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _backup_worker_threads() == []
+
+
+@pytest.mark.asyncio
+async def test_backup_cancelled_before_start_schedules_no_worker(backup_env, monkeypatch):
+    scan = Mock()
+    monkeypatch.setattr(backup, "_scan_backup_manifest", scan)
+    task = asyncio.create_task(backup._build_backup_zip())
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    scan.assert_not_called()
+    assert _backup_worker_threads() == []
+
+
+@pytest.mark.asyncio
+async def test_restore_during_compression_invalidates_snapshot_before_upload(
+    backup_env,
+    monkeypatch,
+):
+    storage.save_update_state(storage._empty_update_state())
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_compress = backup._compress_backup_zip
+
+    def slow_compress(cancelled, members):
+        loop.call_soon_threadsafe(started.set)
+        while not release.wait(0.005):
+            backup._raise_if_backup_cancelled(cancelled)
+        return real_compress(cancelled, members)
+
+    monkeypatch.setattr(backup, "_compress_backup_zip", slow_compress)
+    bot = AsyncMock()
+    send_task = asyncio.create_task(backup.send_backup(bot, "x"))
+    await started.wait()
+    generation = storage.restorable_restore_generation()
+
+    await backup.restore_backup_zip(
+        _zip_bytes({
+            "update_state.json": json.dumps(storage._empty_update_state()),
+        })
+    )
+    release.set()
+
+    assert await send_task is False
+    assert storage.restorable_restore_generation() == generation + 1
+    bot.send_document.assert_not_awaited()
+    assert _backup_worker_threads() == []
+
+
+@pytest.mark.asyncio
+async def test_backup_resource_limits_are_inclusive(backup_env, monkeypatch):
+    monkeypatch.setattr(backup, "_BACKUP_ARCHIVE_MAX_MEMBERS", 2)
+    monkeypatch.setattr(backup, "_BACKUP_RESTORABLE_MEMBER_MAX_BYTES", 4)
+    monkeypatch.setattr(backup, "_BACKUP_TOTAL_MAX_BYTES", 8)
+    (backup_env / "blocked_users.json").write_bytes(b"1234")
+    (backup_env / "stats_all.json").write_bytes(b"5678")
+
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert archive.read("blocked_users.json") == b"1234"
+        assert archive.read("stats_all.json") == b"5678"
+
+    (backup_env / "extra.json").write_bytes(b"x")
+    with pytest.raises(ValueError, match="больше 2 файлов"):
+        await backup._build_backup_zip()
+
+    (backup_env / "extra.json").unlink()
+    (backup_env / "blocked_users.json").write_bytes(b"12345")
+    with pytest.raises(ValueError, match="восстанавливаемый файл больше"):
+        await backup._build_backup_zip()
+
+    (backup_env / "blocked_users.json").write_bytes(b"1234")
+    (backup_env / "stats_all.json").write_bytes(b"56789")
+    with pytest.raises(ValueError, match="суммарный размер backup больше"):
+        await backup._build_backup_zip()
+
+
+def test_completed_zip_limit_is_inclusive(monkeypatch):
+    cancelled = threading.Event()
+    members = (backup._BackupMember("payload.bin", bytes(range(256)) * 16),)
+    monkeypatch.setattr(backup, "_BACKUP_ZIP_MAX_BYTES", 1024 * 1024)
+    raw = backup._compress_backup_zip(cancelled, members)
+
+    monkeypatch.setattr(backup, "_BACKUP_ZIP_MAX_BYTES", len(raw))
+    assert len(backup._compress_backup_zip(cancelled, members)) == len(raw)
+
+    monkeypatch.setattr(backup, "_BACKUP_ZIP_MAX_BYTES", len(raw) - 1)
+    with pytest.raises(ValueError, match="готовый backup ZIP больше"):
+        backup._compress_backup_zip(cancelled, members)
+
+
+def test_export_limits_match_import_and_telegram_boundaries():
+    assert backup._BACKUP_ARCHIVE_MAX_MEMBERS == backup._IMPORT_ARCHIVE_MAX_MEMBERS
+    assert (
+        backup._BACKUP_RESTORABLE_MEMBER_MAX_BYTES
+        == backup._IMPORT_MEMBER_MAX_BYTES
+    )
+    assert backup._BACKUP_TOTAL_MAX_BYTES == backup._IMPORT_TOTAL_MAX_BYTES
+    assert backup._BACKUP_ZIP_MAX_BYTES == backup.IMPORT_DOCUMENT_MAX_BYTES
 
 
 # ─────────────────────────────────────────────────────────────
@@ -834,7 +1102,9 @@ async def test_send_backup_retries_transient_upload_with_fresh_file(
     backup_env,
     monkeypatch,
 ):
-    build = Mock(return_value=b"zip-data")
+    build = AsyncMock(
+        return_value=(b"zip-data", storage.restorable_restore_generation())
+    )
     monkeypatch.setattr(backup, "_build_backup_zip", build)
     monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
     documents = []
@@ -848,7 +1118,7 @@ async def test_send_backup_retries_transient_upload_with_fresh_file(
     bot.send_document.side_effect = _send_document
 
     assert await backup.send_backup(bot, "x") is True
-    build.assert_called_once_with()
+    build.assert_awaited_once_with()
     assert bot.send_document.await_count == 2
     assert documents[0] is not documents[1]
     assert backup._last_backup_sent_at is not None
@@ -873,13 +1143,91 @@ async def test_send_backup_exhausted_retries_do_not_advance_clock(
 
 @pytest.mark.asyncio
 async def test_send_backup_build_failure_is_not_retried(backup_env, monkeypatch):
-    build = Mock(side_effect=OSError("archive failed"))
+    build = AsyncMock(side_effect=OSError("archive failed"))
     monkeypatch.setattr(backup, "_build_backup_zip", build)
     bot = AsyncMock()
 
     assert await backup.send_backup(bot, "x") is False
-    build.assert_called_once_with()
+    build.assert_awaited_once_with()
     bot.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_and_retry_sleep_do_not_hold_restorable_lock(
+    backup_env,
+    monkeypatch,
+):
+    (backup_env / "stats_current.json").write_text(
+        '{"period":"2026-Q2","events":[]}',
+        encoding="utf-8",
+    )
+    attempts = 0
+
+    async def send_document(*args, **kwargs):
+        nonlocal attempts
+        async with storage.restorable_state_transaction():
+            pass
+        attempts += 1
+        if attempts == 1:
+            raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+    async def retry_sleep(_delay):
+        async with storage.restorable_state_transaction():
+            pass
+
+    bot = AsyncMock()
+    bot.send_document.side_effect = send_document
+    monkeypatch.setattr("telegram_delivery._sleep", retry_sleep)
+
+    assert await asyncio.wait_for(backup.send_backup(bot, "x"), timeout=5) is True
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_restore_during_upload_invalidates_confirmed_send(
+    backup_env,
+):
+    storage.save_update_state(storage._empty_update_state())
+
+    async def send_document(*args, **kwargs):
+        await backup.restore_backup_zip(
+            _zip_bytes({
+                "update_state.json": json.dumps(storage._empty_update_state()),
+            })
+        )
+
+    bot = AsyncMock()
+    bot.send_document.side_effect = send_document
+
+    assert await backup.send_backup(bot, "x") is False
+    bot.send_document.assert_awaited_once()
+    assert backup._last_backup_sent_at is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_upload_has_no_worker_or_acknowledgement(backup_env):
+    (backup_env / "stats_current.json").write_text(
+        '{"period":"2026-Q2","events":[]}',
+        encoding="utf-8",
+    )
+    started = asyncio.Event()
+
+    async def send_document(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    bot = AsyncMock()
+    bot.send_document.side_effect = send_document
+    task = asyncio.create_task(backup.send_backup(bot, "x"))
+    await started.wait()
+    assert _backup_worker_threads() == []
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert backup._last_backup_sent_at is None
+    assert _backup_worker_threads() == []
 
 
 # ─────────────────────────────────────────────────────────────
@@ -907,6 +1255,19 @@ async def test_first_eligible_subscription_sends_and_clears_pending(
     schedule = storage.load_subscription_backup_state()
     assert isinstance(schedule["last_backup_at"], float)
     assert schedule["pending"] is None
+
+
+@pytest.mark.asyncio
+async def test_subscription_caller_builds_and_sends_real_archive(backup_env):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    bot = AsyncMock()
+
+    assert await backup._backup_after_subscription(bot) is True
+
+    document = bot.send_document.await_args.kwargs["document"]
+    with zipfile.ZipFile(io.BytesIO(document.data)) as archive:
+        assert "subscribers.json" in archive.namelist()
+    assert "Накопленные изменения подписок" in bot.send_document.await_args.kwargs["caption"]
 
 
 @pytest.mark.asyncio
@@ -1072,6 +1433,29 @@ async def test_restore_during_subscription_send_is_not_acknowledged(
 
 
 @pytest.mark.asyncio
+async def test_unrelated_restore_during_subscription_send_keeps_pending(
+    backup_env,
+    monkeypatch,
+):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+
+    async def send_and_restore(_bot, _caption):
+        await backup.restore_backup_zip(
+            _zip_bytes({
+                "update_state.json": json.dumps(storage._empty_update_state()),
+            })
+        )
+        return True
+
+    monkeypatch.setattr("backup.send_backup", send_and_restore)
+
+    assert await backup._backup_after_subscription(AsyncMock()) is False
+    schedule = storage.load_subscription_backup_state()
+    assert schedule["last_backup_at"] is None
+    assert schedule["pending"]["subscriptions"] == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("last_backup_at", [None, 100.0, 2_000_000.0])
 async def test_missing_stale_and_future_timestamp_make_pending_eligible(
     backup_env,
@@ -1216,6 +1600,21 @@ async def test_weekly_backup_due_sends_and_updates(backup_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_weekly_caller_builds_and_sends_real_archive(backup_env):
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
+    cur = {"period": "2026-Q2", "events": []}
+    _save_subscriber_schedule(last_backup_at=old, weekly_started_at=old)
+    bot = AsyncMock()
+
+    assert await backup._weekly_backup_if_due(bot, cur) is cur
+
+    document = bot.send_document.await_args.kwargs["document"]
+    with zipfile.ZipFile(io.BytesIO(document.data)) as archive:
+        assert "subscribers.json" in archive.namelist()
+    assert "Еженедельный бэкап" in bot.send_document.await_args.kwargs["caption"]
+
+
+@pytest.mark.asyncio
 async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monkeypatch):
     monkeypatch.setattr("backup.send_backup", AsyncMock(return_value=False))
     old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
@@ -1225,6 +1624,29 @@ async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monk
     out = await backup._weekly_backup_if_due(AsyncMock(), cur)
 
     assert out is cur
+    assert storage.load_subscription_backup_state()["last_backup_at"] == old
+
+
+@pytest.mark.asyncio
+async def test_unrelated_restore_during_weekly_send_keeps_old_timestamp(
+    backup_env,
+    monkeypatch,
+):
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
+    cur = {"period": "2026-Q2", "events": []}
+    _save_subscriber_schedule(last_backup_at=old, weekly_started_at=old)
+
+    async def send_and_restore(_bot, _caption):
+        await backup.restore_backup_zip(
+            _zip_bytes({
+                "update_state.json": json.dumps(storage._empty_update_state()),
+            })
+        )
+        return True
+
+    monkeypatch.setattr("backup.send_backup", send_and_restore)
+
+    assert await backup._weekly_backup_if_due(AsyncMock(), cur) is cur
     assert storage.load_subscription_backup_state()["last_backup_at"] == old
 
 
@@ -1368,6 +1790,30 @@ async def test_shutdown_backup_timeout_cancels_retry_sequence(backup_env, monkey
 
     assert wait_for_calls == 1
     bot.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_real_shutdown_timeout_drains_backup_worker(backup_env, monkeypatch):
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
+    monkeypatch.setattr(backup, "SHUTDOWN_BACKUP_TIMEOUT", 0.02)
+    started = threading.Event()
+
+    def slow_scan(cancelled):
+        started.set()
+        while not cancelled.wait(0.005):
+            pass
+        backup._raise_if_backup_cancelled(cancelled)
+
+    monkeypatch.setattr(backup, "_scan_backup_manifest", slow_scan)
+    bot = AsyncMock()
+    before = time.monotonic()
+
+    await backup._shutdown_backup(bot)
+
+    assert started.is_set()
+    assert time.monotonic() - before < 1
+    bot.send_document.assert_not_awaited()
+    assert _backup_worker_threads() == []
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1622,13 +2068,15 @@ def _facts_payload(fact_id: str | None, *, version="backup-test") -> str:
     )
 
 
-def test_backup_export_includes_facts_json(backup_env):
+@pytest.mark.asyncio
+async def test_backup_export_includes_facts_json(backup_env):
     (backup_env / "facts.json").write_text(
         _facts_payload("exported-fact"),
         encoding="utf-8",
     )
 
-    names = set(zipfile.ZipFile(io.BytesIO(backup._build_backup_zip())).namelist())
+    raw, _ = await backup._build_backup_zip()
+    names = set(zipfile.ZipFile(io.BytesIO(raw)).namelist())
 
     assert "facts.json" in names
     assert backup._is_allowed_import_member("facts.json") is True
