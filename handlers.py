@@ -18,7 +18,10 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from aiogram import Bot
-from aiogram.enums import ParseMode
+from aiogram.enums import (
+    ChatType,
+    ParseMode,
+)
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
@@ -3547,6 +3550,12 @@ async def cmd_users(message: Message) -> None:
     if message.from_user is None or message.from_user.id != OWNER_ID:
         await message.answer(
             "🚫 Эта команда только для владельца бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer(
+            "🔒 Каталог пользователей доступен только в личном чате с ботом.",
             parse_mode=ParseMode.HTML,
         )
         return

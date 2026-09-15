@@ -13,10 +13,14 @@ import user_directory_delivery
 from report_delivery import ReportDeliveryResult
 
 
-def _message(user_id: int | None):
+def _message(
+    user_id: int | None,
+    *,
+    chat_type=handlers.ChatType.PRIVATE,
+):
     return SimpleNamespace(
         from_user=(SimpleNamespace(id=user_id) if user_id is not None else None),
-        chat=SimpleNamespace(id=777),
+        chat=SimpleNamespace(id=777, type=chat_type),
         bot=SimpleNamespace(),
         answer=AsyncMock(),
     )
@@ -33,7 +37,26 @@ async def test_cmd_users_rejects_before_directory_access(monkeypatch, user_id):
     await handlers.cmd_users(message)
 
     deliver.assert_not_awaited()
-    message.answer.assert_awaited_once()
+    message.answer.assert_awaited_once_with(
+        "🚫 Эта команда только для владельца бота.",
+        parse_mode=handlers.ParseMode.HTML,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cmd_users_rejects_owner_outside_private_chat(monkeypatch):
+    monkeypatch.setattr(handlers, "OWNER_ID", 999)
+    deliver = AsyncMock()
+    monkeypatch.setattr(handlers, "deliver_user_directory", deliver)
+    message = _message(999, chat_type=handlers.ChatType.GROUP)
+
+    await handlers.cmd_users(message)
+
+    deliver.assert_not_awaited()
+    message.answer.assert_awaited_once_with(
+        "🔒 Каталог пользователей доступен только в личном чате с ботом.",
+        parse_mode=handlers.ParseMode.HTML,
+    )
 
 
 @pytest.mark.asyncio
