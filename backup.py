@@ -20,7 +20,10 @@ import weakref
 import zipfile
 import zlib
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import (
+    asynccontextmanager,
+    suppress,
+)
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -351,10 +354,8 @@ async def _drain_backup_worker(future: asyncio.Future) -> None:
             return
         return
     if not future.cancelled():
-        try:
+        with suppress(Exception):
             future.result()
-        except Exception:
-            pass
 
 
 async def _run_backup_worker(
