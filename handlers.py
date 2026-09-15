@@ -3,8 +3,8 @@
 """
 Хендлеры и фоновый цикл ShikiUpdatesBot.
 
-Верхний слой: команды и FSM (/start, /stop, /subs, /block, /unblock, /blocklist,
-/useralerts, /broadcast, /backup, /facts, /pick, /status, /stats, /lists, /favs,
+Верхний слой: команды и FSM (/start, /stop, /subs, /users, /block, /unblock,
+/blocklist, /useralerts, /broadcast, /backup, /facts, /pick, /status, /stats, /lists, /favs,
 /fact, /info, /version), inline-меню, рассылка, цикл уведомлений (check_and_notify*,
 polling_loop) и ротация квартала. Зависит от всех нижних модулей;
 main.py лишь регистрирует эти функции в Dispatcher.
@@ -223,6 +223,7 @@ from updates import (
     build_version_text,
     refresh_update_state,
 )
+from user_directory_delivery import deliver_user_directory
 from utils import (
     _parse_iso_utc,
     _rel_url,
@@ -3539,6 +3540,18 @@ async def cmd_subs(message: Message) -> None:
         lines.append(f"{i}. {_subscriber_link(cid, uname)}")
     sep = "\n"
     await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_users(message: Message) -> None:
+    """Доставить владельцу единый read-only каталог пользователей."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer(
+            "🚫 Эта команда только для владельца бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await deliver_user_directory(message.bot, message.chat.id)
 
 
 async def cmd_useralerts(
