@@ -1505,6 +1505,55 @@ async def test_identical_restore_during_backup_does_not_clear_pending(quarter_de
 
 
 @pytest.mark.asyncio
+async def test_quarter_caller_builds_and_sends_real_archive(
+    quarter_delivery_env,
+    monkeypatch,
+):
+    cur = _frozen_quarter(["done"], next_unit=1)
+    cur["last_report_sent"] = "2026-Q3"
+    storage.save_stats_current(cur, strict=True)
+    monkeypatch.setattr(handlers, "send_backup", backup.send_backup)
+    bot = AsyncMock()
+
+    result = await handlers._deliver_pending_quarter(bot, cur)
+
+    document = bot.send_document.await_args.kwargs["document"]
+    with zipfile.ZipFile(io.BytesIO(document.data)) as archive:
+        assert "stats_current.json" in archive.namelist()
+    assert "Ротация квартала" in bot.send_document.await_args.kwargs["caption"]
+    assert result["pending_quarter_delivery"] is None
+    assert isinstance(
+        storage.load_subscription_backup_state()["last_backup_at"],
+        float,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unrelated_restore_during_quarter_backup_does_not_clear_pending(
+    quarter_delivery_env,
+):
+    cur = _frozen_quarter(["done"], next_unit=1)
+    cur["last_report_sent"] = "2026-Q3"
+    storage.save_stats_current(cur, strict=True)
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr(
+            "update_state.json",
+            json.dumps(storage._empty_update_state()),
+        )
+
+    async def restore_while_sending(*args):
+        await backup.restore_backup_zip(stream.getvalue())
+        return True
+
+    quarter_delivery_env.side_effect = restore_while_sending
+    await handlers._deliver_pending_quarter(AsyncMock(), cur)
+
+    assert storage.load_stats_current() == cur
+    assert storage.load_subscription_backup_state()["last_backup_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_changed_plan_followup_read_failure_keeps_owner_diagnostic(quarter_delivery_env, monkeypatch):
     cur = _frozen_quarter(["done"], next_unit=1)
     cur["last_report_sent"] = "2026-Q3"
@@ -1512,7 +1561,7 @@ async def test_changed_plan_followup_read_failure_keeps_owner_diagnostic(quarter
 
     async def replace_during_backup(*args):
         async with storage.restorable_state_transaction():
-            storage.mark_quarter_state_restored()
+            storage.mark_restorable_state_restored()
         monkeypatch.setattr("handlers.load_stats_current", MagicMock(side_effect=[
             deepcopy(cur), storage.QuarterDeliveryStateError("current_read"),
         ]))

@@ -14,11 +14,14 @@ import json
 import lzma
 import math
 import tempfile
+import threading
 import time
 import weakref
 import zipfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot
@@ -51,7 +54,8 @@ from storage import (
     known_users_from_payload,
     load_blocked_users,
     load_subscriber_state,
-    mark_quarter_state_restored,
+    mark_restorable_state_restored,
+    restorable_restore_generation,
     restorable_state_transaction,
     save_subscriber_state,
     subscriber_state_from_payload,
@@ -74,9 +78,15 @@ _IMPORT_ARCHIVE_MAX_MEMBERS = 256
 _IMPORT_MEMBER_MAX_BYTES = 8 * 1024 * 1024
 _IMPORT_TOTAL_MAX_BYTES = 32 * 1024 * 1024
 
+_BACKUP_ARCHIVE_MAX_MEMBERS = _IMPORT_ARCHIVE_MAX_MEMBERS
+_BACKUP_RESTORABLE_MEMBER_MAX_BYTES = _IMPORT_MEMBER_MAX_BYTES
+_BACKUP_TOTAL_MAX_BYTES = _IMPORT_TOTAL_MAX_BYTES
+_BACKUP_ZIP_MAX_BYTES = IMPORT_DOCUMENT_MAX_BYTES
+_BACKUP_IO_CHUNK_BYTES = 256 * 1024
+
 SHUTDOWN_BACKUP_DEBOUNCE = 60   # с: не дублировать shutdown-бэкап после свежего
 
-SHUTDOWN_BACKUP_TIMEOUT  = 8    # с: жёсткий потолок отправки в окне graceful-shutdown
+SHUTDOWN_BACKUP_TIMEOUT = 8  # с: deadline; после него только bounded cancellation drain
 
 _last_backup_sent_at: float | None = None   # monotonic-метка последнего успешного бэкапа
 
@@ -98,6 +108,31 @@ _STRICT_IMPORT_FILES: frozenset[str] = frozenset({
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
+
+
+class BackupSnapshotInvalidated(RuntimeError):
+    """Restorable-state был восстановлен во время подготовки или доставки."""
+
+
+class _BackupWorkerCancelled(RuntimeError):
+    """Кооперативная остановка синхронной стадии backup worker."""
+
+
+@dataclass(frozen=True, slots=True)
+class _BackupManifestMember:
+    """Зафиксированный путь одного участника архива."""
+
+    path: Path
+    name: str
+    restorable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _BackupMember:
+    """Неизменяемые bytes одного участника готовящегося архива."""
+
+    name: str
+    data: bytes
 
 
 def _backup_filename() -> str:
@@ -201,24 +236,206 @@ def _remaining_pending_after_success(current: dict, delivered: dict) -> dict | N
     }
 
 
-def _build_backup_zip() -> bytes:
-    """Зипуем весь DATA_DIR в память. Исключаем *.tmp (недописанные хвосты
-    _atomic_write). arcname — путь относительно DATA_DIR, чтобы структура
-    (включая quarters/) восстановилась один-в-один. Возвращаем bytes —
-    готовый архив для BufferedInputFile, без временных файлов на диске."""
+def _raise_if_backup_cancelled(cancelled: threading.Event) -> None:
+    """Остановить worker на ближайшей ограниченной границе работы."""
+    if cancelled.is_set():
+        raise _BackupWorkerCancelled
+
+
+def _scan_backup_manifest(
+    cancelled: threading.Event,
+) -> tuple[_BackupManifestMember, ...]:
+    """Зафиксировать сортированный состав DATA_DIR вне event loop."""
+    members: list[_BackupManifestMember] = []
+    for path in DATA_DIR.rglob("*"):
+        _raise_if_backup_cancelled(cancelled)
+        if not path.is_file() or path.name.endswith(".tmp"):
+            continue
+        relative = path.relative_to(DATA_DIR)
+        if any(
+            part.startswith(".restore-") and part.endswith(".tmp")
+            for part in relative.parts
+        ):
+            continue
+        name = relative.as_posix()
+        members.append(
+            _BackupManifestMember(
+                path=path,
+                name=name,
+                restorable=_is_allowed_import_member(name),
+            )
+        )
+        if len(members) > _BACKUP_ARCHIVE_MAX_MEMBERS:
+            raise ValueError(
+                f"в backup больше {_BACKUP_ARCHIVE_MAX_MEMBERS} файлов"
+            )
+    return tuple(sorted(members, key=lambda member: member.name))
+
+
+def _read_backup_members(
+    cancelled: threading.Event,
+    manifest: tuple[_BackupManifestMember, ...],
+    initial_total: int,
+) -> tuple[tuple[_BackupMember, ...], int]:
+    """Прочитать manifest ограниченными chunks и вернуть неизменяемые bytes."""
+    total = initial_total
+    captured: list[_BackupMember] = []
+    for member in manifest:
+        _raise_if_backup_cancelled(cancelled)
+        size = 0
+        buf = io.BytesIO()
+        with member.path.open("rb") as source:
+            while True:
+                _raise_if_backup_cancelled(cancelled)
+                chunk = source.read(_BACKUP_IO_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                total += len(chunk)
+                if (
+                    member.restorable
+                    and size > _BACKUP_RESTORABLE_MEMBER_MAX_BYTES
+                ):
+                    raise ValueError(
+                        "восстанавливаемый файл больше "
+                        f"{_BACKUP_RESTORABLE_MEMBER_MAX_BYTES // (1024 * 1024)} МиБ"
+                    )
+                if total > _BACKUP_TOTAL_MAX_BYTES:
+                    raise ValueError(
+                        "суммарный размер backup больше "
+                        f"{_BACKUP_TOTAL_MAX_BYTES // (1024 * 1024)} МиБ"
+                    )
+                buf.write(chunk)
+        captured.append(_BackupMember(member.name, buf.getvalue()))
+    return tuple(captured), total
+
+
+def _compress_backup_zip(
+    cancelled: threading.Event,
+    members: tuple[_BackupMember, ...],
+) -> bytes:
+    """Сжать immutable snapshot ограниченными chunks вне event loop."""
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(DATA_DIR.rglob("*")):
-            if not path.is_file() or path.name.endswith(".tmp"):
-                continue
-            relative = path.relative_to(DATA_DIR)
-            if any(
-                part.startswith(".restore-") and part.endswith(".tmp")
-                for part in relative.parts
-            ):
-                continue
-            zf.write(path, relative.as_posix())
-    return buf.getvalue()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for member in members:
+            _raise_if_backup_cancelled(cancelled)
+            with archive.open(member.name, "w") as target:
+                view = memoryview(member.data)
+                for offset in range(0, len(view), _BACKUP_IO_CHUNK_BYTES):
+                    _raise_if_backup_cancelled(cancelled)
+                    target.write(view[offset:offset + _BACKUP_IO_CHUNK_BYTES])
+                    if buf.tell() > _BACKUP_ZIP_MAX_BYTES:
+                        raise ValueError(
+                            "готовый backup ZIP больше "
+                            f"{_BACKUP_ZIP_MAX_BYTES // (1024 * 1024)} МиБ"
+                        )
+    data = buf.getvalue()
+    if len(data) > _BACKUP_ZIP_MAX_BYTES:
+        raise ValueError(
+            "готовый backup ZIP больше "
+            f"{_BACKUP_ZIP_MAX_BYTES // (1024 * 1024)} МиБ"
+        )
+    return data
+
+
+async def _drain_backup_worker(future: asyncio.Future) -> None:
+    """Дождаться кооперативной остановки, не оставляя detached worker."""
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if future.cancelled():
+                return
+            continue
+        except Exception:
+            return
+        return
+    if not future.cancelled():
+        try:
+            future.result()
+        except Exception:
+            pass
+
+
+async def _run_backup_worker(
+    executor: ThreadPoolExecutor,
+    cancelled: threading.Event,
+    operation,
+    *args,
+):
+    """Запустить одну стадию и обязательно остановить её при отмене coroutine."""
+    future = asyncio.get_running_loop().run_in_executor(
+        executor,
+        operation,
+        cancelled,
+        *args,
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        cancelled.set()
+        await _drain_backup_worker(future)
+        raise
+
+
+def _ensure_backup_generation(generation: int) -> None:
+    """Не продолжать работу со snapshot, пережившим restore publication."""
+    if restorable_restore_generation() != generation:
+        raise BackupSnapshotInvalidated
+
+
+async def _build_backup_zip() -> tuple[bytes, int]:
+    """Получить coherent snapshot и сжать его без блокировки event loop."""
+    cancelled = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shikibot-backup")
+    try:
+        async with restorable_state_transaction():
+            generation = restorable_restore_generation()
+            manifest = await _run_backup_worker(
+                executor,
+                cancelled,
+                _scan_backup_manifest,
+            )
+            restorable_manifest = tuple(
+                member for member in manifest if member.restorable
+            )
+            restorable_members, total = await _run_backup_worker(
+                executor,
+                cancelled,
+                _read_backup_members,
+                restorable_manifest,
+                0,
+            )
+
+        _ensure_backup_generation(generation)
+        export_manifest = tuple(
+            member for member in manifest if not member.restorable
+        )
+        export_members, _ = await _run_backup_worker(
+            executor,
+            cancelled,
+            _read_backup_members,
+            export_manifest,
+            total,
+        )
+        _ensure_backup_generation(generation)
+        members = tuple(
+            sorted(
+                (*restorable_members, *export_members),
+                key=lambda member: member.name,
+            )
+        )
+        data = await _run_backup_worker(
+            executor,
+            cancelled,
+            _compress_backup_zip,
+            members,
+        )
+        _ensure_backup_generation(generation)
+        return data, generation
+    finally:
+        cancelled.set()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 async def send_backup(bot: Bot, caption: str) -> bool:
@@ -227,13 +444,17 @@ async def send_backup(bot: Bot, caption: str) -> bool:
     должен ронять вызывающий флоу (подписку, ротацию, цикл)."""
     global _last_backup_sent_at
     try:
-        data = _build_backup_zip()
+        data, generation = await _build_backup_zip()
+    except BackupSnapshotInvalidated:
+        log.warning("send_backup: snapshot устарел после восстановления состояния.")
+        return False
     except Exception as e:
         log.error("send_backup: не удалось собрать архив: %s", e)
         return False
     filename = _backup_filename()
 
     async def _send_document():
+        _ensure_backup_generation(generation)
         return await bot.send_document(
             OWNER_ID,
             document=BufferedInputFile(data, filename=filename),
@@ -243,9 +464,13 @@ async def send_backup(bot: Bot, caption: str) -> bool:
 
     try:
         await send_with_retry(_send_document)
+        _ensure_backup_generation(generation)
         log.info("send_backup: архив отправлен владельцу (%d байт).", len(data))
         _last_backup_sent_at = time.monotonic()
         return True
+    except BackupSnapshotInvalidated:
+        log.warning("send_backup: restore отменил подтверждение старого snapshot.")
+        return False
     except Exception as e:
         log.error("send_backup: не удалось отправить владельцу: %s", e)
         return False
@@ -259,6 +484,8 @@ async def _shutdown_backup(bot: Bot) -> None:
     бэкап уходил только что, второй не шлём. Короткий таймаут — лучше не успеть,
     чем зависнуть и быть убитым жёстко на полпути. SIGKILL/OOM/слишком короткий
     grace этим не покрыть by design — на то и событийные бэкапы (две сети внахлёст).
+    После deadline send_backup кооперативно останавливает и дожидается своего
+    chunked worker; compression, retry и upload после возврата не продолжаются.
     Бонус: само сообщение — сигнал владельцу «бот гасится», на проде нетипично."""
     if (_last_backup_sent_at is not None
             and time.monotonic() - _last_backup_sent_at < SHUTDOWN_BACKUP_DEBOUNCE):
@@ -611,8 +838,7 @@ async def restore_backup_zip(raw: bytes) -> dict:
     async with restorable_state_transaction():
         pending = _prepare_access_restore_candidate(pending)
         restored = _publish_restore_files(pending)
-        if "stats_current.json" in restored:
-            mark_quarter_state_restored()
+        mark_restorable_state_restored()
         if restored_fact_document is not None:
             activate_restored_fact_bank(restored_fact_document)
     log.info("restore_backup_zip: восстановлено %d, пропущено %d.",
@@ -636,6 +862,7 @@ async def _backup_after_subscription(bot: Bot) -> bool:
                 return False
             delivered = dict(pending)
             subscriber_count = len(state.subscribers)
+            generation = restorable_restore_generation()
 
         if not await send_backup(
             bot,
@@ -645,6 +872,12 @@ async def _backup_after_subscription(bot: Bot) -> bool:
 
         completed_at = time.time()
         async with restorable_state_transaction():
+            if restorable_restore_generation() != generation:
+                log.warning(
+                    "subscription backup: состояние восстановлено во время "
+                    "отправки; успех не подтверждаю."
+                )
+                return False
             state = load_subscriber_state(strict_subscribers=True)
             current = state.backup_schedule.get("pending")
             if current is None:
@@ -688,6 +921,7 @@ async def _weekly_backup_if_due(bot: Bot, cur: dict) -> dict:
                 return cur
             expected_state = storage_subscriber_state_json(state)
             subscriber_count = len(state.subscribers)
+            generation = restorable_restore_generation()
 
         caption = (
             "🗓️ Еженедельный бэкап состояния.\n"
@@ -698,6 +932,12 @@ async def _weekly_backup_if_due(bot: Bot, cur: dict) -> dict:
 
         completed_at = time.time()
         async with restorable_state_transaction():
+            if restorable_restore_generation() != generation:
+                log.warning(
+                    "weekly backup: состояние восстановлено во время отправки; "
+                    "успех не подтверждаю."
+                )
+                return cur
             state = load_subscriber_state(strict_subscribers=True)
             if storage_subscriber_state_json(state) != expected_state:
                 log.warning(

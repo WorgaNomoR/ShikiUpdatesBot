@@ -1016,18 +1016,18 @@ class QuarterDeliveryStateError(ValueError):
     """Квартальная доставка не может безопасно прочитать или сохранить состояние."""
 
 
-_quarter_restore_generation = 0
+_restorable_restore_generation = 0
 
 
-def quarter_restore_generation() -> int:
-    """Поколение восстановления: даже идентичный импорт отменяет текущую попытку."""
-    return _quarter_restore_generation
+def restorable_restore_generation() -> int:
+    """Поколение восстановления: любой успешный импорт отменяет старую попытку."""
+    return _restorable_restore_generation
 
 
-def mark_quarter_state_restored() -> None:
-    """Вызывается импортом под общим lock после публикации stats_current.json."""
-    global _quarter_restore_generation
-    _quarter_restore_generation += 1
+def mark_restorable_state_restored() -> None:
+    """Отметить успешную публикацию любого restorable-кандидата под общим lock."""
+    global _restorable_restore_generation
+    _restorable_restore_generation += 1
 
 
 def _quarter_plan_hash(pending: dict) -> str:

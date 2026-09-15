@@ -202,8 +202,8 @@ from storage import (
     migrate_quarter_delivery,
     mutate_subscription,
     new_quarter_delivery_plan,
-    quarter_restore_generation,
     remove_blocked_user,
+    restorable_restore_generation,
     restorable_state_transaction,
     save_seen_favourites,
     save_seen_ids,
@@ -468,7 +468,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         pending = _valid_pending_quarter_delivery(cur)
         if pending is None:
             return cur
-        generation = quarter_restore_generation()
+        generation = restorable_restore_generation()
         migrated = migrate_quarter_delivery(pending)
         units_key = (
             "report_units" if migrated.get("version") == 2 else "report_messages"
@@ -487,7 +487,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         current = load_stats_current(strict=True)
         actual = _valid_pending_quarter_delivery(current)
         expected = dict(pending, next_unit=index)
-        if quarter_restore_generation() != generation or actual != expected:
+        if restorable_restore_generation() != generation or actual != expected:
             raise _QuarterPlanChanged
         return current
 
@@ -582,6 +582,12 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
     except QuarterDeliveryStateError as error:
         await _quarter_state_diagnostic(bot, error)
         return cur
+
+
+async def _load_stats_current_transactional() -> dict:
+    """Создать fallback stats_current только под restorable-state lock."""
+    async with restorable_state_transaction():
+        return load_stats_current()
 
 
 async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
@@ -707,7 +713,7 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
 async def _stats_report_current() -> Report:
     """Отчёт за текущий квартал."""
     stats_all = load_stats_all()
-    cur = load_stats_current()
+    cur = await _load_stats_current_transactional()
     return build_current_stats_messages(cur, stats_all)
 
 
@@ -2037,7 +2043,7 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
 
     if entries is None:
         log.info("Запрос истории не удался — пропускаем цикл.")
-        return seen_ids, load_stats_current()
+        return seen_ids, await _load_stats_current_transactional()
 
     # baseline пуст (первый запуск либо стартовая инициализация не прошла
     # из-за 429/сети) — молча фиксируем текущую историю как baseline и
@@ -2046,13 +2052,13 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
         seen_ids = {e["id"] for e in entries}
         save_seen_ids(seen_ids)
         log.info("История: baseline инициализирован в цикле (%d ID), без отправки.", len(seen_ids))
-        return seen_ids, load_stats_current()
+        return seen_ids, await _load_stats_current_transactional()
 
     new_entries = [e for e in entries if e["id"] not in seen_ids]
 
     if not new_entries:
         log.info("Новых записей нет.")
-        return seen_ids, load_stats_current()
+        return seen_ids, await _load_stats_current_transactional()
 
     log.info("Найдено новых записей: %d", len(new_entries))
 
@@ -2176,7 +2182,7 @@ async def polling_loop(bot: Bot) -> None:
     """
     seen_ids  = load_seen_ids()
     seen_favs = load_seen_favourites()
-    cur = load_stats_current()
+    cur = await _load_stats_current_transactional()
     log.info(
         "Бот запущен. Отображаемое имя: %s | Подписчиков: %d | Виденных ID: %d | Интервал: %d сек.",
         DISPLAY_NAME, len(load_subscribers()), len(seen_ids), CHECK_INTERVAL,
