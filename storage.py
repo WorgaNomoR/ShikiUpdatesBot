@@ -58,6 +58,10 @@ class SubscriptionBackupStateError(ValueError):
     """Состояние отложенного подписочного бэкапа повреждено."""
 
 
+class SubscribersStateError(ValueError):
+    """Существующее состояние подписчиков нельзя строго прочитать."""
+
+
 @dataclass
 class SubscriberState:
     """Подписчики вместе с атомарно публикуемым состоянием их бэкапа."""
@@ -146,6 +150,35 @@ def subscribers_from_payload(payload: object) -> dict[int, str]:
         return {int(key): value for key, value in raw_subscribers.items()}
     except (TypeError, ValueError) as e:
         raise ValueError("ключ подписчика должен быть числовым ID") from e
+
+
+def strict_subscribers_from_payload(payload: object) -> dict[int, str]:
+    """Строго разобрать подписчиков без потери chat ID или подписи."""
+    if not isinstance(payload, dict):
+        raise SubscribersStateError("состояние подписчиков должно быть объектом")
+    raw_subscribers = payload.get("subscribers")
+    if not isinstance(raw_subscribers, dict):
+        raise SubscribersStateError("поле subscribers должно быть объектом")
+
+    subscribers: dict[int, str] = {}
+    for raw_chat_id, label in raw_subscribers.items():
+        if not isinstance(raw_chat_id, str) or not raw_chat_id.isascii():
+            raise SubscribersStateError("ключ подписчика должен быть ASCII chat ID")
+        digits = raw_chat_id[1:] if raw_chat_id.startswith("-") else raw_chat_id
+        if not digits or not digits.isdecimal():
+            raise SubscribersStateError("ключ подписчика должен быть числовым chat ID")
+        chat_id = int(raw_chat_id)
+        if (
+            str(chat_id) != raw_chat_id
+            or chat_id == 0
+            or chat_id < -(2**63)
+            or chat_id > 2**63 - 1
+        ):
+            raise SubscribersStateError("подписчик содержит недопустимый chat ID")
+        if not isinstance(label, str):
+            raise SubscribersStateError("подпись подписчика должна быть строкой")
+        subscribers[chat_id] = label
+    return subscribers
 
 
 def _empty_backup_schedule() -> dict:
@@ -392,6 +425,33 @@ def load_subscribers() -> dict[int, str]:
     Возвращаем dict[chat_id: int, name: str].
     """
     return load_subscriber_state().subscribers
+
+
+def load_subscribers_strict() -> dict[int, str]:
+    """Строго загрузить каталог подписчиков без recovery или миграции."""
+    path = Path(SUBS_FILE)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        subscribers = strict_subscribers_from_payload(payload)
+        subscriber_state_from_payload(payload, strict_schedule=True)
+        return subscribers
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+        SubscriptionBackupStateError,
+        SubscribersStateError,
+        ValueError,
+    ) as e:
+        log.error(
+            "load_subscribers_strict: состояние недоступно или повреждено: %s",
+            e,
+        )
+        raise SubscribersStateError(
+            "состояние подписчиков недоступно или повреждено"
+        ) from e
 
 
 def _load_subscriber_state_for_access_recovery() -> SubscriberState:
@@ -668,6 +728,23 @@ class KnownUserRegistration:
     should_alert: bool
 
 
+class UserDirectorySnapshotError(ValueError):
+    """Один из обязательных источников каталога нельзя прочитать."""
+
+    def __init__(self, source: str):
+        self.source = source
+        super().__init__(f"источник каталога недоступен: {source}")
+
+
+@dataclass(frozen=True)
+class UserDirectorySnapshot:
+    """Неизменяемый согласованный снимок трёх независимых состояний."""
+
+    known_users: tuple[KnownUser, ...]
+    subscribers: tuple[tuple[int, str], ...]
+    blocked_user_ids: frozenset[int]
+
+
 def _validate_known_user_text(value: object, field: str) -> str:
     """Проверить обязательное непустое строковое поле пользователя."""
     if not isinstance(value, str) or not value.strip():
@@ -801,6 +878,32 @@ def known_user_count() -> int:
 def get_known_user(user_id: int) -> KnownUser | None:
     """Вернуть сохранённого пользователя по Telegram ID."""
     return load_known_users().get(validate_telegram_user_id(user_id))
+
+
+async def load_user_directory_snapshot() -> UserDirectorySnapshot:
+    """Скопировать три источника каталога под одним restorable-state lock."""
+    async with restorable_state_transaction():
+        try:
+            known_users = load_known_users()
+        except (KnownUsersStateError, OSError, ValueError) as e:
+            raise UserDirectorySnapshotError("known_users") from e
+        try:
+            subscribers = load_subscribers_strict()
+        except (SubscribersStateError, OSError, ValueError) as e:
+            raise UserDirectorySnapshotError("subscribers") from e
+        try:
+            blocked_user_ids = load_blocked_users()
+        except (BlockedUsersStateError, OSError, ValueError) as e:
+            raise UserDirectorySnapshotError("blocked_users") from e
+
+        return UserDirectorySnapshot(
+            known_users=tuple(
+                known_users[user_id]
+                for user_id in sorted(known_users)
+            ),
+            subscribers=tuple(sorted(subscribers.items())),
+            blocked_user_ids=frozenset(blocked_user_ids),
+        )
 
 
 def user_alerts_from_payload(payload: object) -> bool:

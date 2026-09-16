@@ -77,7 +77,7 @@ class _Counter:
         if not isinstance(value, dict) or not isinstance(value.get("type"), str):
             raise RichMessageValidationError("rich_text_type")
         kind = value["type"]
-        if kind in {"bold", "italic", "subscript"}:
+        if kind in {"bold", "code", "italic", "subscript"}:
             if set(value) != {"type", "text"}:
                 raise RichMessageValidationError("rich_text_fields")
             self.text(value["text"], depth + 1)

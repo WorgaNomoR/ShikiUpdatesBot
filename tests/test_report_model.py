@@ -10,6 +10,7 @@ import pytest
 
 from report_model import (
     Bold,
+    Code,
     Italic,
     Link,
     Poster,
@@ -123,6 +124,17 @@ def _assert_independent_html(report: Report, limit: int) -> list[str]:
         _parse_html(chunk.html)
         assert chunk.visible_length <= limit
     return [chunk.html for chunk in chunks]
+
+
+def test_inline_code_is_escaped_and_keeps_visible_text():
+    report = Report((unit(section(line("Команда: ", Code("/block <ID>")))),))
+
+    chunks = render_report(report)
+
+    assert [chunk.html for chunk in chunks] == [
+        "Команда: <code>/block &lt;ID&gt;</code>"
+    ]
+    assert _visible_text(chunks[0].html) == "Команда: /block <ID>"
 
 
 def test_renderer_escapes_untrusted_text_labels_and_url_only_at_boundary():

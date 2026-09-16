@@ -17,6 +17,7 @@ from aiogram.types import (
     InputRichMessage,
     RichTextAnchorLink,
     RichTextBold,
+    RichTextCode,
     RichTextItalic,
     RichTextSubscript,
     RichTextUrl,
@@ -25,6 +26,7 @@ from aiogram.types import (
 from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
 from report_model import (
     Bold,
+    Code,
     Italic,
     Link,
     Poster,
@@ -112,6 +114,16 @@ def test_renderer_uses_exact_aiogram_types_and_keeps_values_as_text():
     assert ordered.items[0].blocks[0].text.text == "<linked title>"
     assert ordered.items[0].blocks[0].text.url == 'https://example.test/?q=<x>&v="y"'
     assert isinstance(ordered.items[1].blocks[0].text, RichTextItalic)
+
+
+def test_inline_code_maps_to_native_rich_text_code():
+    report = Report((unit(section(line("Команда: ", Code("/block ID")))),))
+
+    paragraph = render_rich_report(report)[0].message.blocks[0]
+
+    assert isinstance(paragraph, InputRichBlockParagraph)
+    assert isinstance(paragraph.text[1], RichTextCode)
+    assert paragraph.text[1].text == "/block ID"
 
 
 def test_table_label_can_improve_rich_layout_without_changing_html_fallback():

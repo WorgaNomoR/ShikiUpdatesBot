@@ -117,6 +117,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.cmd_block in registered_messages
     assert main.cmd_unblock in registered_messages
     assert main.cmd_useralerts in registered_messages
+    assert main.cmd_users in registered_messages
     lists_registrations = [
         call
         for call in app.dispatcher.message.register.call_args_list
@@ -142,6 +143,8 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert "facts" not in public_commands
     assert "pick" not in public_commands
     assert "useralerts" not in public_commands
+    assert "users" not in public_commands
+    assert "subs" not in public_commands
     facts_registrations = [
         call
         for call in app.dispatcher.message.register.call_args_list
@@ -245,6 +248,17 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     useralerts_filter = useralerts_registration.args[1]
     assert isinstance(useralerts_filter, main.Command)
     assert useralerts_filter.commands == ("useralerts",)
+    users_registration = next(
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.cmd_users
+    )
+    users_filter = users_registration.args[1]
+    assert isinstance(users_filter, main.Command)
+    assert users_filter.commands == ("users",)
+    assert users_registration.kwargs["flags"] == {
+        main.REGISTRATION_NEUTRAL_FLAG: True,
+    }
     app.dispatcher.shutdown.register.assert_not_called()
     app.probe.assert_awaited_once_with(app.bot)
     app.start_updates.assert_called_once_with(app.bot)

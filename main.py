@@ -62,6 +62,7 @@ from handlers import (
     cmd_subs,
     cmd_unblock,
     cmd_useralerts,
+    cmd_users,
     cmd_version,
     fact_next_cb,
     facts_apply_cb,
@@ -89,7 +90,10 @@ from storage import (
     reconcile_blocked_subscribers,
 )
 from updates import start_update_loop
-from user_registry import UserRegistryMiddleware
+from user_registry import (
+    REGISTRATION_NEUTRAL_FLAG,
+    UserRegistryMiddleware,
+)
 
 
 async def main() -> None:
@@ -140,6 +144,11 @@ async def main() -> None:
     dp.message.register(cmd_unblock,   Command("unblock"))
     dp.message.register(cmd_blocklist, Command("blocklist"))
     dp.message.register(cmd_useralerts, Command("useralerts"))
+    dp.message.register(
+        cmd_users,
+        Command("users"),
+        flags={REGISTRATION_NEUTRAL_FLAG: True},
+    )
     dp.inline_query.register(cmd_inline_search)
 
     # FSM-обработчики для /broadcast

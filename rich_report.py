@@ -20,6 +20,7 @@ from aiogram.types import (
     RichBlockTableCell,
     RichTextAnchorLink,
     RichTextBold,
+    RichTextCode,
     RichTextItalic,
     RichTextSubscript,
     RichTextUrl,
@@ -28,6 +29,7 @@ from aiogram.types import (
 from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
 from report_model import (
     Bold,
+    Code,
     Heading,
     Inline,
     Italic,
@@ -79,6 +81,8 @@ def _rich_inline(part: Inline):
         return RichTextBold(text=part.value)
     if isinstance(part, Italic):
         return RichTextItalic(text=part.value)
+    if isinstance(part, Code):
+        return RichTextCode(text=part.value)
     if isinstance(part, Link):
         return RichTextUrl(text=part.text, url=part.url)
     if isinstance(part, Title):
@@ -414,7 +418,7 @@ def _inline_value(part: Inline) -> str:
 
 def _clone_text_inline(part: Inline, text: str) -> Inline:
     """Продолжить только допускающий разбиение текстовый стиль."""
-    if isinstance(part, (Text, Bold, Italic)):
+    if isinstance(part, (Text, Bold, Italic, Code)):
         return type(part)(text)
     raise RichReportRenderError("render")
 

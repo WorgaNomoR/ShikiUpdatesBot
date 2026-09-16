@@ -560,6 +560,168 @@ def test_load_subscribers_non_int_key_falls_back_to_empty(monkeypatch, tmp_path)
     assert load_subscribers() == {}
 
 
+def test_load_subscribers_strict_accepts_missing_legacy_and_current_state(
+    monkeypatch,
+    tmp_path,
+):
+    file = tmp_path / "subs.json"
+    monkeypatch.setattr(storage, "SUBS_FILE", file)
+
+    assert storage.load_subscribers_strict() == {}
+
+    legacy = json.dumps({"subscribers": {"1": "One", "-100": "Channel"}})
+    file.write_text(legacy, encoding="utf-8")
+    before = file.read_bytes()
+    assert storage.load_subscribers_strict() == {1: "One", -100: "Channel"}
+    assert file.read_bytes() == before
+
+    storage.save_subscriber_state(storage.SubscriberState(
+        {2: "Two"},
+        {
+            "version": 1,
+            "last_backup_at": None,
+            "weekly_started_at": 100.0,
+            "pending": None,
+        },
+    ))
+    assert storage.load_subscribers_strict() == {2: "Two"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"subscribers": []},
+        {"subscribers": {"abc": "Name"}},
+        {"subscribers": {"01": "Name"}},
+        {"subscribers": {"+1": "Name"}},
+        {"subscribers": {" 1": "Name"}},
+        {"subscribers": {"0": "Name"}},
+        {"subscribers": {str(2**63): "Name"}},
+        {"subscribers": {str(-(2**63) - 1): "Name"}},
+        {"subscribers": {"1": 7}},
+    ],
+)
+def test_load_subscribers_strict_rejects_malformed_or_lossy_state(
+    monkeypatch,
+    tmp_path,
+    payload,
+):
+    file = tmp_path / "subs.json"
+    file.write_text(json.dumps(payload), encoding="utf-8")
+    before = file.read_bytes()
+    monkeypatch.setattr(storage, "SUBS_FILE", file)
+
+    with pytest.raises(storage.SubscribersStateError):
+        storage.load_subscribers_strict()
+
+    assert file.read_bytes() == before
+
+
+def test_load_subscribers_strict_rejects_invalid_utf8(monkeypatch, tmp_path):
+    file = tmp_path / "subs.json"
+    file.write_bytes(b"\xff")
+    monkeypatch.setattr(storage, "SUBS_FILE", file)
+
+    with pytest.raises(storage.SubscribersStateError):
+        storage.load_subscribers_strict()
+
+    assert file.read_bytes() == b"\xff"
+
+
+def test_load_subscribers_strict_rejects_read_error(monkeypatch, tmp_path):
+    file = tmp_path / "subs.json"
+    file.write_text('{"subscribers": {}}', encoding="utf-8")
+    monkeypatch.setattr(storage, "SUBS_FILE", file)
+
+    def fail_read(*_args, **_kwargs):
+        raise OSError("read failure")
+
+    monkeypatch.setattr(storage.Path, "read_text", fail_read)
+
+    with pytest.raises(storage.SubscribersStateError):
+        storage.load_subscribers_strict()
+
+
+def test_load_subscribers_strict_rejects_malformed_present_schedule(
+    monkeypatch,
+    tmp_path,
+):
+    file = tmp_path / "subs.json"
+    payload = {
+        "subscribers": {"1": "One"},
+        "backup_schedule": {"version": 1},
+    }
+    file.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(storage, "SUBS_FILE", file)
+
+    with pytest.raises(storage.SubscribersStateError):
+        storage.load_subscribers_strict()
+
+
+@pytest.mark.asyncio
+async def test_user_directory_snapshot_waits_for_complete_restorable_write(backup_env):
+    storage.save_known_users({
+        1: _known_user(1, "Old", None, "2026-09-03T10:20:30Z"),
+    })
+    storage.save_subscribers({1: "Old"})
+    storage.save_blocked_users(set())
+    first_file_published = asyncio.Event()
+    finish_write = asyncio.Event()
+
+    async def publish_new_state():
+        async with storage.restorable_state_transaction():
+            storage.save_known_users({
+                2: _known_user(2, "New", None, "2026-09-04T10:20:30Z"),
+            })
+            first_file_published.set()
+            await finish_write.wait()
+            storage.save_subscribers({2: "New"})
+            storage.save_blocked_users({3})
+
+    writer = asyncio.create_task(publish_new_state())
+    await first_file_published.wait()
+    reader = asyncio.create_task(storage.load_user_directory_snapshot())
+    await asyncio.sleep(0)
+    assert not reader.done()
+
+    finish_write.set()
+    await writer
+    snapshot = await reader
+
+    assert [user.user_id for user in snapshot.known_users] == [2]
+    assert snapshot.subscribers == ((2, "New"),)
+    assert snapshot.blocked_user_ids == frozenset({3})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("loader_name", "error", "source"),
+    [
+        ("load_known_users", storage.KnownUsersStateError("broken"), "known_users"),
+        ("load_subscribers_strict", storage.SubscribersStateError("broken"), "subscribers"),
+        ("load_blocked_users", storage.BlockedUsersStateError("broken"), "blocked_users"),
+    ],
+)
+async def test_user_directory_snapshot_identifies_failed_source(
+    backup_env,
+    monkeypatch,
+    loader_name,
+    error,
+    source,
+):
+    def fail():
+        raise error
+
+    monkeypatch.setattr(storage, loader_name, fail)
+
+    with pytest.raises(storage.UserDirectorySnapshotError) as exc_info:
+        await storage.load_user_directory_snapshot()
+
+    assert exc_info.value.source == source
+
+
 def test_save_subscribers(monkeypatch, tmp_path):
     file = tmp_path / "subs.json"
 

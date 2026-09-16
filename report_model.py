@@ -35,6 +35,13 @@ class Italic:
 
 
 @dataclass(frozen=True)
+class Code:
+    """Недоверенный моноширинный текст для удобного копирования."""
+
+    value: str
+
+
+@dataclass(frozen=True)
 class Poster:
     """Необязательный недоверенный media source для визуализации тайтла."""
 
@@ -58,7 +65,7 @@ class Title:
     poster: Poster | None = None
 
 
-Inline = Text | Bold | Italic | Link | Title
+Inline = Text | Bold | Italic | Code | Link | Title
 
 
 @dataclass(frozen=True)
@@ -228,6 +235,8 @@ def _render_inline(part: Inline) -> str:
         return f"<b>{text}</b>"
     if isinstance(part, Italic):
         return f"<i>{text}</i>"
+    if isinstance(part, Code):
+        return f"<code>{text}</code>"
     if isinstance(part, Link):
         return f'<a href="{escape(part.url, quote=True)}">{text}</a>'
     if isinstance(part, Title) and part.url:

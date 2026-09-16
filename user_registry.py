@@ -33,6 +33,14 @@ USER_ALERTS_HINT = (
     "Подсказка: <code>/useralerts off</code> — отключить такие уведомления; "
     "<code>/useralerts on</code> — включить снова."
 )
+REGISTRATION_NEUTRAL_FLAG = "registration_neutral"
+
+
+def _is_registration_neutral(data: dict[str, Any]) -> bool:
+    """Проверить явный handler flag до любого обращения к registry storage."""
+    handler = data.get("handler")
+    flags = getattr(handler, "flags", None)
+    return isinstance(flags, dict) and flags.get(REGISTRATION_NEUTRAL_FLAG) is True
 
 
 def _event_identity(event: Message | CallbackQuery) -> tuple[int, str, str | None] | None:
@@ -96,6 +104,9 @@ class UserRegistryMiddleware(BaseMiddleware):
         event: Message | CallbackQuery,
         data: dict[str, Any],
     ) -> Any:
+        if _is_registration_neutral(data):
+            return await handler(event, data)
+
         identity = _event_identity(event)
         registration = None
         if identity is not None and identity[0] != OWNER_ID:

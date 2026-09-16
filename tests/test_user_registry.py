@@ -182,6 +182,33 @@ async def test_owner_runs_handler_without_registration_or_alert(registry_env):
 
 
 @pytest.mark.asyncio
+async def test_registration_neutral_handler_skips_registry_before_storage(
+    registry_env,
+    monkeypatch,
+):
+    register = AsyncMock()
+    monkeypatch.setattr(user_registry, "register_known_user", register)
+    handler = AsyncMock(return_value="handled")
+    data = {
+        "bot": SimpleNamespace(send_message=AsyncMock()),
+        "handler": SimpleNamespace(flags={
+            user_registry.REGISTRATION_NEUTRAL_FLAG: True,
+        }),
+    }
+
+    result = await user_registry.UserRegistryMiddleware()(
+        handler,
+        _event(10),
+        data,
+    )
+
+    assert result == "handled"
+    register.assert_not_awaited()
+    handler.assert_awaited_once()
+    data["bot"].send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_events_create_one_record_and_one_alert(registry_env):
     bot = SimpleNamespace(send_message=AsyncMock())
     handlers = [AsyncMock() for _ in range(10)]
