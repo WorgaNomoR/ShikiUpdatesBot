@@ -47,6 +47,15 @@ def test_rich_text_must_be_valid_utf8():
         validate_rich_payload(_message(_paragraph("\ud800")))
 
 
+def test_code_is_a_supported_nested_rich_text_style():
+    payload = _message(_paragraph({
+        "type": "code",
+        "text": "/useralerts on|off",
+    }))
+
+    assert validate_rich_payload(payload) is payload
+
+
 @pytest.mark.parametrize(
     "within,over",
     [

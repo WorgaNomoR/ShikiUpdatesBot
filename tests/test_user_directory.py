@@ -110,6 +110,26 @@ def test_empty_directory_keeps_all_three_sections_visible():
     assert html.count("В этом разделе пока никого нет.") == 3
 
 
+def test_report_omits_repeated_headers_and_formats_management_commands_as_code():
+    directory = build_user_directory(
+        UserDirectorySnapshot((), ((999, "Owner"),), frozenset()),
+        owner_id=999,
+    )
+    report = build_user_directory_report(directory)
+
+    html = "\n".join(chunk.html for chunk in render_report(report))
+    rich = json.dumps(
+        [fragment.payload for fragment in render_rich_report(report)],
+        ensure_ascii=False,
+    )
+
+    assert "Поле" not in rich
+    assert "Значение" not in rich
+    for command in ("/block ID", "/unblock ID", "/useralerts on|off"):
+        assert f"<code>{command}</code>" in html
+        assert f'"type": "code", "text": "{command}"' in rich
+
+
 def test_empty_legacy_label_is_preserved_without_inventing_identity():
     snapshot = UserDirectorySnapshot(
         known_users=(),

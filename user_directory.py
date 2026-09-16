@@ -9,6 +9,7 @@ from typing import Protocol
 from report_model import (
     TELEGRAM_TEXT_LIMIT,
     Bold,
+    Code,
     Italic,
     Link,
     Report,
@@ -276,7 +277,6 @@ def _directory_section(
     items.append(Table(
         columns=2,
         groups=groups,
-        header=TableRow((_cell("Поле"), _cell("Значение"))),
         separate_groups=True,
     ))
     return section(*items)
@@ -294,7 +294,12 @@ def build_user_directory_report(directory: UserDirectory) -> Report:
             "Учёт охватывает только период после включения регистрации новых пользователей."
         )),
         line(
-            "Управление: /block ID  ·  /unblock ID  ·  /useralerts on|off"
+            "Управление: ",
+            Code("/block ID"),
+            "  ·  ",
+            Code("/unblock ID"),
+            "  ·  ",
+            Code("/useralerts on|off"),
         ),
     )
     return Report((unit(
