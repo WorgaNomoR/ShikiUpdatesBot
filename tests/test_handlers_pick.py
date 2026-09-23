@@ -605,6 +605,27 @@ async def test_second_command_invalidates_first_and_stale_callbacks_do_not_mutat
 
 
 @pytest.mark.asyncio
+async def test_direct_pick_replaces_active_main_menu(monkeypatch):
+    _patch_snapshot(monkeypatch, _stats())
+    state = _State()
+    state.state = handlers.MainMenuStates.active.state
+    state.data = {
+        "main_menu_chat_id": 55,
+        "main_menu_message_id": 300,
+        "main_menu_command_message_id": 99,
+    }
+    message = _message(message_id=100)
+
+    await handlers.cmd_pick(message, state)
+
+    message.bot.delete_message.assert_any_await(55, 300)
+    message.bot.delete_message.assert_any_await(55, 99)
+    assert state.state == handlers.PickStates.active.state
+    assert state.data["pick_menu_message_id"] == 200
+    assert state.data["pick_command_message_id"] == 100
+
+
+@pytest.mark.asyncio
 async def test_unknown_missing_message_and_close_paths_are_safe(monkeypatch):
     _patch_snapshot(monkeypatch, _stats())
     state = _State()

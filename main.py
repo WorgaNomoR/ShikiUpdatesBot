@@ -18,6 +18,7 @@ from aiogram.filters import (
     StateFilter,
 )
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.strategy import FSMStrategy
 from aiogram.types import BotCommand
 
 from access_control import AccessControlMiddleware
@@ -25,7 +26,6 @@ from backup import _shutdown_backup
 from config import (
     BOT_TOKEN,
     CHECK_INTERVAL,
-    DISPLAY_NAME,
     log,
 )
 from fact_bank import reload_fact_bank
@@ -75,6 +75,7 @@ from handlers import (
     facts_receive,
     facts_upload_cb,
     lists_menu_cb,
+    main_menu_cb,
     pick_menu_cb,
     probe_owner_and_start,
     stats_menu_cb,
@@ -114,7 +115,10 @@ async def main() -> None:
         )
 
     bot = Bot(token=BOT_TOKEN)
-    dp  = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(
+        storage=MemoryStorage(),
+        fsm_strategy=FSMStrategy.USER_IN_CHAT,
+    )
 
     # Глобальная проверка списка блокировок — первый проектный middleware.
     dp.update.outer_middleware(AccessControlMiddleware())
@@ -150,6 +154,14 @@ async def main() -> None:
         flags={REGISTRATION_NEUTRAL_FLAG: True},
     )
     dp.inline_query.register(cmd_inline_search)
+
+    # Единое меню нейтрально к реестру: старый или поддельный callback не
+    # должен превращаться в регистрацию пользователя.
+    dp.callback_query.register(
+        main_menu_cb,
+        F.data.startswith("menu:"),
+        flags={REGISTRATION_NEUTRAL_FLAG: True},
+    )
 
     # FSM-обработчики для /broadcast
     dp.message.register(broadcast_receive, BroadcastStates.waiting_content)
@@ -206,16 +218,10 @@ async def main() -> None:
         F.data.startswith("pick:"),
     )
 
-    # Публичные команды в меню "/" — команды владельца не показываем
+    # Единственная публично рекламируемая точка входа. Все старые команды
+    # остаются зарегистрированными выше как hidden compatibility entrypoints.
     await bot.set_my_commands([
-        BotCommand(command="start",  description="Подписаться на уведомления 🥳"),
-        BotCommand(command="status", description=f"Что сейчас смотрит и читает {DISPLAY_NAME} 👀"),
-        BotCommand(command="stats",  description="Статистика: квартал или всё время 📊"),
-        BotCommand(command="lists",  description="Списки аниме, манги и ранобэ 📋"),
-        BotCommand(command="favs",   description="Избранное ❤️"),
-        BotCommand(command="fact",   description="Интересный факт 💡"),
-        BotCommand(command="info",   description="О боте ℹ️"),
-        BotCommand(command="stop",   description="Отписаться 😢"),
+        BotCommand(command="start", description="Открыть главное меню 🎌"),
     ])
 
     # Healthcheck и финальный бэкап нужны source/Docker-хостингу. Portable exe

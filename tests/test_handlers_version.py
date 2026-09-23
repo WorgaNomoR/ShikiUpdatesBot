@@ -70,6 +70,34 @@ async def test_version_refreshes_and_renders(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_version_refresh_failure_sends_one_static_notice(monkeypatch):
+    refresh = AsyncMock(side_effect=RuntimeError("storage unavailable"))
+    send = AsyncMock()
+    monkeypatch.setattr(handlers, "refresh_update_state", refresh)
+
+    await handlers._deliver_owner_version(send)
+
+    refresh.assert_awaited_once_with(force=True)
+    send.assert_awaited_once_with("⚠️ Сведения о версиях сейчас недоступны.")
+
+
+@pytest.mark.asyncio
+async def test_version_transport_failure_is_not_retried(monkeypatch):
+    refresh = AsyncMock(return_value={})
+    send = AsyncMock(side_effect=RuntimeError("ambiguous transport"))
+    monkeypatch.setattr(handlers, "refresh_update_state", refresh)
+
+    await handlers._deliver_owner_version(send)
+
+    send.assert_awaited_once()
+    text = send.await_args.args[0]
+    assert "<b>ShikiUpdatesBot</b>" in text
+    assert text != "⚠️ Сведения о версиях сейчас недоступны."
+    assert send.await_args.kwargs["parse_mode"] == ParseMode.HTML
+    assert send.await_args.kwargs["reply_markup"] is not None
+
+
+@pytest.mark.asyncio
 async def test_info_is_public_cache_only_and_uses_html(monkeypatch, info_preview):
     state = {
         "latest_main_version": "v1.3.0",

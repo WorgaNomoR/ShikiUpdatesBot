@@ -12,6 +12,8 @@ import report_assets
 from report_asset_ids import (
     REPORT_POSTER_PLACEHOLDER_MEDIA,
     REPORT_POSTER_PLACEHOLDER_SHA256,
+    REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
+    REPORT_POSTER_PLACEHOLDER_V1_SHA256,
 )
 from report_assets import (
     ReportAssetError,
@@ -31,20 +33,34 @@ def _message(media: str) -> dict:
     }
 
 
-def test_versioned_asset_is_loaded_as_exact_buffered_input_file():
-    message = materialize_rich_message(_message(REPORT_POSTER_PLACEHOLDER_MEDIA))
+@pytest.mark.parametrize(("reference", "filename", "expected_hash"), [
+    (
+        REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
+        "report-poster-placeholder-v1.png",
+        REPORT_POSTER_PLACEHOLDER_V1_SHA256,
+    ),
+    (
+        REPORT_POSTER_PLACEHOLDER_MEDIA,
+        "report-poster-placeholder-v2.jpg",
+        REPORT_POSTER_PLACEHOLDER_SHA256,
+    ),
+])
+def test_versioned_asset_is_loaded_as_exact_buffered_input_file(
+    reference,
+    filename,
+    expected_hash,
+):
+    message = materialize_rich_message(_message(reference))
     media = message.blocks[0].photo.media
-    expected_bytes = (
-        ROOT / "assets" / "report-poster-placeholder-v1.png"
-    ).read_bytes()
+    expected_bytes = (ROOT / "assets" / filename).read_bytes()
 
     assert isinstance(media, BufferedInputFile)
-    assert media.filename == "report-poster-placeholder-v1.png"
+    assert media.filename == filename
     assert media.data == expected_bytes
-    assert REPORT_POSTER_PLACEHOLDER_SHA256 == hashlib.sha256(
+    assert expected_hash == hashlib.sha256(
         expected_bytes,
     ).hexdigest()
-    assert REPORT_POSTER_PLACEHOLDER_SHA256 in REPORT_POSTER_PLACEHOLDER_MEDIA
+    assert expected_hash in reference
 
 
 def test_external_https_media_is_not_rewritten():
@@ -64,7 +80,7 @@ def test_missing_or_changed_versioned_asset_fails_before_send(
     asset_dir = tmp_path / "assets"
     asset_dir.mkdir()
     if create_corrupt_file:
-        (asset_dir / "report-poster-placeholder-v1.png").write_bytes(b"changed")
+        (asset_dir / "report-poster-placeholder-v2.jpg").write_bytes(b"changed")
     monkeypatch.setattr(report_assets, "RESOURCE_ROOT", tmp_path)
 
     expected = "asset_hash" if create_corrupt_file else "asset_unavailable"

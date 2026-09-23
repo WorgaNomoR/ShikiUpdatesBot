@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from main_menu import MAIN_MENU_ASSETS
+
 COMPOSE_PATH = Path(__file__).resolve().parents[1] / "docker-compose.yml"
 DOCKERIGNORE_PATH = COMPOSE_PATH.with_name(".dockerignore")
 DOCKERFILE_PATH = COMPOSE_PATH.with_name("Dockerfile")
@@ -59,6 +61,9 @@ def test_docker_context_keeps_required_runtime_files():
         "assets/*",
         "!assets/info-preview.png",
         "!assets/report-poster-placeholder-v1.png",
+        "!assets/report-poster-placeholder-v2.jpg",
+        "!assets/main-menu/",
+        "!assets/main-menu/*.jpg",
     ]
     assert "assets/" not in patterns
     assert active_patterns[-1] == "!examples/facts.json"
@@ -66,10 +71,26 @@ def test_docker_context_keeps_required_runtime_files():
 
 def test_docker_build_requires_runtime_assets_in_effective_context():
     instructions = DOCKERFILE_PATH.read_text(encoding="utf-8").splitlines()
+    dockerfile = "\n".join(instructions)
 
     assert "RUN test -f /app/assets/info-preview.png" in instructions
     assert (
         "RUN test -f /app/assets/report-poster-placeholder-v1.png"
         in instructions
     )
+    assert (
+        "RUN test -f /app/assets/report-poster-placeholder-v2.jpg"
+        in instructions
+    )
+    asset_loop_start = dockerfile.index("for asset in")
+    asset_loop_end = dockerfile.index("done;", asset_loop_start)
+    asset_loop = dockerfile[asset_loop_start:asset_loop_end]
+    assert 'test -f "/app/assets/main-menu/$asset"' in asset_loop
+    for filename in MAIN_MENU_ASSETS.values():
+        assert filename in asset_loop
+    assert (
+        "find /app/assets/main-menu -maxdepth 1 -type f -name '*.jpg'"
+        in dockerfile
+    )
+    assert f'wc -l)" -eq {len(MAIN_MENU_ASSETS)}' in dockerfile
     assert "RUN test -f /app/examples/facts.json" in instructions

@@ -46,7 +46,7 @@ def _make_message(*, message_id=12, chat_id=123, answer_id=600, **content):
 
     m.message_id = message_id
     m.chat = MagicMock(id=chat_id)
-    m.from_user = MagicMock(id=0)  # перепишем на OWNER_ID в тесте
+    m.from_user = MagicMock(id=config.OWNER_ID)
 
     m.bot = AsyncMock()
     m.bot.send_message.return_value   = MagicMock(message_id=501)
@@ -63,6 +63,7 @@ def _make_message(*, message_id=12, chat_id=123, answer_id=600, **content):
 
 def _make_callback(*, control_id=600, chat_id=123):
     cb = MagicMock()
+    cb.from_user = MagicMock(id=config.OWNER_ID)
     cb.answer = AsyncMock()
     cb.message = MagicMock()
     cb.message.message_id = control_id
@@ -216,6 +217,19 @@ async def test_broadcast_receive_unsupported_type_keeps_state(monkeypatch):
     state.set_state.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_broadcast_continuation_rechecks_owner():
+    msg = _make_message(message_id=12, text="hello")
+    msg.from_user.id = config.OWNER_ID + 1
+    state = _make_state({"prompt_msg_id": 11})
+
+    await handlers.broadcast_receive(msg, state)
+
+    state.get_data.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+    msg.bot.send_message.assert_not_awaited()
+
+
 # ─────────────────────────────────────────────────────────────────────────
 #  Юнит 5 — confirm / cancel
 # ─────────────────────────────────────────────────────────────────────────
@@ -269,6 +283,23 @@ async def test_broadcast_cancel_deletes_preview_and_control(monkeypatch):
     cb.message.bot.delete_message.assert_any_await(123, 501)   # превью
     cb.message.bot.delete_message.assert_any_await(123, 600)   # контрол
     cb.message.bot.send_message.assert_not_called()            # ничего не разослали
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler",
+    [handlers.broadcast_confirm_cb, handlers.broadcast_cancel_cb],
+)
+async def test_broadcast_callbacks_recheck_owner(handler):
+    cb = _make_callback()
+    cb.from_user.id = config.OWNER_ID + 1
+    state = _make_state({"preview_msg_ids": [501]})
+
+    await handler(cb, state)
+
+    cb.answer.assert_awaited_once()
+    assert cb.answer.await_args.kwargs["show_alert"] is True
+    state.get_data.assert_not_awaited()
 
 
 @pytest.mark.asyncio

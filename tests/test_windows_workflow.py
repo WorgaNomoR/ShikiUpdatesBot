@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 import release_security
-from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
+from main_menu import MAIN_MENU_ASSETS
 
 WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "windows-exe.yml"
 WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -38,16 +38,31 @@ def test_pyinstaller_bundles_info_preview():
     )
 
 
-def test_pyinstaller_bundles_report_poster_placeholder():
-    asset_name = (
-        REPORT_POSTER_PLACEHOLDER_MEDIA.removeprefix("asset://").split("/", 1)[0]
-        + ".png"
-    )
+@pytest.mark.parametrize("asset_name", [
+    "report-poster-placeholder-v1.png",
+    "report-poster-placeholder-v2.jpg",
+])
+def test_pyinstaller_bundles_report_poster_placeholder(asset_name):
     assert (
         f'datas.append((str(root / "assets" / "{asset_name}"), "assets"))'
         in PYINSTALLER_SPEC
     )
     assert (ROOT / "assets" / asset_name).is_file()
+
+
+def test_pyinstaller_bundles_complete_main_menu_artwork_set():
+    assert (
+        'datas.append((str(root / "assets" / "main-menu"), "assets/main-menu"))'
+        in PYINSTALLER_SPEC
+    )
+    asset_dir = ROOT / "assets" / "main-menu"
+    assert {path.name for path in asset_dir.glob("*.jpg")} == set(
+        MAIN_MENU_ASSETS.values()
+    )
+    for filename in MAIN_MENU_ASSETS.values():
+        content = (asset_dir / filename).read_bytes()
+        assert content.startswith(b"\xff\xd8\xff")
+        assert content.endswith(b"\xff\xd9")
 
 
 def test_pyinstaller_bundles_fact_bank_example():
