@@ -15,6 +15,7 @@ from messages import (
     build_favourite_message,
     build_message,
     build_startup_snapshot,
+    build_status_report,
     classify_event,
     clean_description,
     extract_score,
@@ -24,6 +25,11 @@ from messages import (
 from name_grammar import (
     DisplayNameContext,
     build_display_name_context,
+)
+from report_model import (
+    Gallery,
+    Report,
+    rendered_html,
 )
 from utils import (
     _utcnow,
@@ -1265,7 +1271,7 @@ def test_format_rate_entry_uses_independent_media_label_matrix(
 
     assert result == (
         f'▶️ <a href="https://shikimori.io/{media}s/1-title">Title</a> '
-        f"({expected_label})"
+        f"<b>({expected_label})</b>"
     )
     assert result.count("Title") == 1
     assert result.count(f"({expected_label})") == 1
@@ -1288,7 +1294,8 @@ def test_format_rate_entry_normalizes_relative_and_full_urls(url):
     )
 
     assert result == (
-        '▶️ <a href="https://shikimori.io/animes/1-title">Title</a> (аниме)'
+        '▶️ <a href="https://shikimori.io/animes/1-title">Title</a> '
+        '<b>(аниме)</b>'
     )
     assert result.count("https://shikimori.io") == 1
 
@@ -1308,7 +1315,8 @@ def test_format_rate_entry_escapes_url_inside_html_attribute():
 
     assert result == (
         '▶️ <a href="https://shikimori.io/animes/1-title?'
-        'from=&lt;status&gt;&amp;label=&quot;quoted&quot;">Title</a> (аниме)'
+        'from=&lt;status&gt;&amp;label=&quot;quoted&quot;">Title</a> '
+        '<b>(аниме)</b>'
     )
 
 
@@ -1329,7 +1337,7 @@ def test_format_rate_entry_treats_non_string_url_as_absent(url):
         "anime",
     )
 
-    assert result == "▶️ Title (аниме)"
+    assert result == "▶️ Title <b>(аниме)</b>"
 
 
 def test_format_rate_entry_unlinked_label_follows_title():
@@ -1341,7 +1349,253 @@ def test_format_rate_entry_unlinked_label_follows_title():
         "manga",
     )
 
-    assert result == "▶️ Title (манга)"
+    assert result == "▶️ Title <b>(манга)</b>"
+
+
+def test_build_status_report_preserves_groups_order_markers_links_and_labels():
+    anime = [
+        {
+            "_status": "watching",
+            "anime": {
+                "id": 10,
+                "name": "Second",
+                "russian": "Первый",
+                "kind": "tv",
+                "url": "https://shikimori.io/animes/10-first",
+            },
+        },
+        {
+            "_status": "rewatching",
+            "anime": {
+                "id": 11,
+                "name": "Second",
+                "kind": "movie",
+                "url": "/animes/11-second",
+            },
+        },
+    ]
+    manga = [
+        {
+            "_status": "watching",
+            "manga": {
+                "id": 12,
+                "name": "Ranobe",
+                "kind": "light_novel",
+                "url": "/mangas/12-ranobe",
+            },
+        },
+        {
+            "_status": "rewatching",
+            "manga": {"id": 13, "name": "Manga", "kind": "future"},
+        },
+    ]
+
+    report = build_status_report(anime, manga, {})
+    html = rendered_html(report)[0]
+    visible_text = re.sub(r"<[^>]+>", "", html)
+
+    assert isinstance(report, Report)
+    assert [visible_text.index(token) for token in (
+        "Сейчас смотрит · 2",
+        "Первый",
+        "Second",
+        "Сейчас читает · 2",
+        "Ranobe",
+        "Manga",
+    )] == sorted(visible_text.index(token) for token in (
+        "Сейчас смотрит · 2",
+        "Первый",
+        "Second",
+        "Сейчас читает · 2",
+        "Ranobe",
+        "Manga",
+    ))
+    assert "▶️" in html and "🔁" in html
+    assert html.count("(аниме)") == 2
+    assert "Ranobe</a> <b>(ранобэ)</b>" in html
+    assert "Manga <b>(манга)</b>" in html
+    assert html.count("https://shikimori.io") == 3
+
+
+def test_status_posters_join_by_exact_domain_and_target_id_not_title():
+    anime = [{
+        "_status": "watching",
+        "anime": {"id": 7, "name": "Same title", "kind": "tv"},
+    }]
+    manga = [{
+        "_status": "watching",
+        "manga": {"id": "7", "name": "Same title", "kind": "manga"},
+    }]
+    stats_all = {
+        "anime": {"titles": {
+            "7": {"title": "Unrelated local title", "poster_url": "https://cdn.test/a.jpg"},
+        }},
+        "manga": {"titles": {
+            "7": {"title": "Another title", "poster_url": "https://cdn.test/m.jpg"},
+        }},
+    }
+
+    report = build_status_report(anime, manga, stats_all)
+    galleries = [
+        report_section.items[0]
+        for report_section in report.units[0].sections
+        if isinstance(report_section.items[0], Gallery)
+    ]
+
+    assert [
+        [poster.url for poster in gallery.posters]
+        for gallery in galleries
+    ] == [
+        ["https://cdn.test/a.jpg"],
+        ["https://cdn.test/m.jpg"],
+    ]
+
+
+def test_status_keeps_one_bounded_gallery_for_each_media_group():
+    anime = [
+        {"_status": "watching", "anime": {"id": index, "name": f"A{index}", "kind": "tv"}}
+        for index in range(1, 5)
+    ]
+    manga = [
+        {"_status": "watching", "manga": {"id": index, "name": f"M{index}", "kind": "manga"}}
+        for index in range(1, 5)
+    ]
+    stats_all = {
+        media: {"titles": {
+            str(index): {"poster_url": f"https://cdn.test/{media}-{index}.jpg"}
+            for index in range(1, 5)
+        }}
+        for media in ("anime", "manga")
+    }
+
+    report = build_status_report(anime, manga, stats_all)
+    galleries = [
+        report_section.items[0]
+        for report_section in report.units[0].sections
+        if isinstance(report_section.items[0], Gallery)
+    ]
+
+    assert [
+        [poster.url for poster in gallery.posters]
+        for gallery in galleries
+    ] == [
+        [
+            "https://cdn.test/anime-1.jpg",
+            "https://cdn.test/anime-2.jpg",
+            "https://cdn.test/anime-3.jpg",
+        ],
+        [
+            "https://cdn.test/manga-1.jpg",
+            "https://cdn.test/manga-2.jpg",
+            "https://cdn.test/manga-3.jpg",
+        ],
+    ]
+
+
+@pytest.mark.parametrize(
+    "stats_all",
+    [
+        None,
+        [],
+        {"anime": None},
+        {"anime": {"titles": []}},
+        {"anime": {"titles": {"1": None}}},
+        {"anime": {"titles": {
+            "2": {"title": "Visible", "poster_url": "https://cdn.test/a.jpg"},
+        }}},
+        {"anime": {"titles": {"1": {"poster_url": "http://cdn.test/a.jpg"}}}},
+        {"anime": {"titles": {"1": {"poster_url": "https://u:p@cdn.test/a.jpg"}}}},
+    ],
+)
+def test_status_malformed_or_unusable_local_posters_degrade_to_text(stats_all):
+    report = build_status_report(
+        [{"_status": "watching", "anime": {"id": 1, "name": "Visible", "kind": "tv"}}],
+        [],
+        stats_all,
+    )
+
+    assert "Visible" in rendered_html(report)[0]
+    assert all(
+        not isinstance(item, Gallery)
+        for report_section in report.units[0].sections
+        for item in report_section.items
+    )
+
+
+@pytest.mark.parametrize("target_id", [None, True, 0, -1, "01", " 1", "1 ", 1.0])
+def test_status_malformed_target_id_never_borrows_a_local_poster(target_id):
+    report = build_status_report(
+        [{
+            "_status": "watching",
+            "anime": {"id": target_id, "name": "Visible", "kind": "tv"},
+        }],
+        [],
+        {"anime": {"titles": {"1": {"poster_url": "https://cdn.test/a.jpg"}}}},
+    )
+
+    assert len(report.units[0].sections) == 1
+    assert "Visible" in rendered_html(report)[0]
+
+
+def test_status_gallery_is_bounded_but_large_text_list_remains_complete():
+    anime = [
+        {
+            "_status": "rewatching" if index % 2 else "watching",
+            "anime": {
+                "id": index,
+                "name": f"Title {index:02d}",
+                "kind": "tv",
+                "url": f"/animes/{index}-title",
+            },
+        }
+        for index in range(1, 61)
+    ]
+    stats_all = {"anime": {"titles": {
+        str(index): {"poster_url": f"https://cdn.test/{index}.jpg"}
+        for index in range(1, 61)
+    }}}
+
+    report = build_status_report(anime, [], stats_all)
+    gallery = report.units[0].sections[-1].items[0]
+    html = "\n".join(rendered_html(report))
+
+    assert isinstance(gallery, Gallery)
+    assert [poster.url for poster in gallery.posters] == [
+        "https://cdn.test/1.jpg",
+        "https://cdn.test/2.jpg",
+        "https://cdn.test/3.jpg",
+    ]
+    assert all(f"Title {index:02d}" in html for index in range(1, 61))
+
+
+def test_status_partial_posters_fill_gallery_in_textual_order_without_mutation():
+    anime = [
+        {
+            "_status": "watching",
+            "anime": {"id": index, "name": f"Title {index}", "kind": "tv"},
+        }
+        for index in range(1, 6)
+    ]
+    stats_all = {"anime": {"titles": {
+        "1": {"poster_url": "http://cdn.test/invalid.jpg"},
+        "2": {"poster_url": "https://cdn.test/2.jpg"},
+        "4": {"poster_url": "https://cdn.test/4.jpg"},
+        "5": {"poster_url": "https://cdn.test/5.jpg"},
+    }}}
+    original_anime = json.loads(json.dumps(anime))
+    original_stats = json.loads(json.dumps(stats_all))
+
+    report = build_status_report(anime, [], stats_all)
+    gallery = report.units[0].sections[-1].items[0]
+
+    assert isinstance(gallery, Gallery)
+    assert [poster.url for poster in gallery.posters] == [
+        "https://cdn.test/2.jpg",
+        "https://cdn.test/4.jpg",
+        "https://cdn.test/5.jpg",
+    ]
+    assert anime == original_anime
+    assert stats_all == original_stats
 
 
 # ============================================================

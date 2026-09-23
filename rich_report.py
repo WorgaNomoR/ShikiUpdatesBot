@@ -30,6 +30,7 @@ from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
 from report_model import (
     Bold,
     Code,
+    Gallery,
     Heading,
     Inline,
     Italic,
@@ -117,7 +118,7 @@ def _line_list_marker(value: Line) -> tuple[bool, int | None, tuple[Inline, ...]
 def report_has_rich_features(report: Report) -> bool:
     """Есть ли в отчёте структура, которую rich transport реально улучшит."""
     return any(
-        isinstance(item, (Heading, Rows, Table))
+        isinstance(item, (Gallery, Heading, Rows, Table))
         or isinstance(item, Line) and _line_list_marker(item) is not None
         for logical_unit in report.units
         for logical_section in logical_unit.sections
@@ -274,6 +275,32 @@ def _poster_collage(posters: list[Poster]) -> InputRichBlockCollage | None:
     ])
 
 
+def _gallery_blocks(value: Gallery) -> list:
+    """Отобразить до трёх пригодных обложек без placeholder-подстановки."""
+    if len(value.posters) > 3:
+        raise RichReportRenderError("gallery_size")
+    sources = []
+    for poster in value.posters:
+        if not isinstance(poster, Poster):
+            raise RichReportRenderError("render")
+        source = _safe_poster_url(poster.url)
+        if source is not None:
+            sources.append(source)
+    photos = [
+        InputRichBlockPhoto(photo=InputMediaPhoto(
+            media=source,
+            parse_mode=None,
+            show_caption_above_media=None,
+        ))
+        for source in sources
+    ]
+    if len(photos) == 1:
+        return photos
+    if len(photos) in {2, 3}:
+        return [InputRichBlockCollage(blocks=photos)]
+    return []
+
+
 def _render_items(items: tuple[ReportItem, ...]) -> list:
     blocks = []
     index = 0
@@ -294,6 +321,10 @@ def _render_items(items: tuple[ReportItem, ...]) -> list:
             continue
         if isinstance(item, Table):
             blocks.extend(_catalog_table_blocks(item))
+            index += 1
+            continue
+        if isinstance(item, Gallery):
+            blocks.extend(_gallery_blocks(item))
             index += 1
             continue
         if not isinstance(item, Line):

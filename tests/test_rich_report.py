@@ -5,6 +5,7 @@
 import json
 from html import unescape
 
+import pytest
 from aiogram.types import (
     InputRichBlockAnchor,
     InputRichBlockCollage,
@@ -27,6 +28,7 @@ from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
 from report_model import (
     Bold,
     Code,
+    Gallery,
     Italic,
     Link,
     Poster,
@@ -49,7 +51,10 @@ from rich_message_schema import (
     RICH_TEXT_LIMIT,
     validate_rich_payload,
 )
-from rich_report import render_rich_report
+from rich_report import (
+    RichReportRenderError,
+    render_rich_report,
+)
 
 
 def _structured_report() -> Report:
@@ -398,6 +403,68 @@ def test_partial_poster_hints_never_create_a_misaligned_collage():
     assert [type(block) for block in details.blocks] == [
         InputRichBlockList,
     ]
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3])
+def test_explicit_gallery_uses_no_placeholder_and_keeps_bounded_layout(count):
+    report = Report((unit(
+        section(heading("Status", level=1)),
+        section(Gallery(tuple(
+            Poster(f"https://cdn.example.test/{index}.jpg")
+            for index in range(count)
+        ))),
+    ),))
+
+    rendered = render_rich_report(report)[0]
+    media_blocks = rendered.message.blocks[1:]
+
+    if count == 0:
+        assert media_blocks == []
+    elif count == 1:
+        assert len(media_blocks) == 1
+        assert isinstance(media_blocks[0], InputRichBlockPhoto)
+        assert media_blocks[0].photo.media == "https://cdn.example.test/0.jpg"
+    else:
+        assert len(media_blocks) == 1
+        assert isinstance(media_blocks[0], InputRichBlockCollage)
+        assert [photo.photo.media for photo in media_blocks[0].blocks] == [
+            f"https://cdn.example.test/{index}.jpg"
+            for index in range(count)
+        ]
+    assert REPORT_POSTER_PLACEHOLDER_MEDIA not in json.dumps(
+        rendered.payload,
+        ensure_ascii=False,
+    )
+
+
+def test_explicit_gallery_omits_invalid_sources_instead_of_filling_slots():
+    report = Report((unit(
+        section(heading("Status", level=1)),
+        section(Gallery((
+            Poster("https://cdn.example.test/first.jpg"),
+            Poster(None),
+            Poster("http://cdn.example.test/insecure.jpg"),
+        ))),
+    ),))
+
+    rendered = render_rich_report(report)[0]
+
+    assert len(rendered.message.blocks) == 2
+    assert isinstance(rendered.message.blocks[1], InputRichBlockPhoto)
+    assert rendered.message.blocks[1].photo.media == "https://cdn.example.test/first.jpg"
+
+
+def test_explicit_gallery_rejects_unbounded_media_hint():
+    report = Report((unit(
+        section(heading("Status", level=1)),
+        section(Gallery(tuple(
+            Poster(f"https://cdn.example.test/{index}.jpg")
+            for index in range(4)
+        ))),
+    ),))
+
+    with pytest.raises(RichReportRenderError, match="^gallery_size$"):
+        render_rich_report(report)
 
 
 def _catalog_report(count: int, *, padding: int = 0) -> Report:

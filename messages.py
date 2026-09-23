@@ -4,8 +4,9 @@
 Тексты и форматирование ShikiUpdatesBot.
 
 Банк шаблонов уведомлений, парсеры описаний истории и построение коротких
-сообщений. Зависит от config/utils/shiki_api; доменную агрегацию (stats),
-типизированные отчёты и хендлеры не знает — они зависят от него.
+сообщений, а также typed-представление текущей активности. Зависит от
+config/utils/shiki_api/report_model; доменную агрегацию (stats) и хендлеры
+не знает — они зависят от него.
 """
 
 import random
@@ -24,6 +25,20 @@ from name_grammar import (
     build_display_name_context,
     format_name_template,
 )
+from report_model import (
+    Bold,
+    Gallery,
+    Line,
+    Poster,
+    Report,
+    Text,
+    Title,
+    heading,
+    rendered_html,
+    section,
+    unit,
+)
+from rich_message_schema import is_safe_https_media_url
 from shiki_api import (
     RANOBE_KINDS,
     get_media_info,
@@ -928,24 +943,124 @@ def _pct_diff(curr: int, prev: int) -> str:
 
 def format_rate_entry(item: dict, media: str) -> str:
     """Форматирует одну запись из rates API в строку для сообщения."""
-    # Название тайтла — в rates API вложено в item["anime"] или item["manga"]
-    target = item.get(media) or {}
-    title_ru = target.get("russian") or ""
-    title_en = target.get("name") or "???"
-    title = h(title_ru if title_ru else title_en)
+    rate_line = _status_rate_line(item, media)
+    return rendered_html(Report((unit(section(rate_line)),)))[0]
 
-    status = item.get("_status", "")
-    # Иконка в зависимости от статуса
+
+_STATUS_GALLERY_LIMIT = 3
+
+
+def _status_target(item: object, media: str) -> dict:
+    """Вернуть безопасный rates target без изменения исходной записи."""
+    if not isinstance(item, dict):
+        return {}
+    target = item.get(media)
+    return target if isinstance(target, dict) else {}
+
+
+def _status_title(target: dict) -> str:
+    """Выбрать прежний русский/английский заголовок с безопасным fallback."""
+    title_ru = target.get("russian")
+    if isinstance(title_ru, str) and title_ru:
+        return title_ru
+    title_en = target.get("name")
+    return title_en if isinstance(title_en, str) and title_en else "???"
+
+
+def _status_media_key(target: dict, media: str) -> str:
+    """Сохранить presentation-only деление Manga/Ranobe для /status."""
+    if media == "manga" and target.get("kind") in RANOBE_KINDS:
+        return "ranobe"
+    return media
+
+
+def _status_rate_line(item: object, media: str) -> Line:
+    """Собрать одну typed-строку /status без промежуточного HTML."""
+    target = _status_target(item, media)
+    status = item.get("_status", "") if isinstance(item, dict) else ""
     icon = {
-        "watching":   "▶️",
+        "watching": "▶️",
         "rewatching": "🔁",
     }.get(status, "•")
-
     raw_url = target.get("url")
-    url = _rel_url(raw_url) if isinstance(raw_url, str) else ""
-    linked_title = f'<a href="{SHIKI_BASE_URL}{h(url)}">{title}</a>' if url else title
-    media_key = "ranobe" if media == "manga" and target.get("kind") in RANOBE_KINDS else media
-    return f"{icon} {_label_media_title(linked_title, media_key)}"
+    relative_url = _rel_url(raw_url) if isinstance(raw_url, str) else ""
+    full_url = f"{SHIKI_BASE_URL}{relative_url}" if relative_url else None
+    media_label = _MEDIA_LABELS.get(_status_media_key(target, media))
+    parts = [Text(f"{icon} "), Title(_status_title(target), full_url)]
+    if media_label:
+        parts.extend((Text(" "), Bold(f"({media_label})")))
+    return Line(tuple(parts))
+
+
+def _status_target_id(target: dict) -> str | None:
+    """Нормализовать только канонический положительный Shikimori target ID."""
+    target_id = target.get("id")
+    if type(target_id) is int and target_id > 0:
+        return str(target_id)
+    if (
+        isinstance(target_id, str)
+        and target_id.isascii()
+        and target_id.isdigit()
+        and not target_id.startswith("0")
+    ):
+        return target_id
+    return None
+
+
+def _status_poster_url(stats_all: object, media: str, target: dict) -> str | None:
+    """Найти пригодную обложку только по точному домену и target ID."""
+    target_id = _status_target_id(target)
+    if target_id is None or not isinstance(stats_all, dict):
+        return None
+    domain = stats_all.get(media)
+    if not isinstance(domain, dict):
+        return None
+    titles = domain.get("titles")
+    if not isinstance(titles, dict):
+        return None
+    record = titles.get(target_id)
+    if not isinstance(record, dict):
+        return None
+    poster_url = record.get("poster_url")
+    return poster_url if is_safe_https_media_url(poster_url) else None
+
+
+def build_status_report(
+    anime_list: list[dict],
+    manga_list: list[dict],
+    stats_all: object,
+) -> Report:
+    """Собрать полный typed `/status` и bounded media-group galleries."""
+    sections = []
+    for media, emoji, title, items in (
+        ("anime", "🎌", "Сейчас смотрит", anime_list),
+        ("manga", "📚", "Сейчас читает", manga_list),
+    ):
+        if not items:
+            continue
+        sections.append(section(
+            heading(
+                f"{emoji} ",
+                Bold(title),
+                f" · {len(items)}",
+                level=2,
+            ),
+            *(_status_rate_line(item, media) for item in items),
+        ))
+        posters = []
+        for item in items:
+            if len(posters) >= _STATUS_GALLERY_LIMIT:
+                break
+            poster_url = _status_poster_url(
+                stats_all,
+                media,
+                _status_target(item, media),
+            )
+            if poster_url is not None:
+                posters.append(Poster(poster_url))
+        if posters:
+            sections.append(section(Gallery(tuple(posters))))
+    return Report((unit(*sections),))
 
 
 # ═══════════════════════════════════════════════════════════════════

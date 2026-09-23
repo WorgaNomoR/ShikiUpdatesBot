@@ -8,6 +8,7 @@ import types
 import pytest
 
 import handlers
+from report_model import rendered_html
 
 
 class DummyMessage:
@@ -19,6 +20,8 @@ class DummyMessage:
             else None
         )
         self.calls = []
+        self.chat = types.SimpleNamespace(id=chat_id)
+        self.bot = types.SimpleNamespace(status_message=self)
 
     async def answer(self, text, **kwargs):
         self.calls.append((text, kwargs))
@@ -49,6 +52,20 @@ def _reset_status_cache(monkeypatch):
     monkeypatch.setattr(handlers, "_status_cache", None)
     monkeypatch.setattr(handlers, "_status_cache_at", 0.0)
     monkeypatch.setattr(handlers, "_status_cache_lock", None)
+    monkeypatch.setattr("handlers.load_stats_all", lambda: {})
+
+    async def _deliver(bot, chat_id, report, **kwargs):
+        assert chat_id == bot.status_message.chat.id
+        for html in rendered_html(report):
+            bot.status_message.calls.append((html, kwargs))
+        return types.SimpleNamespace(
+            delivered=True,
+            delivered_units=len(report.units),
+            total_units=len(report.units),
+            error=None,
+        )
+
+    monkeypatch.setattr("handlers.deliver_report", _deliver)
 
 
 class FakeClock:
@@ -109,6 +126,73 @@ async def test_status_anime_and_manga(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_nonempty_status_uses_local_posters_and_shared_rich_delivery(monkeypatch):
+    anime = [{
+        "_status": "watching",
+        "anime": {
+            "id": 1,
+            "name": "Ergo Proxy",
+            "kind": "tv",
+            "url": "/animes/1-ergo-proxy",
+        },
+    }]
+    _patch_rates(monkeypatch, anime=anime, manga=[])
+    stats_all = {
+        "anime": {"titles": {
+            "1": {"poster_url": "https://cdn.test/ergo.jpg"},
+        }},
+    }
+    local_reads = []
+    delivered = []
+    monkeypatch.setattr(
+        "handlers.load_stats_all",
+        lambda: local_reads.append(True) or stats_all,
+    )
+
+    async def _deliver(bot, chat_id, report, **kwargs):
+        delivered.append((bot, chat_id, report, kwargs))
+        return types.SimpleNamespace(
+            delivered=True,
+            delivered_units=1,
+            total_units=1,
+            error=None,
+        )
+
+    monkeypatch.setattr("handlers.deliver_report", _deliver)
+    message = DummyMessage(chat_id=77)
+
+    await handlers.cmd_status(message)
+
+    assert local_reads == [True]
+    assert len(delivered) == 1
+    bot, chat_id, report, kwargs = delivered[0]
+    assert bot is message.bot
+    assert chat_id == 77
+    assert kwargs == {"disable_preview": False, "notify_partial": True}
+    assert "Ergo Proxy" in rendered_html(report)[0]
+    assert message.calls == []
+
+
+@pytest.mark.asyncio
+async def test_empty_status_never_reads_local_posters_or_enters_report_delivery(monkeypatch):
+    _patch_rates(monkeypatch, anime=[], manga=[])
+
+    def _unexpected_read():
+        raise AssertionError("empty status must not read stats_all")
+
+    async def _unexpected_delivery(*args, **kwargs):
+        raise AssertionError("empty status must stay an ordinary short reply")
+
+    monkeypatch.setattr("handlers.load_stats_all", _unexpected_read)
+    monkeypatch.setattr("handlers.deliver_report", _unexpected_delivery)
+
+    message = DummyMessage()
+    await handlers.cmd_status(message)
+
+    assert "ничего не смотрит" in message.calls[0][0].lower()
+
+
+@pytest.mark.asyncio
 async def test_status_filters_disallowed_anime_kind(monkeypatch):
     # music — нерелевантный kind → отфильтрован → как будто ничего не смотрит
     _patch_rates(monkeypatch, anime=[_anime_item("Music Clip", kind="music")], manga=[])
@@ -144,13 +228,14 @@ async def test_status_cache_reuses_raw_rates_across_chats_and_renders_each_time(
         manga=[_manga_item("Berserk")],
     )
     rendered = []
-    real_formatter = handlers.format_rate_entry
+    real_builder = handlers.build_status_report
 
-    def _format(item, media):
-        rendered.append((item, media))
-        return real_formatter(item, media)
+    def _build(anime, manga, stats_all):
+        rendered.extend((item, "anime") for item in anime)
+        rendered.extend((item, "manga") for item in manga)
+        return real_builder(anime, manga, stats_all)
 
-    monkeypatch.setattr("handlers.format_rate_entry", _format)
+    monkeypatch.setattr("handlers.build_status_report", _build)
 
     first = DummyMessage(chat_id=1)
     second = DummyMessage(chat_id=2)

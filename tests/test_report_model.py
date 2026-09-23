@@ -11,6 +11,7 @@ import pytest
 from report_model import (
     Bold,
     Code,
+    Gallery,
     Italic,
     Link,
     Poster,
@@ -361,3 +362,15 @@ def test_oversized_grouped_table_keeps_blank_line_between_adjacent_cards():
         sum(chunk.count(token) for chunk in visible_chunks) == 1
         for token in tokens
     )
+
+
+def test_gallery_is_invisible_to_ordinary_html_without_extra_spacing():
+    report = Report((unit(
+        section(line("before"), Gallery((Poster("https://cdn.test/1.jpg"),)), line("after")),
+        section(Gallery((Poster("https://cdn.test/2.jpg"),))),
+    ),))
+
+    chunks = render_report(report)
+
+    assert [chunk.html for chunk in chunks] == ["before\nafter"]
+    assert [chunk.visible_length for chunk in chunks] == [len("before\nafter")]

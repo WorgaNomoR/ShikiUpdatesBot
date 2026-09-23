@@ -130,11 +130,11 @@ from messages import (
     build_favourite_message,
     build_message,
     build_startup_snapshot,
+    build_status_report,
     classify_event,
     clean_description,
     extract_score,
     extract_score_change,
-    format_rate_entry,
 )
 from report_delivery import (
     deliver_frozen_report,
@@ -4949,6 +4949,8 @@ async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> Non
 
 
 async def _deliver_status_response(
+    bot: Bot,
+    chat_id: int,
     send,
     *,
     is_owner: bool,
@@ -4977,28 +4979,27 @@ async def _deliver_status_response(
         if (item.get("anime") or {}).get("kind", "") in ANIME_ALLOWED_KINDS
     ]
 
-    lines: list[str] = []
-
-    if anime_list:
-        lines.append("🎌 <b>Сейчас смотрит:</b>")
-        for item in anime_list:
-            lines.append(format_rate_entry(item, "anime"))
-
-    if manga_list:
-        if lines:
-            lines.append("")  # пустая строка-разделитель
-        lines.append("📚 <b>Сейчас читает:</b>")
-        for item in manga_list:
-            lines.append(format_rate_entry(item, "manga"))
-
-    if not lines:
+    if not anime_list and not manga_list:
         await send(
             f"😴 {DISPLAY_NAME} сейчас ничего не смотрит и не читает. Подозрительно.",
         )
         return
 
-    sep = "\n"
-    await send(sep.join(lines), parse_mode=ParseMode.HTML)
+    report = build_status_report(anime_list, manga_list, load_stats_all())
+    result = await deliver_report(
+        bot,
+        chat_id,
+        report,
+        disable_preview=False,
+        notify_partial=True,
+    )
+    if not result.delivered:
+        log.error(
+            "status: доставка остановлена после %d/%d частей: %s",
+            result.delivered_units,
+            result.total_units,
+            result.error,
+        )
 
 
 async def _send_status_to_chat(
@@ -5012,13 +5013,20 @@ async def _send_status_to_chat(
     async def send(text: str, **kwargs) -> None:
         await bot.send_message(chat_id, text, **kwargs)
 
-    await _deliver_status_response(send, is_owner=is_owner)
+    await _deliver_status_response(
+        bot,
+        chat_id,
+        send,
+        is_owner=is_owner,
+    )
 
 
 async def cmd_status(message: Message) -> None:
     """Показать текущую активность через общий command/menu use-case."""
     from_user = getattr(message, "from_user", None)
     await _deliver_status_response(
+        message.bot,
+        message.chat.id,
         message.answer,
         is_owner=from_user is not None and from_user.id == OWNER_ID,
     )
