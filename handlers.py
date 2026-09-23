@@ -11,10 +11,15 @@ main.py лишь регистрирует эти функции в Dispatcher.
 """
 
 import asyncio
+import inspect
 import io
 import math
+import re
 import time
-from urllib.parse import urlsplit
+from urllib.parse import (
+    quote,
+    urlsplit,
+)
 
 import aiohttp
 from aiogram import Bot
@@ -42,6 +47,7 @@ from aiogram.types import (
     ReplyParameters,
 )
 
+import main_menu
 from access_control import (
     INLINE_ACCESS_ALLOWED,
     INLINE_ACCESS_BLOCKED,
@@ -121,7 +127,6 @@ from lists import (
 )
 from messages import (
     BROADCAST_HEADER,
-    DISPLAY_NAME_CONTEXT,
     build_favourite_message,
     build_message,
     build_startup_snapshot,
@@ -268,7 +273,10 @@ FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
 FACTS_CONFIRM_CLEAR_CALLBACK_PREFIX = "facts:confirm-clear:"
 FACT_BANK_EXAMPLE_PATH = RESOURCE_ROOT / "examples" / "facts.json"
 INFO_PREVIEW_PATH = RESOURCE_ROOT / "assets" / "info-preview.png"
+MAIN_MENU_ASSET_DIR = RESOURCE_ROOT / "assets" / "main-menu"
 _info_preview_file_id: str | None = None
+_main_menu_file_ids: dict[str, str] = {}
+_main_menu_artwork_bytes: dict[str, bytes] = {}
 _status_cache: tuple[list[dict], list[dict]] | None = None
 _status_cache_at = 0.0
 _status_cache_lock: asyncio.Lock | None = None
@@ -347,6 +355,10 @@ class PickStates(StatesGroup):
 
 class ListsStates(StatesGroup):
     active = State()  # одно публичное меню, привязанное к инициатору и сообщению
+
+
+class MainMenuStates(StatesGroup):
+    active = State()  # одно главное меню, привязанное к инициатору и сообщению
 
 
 def _confirm_kb() -> InlineKeyboardMarkup:
@@ -824,17 +836,24 @@ async def _cleanup_inline_control(message: Message | None) -> None:
             log.debug("_cleanup_inline_control: не удалось убрать кнопки меню: %s", e)
 
 
-async def _cleanup_inline_menu(message: Message | None) -> None:
-    """Удалить inline-меню и команду, на которую оно отвечает, если возможно."""
+async def _cleanup_inline_command(message: Message | None) -> None:
+    """Удалить команду, на которую отвечает control message."""
     if message is None:
         return
-    await _cleanup_inline_control(message)
     command = getattr(message, "reply_to_message", None)
     if command is not None:
         try:
             await command.delete()
         except Exception as e:
-            log.debug("_cleanup_inline_menu: не удалось удалить команду: %s", e)
+            log.debug("_cleanup_inline_command: не удалось удалить команду: %s", e)
+
+
+async def _cleanup_inline_menu(message: Message | None) -> None:
+    """Удалить inline-меню и команду, на которую оно отвечает, если возможно."""
+    if message is None:
+        return
+    await _cleanup_inline_control(message)
+    await _cleanup_inline_command(message)
 
 
 async def _claim_inline_menu(message: Message) -> bool:
@@ -985,6 +1004,9 @@ async def cmd_lists(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Не удалось определить отправителя команды.")
         return
     current_state = await state.get_state()
+    if _main_menu_state_is_active(current_state):
+        await _discard_active_main_menu(message, state)
+        current_state = None
     if current_state is not None and not _lists_state_is_active(current_state):
         await message.answer(
             "⚠️ Сначала заверши текущую операцию или отправь /cancel."
@@ -1520,13 +1542,18 @@ def _pick_state_is_active(value: object) -> bool:
     return value == PickStates.active or value == PickStates.active.state
 
 
-async def cmd_pick(message: Message, state: FSMContext) -> None:
-    """Открыть скрытый owner-only выбор из локального planned snapshot."""
-    if message.from_user is None or message.from_user.id != OWNER_ID:
-        await message.answer("🚫 Эта команда только для владельца бота.")
-        return
-
+async def _open_pick_menu(
+    message: Message,
+    state: FSMContext,
+    *,
+    send,
+    command_message_id: int | None,
+) -> None:
+    """Открыть существующий picker через выбранный безопасный transport."""
     current_state = await state.get_state()
+    if _main_menu_state_is_active(current_state):
+        await _discard_active_main_menu(message, state)
+        current_state = None
     if current_state is not None and not _pick_state_is_active(current_state):
         await message.answer(
             "⚠️ Сначала заверши текущую операцию или отправь /cancel."
@@ -1538,7 +1565,7 @@ async def cmd_pick(message: Message, state: FSMContext) -> None:
         await state.clear()
     snapshot_state, catalog = _load_pick_catalog()
     try:
-        menu = await message.reply(
+        menu = await send(
             _pick_root_text(snapshot_state, catalog),
             parse_mode=ParseMode.HTML,
             reply_markup=_pick_root_keyboard(),
@@ -1551,10 +1578,23 @@ async def cmd_pick(message: Message, state: FSMContext) -> None:
         pick_menu_chat_id=message.chat.id,
         pick_menu_message_id=menu.message_id,
         pick_menu_kind=_PICK_MENU_TEXT,
-        pick_command_message_id=message.message_id,
+        pick_command_message_id=command_message_id,
         pick_category=None,
         pick_shown_ids=[],
         pick_anchor=None,
+    )
+
+
+async def cmd_pick(message: Message, state: FSMContext) -> None:
+    """Открыть скрытый owner-only выбор из локального planned snapshot."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+    await _open_pick_menu(
+        message,
+        state,
+        send=message.reply,
+        command_message_id=message.message_id,
     )
 
 
@@ -2511,6 +2551,19 @@ async def cmd_backup(message: Message) -> None:
     )
 
 
+async def _send_backup_export(bot: Bot, chat_id: int) -> None:
+    """Выполнить существующий экспорт для command/menu orchestration."""
+    caption = (
+        "📤 Экспорт состояния.\n"
+        f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}"
+    )
+    if not await send_backup(bot, caption):
+        await bot.send_message(
+            chat_id,
+            "❌ Не удалось собрать/отправить архив — см. логи.",
+        )
+
+
 async def backup_export_cb(callback: CallbackQuery) -> None:
     """Кнопка «Экспорт» — собираем и шлём архив, меню убираем."""
     if callback.from_user is None or callback.from_user.id != OWNER_ID:
@@ -2519,10 +2572,37 @@ async def backup_export_cb(callback: CallbackQuery) -> None:
     await callback.answer("Собираю архив...")
     bot, chat_id = callback.message.bot, callback.message.chat.id
     await _safe_delete(bot, chat_id, callback.message.message_id)
-    caption = (f"📤 Экспорт состояния.\n"
-               f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}")
-    if not await send_backup(bot, caption):
-        await bot.send_message(chat_id, "❌ Не удалось собрать/отправить архив — см. логи.")
+    await _send_backup_export(bot, chat_id)
+
+
+async def _begin_backup_import(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
+    """Войти в существующий FSM ожидания ZIP с заданной навигацией."""
+    try:
+        prompt = await _edit_main_menu_content(
+            callback.message,
+            "📥 Пришли <b>.zip</b>-архив бэкапа (как файл-документ).\n\n"
+            "Возьму из него только нужное — список блокировок, подписчиков, "
+            "дополнительные факты, сведения о доступных обновлениях и данные "
+            "текущего и завершённых кварталов. Лишнее в архиве не помешает, "
+            "спокойно пропущу.\n\n/cancel — отмена",
+            reply_markup=reply_markup,
+        )
+    except TelegramBadRequest as e:
+        log.warning("backup: не удалось открыть импорт: %s", e)
+        await callback.answer(
+            "Не удалось открыть импорт. Попробуй ещё раз.",
+            show_alert=True,
+        )
+        return False
+    await state.set_state(BackupStates.waiting_import_file)
+    await state.update_data(prompt_msg_id=prompt.message_id)
+    await callback.answer()
+    return True
 
 
 async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2530,16 +2610,7 @@ async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user is None or callback.from_user.id != OWNER_ID:
         await callback.answer("🚫 Только для владельца.", show_alert=True)
         return
-    await callback.answer()
-    await state.set_state(BackupStates.waiting_import_file)
-    prompt = await callback.message.edit_text(
-        "📥 Пришли <b>.zip</b>-архив бэкапа (как файл-документ).\n\n"
-        "Возьму из него только нужное — список блокировок, подписчиков, дополнительные "
-        "факты, сведения о доступных обновлениях и данные текущего и завершённых "
-        "кварталов. Лишнее в архиве не помешает, спокойно пропущу.\n\n/cancel — отмена",
-        parse_mode=ParseMode.HTML,
-    )
-    await state.update_data(prompt_msg_id=prompt.message_id)
+    await _begin_backup_import(callback, state)
 
 
 async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2716,18 +2787,29 @@ async def _facts_edit_status(
     return snapshot
 
 
+async def _open_facts_menu(
+    message: Message,
+    state: FSMContext,
+    *,
+    send,
+) -> None:
+    """Открыть существующее меню банка фактов через заданный transport."""
+    await _discard_active_main_menu(message, state)
+    await state.clear()
+    snapshot = reload_fact_bank()
+    await send(
+        _facts_status_text(snapshot),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_facts_menu_keyboard(snapshot),
+    )
+
+
 async def cmd_facts(message: Message, state: FSMContext) -> None:
     """Открыть скрытое меню управления дополнительными фактами."""
     if message.from_user is None or message.from_user.id != OWNER_ID:
         await message.answer("🚫 Эта команда только для владельца бота.")
         return
-    await state.clear()
-    snapshot = reload_fact_bank()
-    await message.reply(
-        _facts_status_text(snapshot),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_facts_menu_keyboard(snapshot),
-    )
+    await _open_facts_menu(message, state, send=message.reply)
 
 
 async def facts_upload_cb(callback: CallbackQuery, state: FSMContext) -> None:
@@ -3224,16 +3306,6 @@ async def fact_next_cb(callback: CallbackQuery) -> None:
         )
 
 
-def _return_to_inline_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка ручного возврата к выбору чата без автоматического поиска."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="Вернуться к поиску",
-            switch_inline_query="",
-        )
-    ]])
-
-
 def _inline_limit_text() -> str:
     """Объяснение после перехода из кнопки исчерпанного inline-лимита."""
     return (
@@ -3414,116 +3486,1083 @@ async def cmd_inline_search(inline_query: InlineQuery) -> None:
             log.debug("inline-search: Telegram не принял пустой ответ")
 
 
+def _main_menu_state_is_active(value: object) -> bool:
+    """Учесть объект State и строковое значение реального FSM storage."""
+    return value == MainMenuStates.active or value == MainMenuStates.active.state
+
+
+async def _cleanup_main_menu_messages(message: Message, data: dict) -> bool:
+    """Удалить сообщения одной main-menu сессии в привязанном чате."""
+    if data.get("main_menu_chat_id") != message.chat.id:
+        return False
+    found = False
+    for key in ("main_menu_message_id", "main_menu_command_message_id"):
+        message_id = data.get(key)
+        if type(message_id) is int:
+            found = True
+            await _safe_delete(message.bot, message.chat.id, message_id)
+    return found
+
+
+async def _discard_active_main_menu(message: Message, state: FSMContext) -> bool:
+    """Инвалидировать активную main-menu сессию и убрать её сообщения."""
+    if not _main_menu_state_is_active(await state.get_state()):
+        return False
+    data = await state.get_data()
+    await state.clear()
+    await _cleanup_main_menu_messages(message, data)
+    return True
+
+
+def _menu_owner_allowed(user_id: object, chat_type: object) -> bool:
+    """Проверить обе границы приватных инструментов владельца."""
+    return user_id == OWNER_ID and chat_type == ChatType.PRIVATE
+
+
+def _chat_is_subscribed(chat_id: int) -> bool:
+    """Прочитать текущее состояние подписки без миграции или записи."""
+    return chat_id in load_subscribers()
+
+
+def _inline_search_allowed(
+    user_id: int,
+    subscribers: dict[int, str],
+) -> bool:
+    """Проверить единое личное право inline-поиска без storage I/O."""
+    return user_id == OWNER_ID or user_id in subscribers
+
+
+_BOT_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+
+
+def _shikimori_profile_url() -> str:
+    """Собрать ссылку на настроенный профиль без HTML-представления."""
+    username = quote(SHIKI_USER, safe="")
+    return f"{SHIKI_BASE_URL.rstrip('/')}/{username}"
+
+
+async def _private_inline_search_url(bot: Bot) -> str | None:
+    """Получить private deep link либо безопасно оставить callback fallback."""
+    try:
+        bot_user = await bot.me()
+    except Exception as e:
+        log.debug(
+            "main-menu: не удалось определить username бота: %s",
+            type(e).__name__,
+        )
+        return None
+    username = getattr(bot_user, "username", None)
+    if not isinstance(username, str):
+        return None
+    username = username.removeprefix("@")
+    if not _BOT_USERNAME_RE.fullmatch(username):
+        return None
+    return f"https://t.me/{username}?start=inline_search"
+
+
+async def _main_menu_home_view(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    chat_type: object,
+    *,
+    notice: str | None = None,
+) -> main_menu.MenuView:
+    """Собрать home по chat-подписке и независимому личному entitlement."""
+    subscribers = load_subscribers()
+    subscribed = chat_id in subscribers
+    inline_search_allowed = _inline_search_allowed(user_id, subscribers)
+    private_chat = chat_type == ChatType.PRIVATE
+    private_search_url = None
+    if not private_chat and not inline_search_allowed:
+        private_search_url = await _private_inline_search_url(bot)
+    return main_menu.home_view(
+        DISPLAY_NAME,
+        _shikimori_profile_url(),
+        subscribed=subscribed,
+        owner_tools=_menu_owner_allowed(user_id, chat_type),
+        inline_search_allowed=inline_search_allowed,
+        private_chat=private_chat,
+        private_search_url=private_search_url,
+        notice=notice,
+    )
+
+
+async def _discard_active_flow_for_menu(
+    message: Message,
+    state: FSMContext | None,
+) -> None:
+    """Отменить прежний process-local flow и убрать известные control messages."""
+    if state is None:
+        return
+    data = await state.get_data()
+    await state.clear()
+    chat_id = message.chat.id
+    bound_chat = data.get("main_menu_chat_id")
+    if bound_chat is not None and bound_chat != chat_id:
+        return
+    message_ids = {
+        data.get("main_menu_message_id"),
+        data.get("main_menu_command_message_id"),
+        data.get("lists_menu_message_id"),
+        data.get("pick_menu_message_id"),
+        data.get("prompt_msg_id"),
+        data.get("control_msg_id"),
+    }
+    message_ids.update(data.get("preview_msg_ids", []))
+    for message_id in message_ids:
+        if type(message_id) is int:
+            await _safe_delete(message.bot, chat_id, message_id)
+
+
+def _load_main_menu_artwork(view: main_menu.MenuView) -> str | BufferedInputFile | None:
+    """Материализовать иллюстрацию или вернуть текстовый fallback."""
+    cached = _main_menu_file_ids.get(view.artwork)
+    if cached:
+        return cached
+    filename = main_menu.MAIN_MENU_ASSETS.get(view.artwork)
+    if filename is None:
+        log.warning("main-menu: неизвестная иллюстрация %s", view.artwork)
+        return None
+    content = _main_menu_artwork_bytes.get(filename)
+    if content is None:
+        path = MAIN_MENU_ASSET_DIR / filename
+        try:
+            content = path.read_bytes()
+        except OSError as e:
+            log.warning(
+                "main-menu: не удалось прочитать иллюстрацию %s: %s",
+                view.artwork,
+                type(e).__name__,
+            )
+            return None
+        if not content:
+            log.warning("main-menu: иллюстрация %s пуста", view.artwork)
+            return None
+        _main_menu_artwork_bytes[filename] = content
+    return BufferedInputFile(content, filename=filename)
+
+
+def _remember_main_menu_file_id(artwork: str, message: Message) -> None:
+    """Запомнить Telegram file_id после первой загрузки иллюстрации."""
+    photos = getattr(message, "photo", None)
+    if not isinstance(photos, (list, tuple)) or not photos:
+        return
+    file_id = getattr(photos[-1], "file_id", None)
+    if isinstance(file_id, str) and file_id:
+        _main_menu_file_ids[artwork] = file_id
+
+
+def _main_menu_message_has_photo(message: Message) -> bool:
+    """Определить реальное photo-сообщение без зависимости от mock-атрибутов."""
+    photos = getattr(message, "photo", None)
+    return isinstance(photos, (list, tuple)) and bool(photos)
+
+
+def _main_menu_edit_is_not_modified(error: TelegramBadRequest) -> bool:
+    """Распознать идемпотентный отказ Telegram для уже актуального меню."""
+    return "message is not modified" in str(error).casefold()
+
+
+async def _edit_main_menu_content(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Message:
+    """Изменить инструкцию в caption или обычном текстовом сообщении."""
+    try:
+        if _main_menu_message_has_photo(message):
+            return await message.edit_caption(
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        return await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    except TelegramBadRequest as e:
+        if _main_menu_edit_is_not_modified(e):
+            return message
+        raise
+
+
+async def _send_main_menu_view(
+    message: Message,
+    view: main_menu.MenuView,
+) -> Message:
+    """Ответить экраном с иллюстрацией либо полным текстовым fallback."""
+    artwork = _load_main_menu_artwork(view)
+    if artwork is None:
+        return await message.reply(
+            view.text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=view.keyboard,
+        )
+    try:
+        sent = await message.reply_photo(
+            artwork,
+            caption=view.caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=view.keyboard,
+        )
+    except TelegramBadRequest as e:
+        _main_menu_file_ids.pop(view.artwork, None)
+        log.warning(
+            "main-menu: Telegram отклонил иллюстрацию %s: %s",
+            view.artwork,
+            e,
+        )
+        return await message.reply(
+            view.text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=view.keyboard,
+        )
+    _remember_main_menu_file_id(view.artwork, sent)
+    return sent
+
+
+async def _replace_main_menu_with_text(
+    callback: CallbackQuery,
+    state: FSMContext,
+    view: main_menu.MenuView,
+) -> Message:
+    """Заменить photo-control полным текстовым экраном при отказе media."""
+    data = await state.get_data()
+    reply_parameters = None
+    command_message_id = data.get("main_menu_command_message_id")
+    if type(command_message_id) is int:
+        reply_parameters = ReplyParameters(
+            message_id=command_message_id,
+            allow_sending_without_reply=True,
+        )
+    sent = await callback.message.bot.send_message(
+        callback.message.chat.id,
+        view.text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=view.keyboard,
+        reply_parameters=reply_parameters,
+    )
+    await _safe_delete(
+        callback.message.bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+    )
+    return sent
+
+
+async def _edit_main_menu_view(
+    callback: CallbackQuery,
+    state: FSMContext,
+    view: main_menu.MenuView,
+) -> Message:
+    """Переключить экран, сохранив media-режим текущей сессии."""
+    if not _main_menu_message_has_photo(callback.message):
+        try:
+            return await callback.message.edit_text(
+                view.text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=view.keyboard,
+            )
+        except TelegramBadRequest as e:
+            if _main_menu_edit_is_not_modified(e):
+                return callback.message
+            raise
+    artwork = _load_main_menu_artwork(view)
+    if artwork is None:
+        return await _replace_main_menu_with_text(callback, state, view)
+    try:
+        sent = await callback.message.edit_media(
+            media=InputMediaPhoto(
+                media=artwork,
+                caption=view.caption,
+                parse_mode=ParseMode.HTML,
+            ),
+            reply_markup=view.keyboard,
+        )
+    except TelegramBadRequest as e:
+        if _main_menu_edit_is_not_modified(e):
+            return callback.message
+        _main_menu_file_ids.pop(view.artwork, None)
+        log.warning(
+            "main-menu: Telegram отклонил иллюстрацию %s: %s",
+            view.artwork,
+            e,
+        )
+        return await _replace_main_menu_with_text(callback, state, view)
+    _remember_main_menu_file_id(view.artwork, sent)
+    return sent
+
+
+async def _open_main_menu(
+    message: Message,
+    state: FSMContext | None,
+    *,
+    screen: str = "home",
+    target_subscription: bool | None = None,
+    origin: str = "start",
+) -> None:
+    """Открыть корень или подтверждение как одну session-bound FSM-сессию."""
+    if message.from_user is None:
+        await message.answer("⚠️ Не удалось определить отправителя команды.")
+        return
+    await _discard_active_flow_for_menu(message, state)
+    try:
+        if screen == "subscription":
+            subscribed = _chat_is_subscribed(message.chat.id)
+            target = bool(target_subscription)
+            view = main_menu.subscription_view(
+                subscribed=subscribed,
+                target=target,
+            )
+        else:
+            target = None
+            view = await _main_menu_home_view(
+                message.bot,
+                message.chat.id,
+                message.from_user.id,
+                message.chat.type,
+            )
+    except Exception as e:
+        log.error("main-menu: не удалось прочитать подписку: %s", e)
+        await message.answer(
+            "⚠️ Не удалось открыть меню: состояние подписки недоступно."
+        )
+        return
+    try:
+        control = await _send_main_menu_view(message, view)
+    except Exception as e:
+        log.warning("main-menu: не удалось открыть меню: %s", e)
+        return
+    if state is None:
+        return
+    await state.set_state(MainMenuStates.active)
+    await state.update_data(
+        main_menu_user_id=message.from_user.id,
+        main_menu_chat_id=message.chat.id,
+        main_menu_message_id=control.message_id,
+        main_menu_command_message_id=message.message_id,
+        main_menu_screen=screen,
+        main_menu_origin=origin,
+        main_menu_target_subscription=target,
+    )
+
+
+def _main_menu_known_state(value: object, screen: object) -> bool:
+    """Связать разрешённое FSM-состояние с экраном главного меню."""
+    if value in {
+        MainMenuStates.active,
+        MainMenuStates.active.state,
+    }:
+        return True
+    if screen == "owner:backup:import":
+        return value in {
+            BackupStates.waiting_import_file,
+            BackupStates.waiting_import_file.state,
+        }
+    if screen == "owner:broadcast:content":
+        return value in {
+            BroadcastStates.waiting_content,
+            BroadcastStates.waiting_content.state,
+        }
+    return False
+
+
+async def _main_menu_session(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> dict | None:
+    """Проверить инициатора, чат, control message и живую FSM-сессию."""
+    if callback.message is None:
+        await callback.answer(
+            "Меню устарело. Отправь /start ещё раз.",
+            show_alert=True,
+        )
+        return None
+    data = await state.get_data()
+    if not _main_menu_known_state(
+        await state.get_state(),
+        data.get("main_menu_screen"),
+    ):
+        await callback.answer(
+            "Меню устарело. Отправь /start ещё раз.",
+            show_alert=True,
+        )
+        return None
+    sender_id = getattr(callback.from_user, "id", None)
+    if sender_id != data.get("main_menu_user_id"):
+        await callback.answer(
+            "Это меню открыто другим пользователем.",
+            show_alert=True,
+        )
+        return None
+    if (
+        data.get("main_menu_chat_id") != callback.message.chat.id
+        or data.get("main_menu_message_id") != callback.message.message_id
+    ):
+        await callback.answer("Это меню уже неактивно.", show_alert=True)
+        return None
+    return data
+
+
+async def _edit_main_menu(
+    callback: CallbackQuery,
+    state: FSMContext,
+    view: main_menu.MenuView,
+    *,
+    screen: str,
+    target_subscription: bool | None = None,
+    origin: str | None = None,
+) -> bool:
+    """Безопасно заменить экран и только затем опубликовать переход FSM."""
+    try:
+        control = await _edit_main_menu_view(callback, state, view)
+    except Exception as e:
+        log.debug("main-menu: не удалось обновить экран: %s", e)
+        await callback.answer(
+            "Не удалось обновить меню. Попробуй ещё раз.",
+            show_alert=True,
+        )
+        return False
+    await state.set_state(MainMenuStates.active)
+    updates = dict(
+        main_menu_message_id=control.message_id,
+        main_menu_screen=screen,
+        main_menu_target_subscription=target_subscription,
+        prompt_msg_id=None,
+    )
+    if origin is not None:
+        updates["main_menu_origin"] = origin
+    await state.update_data(**updates)
+    await callback.answer()
+    return True
+
+
+async def _show_main_home(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    notice: str | None = None,
+) -> None:
+    """Вернуть session-bound меню в корень по текущей подписке."""
+    try:
+        view = await _main_menu_home_view(
+            callback.message.bot,
+            callback.message.chat.id,
+            callback.from_user.id,
+            callback.message.chat.type,
+            notice=notice,
+        )
+    except Exception as e:
+        log.error("main-menu: не удалось перечитать подписку: %s", e)
+        await callback.answer("Состояние подписки недоступно.", show_alert=True)
+        return
+    await _edit_main_menu(
+        callback,
+        state,
+        view,
+        screen="home",
+        origin="start",
+    )
+
+
+async def _finish_main_menu(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> tuple[Bot, int]:
+    """Инвалидировать сессию до best-effort очистки terminal action."""
+    bot = callback.message.bot
+    chat_id = callback.message.chat.id
+    await state.clear()
+    await callback.answer()
+    await _cleanup_inline_menu(callback.message)
+    return bot, chat_id
+
+
+async def _confirmed_subscription_change(
+    chat_id: int,
+    name: str,
+    *,
+    subscribed: bool,
+):
+    """Изменить подписку и вернуть точный результат мутации."""
+    mutation = await mutate_subscription(
+        chat_id,
+        name,
+        subscribed=subscribed,
+    )
+    if not mutation.changed:
+        return mutation
+    action = "Новый подписчик" if subscribed else "Отписался"
+    log.info(
+        "%s: %s (chat_id=%d). Всего: %d.",
+        action,
+        name,
+        chat_id,
+        mutation.subscriber_count,
+    )
+    return mutation
+
+
+async def _backup_after_confirmed_change(bot: Bot, mutation) -> None:
+    """Запустить backup после ответа UI только для реального изменения."""
+    if not mutation.changed:
+        return
+    try:
+        await _backup_after_subscription(bot)
+    except Exception as e:
+        log.exception(
+            "Не удалось обработать подписочный backup после подтверждения: %s",
+            e,
+        )
+
+
+async def _deliver_main_report(
+    callback: CallbackQuery,
+    state: FSMContext,
+    builder,
+    *,
+    label: str,
+    disable_preview: bool = False,
+) -> None:
+    """Завершить меню и доставить существующий typed report."""
+    bot, chat_id = await _finish_main_menu(callback, state)
+    try:
+        report = builder()
+        if inspect.isawaitable(report):
+            report = await report
+    except Exception as e:
+        log.error("main-menu: формирование %s: %s", label, e)
+        await bot.send_message(
+            chat_id,
+            "⚠️ Не удалось сформировать отчёт, попробуй позже.",
+        )
+        return
+    result = await deliver_report(
+        bot,
+        chat_id,
+        report,
+        disable_preview=disable_preview,
+        notify_partial=True,
+    )
+    if not result.delivered:
+        log.error(
+            "main-menu: доставка %s остановлена после %d/%d частей: %s",
+            label,
+            result.delivered_units,
+            result.total_units,
+            result.error,
+        )
+
+
+async def _main_menu_subscription_confirm(
+    callback: CallbackQuery,
+    state: FSMContext,
+    data: dict,
+    *,
+    subscribed: bool,
+) -> None:
+    """Подтвердить ожидаемое состояние и обновить либо завершить меню."""
+    if data.get("main_menu_screen") != "subscription":
+        await callback.answer("Это действие уже неактивно.", show_alert=True)
+        return
+    if data.get("main_menu_target_subscription") is not subscribed:
+        await callback.answer("Это действие уже неактивно.", show_alert=True)
+        return
+    if callback.message.chat.type == ChatType.PRIVATE:
+        candidate_name = getattr(callback.from_user, "full_name", None)
+    else:
+        candidate_name = getattr(callback.message.chat, "title", None)
+    name = (
+        candidate_name
+        if isinstance(candidate_name, str) and candidate_name.strip()
+        else str(callback.message.chat.id)
+    )
+    try:
+        mutation = await _confirmed_subscription_change(
+            callback.message.chat.id,
+            name,
+            subscribed=subscribed,
+        )
+    except Exception as e:
+        log.error("main-menu: подтверждение подписки: %s", e)
+        await callback.answer(
+            "Не удалось изменить подписку. Попробуй позже.",
+            show_alert=True,
+        )
+        return
+    if data.get("main_menu_origin") == "inline_search" and subscribed:
+        await state.clear()
+        await callback.answer()
+        text = (
+            "✅ Подписка оформлена. Можно вернуться к поиску."
+            if mutation.changed
+            else "☕ Подписка уже активна. Можно вернуться к поиску."
+        )
+        try:
+            await _edit_main_menu_content(
+                callback.message,
+                text,
+                reply_markup=main_menu.inline_return_keyboard(),
+            )
+        except Exception as e:
+            log.debug("main-menu: не удалось завершить inline deep link: %s", e)
+        await _cleanup_inline_command(callback.message)
+        await _backup_after_confirmed_change(callback.message.bot, mutation)
+        return
+    if mutation.changed:
+        notice = (
+            "✅ Подписка оформлена."
+            if subscribed
+            else "✅ Подписка отключена. Остальные функции доступны как раньше."
+        )
+    else:
+        notice = (
+            "ℹ️ Подписка уже активна."
+            if subscribed
+            else "ℹ️ Подписка уже отключена."
+        )
+    await _show_main_home(callback, state, notice=notice)
+    await _backup_after_confirmed_change(callback.message.bot, mutation)
+
+
+async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Оркестрировать меню без переноса доменной логики в navigation layer."""
+    data = await _main_menu_session(callback, state)
+    if data is None:
+        return
+    action = callback.data or ""
+    screen = data.get("main_menu_screen")
+    if action.startswith("menu:owner") and not _menu_owner_allowed(
+        callback.from_user.id,
+        callback.message.chat.type,
+    ):
+        await callback.answer(
+            "Только для владельца в личном чате.",
+            show_alert=True,
+        )
+        return
+
+    if screen == "home":
+        if action == "menu:close":
+            await state.clear()
+            await callback.answer()
+            await _cleanup_inline_menu(callback.message)
+            return
+        if action == "menu:inline_search":
+            try:
+                inline_search_allowed = _inline_search_allowed(
+                    callback.from_user.id,
+                    load_subscribers(),
+                )
+            except Exception as e:
+                log.error("main-menu: не удалось проверить inline-поиск: %s", e)
+                await callback.answer(
+                    "Состояние подписки недоступно.",
+                    show_alert=True,
+                )
+                return
+            if inline_search_allowed:
+                await _show_main_home(
+                    callback,
+                    state,
+                    notice="✅ Поиск уже доступен — нажми кнопку ещё раз.",
+                )
+                return
+            if callback.message.chat.type != ChatType.PRIVATE:
+                await callback.answer(
+                    "Открой личный чат с ботом, чтобы оформить подписку.",
+                    show_alert=True,
+                )
+                return
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.subscription_view(
+                    subscribed=False,
+                    target=True,
+                ),
+                screen="subscription",
+                target_subscription=True,
+                origin="inline_search",
+            )
+            return
+        if action == "menu:subscription":
+            try:
+                subscribed = _chat_is_subscribed(callback.message.chat.id)
+            except Exception as e:
+                log.error("main-menu: не удалось открыть подписку: %s", e)
+                await callback.answer(
+                    "Состояние подписки недоступно.",
+                    show_alert=True,
+                )
+                return
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.subscription_view(
+                    subscribed=subscribed,
+                    target=not subscribed,
+                ),
+                screen="subscription",
+                target_subscription=not subscribed,
+                origin="start",
+            )
+            return
+        if action == "menu:stats":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.stats_view(),
+                screen="stats",
+            )
+            return
+        if action == "menu:lists":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.lists_view(),
+                screen="lists",
+            )
+            return
+        if action == "menu:owner":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.owner_view(),
+                screen="owner",
+            )
+            return
+        if action == "menu:status":
+            bot, chat_id = await _finish_main_menu(callback, state)
+            await _send_status_to_chat(
+                bot,
+                chat_id,
+                is_owner=callback.from_user.id == OWNER_ID,
+            )
+            return
+        if action == "menu:favs":
+            await _deliver_main_report(
+                callback,
+                state,
+                _stats_report_favourites,
+                label="favourites",
+                disable_preview=True,
+            )
+            return
+        if action == "menu:fact":
+            bot, chat_id = await _finish_main_menu(callback, state)
+            fact = select_fact(
+                _fact_message_seed(
+                    callback.from_user.id,
+                    callback.message.message_id,
+                )
+            )
+            await bot.send_message(
+                chat_id,
+                build_fact_text(fact),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_fact_keyboard(
+                    fact.id,
+                    initiator_id=callback.from_user.id,
+                ),
+            )
+            return
+        if action == "menu:info":
+            bot, chat_id = await _finish_main_menu(callback, state)
+            await _send_info_to_chat(
+                bot,
+                chat_id,
+                is_owner=callback.from_user.id == OWNER_ID,
+            )
+            return
+
+    if screen == "subscription":
+        if action == "menu:home":
+            await _show_main_home(callback, state)
+            return
+        if action == "menu:subscription:confirm:on":
+            await _main_menu_subscription_confirm(
+                callback,
+                state,
+                data,
+                subscribed=True,
+            )
+            return
+        if action == "menu:subscription:confirm:off":
+            await _main_menu_subscription_confirm(
+                callback,
+                state,
+                data,
+                subscribed=False,
+            )
+            return
+
+    if screen == "stats":
+        if action == "menu:home":
+            await _show_main_home(callback, state)
+            return
+        if action == "menu:stats:current":
+            await _deliver_main_report(
+                callback,
+                state,
+                _stats_report_current,
+                label="stats-current",
+            )
+            return
+        if action == "menu:stats:all":
+            await _deliver_main_report(
+                callback,
+                state,
+                _stats_report_all,
+                label="stats-all",
+            )
+            return
+
+    if screen == "lists":
+        if action == "menu:home":
+            await _show_main_home(callback, state)
+            return
+        if action == "menu:lists:combined":
+            await _deliver_main_report(
+                callback,
+                state,
+                lambda: _lists_snapshot_report(MEDIA_COMBINED, VIEW_ALL),
+                label="lists-combined",
+                disable_preview=True,
+            )
+            return
+        media_actions = {
+            f"menu:lists:{key}": key
+            for key in main_menu.LIST_MEDIA
+        }
+        media_key = media_actions.get(action)
+        if media_key is not None:
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.list_media_view(media_key),
+                screen=f"lists:{media_key}",
+            )
+            return
+
+    if isinstance(screen, str) and screen.startswith("lists:"):
+        media_key = screen.split(":", 1)[1]
+        if action == "menu:lists":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.lists_view(),
+                screen="lists",
+            )
+            return
+        prefix = f"menu:lists:{media_key}:"
+        if action.startswith(prefix):
+            view_key = action.removeprefix(prefix)
+            if view_key in LIST_VIEW_BY_KEY:
+                await _deliver_main_report(
+                    callback,
+                    state,
+                    lambda: _lists_snapshot_report(media_key, view_key),
+                    label=f"lists-{media_key}-{view_key}",
+                    disable_preview=True,
+                )
+                return
+
+    if screen == "owner":
+        if action == "menu:home":
+            await _show_main_home(callback, state)
+            return
+        if action == "menu:owner:pick":
+            await _finish_main_menu(callback, state)
+            await _open_pick_menu(
+                callback.message,
+                state,
+                send=callback.message.answer,
+                command_message_id=None,
+            )
+            return
+        if action == "menu:owner:facts":
+            await _finish_main_menu(callback, state)
+            await _open_facts_menu(
+                callback.message,
+                state,
+                send=callback.message.answer,
+            )
+            return
+        if action == "menu:owner:backup":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.owner_backup_view(),
+                screen="owner:backup",
+            )
+            return
+        if action == "menu:owner:broadcast":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.owner_broadcast_view(),
+                screen="owner:broadcast",
+            )
+            return
+        if action == "menu:owner:users":
+            bot, chat_id = await _finish_main_menu(callback, state)
+            await deliver_user_directory(bot, chat_id)
+            return
+    if screen == "owner:backup":
+        if action == "menu:owner":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.owner_view(),
+                screen="owner",
+            )
+            return
+        if action == "menu:owner:backup:export":
+            bot, chat_id = await _finish_main_menu(callback, state)
+            await _send_backup_export(bot, chat_id)
+            return
+        if action == "menu:owner:backup:import":
+            opened = await _begin_backup_import(
+                callback,
+                state,
+                reply_markup=main_menu.owner_operation_back_keyboard(
+                    "menu:owner:backup"
+                ),
+            )
+            if opened:
+                await state.update_data(main_menu_screen="owner:backup:import")
+            return
+
+    if screen == "owner:backup:import" and action == "menu:owner:backup":
+        await _edit_main_menu(
+            callback,
+            state,
+            main_menu.owner_backup_view(),
+            screen="owner:backup",
+        )
+        return
+
+    if screen == "owner:broadcast":
+        if action == "menu:owner":
+            await _edit_main_menu(
+                callback,
+                state,
+                main_menu.owner_view(),
+                screen="owner",
+            )
+            return
+        if action == "menu:owner:broadcast:start":
+            try:
+                prompt = await _edit_main_menu_content(
+                    callback.message,
+                    "✍️ Пришли сообщение для рассылки.\n"
+                    "Поддерживаются: текст, фото, видео, GIF, стикер, "
+                    "документ, голосовое.",
+                    reply_markup=main_menu.owner_operation_back_keyboard(
+                        "menu:owner:broadcast"
+                    ),
+                )
+            except Exception as e:
+                log.debug("main-menu: не удалось начать рассылку: %s", e)
+                await callback.answer(
+                    "Не удалось начать рассылку.",
+                    show_alert=True,
+                )
+                return
+            await state.set_state(BroadcastStates.waiting_content)
+            await state.update_data(
+                main_menu_screen="owner:broadcast:content",
+                prompt_msg_id=prompt.message_id,
+            )
+            await callback.answer()
+            return
+
+    if (
+        screen == "owner:broadcast:content"
+        and action == "menu:owner:broadcast"
+    ):
+        await _edit_main_menu(
+            callback,
+            state,
+            main_menu.owner_broadcast_view(),
+            screen="owner:broadcast",
+        )
+        return
+
+    await callback.answer(
+        "Неизвестное или устаревшее действие.",
+        show_alert=True,
+    )
+
+
 async def cmd_start(
     message: Message,
     command: CommandObject | None = None,
+    state: FSMContext | None = None,
 ) -> None:
-    """Подписаться на уведомления (для владельца — заодно добудить фоновый цикл)."""
+    """Открыть нейтральное главное меню и сохранить recovery path владельца."""
     chat_id = message.chat.id
-    name = message.from_user.full_name if message.from_user else str(chat_id)
-    info_start = bool(
-        command is not None
-        and command.args == "info"
-        and message.from_user is not None
+    args = command.args.strip() if command and command.args else ""
+    private = (
+        message.from_user is not None
+        and message.chat.type == ChatType.PRIVATE
         and chat_id == message.from_user.id
     )
-    if info_start:
+    if private and args == "info":
         await _send_info(message)
         return
-
-    inline_limit_start = bool(
-        command is not None
-        and command.args == "inline_search_limit"
-        and message.from_user is not None
-        and chat_id == message.from_user.id
-    )
-    if inline_limit_start:
+    if private and args == "inline_search_limit":
         await message.answer(
             _inline_limit_text(),
             parse_mode=ParseMode.HTML,
-            reply_markup=_return_to_inline_keyboard(),
+            reply_markup=main_menu.inline_return_keyboard(),
+        )
+        return
+    if private and args == "inline_search":
+        try:
+            subscribed = _chat_is_subscribed(chat_id)
+        except Exception as e:
+            log.error("inline deep link: не удалось прочитать подписку: %s", e)
+            await message.answer("⚠️ Состояние подписки недоступно.")
+            return
+        if message.from_user.id == OWNER_ID or subscribed:
+            await message.answer(
+                "🔎 Можно вернуться к поиску.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu.inline_return_keyboard(),
+            )
+            return
+        await _open_main_menu(
+            message,
+            state,
+            screen="subscription",
+            target_subscription=True,
+            origin="inline_search",
         )
         return
 
-    if message.from_user is not None and message.from_user.id == OWNER_ID:
+    if not args and message.from_user is not None and message.from_user.id == OWNER_ID:
         if start_polling_loop(message.bot):
             log.info("Фоновый цикл добужен владельцем через /start.")
+    await _open_main_menu(message, state)
 
-    inline_search_start = bool(
-        command is not None
-        and command.args == "inline_search"
-        and message.from_user is not None
-        and chat_id == message.from_user.id
+
+async def cmd_stop(
+    message: Message,
+    state: FSMContext | None = None,
+) -> None:
+    """Открыть подтверждение отключения уведомлений без немедленной мутации."""
+    await _open_main_menu(
+        message,
+        state,
+        screen="subscription",
+        target_subscription=False,
+        origin="stop",
     )
-    answer_kwargs = {"parse_mode": ParseMode.HTML}
-    if inline_search_start:
-        answer_kwargs["reply_markup"] = _return_to_inline_keyboard()
-
-    mutation = await mutate_subscription(
-        chat_id,
-        name,
-        subscribed=True,
-    )
-
-    if not mutation.changed:
-        await message.answer(
-            f"☕ Ты уже подписан, {h(name)}! Буду слать новости об активности "
-            f"{h(DISPLAY_NAME_CONTEXT.genitive)}.",
-            **answer_kwargs,
-        )
-        return
-
-    log.info(
-        "Новый подписчик: %s (chat_id=%d). Всего: %d.",
-        name,
-        chat_id,
-        mutation.subscriber_count,
-    )
-    try:
-        await _backup_after_subscription(message.bot)
-    except Exception as e:
-        log.exception("Не удалось обработать подписочный backup после /start: %s", e)
-    reply = (
-        f"✅ Подписка оформлена, {h(name)}!\n"
-        "Теперь ты будешь получать уведомления об активности "
-        f"{h(DISPLAY_NAME_CONTEXT.genitive)} на Shikimori. \U0001f3cc\n\n"
-        "Чтобы отписаться — /stop"
-    )
-    await message.answer(reply, **answer_kwargs)
-
-
-async def cmd_stop(message: Message) -> None:
-    """Отписаться от уведомлений."""
-    chat_id = message.chat.id
-    name = message.from_user.full_name if message.from_user else str(chat_id)
-
-    mutation = await mutate_subscription(
-        chat_id,
-        name,
-        subscribed=False,
-    )
-
-    if not mutation.changed:
-        await message.answer(
-            "🤔 Ты и так не подписан. Напиши /start чтобы подписаться."
-        )
-        return
-
-    log.info(
-        "Отписался: %s (chat_id=%d). Осталось: %d.",
-        name,
-        chat_id,
-        mutation.subscriber_count,
-    )
-    try:
-        await _backup_after_subscription(message.bot)
-    except Exception as e:
-        log.exception("Не удалось обработать подписочный backup после /stop: %s", e)
-    reply = (
-        f"👋 Ты отписан, {name}. Жаль терять такого зрителя!\n"
-        "Если передумаешь — /start"
-    )
-    await message.answer(reply)
 
 
 async def cmd_subs(message: Message) -> None:
@@ -3775,6 +4814,8 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     await state.clear()
+    if await _cleanup_main_menu_messages(message, data):
+        await _safe_delete(message.bot, message.chat.id, message.message_id)
     # /pick хранит только ID текущего control message и команды. Удаляем их
     # тем же best-effort контрактом, что использует Close.
     if (
@@ -3806,6 +4847,8 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 async def broadcast_receive(message: Message, state: FSMContext) -> None:
     """Принять контент от владельца, показать превью, убрать служебный мусор."""
+    if message.from_user is None or message.from_user.id != OWNER_ID:
+        return
     if message.sticker:
         data = {"msg_type": "sticker", "file_id": message.sticker.file_id, "user_text": ""}
     elif message.photo:
@@ -3850,6 +4893,9 @@ async def broadcast_receive(message: Message, state: FSMContext) -> None:
 
 async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """Подтверждение — рассылаем подписчикам, превью убираем, контрол правим в результат."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
     data = await state.get_data()
     await state.clear()
     bot, chat_id = callback.message.bot, callback.message.chat.id
@@ -3890,6 +4936,9 @@ async def broadcast_confirm_cb(callback: CallbackQuery, state: FSMContext) -> No
 
 async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """Отмена — ничего не шлём, чистим превью и контрол подчистую."""
+    if callback.from_user is None or callback.from_user.id != OWNER_ID:
+        await callback.answer("🚫 Только для владельца.", show_alert=True)
+        return
     data = await state.get_data()
     await state.clear()
     bot, chat_id = callback.message.bot, callback.message.chat.id
@@ -3899,26 +4948,26 @@ async def broadcast_cancel_cb(callback: CallbackQuery, state: FSMContext) -> Non
     await _safe_delete(bot, chat_id, callback.message.message_id)
 
 
-async def cmd_status(message: Message) -> None:
-    """
-    /status — показывает что сейчас смотрит/читает пользователь.
-    Переиспользует общий свежий результат для всех чатов, затем собирает
-    ответ с учётом всех комбинаций.
-    """
+async def _deliver_status_response(
+    send,
+    *,
+    is_owner: bool,
+) -> None:
+    """Доставить текущую активность через общий command/menu use-case."""
     try:
         rates = await _get_status_rates()
     except ProfilePrivacyError:
-        from_user = getattr(message, "from_user", None)
-        is_owner = from_user is not None and from_user.id == OWNER_ID
         text = (
             _profile_privacy_owner_text()
             if is_owner
             else _profile_privacy_public_text()
         )
-        await message.answer(text, parse_mode=ParseMode.HTML)
+        await send(text, parse_mode=ParseMode.HTML)
         return
     if rates is None:
-        await message.answer("⚠️ Не удалось получить данные от Shikimori. Попробуй позже.")
+        await send(
+            "⚠️ Не удалось получить данные от Shikimori. Попробуй позже.",
+        )
         return
     anime_list, manga_list = rates
 
@@ -3943,13 +4992,71 @@ async def cmd_status(message: Message) -> None:
             lines.append(format_rate_entry(item, "manga"))
 
     if not lines:
-        await message.answer(
-            f"😴 {DISPLAY_NAME} сейчас ничего не смотрит и не читает. Подозрительно."
+        await send(
+            f"😴 {DISPLAY_NAME} сейчас ничего не смотрит и не читает. Подозрительно.",
         )
         return
 
     sep = "\n"
-    await message.answer(sep.join(lines), parse_mode=ParseMode.HTML)
+    await send(sep.join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _send_status_to_chat(
+    bot: Bot,
+    chat_id: int,
+    *,
+    is_owner: bool,
+) -> None:
+    """Адаптировать общий status use-case к отдельной Telegram-доставке."""
+
+    async def send(text: str, **kwargs) -> None:
+        await bot.send_message(chat_id, text, **kwargs)
+
+    await _deliver_status_response(send, is_owner=is_owner)
+
+
+async def cmd_status(message: Message) -> None:
+    """Показать текущую активность через общий command/menu use-case."""
+    from_user = getattr(message, "from_user", None)
+    await _deliver_status_response(
+        message.answer,
+        is_owner=from_user is not None and from_user.id == OWNER_ID,
+    )
+
+
+async def _deliver_owner_version(send) -> None:
+    """Обновить сведения о версиях и безопасно доставить один результат."""
+    try:
+        state = await refresh_update_state(force=True)
+        text = _build_info_text(state)
+        keyboard = build_version_keyboard(
+            state.get("release_url"),
+            include_refresh=True,
+        )
+    except Exception as e:
+        log.error(
+            "Не удалось подготовить сведения о версиях (%s)",
+            type(e).__name__,
+        )
+        try:
+            await send("⚠️ Сведения о версиях сейчас недоступны.")
+        except Exception as send_error:
+            log.warning(
+                "Не удалось отправить отказ сведений о версиях (%s)",
+                type(send_error).__name__,
+            )
+        return
+    try:
+        await send(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        log.warning(
+            "Не удалось отправить сведения о версиях (%s)",
+            type(e).__name__,
+        )
 
 
 async def cmd_version(message: Message) -> None:
@@ -3957,15 +5064,7 @@ async def cmd_version(message: Message) -> None:
     if message.from_user is None or message.from_user.id != OWNER_ID:
         await message.answer("🚫 Эта команда только для владельца бота.")
         return
-    state = await refresh_update_state(force=True)
-    await message.answer(
-        _build_info_text(state),
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_version_keyboard(
-            state.get("release_url"),
-            include_refresh=True,
-        ),
-    )
+    await _deliver_owner_version(message.answer)
 
 
 def _build_info_text(state: dict) -> str:
@@ -4011,11 +5110,15 @@ def _remember_info_preview_file_id(message: Message) -> None:
         _info_preview_file_id = file_id
 
 
-async def _send_info(message: Message) -> None:
-    """Отправить публичную карточку только из локального состояния."""
+async def _deliver_info_card(
+    send_text,
+    send_photo,
+    *,
+    is_owner: bool,
+) -> None:
+    """Собрать и доставить общую локальную карточку для command/menu входа."""
     global _info_preview_file_id
     state = load_update_state()
-    is_owner = message.from_user is not None and message.from_user.id == OWNER_ID
     text = _build_info_text(state)
     keyboard = build_version_keyboard(
         state.get("release_url"),
@@ -4023,14 +5126,14 @@ async def _send_info(message: Message) -> None:
     )
     preview = _info_preview_file_id or _load_info_preview()
     if preview is None:
-        await message.answer(
+        await send_text(
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
         return
     try:
-        sent = await message.answer_photo(
+        sent = await send_photo(
             preview,
             caption=text,
             parse_mode=ParseMode.HTML,
@@ -4039,7 +5142,7 @@ async def _send_info(message: Message) -> None:
     except TelegramBadRequest as e:
         _info_preview_file_id = None
         log.warning("Не удалось отправить иллюстрацию /info: %s", e)
-        await message.answer(
+        await send_text(
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
@@ -4047,6 +5150,36 @@ async def _send_info(message: Message) -> None:
         return
     if _info_preview_file_id is None:
         _remember_info_preview_file_id(sent)
+
+
+async def _send_info(message: Message) -> None:
+    """Отправить публичную карточку только из локального состояния."""
+    await _deliver_info_card(
+        message.answer,
+        message.answer_photo,
+        is_owner=message.from_user is not None and message.from_user.id == OWNER_ID,
+    )
+
+
+async def _send_info_to_chat(
+    bot: Bot,
+    chat_id: int,
+    *,
+    is_owner: bool,
+) -> None:
+    """Адаптировать общую info-карточку к отдельной Telegram-доставке."""
+
+    async def send_text(text: str, **kwargs):
+        return await bot.send_message(chat_id, text, **kwargs)
+
+    async def send_photo(photo, **kwargs):
+        return await bot.send_photo(chat_id, photo, **kwargs)
+
+    await _deliver_info_card(
+        send_text,
+        send_photo,
+        is_owner=is_owner,
+    )
 
 
 async def cmd_info(message: Message) -> None:

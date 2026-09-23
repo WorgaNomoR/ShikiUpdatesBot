@@ -8,7 +8,10 @@ from uuid import uuid4
 import pytest
 
 import storage
-from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
+from report_asset_ids import (
+    REPORT_POSTER_PLACEHOLDER_MEDIA,
+    REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
+)
 from storage import (
     BlockedUsersMutationError,
     BlockedUsersStateError,
@@ -1282,7 +1285,13 @@ def test_version2_quarter_plan_validates_exact_transport_content_and_progress():
     assert storage.validate_pending_quarter_delivery(cur)["plan_hash"] == digest
 
 
-def test_version2_quarter_plan_accepts_exact_versioned_local_media_reference():
+@pytest.mark.parametrize("placeholder_media", [
+    REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
+    REPORT_POSTER_PLACEHOLDER_MEDIA,
+])
+def test_version2_quarter_plan_accepts_exact_versioned_local_media_reference(
+    placeholder_media,
+):
     media_unit = _rich_frozen_unit("media")
     media_unit["content"]["blocks"] = [{
         "type": "collage",
@@ -1298,7 +1307,7 @@ def test_version2_quarter_plan_accepts_exact_versioned_local_media_reference():
                 "type": "photo",
                 "photo": {
                     "type": "photo",
-                    "media": REPORT_POSTER_PLACEHOLDER_MEDIA,
+                    "media": placeholder_media,
                 },
             },
         ],

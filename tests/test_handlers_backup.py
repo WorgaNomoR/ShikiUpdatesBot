@@ -17,6 +17,7 @@ from unittest.mock import (
 )
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
 import handlers
 from storage import QuarterDeliveryStateError
@@ -206,6 +207,28 @@ async def test_backup_import_enters_fsm_and_stores_prompt(backup_env):
     cb.message.edit_text.assert_awaited_once()  # промпт-сообщение переписано
     assert "доступных обновлениях" in cb.message.edit_text.call_args.args[0]
     state.update_data.assert_awaited_once_with(prompt_msg_id=555)  # id промпта сохранён для чистки
+
+
+@pytest.mark.asyncio
+async def test_backup_import_edit_rejection_does_not_enter_fsm(backup_env):
+    state = AsyncMock()
+    cb = MagicMock()
+    cb.from_user.id = handlers.OWNER_ID
+    cb.answer = AsyncMock()
+    cb.message.photo = []
+    cb.message.edit_text = AsyncMock(side_effect=TelegramBadRequest(
+        method=MagicMock(),
+        message="message can't be edited",
+    ))
+
+    await handlers.backup_import_cb(cb, state)
+
+    cb.answer.assert_awaited_once_with(
+        "Не удалось открыть импорт. Попробуй ещё раз.",
+        show_alert=True,
+    )
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
 
 
 # ─────────────────────────────────────────────────────────────

@@ -54,6 +54,9 @@ release_security.py
 assets/*
 !assets/info-preview.png
 !assets/report-poster-placeholder-v1.png
+!assets/report-poster-placeholder-v2.jpg
+!assets/main-menu/
+!assets/main-menu/*.jpg
 
 # Документация, не нужная во время выполнения контейнера
 README.md

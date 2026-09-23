@@ -5,7 +5,7 @@
 import re
 from urllib.parse import urlsplit
 
-from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
+from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES
 
 RICH_TEXT_LIMIT = 32768
 RICH_BLOCK_LIMIT = 500
@@ -56,7 +56,10 @@ class _Counter:
 
     def media_reference(self, value: object) -> None:
         """Проверить внешний HTTPS URL или известный локальный asset id."""
-        if value == REPORT_POSTER_PLACEHOLDER_MEDIA:
+        if (
+            isinstance(value, str)
+            and value in REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES
+        ):
             return
         if not is_safe_https_media_url(value):
             raise RichMessageValidationError("media_url")

@@ -15,6 +15,7 @@ import main
 
 def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     bot = SimpleNamespace(set_my_commands=AsyncMock())
+    storage = object()
     registration_order = []
     reconcile_access = AsyncMock(
         side_effect=lambda: registration_order.append("access-recovery")
@@ -53,6 +54,7 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
         start_polling=AsyncMock(side_effect=RuntimeError("polling stopped")),
         stop_polling=AsyncMock(),
     )
+    dispatcher_factory = MagicMock(return_value=dispatcher)
     probe = AsyncMock()
     health = AsyncMock()
     start_updates = MagicMock(return_value=True)
@@ -60,8 +62,8 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     guard_factory = MagicMock(return_value=guard)
 
     monkeypatch.setattr(main, "Bot", lambda token: bot)
-    monkeypatch.setattr(main, "Dispatcher", lambda storage: dispatcher)
-    monkeypatch.setattr(main, "MemoryStorage", lambda: object())
+    monkeypatch.setattr(main, "Dispatcher", dispatcher_factory)
+    monkeypatch.setattr(main, "MemoryStorage", lambda: storage)
     monkeypatch.setattr(main, "reconcile_blocked_subscribers", reconcile_access)
     monkeypatch.setattr(main, "reload_fact_bank", reload_facts)
     monkeypatch.setattr(main, "probe_owner_and_start", probe)
@@ -71,7 +73,9 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     monkeypatch.setattr(main, "IS_FROZEN", frozen)
     return SimpleNamespace(
         bot=bot,
+        storage=storage,
         dispatcher=dispatcher,
+        dispatcher_factory=dispatcher_factory,
         probe=probe,
         health=health,
         start_updates=start_updates,
@@ -91,6 +95,10 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         await main.main()
 
     app.bot.set_my_commands.assert_awaited_once()
+    app.dispatcher_factory.assert_called_once_with(
+        storage=app.storage,
+        fsm_strategy=main.FSMStrategy.USER_IN_CHAT,
+    )
     public_commands = [
         command.command
         for command in app.bot.set_my_commands.await_args.args[0]
@@ -99,25 +107,34 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         command.command: command.description
         for command in app.bot.set_my_commands.await_args.args[0]
     }
-    assert "info" in public_commands
-    assert "fact" in public_commands
-    assert "lists" in public_commands
-    assert public_descriptions["fact"] == "Интересный факт 💡"
-    assert public_descriptions["lists"] == "Списки аниме, манги и ранобэ 📋"
-    assert "version" not in public_commands
+    assert public_commands == ["start"]
+    assert public_descriptions == {"start": "Открыть главное меню 🎌"}
     registered_messages = [
         call.args[0]
         for call in app.dispatcher.message.register.call_args_list
     ]
-    assert main.cmd_info in registered_messages
-    assert main.cmd_fact in registered_messages
-    assert main.cmd_lists in registered_messages
-    assert main.cmd_facts in registered_messages
-    assert main.cmd_pick in registered_messages
-    assert main.cmd_block in registered_messages
-    assert main.cmd_unblock in registered_messages
-    assert main.cmd_useralerts in registered_messages
-    assert main.cmd_users in registered_messages
+    assert {
+        main.cmd_start,
+        main.cmd_stop,
+        main.cmd_subs,
+        main.cmd_backup,
+        main.cmd_status,
+        main.cmd_broadcast,
+        main.cmd_cancel,
+        main.cmd_stats,
+        main.cmd_lists,
+        main.cmd_favs,
+        main.cmd_fact,
+        main.cmd_facts,
+        main.cmd_pick,
+        main.cmd_info,
+        main.cmd_version,
+        main.cmd_block,
+        main.cmd_unblock,
+        main.cmd_blocklist,
+        main.cmd_useralerts,
+        main.cmd_users,
+    }.issubset(registered_messages)
     lists_registrations = [
         call
         for call in app.dispatcher.message.register.call_args_list
@@ -205,6 +222,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     assert main.facts_close_cb in registered_callbacks
     assert main.pick_menu_cb in registered_callbacks
     assert main.lists_menu_cb in registered_callbacks
+    assert main.main_menu_cb in registered_callbacks
     facts_apply_registration = next(
         call
         for call in app.dispatcher.callback_query.register.call_args_list
@@ -240,6 +258,17 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
     lists_filter = lists_registration.args[1]
     assert lists_filter.resolve(SimpleNamespace(data="lists:media:anime")) is True
     assert lists_filter.resolve(SimpleNamespace(data="stats:all")) is False
+    main_menu_registration = next(
+        call
+        for call in app.dispatcher.callback_query.register.call_args_list
+        if call.args[0] is main.main_menu_cb
+    )
+    main_menu_filter = main_menu_registration.args[1]
+    assert main_menu_filter.resolve(SimpleNamespace(data="menu:lists")) is True
+    assert main_menu_filter.resolve(SimpleNamespace(data="lists:combined")) is False
+    assert main_menu_registration.kwargs["flags"] == {
+        main.REGISTRATION_NEUTRAL_FLAG: True,
+    }
     useralerts_registration = next(
         call
         for call in app.dispatcher.message.register.call_args_list

@@ -15,12 +15,18 @@ from aiogram.types import (
 from report_asset_ids import (
     REPORT_POSTER_PLACEHOLDER_MEDIA,
     REPORT_POSTER_PLACEHOLDER_SHA256,
+    REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
+    REPORT_POSTER_PLACEHOLDER_V1_SHA256,
 )
 from runtime import RESOURCE_ROOT
 
 _REPORT_ASSETS = {
-    REPORT_POSTER_PLACEHOLDER_MEDIA: (
+    REPORT_POSTER_PLACEHOLDER_V1_MEDIA: (
         "report-poster-placeholder-v1.png",
+        REPORT_POSTER_PLACEHOLDER_V1_SHA256,
+    ),
+    REPORT_POSTER_PLACEHOLDER_MEDIA: (
+        "report-poster-placeholder-v2.jpg",
         REPORT_POSTER_PLACEHOLDER_SHA256,
     ),
 }

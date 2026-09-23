@@ -1,378 +1,590 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Тесты команд подписочного домена: /subs (список для владельца) и /stop
-(отписка). Ассертим оркестрацию (кого зовём, что сохраняем), не рендер-текст.
-Границы ввода-вывода (storage, авто-бэкап) мокаем."""
+"""Подписка через единое меню и hidden compatibility-команды."""
 
+from types import SimpleNamespace
 from unittest.mock import (
     AsyncMock,
     MagicMock,
 )
 
 import pytest
-from aiogram.enums import ParseMode
+from aiogram.enums import (
+    ChatType,
+    ParseMode,
+)
+from aiogram.exceptions import TelegramBadRequest
 
 import handlers
 import storage
-from name_grammar import build_display_name_context
 
-# ── /subs — только для владельца, ветвление по наличию подписчиков ──
+
+class _State:
+    def __init__(self, state=None, data=None):
+        self.state = state
+        self.data = dict(data or {})
+
+    async def get_state(self):
+        return self.state
+
+    async def set_state(self, state):
+        self.state = state
+
+    async def get_data(self):
+        return dict(self.data)
+
+    async def update_data(self, **values):
+        self.data.update(values)
+
+    async def clear(self):
+        self.state = None
+        self.data = {}
+
+
+def _control(*, chat_id=555, message_id=200, chat_type=ChatType.PRIVATE):
+    control = MagicMock()
+    control.chat.id = chat_id
+    control.chat.type = chat_type
+    control.message_id = message_id
+    control.bot = AsyncMock()
+    control.photo = [MagicMock(file_id="telegram-menu")]
+    control.edit_caption = AsyncMock(return_value=control)
+    control.edit_media = AsyncMock(return_value=control)
+    control.edit_text = AsyncMock()
+    control.delete = AsyncMock()
+    control.edit_reply_markup = AsyncMock()
+    control.reply_to_message = None
+    return control
+
+
+def _message(
+    *,
+    user_id=555,
+    chat_id=555,
+    chat_type=ChatType.PRIVATE,
+    control=None,
+):
+    message = MagicMock()
+    message.from_user = MagicMock(id=user_id, full_name="<Neo & Trinity>")
+    message.chat.id = chat_id
+    message.chat.type = chat_type
+    message.message_id = 100
+    message.bot = AsyncMock()
+    message.answer = AsyncMock()
+    message.reply = AsyncMock(
+        return_value=control
+        or _control(chat_id=chat_id, chat_type=chat_type)
+    )
+    message.reply_photo = AsyncMock(
+        return_value=control
+        or _control(chat_id=chat_id, chat_type=chat_type)
+    )
+    return message
+
+
+def _callback(
+    action,
+    state,
+    *,
+    user_id=555,
+    chat_id=555,
+    chat_type=ChatType.PRIVATE,
+):
+    callback = MagicMock()
+    callback.data = action
+    callback.from_user = MagicMock(id=user_id, full_name="<Neo & Trinity>")
+    callback.message = _control(
+        chat_id=chat_id,
+        message_id=state.data["main_menu_message_id"],
+        chat_type=chat_type,
+    )
+    callback.answer = AsyncMock()
+    return callback
+
+
+def _callbacks(markup):
+    return [
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+    ]
+
 
 @pytest.mark.asyncio
 async def test_cmd_subs_rejects_non_owner(monkeypatch):
     load = MagicMock(return_value={1: "X"})
     monkeypatch.setattr(handlers, "load_subscribers", load)
+    message = _message(user_id=handlers.OWNER_ID + 1)
 
-    msg = MagicMock()
-    msg.from_user = MagicMock(id=handlers.OWNER_ID + 1)   # не владелец
-    msg.answer = AsyncMock()
+    await handlers.cmd_subs(message)
 
-    await handlers.cmd_subs(msg)
-
-    msg.answer.assert_awaited_once()
-    assert "владельца" in msg.answer.call_args.args[0]
-    load.assert_not_called()                     # до чтения списка не доходим
+    assert "владельца" in message.answer.await_args.args[0]
+    load.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_cmd_subs_empty_list(monkeypatch):
     monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    message = _message(user_id=handlers.OWNER_ID)
 
-    msg = MagicMock()
-    msg.from_user = MagicMock(id=handlers.OWNER_ID)
-    msg.answer = AsyncMock()
+    await handlers.cmd_subs(message)
 
-    await handlers.cmd_subs(msg)
-
-    msg.answer.assert_awaited_once()
-    assert "нет" in msg.answer.call_args.args[0].lower()
+    assert "нет" in message.answer.await_args.args[0].lower()
 
 
 @pytest.mark.asyncio
-async def test_cmd_subs_lists_all_subscribers(monkeypatch):
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {111: "Alice", 222: "Bob"})
+async def test_cmd_subs_lists_and_escapes_all_subscribers(monkeypatch):
+    monkeypatch.setattr(
+        handlers,
+        "load_subscribers",
+        lambda: {111: "<b>A&B</b>", 222: "Bob"},
+    )
+    message = _message(user_id=handlers.OWNER_ID)
 
-    msg = MagicMock()
-    msg.from_user = MagicMock(id=handlers.OWNER_ID)
-    msg.answer = AsyncMock()
+    await handlers.cmd_subs(message)
 
-    await handlers.cmd_subs(msg)
-
-    text = msg.answer.call_args.args[0]
-    assert "<b>2</b>" in text                     # счётчик подписчиков
-    assert "Alice" in text and "Bob" in text      # оба в списке
-    alice = '<a href="tg://user?id=111">Alice</a> (<code>111</code>)'
-    bob = '<a href="tg://user?id=222">Bob</a> (<code>222</code>)'
-    assert alice in text and bob in text            # профили и копируемые ID
-    assert text.index(alice) < text.index(bob)      # порядок хранилища сохранён
-    assert msg.answer.call_args.kwargs.get("parse_mode") == ParseMode.HTML
+    text = message.answer.await_args.args[0]
+    assert "<b>2</b>" in text
+    assert "&lt;b&gt;A&amp;B&lt;/b&gt;" in text
+    assert "<b>A&B</b>" not in text
+    assert message.answer.await_args.kwargs["parse_mode"] == ParseMode.HTML
 
 
 @pytest.mark.asyncio
-async def test_cmd_subs_escapes_html_in_subscriber_names(monkeypatch):
-    """Имена подписчиков из Telegram идут в HTML-сообщение -> обязаны
-    экранироваться h(), иначе < > & ломают разметку."""
-    monkeypatch.setattr(handlers, "load_subscribers", lambda: {111: "<b>A&B</b>"})
-
-    msg = MagicMock()
-    msg.from_user = MagicMock(id=handlers.OWNER_ID)
-    msg.answer = AsyncMock()
-
-    await handlers.cmd_subs(msg)
-
-    text = msg.answer.call_args.args[0]
-    assert (
-        '<a href="tg://user?id=111">&lt;b&gt;A&amp;B&lt;/b&gt;</a> '
-        '(<code>111</code>)'
-        in text
-    )                                               # ссылка + экранирование
-    assert "<b>A&B</b>" not in text                 # сырой вид не просочился
-
-
-# ── /stop — отписка: ветвление «не подписан» / реальная отписка ──
-
-@pytest.mark.asyncio
-async def test_cmd_stop_when_not_subscribed_does_nothing(monkeypatch):
-    mutate = AsyncMock(return_value=storage.SubscriptionMutation(False, 0))
+async def test_plain_start_opens_home_without_mutation_or_backup(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    mutate = AsyncMock()
+    backup = AsyncMock()
     monkeypatch.setattr(handlers, "mutate_subscription", mutate)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    message = _message()
+    state = _State()
+
+    await handlers.cmd_start(message, state=state)
+
+    message.reply_photo.assert_awaited_once()
+    markup = message.reply_photo.await_args.kwargs["reply_markup"]
+    assert _callbacks(markup)[:2] == [
+        "menu:inline_search",
+        "menu:subscription",
+    ]
+    text = message.reply_photo.await_args.kwargs["caption"]
+    assert "Профиль Shikimori прямо в Telegram" in text
+    assert "<code>а Фрирен</code>" in text
+    assert "menu:owner" not in _callbacks(markup)
+    assert handlers._main_menu_state_is_active(state.state)
+    assert state.data["main_menu_screen"] == "home"
+    mutate.assert_not_awaited()
+    backup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_falls_back_to_complete_text_when_photo_is_rejected(
+    monkeypatch,
+):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    handlers._main_menu_file_ids.clear()
+    message = _message()
+    message.reply_photo.side_effect = TelegramBadRequest(
+        method=MagicMock(),
+        message="wrong file identifier",
+    )
+    state = _State()
+
+    await handlers.cmd_start(message, state=state)
+
+    message.reply.assert_awaited_once()
+    assert "Профиль Shikimori прямо в Telegram" in (
+        message.reply.await_args.args[0]
+    )
+    assert state.data["main_menu_screen"] == "home"
+
+
+@pytest.mark.asyncio
+async def test_owner_start_rearms_before_failed_menu_read(monkeypatch):
+    order = []
+    monkeypatch.setattr(
+        handlers,
+        "start_polling_loop",
+        MagicMock(side_effect=lambda _bot: order.append("polling") or True),
+    )
+
+    def fail_load():
+        order.append("load")
+        raise OSError("broken")
+
+    monkeypatch.setattr(handlers, "load_subscribers", fail_load)
+    message = _message(user_id=handlers.OWNER_ID, chat_id=handlers.OWNER_ID)
+
+    await handlers.cmd_start(message, state=_State())
+
+    assert order == ["polling", "load"]
+    assert "состояние подписки недоступно" in message.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_stop_opens_confirmation_without_mutation(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {555: "Neo"})
+    mutate = AsyncMock()
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    message = _message()
+    state = _State()
+
+    await handlers.cmd_stop(message, state)
+
+    assert state.data["main_menu_screen"] == "subscription"
+    assert state.data["main_menu_target_subscription"] is False
+    assert "menu:subscription:confirm:off" in _callbacks(
+        message.reply_photo.await_args.kwargs["reply_markup"]
+    )
+    mutate.assert_not_awaited()
+    backup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_back_from_confirmation_is_read_only(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    mutate = AsyncMock()
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    message = _message()
+    state = _State()
+    await handlers.cmd_stop(message, state)
+    callback = _callback("menu:home", state)
+
+    await handlers.main_menu_cb(callback, state)
+
+    assert state.data["main_menu_screen"] == "home"
+    mutate.assert_not_awaited()
+    backup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed", "backup_calls"),
+    [(True, 1), (False, 0)],
+)
+async def test_confirm_mutates_and_schedules_only_for_real_change(
+    monkeypatch,
+    changed,
+    backup_calls,
+):
+    subscriber_state = {}
+
+    def load():
+        return dict(subscriber_state)
+
+    async def mutate(_chat_id, _name, *, subscribed):
+        if changed and subscribed:
+            subscriber_state[555] = "Neo"
+        return storage.SubscriptionMutation(changed, len(subscriber_state))
+
+    monkeypatch.setattr(handlers, "load_subscribers", load)
+    monkeypatch.setattr(handlers, "mutate_subscription", AsyncMock(side_effect=mutate))
     backup = AsyncMock()
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    message = _message()
+    state = _State()
+    await handlers.cmd_start(message, state=state)
+    open_subscription = _callback("menu:subscription", state)
+    await handlers.main_menu_cb(open_subscription, state)
+    confirm = _callback("menu:subscription:confirm:on", state)
 
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Ghost", id=555)
-    msg.answer = AsyncMock()
+    await handlers.main_menu_cb(confirm, state)
 
-    await handlers.cmd_stop(msg)
-
-    msg.answer.assert_awaited_once()
-    mutate.assert_awaited_once_with(555, "Ghost", subscribed=False)
-    backup.assert_not_awaited()                   # и бэкап не гоняли
+    handlers.mutate_subscription.assert_awaited_once_with(
+        555,
+        "<Neo & Trinity>",
+        subscribed=True,
+    )
+    assert backup.await_count == backup_calls
+    assert state.data["main_menu_screen"] == "home"
 
 
 @pytest.mark.asyncio
-async def test_cmd_stop_removes_subscriber_and_triggers_backup(monkeypatch):
+async def test_confirm_mutation_failure_keeps_confirmation_and_skips_backup(
+    monkeypatch,
+):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    mutate = AsyncMock(side_effect=RuntimeError("storage unavailable"))
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    message = _message()
+    state = _State()
+    await handlers.cmd_start(message, state=state)
+    open_subscription = _callback("menu:subscription", state)
+    await handlers.main_menu_cb(open_subscription, state)
+    confirm = _callback("menu:subscription:confirm:on", state)
+
+    await handlers.main_menu_cb(confirm, state)
+
+    confirm.answer.assert_awaited_once_with(
+        "Не удалось изменить подписку. Попробуй позже.",
+        show_alert=True,
+    )
+    assert state.data["main_menu_screen"] == "subscription"
+    backup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backup_failure_is_contained_after_subscription_ui_reaches_home(
+    monkeypatch,
+):
+    subscriber_state = {}
+
+    def load():
+        return dict(subscriber_state)
+
+    async def mutate(_chat_id, name, *, subscribed):
+        subscriber_state[555] = name
+        return storage.SubscriptionMutation(subscribed, len(subscriber_state))
+
+    state = _State()
+    monkeypatch.setattr(handlers, "load_subscribers", load)
+    monkeypatch.setattr(handlers, "mutate_subscription", AsyncMock(side_effect=mutate))
+
+    async def failed_backup(_bot):
+        assert state.data["main_menu_screen"] == "home"
+        raise RuntimeError("backup unavailable")
+
+    backup = AsyncMock(side_effect=failed_backup)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    message = _message()
+    await handlers.cmd_start(message, state=state)
+    open_subscription = _callback("menu:subscription", state)
+    await handlers.main_menu_cb(open_subscription, state)
+    confirm = _callback("menu:subscription:confirm:on", state)
+
+    await handlers.main_menu_cb(confirm, state)
+
+    confirm.answer.assert_awaited_once_with()
+    assert state.data["main_menu_screen"] == "home"
+    backup.assert_awaited_once_with(confirm.message.bot)
+
+
+@pytest.mark.asyncio
+async def test_confirm_unsubscribe_mutates_and_schedules_backup(monkeypatch):
+    subscriber_state = {555: "Neo"}
+
+    def load():
+        return dict(subscriber_state)
+
+    async def mutate(_chat_id, _name, *, subscribed):
+        assert subscribed is False
+        subscriber_state.pop(555)
+        return storage.SubscriptionMutation(True, 0)
+
+    monkeypatch.setattr(handlers, "load_subscribers", load)
+    monkeypatch.setattr(handlers, "mutate_subscription", AsyncMock(side_effect=mutate))
+    backup = AsyncMock()
+    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    message = _message()
+    state = _State()
+    await handlers.cmd_stop(message, state)
+    confirm = _callback("menu:subscription:confirm:off", state)
+
+    await handlers.main_menu_cb(confirm, state)
+
+    handlers.mutate_subscription.assert_awaited_once_with(
+        555,
+        "<Neo & Trinity>",
+        subscribed=False,
+    )
+    backup.assert_awaited_once_with(confirm.message.bot)
+    assert state.data["main_menu_screen"] == "home"
+
+
+@pytest.mark.asyncio
+async def test_group_subscription_uses_chat_title_instead_of_actor_name(
+    monkeypatch,
+):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
     mutate = AsyncMock(return_value=storage.SubscriptionMutation(True, 1))
     monkeypatch.setattr(handlers, "mutate_subscription", mutate)
+    monkeypatch.setattr(handlers, "_backup_after_subscription", AsyncMock())
+    message = _message(
+        user_id=555,
+        chat_id=-100,
+        chat_type=ChatType.SUPERGROUP,
+    )
+    state = _State()
+    await handlers.cmd_start(message, state=state)
+    open_subscription = _callback(
+        "menu:subscription",
+        state,
+        user_id=555,
+        chat_id=-100,
+        chat_type=ChatType.SUPERGROUP,
+    )
+    await handlers.main_menu_cb(open_subscription, state)
+    confirm = _callback(
+        "menu:subscription:confirm:on",
+        state,
+        user_id=555,
+        chat_id=-100,
+        chat_type=ChatType.SUPERGROUP,
+    )
+    confirm.message.chat.title = "<Anime Club>"
+
+    await handlers.main_menu_cb(confirm, state)
+
+    mutate.assert_awaited_once_with(
+        -100,
+        "<Anime Club>",
+        subscribed=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_info_and_limit_deep_links_remain_read_only(monkeypatch):
+    send_info = AsyncMock()
+    mutate = AsyncMock()
     backup = AsyncMock()
-    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
-
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Neo", id=555)
-    msg.bot = MagicMock()
-    msg.answer = AsyncMock()
-
-    await handlers.cmd_stop(msg)
-
-    mutate.assert_awaited_once_with(555, "Neo", subscribed=False)
-    backup.assert_awaited_once_with(msg.bot)
-    msg.answer.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_cmd_stop_confirms_saved_change_when_backup_scheduler_fails(monkeypatch):
-    monkeypatch.setattr(
-        handlers,
-        "mutate_subscription",
-        AsyncMock(return_value=storage.SubscriptionMutation(True, 0)),
-    )
-    backup = AsyncMock(side_effect=OSError("read failure"))
-    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Neo", id=555)
-    msg.bot = MagicMock()
-    msg.answer = AsyncMock()
-
-    await handlers.cmd_stop(msg)
-
-    backup.assert_awaited_once_with(msg.bot)
-    assert "отписан" in msg.answer.await_args.args[0]
-
-
-# ── /start — подписка зрителя + авто-бэкап (зеркало /stop) ──
-
-@pytest.mark.asyncio
-async def test_cmd_start_already_subscribed_uses_genitive_display_name(monkeypatch):
-    monkeypatch.setattr(
-        handlers,
-        "mutate_subscription",
-        AsyncMock(return_value=storage.SubscriptionMutation(False, 1)),
-    )
-    monkeypatch.setattr(
-        handlers,
-        "DISPLAY_NAME_CONTEXT",
-        build_display_name_context("Костя"),
-    )
-
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Morpheus", id=555)
-    msg.answer = AsyncMock()
-
-    await handlers.cmd_start(msg)
-
-    reply = msg.answer.call_args.args[0]
-    assert "об активности Кости" in reply
-    assert "активности Костя" not in reply
-
-
-@pytest.mark.asyncio
-async def test_cmd_start_subscribes_and_triggers_backup(monkeypatch):
-    mutate = AsyncMock(return_value=storage.SubscriptionMutation(True, 1))
+    polling = MagicMock()
+    monkeypatch.setattr(handlers, "_send_info", send_info)
     monkeypatch.setattr(handlers, "mutate_subscription", mutate)
-    monkeypatch.setattr(
-        handlers,
-        "DISPLAY_NAME_CONTEXT",
-        build_display_name_context("Костя"),
-    )
-    backup = AsyncMock()
     monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
+    monkeypatch.setattr(handlers, "start_polling_loop", polling)
 
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Morpheus", id=555)
-    msg.bot = MagicMock()
-    msg.answer = AsyncMock()
+    info = _message(user_id=handlers.OWNER_ID, chat_id=handlers.OWNER_ID)
+    await handlers.cmd_start(
+        info,
+        SimpleNamespace(args="info"),
+        _State(),
+    )
+    limit = _message()
+    await handlers.cmd_start(
+        limit,
+        SimpleNamespace(args="inline_search_limit"),
+        _State(),
+    )
 
-    await handlers.cmd_start(msg)
-
-    mutate.assert_awaited_once_with(555, "Morpheus", subscribed=True)
-    backup.assert_awaited_once_with(msg.bot)
-    msg.answer.assert_awaited_once()
-    reply = msg.answer.call_args.args[0]
-    assert "об активности Кости" in reply
-    assert "активности Костя" not in reply
+    send_info.assert_awaited_once_with(info)
+    assert "Shikimori попросил сделать паузу" in limit.answer.await_args.args[0]
+    mutate.assert_not_awaited()
+    backup.assert_not_awaited()
+    polling.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_cmd_start_confirms_saved_change_when_backup_scheduler_fails(monkeypatch):
+async def test_inline_search_subscriber_returns_without_mutation(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {555: "Neo"})
+    mutate = AsyncMock()
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
+    message = _message()
+
+    await handlers.cmd_start(
+        message,
+        SimpleNamespace(args="inline_search"),
+        _State(),
+    )
+
+    button = message.answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.switch_inline_query == ""
+    mutate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inline_search_owner_bypasses_subscription(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    message = _message(user_id=handlers.OWNER_ID, chat_id=handlers.OWNER_ID)
+    state = _State()
+
+    await handlers.cmd_start(
+        message,
+        SimpleNamespace(args="inline_search"),
+        state,
+    )
+
+    button = message.answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.switch_inline_query == ""
+    message.reply_photo.assert_not_awaited()
+    assert state.state is None
+    assert state.data == {}
+
+
+@pytest.mark.asyncio
+async def test_inline_search_unsubscribed_requires_confirmation(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
+    mutate = AsyncMock()
+    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
+    message = _message()
+    state = _State()
+
+    await handlers.cmd_start(
+        message,
+        SimpleNamespace(args="inline_search"),
+        state,
+    )
+
+    assert state.data["main_menu_origin"] == "inline_search"
+    assert state.data["main_menu_target_subscription"] is True
+    mutate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inline_search_confirmation_removes_start_but_keeps_return(
+    monkeypatch,
+):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {})
     monkeypatch.setattr(
         handlers,
         "mutate_subscription",
         AsyncMock(return_value=storage.SubscriptionMutation(True, 1)),
     )
-    backup = AsyncMock(side_effect=OSError("read failure"))
-    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Neo", id=555)
-    msg.bot = MagicMock()
-    msg.answer = AsyncMock()
-
-    await handlers.cmd_start(msg)
-
-    backup.assert_awaited_once_with(msg.bot)
-    assert "Подписка оформлена" in msg.answer.await_args.args[0]
-
-
-@pytest.mark.parametrize("already_subscribed", [True, False])
-@pytest.mark.asyncio
-async def test_cmd_start_escapes_html_names_in_both_branches(
-    monkeypatch,
-    already_subscribed,
-):
-    """Оба ответа /start включают HTML: экранируем имя подписчика и
-    склонённое DISPLAY_NAME, а в хранилище оставляем исходное имя."""
-    subscriber_name = "<Neo & Trinity>"
-    mutate = AsyncMock(
-        return_value=storage.SubscriptionMutation(not already_subscribed, 1)
-    )
-    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
-    monkeypatch.setattr(
-        handlers,
-        "DISPLAY_NAME_CONTEXT",
-        build_display_name_context("<Костя & Co>", "none"),
-    )
-    backup = AsyncMock()
-    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
-
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name=subscriber_name, id=555)
-    msg.bot = MagicMock()
-    msg.answer = AsyncMock()
-
-    await handlers.cmd_start(msg)
-
-    msg.answer.assert_awaited_once()
-    reply = msg.answer.call_args.args[0]
-    assert "&lt;Neo &amp; Trinity&gt;" in reply
-    assert "&lt;Костя &amp; Co&gt;" in reply
-    assert subscriber_name not in reply
-    assert "<Костя & Co>" not in reply
-    assert msg.answer.call_args.kwargs == {"parse_mode": ParseMode.HTML}
-
-    if already_subscribed:
-        backup.assert_not_awaited()
-    else:
-        backup.assert_awaited_once_with(msg.bot)
-    mutate.assert_awaited_once_with(555, subscriber_name, subscribed=True)
-
-
-@pytest.mark.parametrize("already_subscribed", [True, False])
-@pytest.mark.asyncio
-async def test_inline_search_deep_link_adds_only_manual_return_button(
-    monkeypatch,
-    already_subscribed,
-):
-    monkeypatch.setattr(
-        handlers,
-        "mutate_subscription",
-        AsyncMock(
-            return_value=storage.SubscriptionMutation(not already_subscribed, 1)
-        ),
-    )
     monkeypatch.setattr(handlers, "_backup_after_subscription", AsyncMock())
-    search_service = MagicMock()
-    monkeypatch.setattr(handlers, "_inline_search_service", search_service)
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Morpheus", id=555)
-    msg.bot = MagicMock()
-    msg.answer = AsyncMock()
+    message = _message()
+    state = _State()
+    await handlers.cmd_start(
+        message,
+        SimpleNamespace(args="inline_search"),
+        state,
+    )
+    callback = _callback("menu:subscription:confirm:on", state)
+    command = MagicMock()
+    command.delete = AsyncMock()
+    callback.message.reply_to_message = command
 
-    await handlers.cmd_start(msg, MagicMock(args="inline_search"))
+    await handlers.main_menu_cb(callback, state)
 
-    keyboard = msg.answer.await_args.kwargs["reply_markup"]
-    button = keyboard.inline_keyboard[0][0]
-    assert button.text == "Вернуться к поиску"
-    assert button.switch_inline_query == ""
-    assert button.switch_inline_query_current_chat is None
-    assert search_service.method_calls == []
-
-
-@pytest.mark.asyncio
-async def test_inline_search_parameter_in_group_keeps_ordinary_start_response(monkeypatch):
-    mutate = AsyncMock(return_value=storage.SubscriptionMutation(False, 1))
-    backup = AsyncMock()
-    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
-    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
-    msg = MagicMock()
-    msg.chat.id = -100
-    msg.from_user = MagicMock(full_name="Morpheus", id=555)
-    msg.answer = AsyncMock()
-
-    await handlers.cmd_start(msg, MagicMock(args="inline_search"))
-
-    assert msg.answer.await_args.kwargs == {"parse_mode": ParseMode.HTML}
-    mutate.assert_awaited_once_with(-100, "Morpheus", subscribed=True)
-    backup.assert_not_awaited()
+    assert state.state is None
+    command.delete.assert_awaited_once_with()
+    callback.message.delete.assert_not_awaited()
+    markup = callback.message.edit_caption.await_args.kwargs["reply_markup"]
+    assert markup.inline_keyboard[0][0].switch_inline_query == ""
 
 
 @pytest.mark.asyncio
-async def test_inline_limit_deep_link_explains_and_changes_no_subscription_state(
-    monkeypatch,
-):
+async def test_group_deep_link_falls_back_to_home_without_mutation(monkeypatch):
+    monkeypatch.setattr(handlers, "load_subscribers", lambda: {-100: "Group"})
     mutate = AsyncMock()
-    backup = AsyncMock()
     polling = MagicMock()
-    search_service = MagicMock()
     monkeypatch.setattr(handlers, "mutate_subscription", mutate)
-    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
     monkeypatch.setattr(handlers, "start_polling_loop", polling)
-    monkeypatch.setattr(handlers, "_inline_search_service", search_service)
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Morpheus", id=555)
-    msg.answer = AsyncMock()
+    message = _message(
+        chat_id=-100,
+        chat_type=ChatType.SUPERGROUP,
+    )
+    message.bot.me = AsyncMock(
+        return_value=SimpleNamespace(username="WorgaTestBot"),
+    )
+    state = _State()
 
-    await handlers.cmd_start(msg, MagicMock(args="inline_search_limit"))
+    await handlers.cmd_start(
+        message,
+        SimpleNamespace(args="inline_search"),
+        state,
+    )
 
-    text = msg.answer.await_args.args[0]
-    assert "Shikimori попросил сделать паузу" in text
-    assert "меньше чем через минуту" in text
-    keyboard = msg.answer.await_args.kwargs["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].switch_inline_query == ""
+    assert state.data["main_menu_screen"] == "home"
+    search = message.reply_photo.await_args.kwargs[
+        "reply_markup"
+    ].inline_keyboard[0][0]
+    assert search.switch_inline_query is None
+    assert search.url == "https://t.me/WorgaTestBot?start=inline_search"
     mutate.assert_not_awaited()
-    backup.assert_not_awaited()
     polling.assert_not_called()
-    assert search_service.method_calls == []
-
-
-@pytest.mark.asyncio
-async def test_info_deep_link_is_private_read_only_and_does_not_subscribe(
-    monkeypatch,
-):
-    send_info = AsyncMock()
-    mutate = AsyncMock()
-    backup = AsyncMock()
-    polling = MagicMock()
-    search_service = MagicMock()
-    monkeypatch.setattr(handlers, "_send_info", send_info)
-    monkeypatch.setattr(handlers, "mutate_subscription", mutate)
-    monkeypatch.setattr(handlers, "_backup_after_subscription", backup)
-    monkeypatch.setattr(handlers, "start_polling_loop", polling)
-    monkeypatch.setattr(handlers, "_inline_search_service", search_service)
-    msg = MagicMock()
-    msg.chat.id = 555
-    msg.from_user = MagicMock(full_name="Morpheus", id=555)
-
-    await handlers.cmd_start(msg, MagicMock(args="info"))
-
-    send_info.assert_awaited_once_with(msg)
-    mutate.assert_not_awaited()
-    backup.assert_not_awaited()
-    polling.assert_not_called()
-    assert search_service.method_calls == []
