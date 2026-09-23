@@ -379,15 +379,28 @@ def test_gallery_is_invisible_to_ordinary_html_without_extra_spacing():
 
 def test_gallery_is_invisible_when_ordinary_section_exceeds_chunk_limit():
     report = Report((unit(section(
-        line("before"),
+        line("a"),
+        Gallery((Poster("https://cdn.test/1.jpg"),)),
+        line("1234567"),
+    )),))
+
+    chunks = render_report(report, limit=8)
+
+    assert [chunk.html for chunk in chunks] == ["a", "1234567"]
+    assert [chunk.visible_length for chunk in chunks] == [1, 7]
+
+
+def test_gallery_does_not_force_fitting_ordinary_section_over_limit():
+    report = Report((unit(section(
+        line("a"),
         Gallery((Poster("https://cdn.test/1.jpg"),)),
         line("after"),
     )),))
 
-    chunks = render_report(report, limit=6)
+    chunks = render_report(report, limit=7)
 
-    assert [chunk.html for chunk in chunks] == ["before", "after"]
-    assert [chunk.visible_length for chunk in chunks] == [6, 5]
+    assert [chunk.html for chunk in chunks] == ["a\nafter"]
+    assert [chunk.visible_length for chunk in chunks] == [7]
 
 
 def test_empty_line_keeps_ordinary_blank_line_semantics():
@@ -396,6 +409,19 @@ def test_empty_line_keeps_ordinary_blank_line_semantics():
         Line(()),
         line("after"),
     )),))
+
+    chunks = render_report(report)
+
+    assert [chunk.html for chunk in chunks] == ["before\n\nafter"]
+    assert [chunk.visible_length for chunk in chunks] == [len("before\n\nafter")]
+
+
+def test_empty_html_section_does_not_add_inter_section_spacing():
+    report = Report((unit(
+        section(line("before")),
+        section(Line(())),
+        section(line("after")),
+    ),))
 
     chunks = render_report(report)
 

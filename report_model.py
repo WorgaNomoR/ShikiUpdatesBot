@@ -499,10 +499,7 @@ def _render_unit(value: Unit, limit: int, unit_index: int) -> list[RenderedChunk
         if not logical_section.items:
             continue
         section_html, section_length = _render_section(logical_section)
-        if not any(
-            not isinstance(item, Gallery)
-            for item in logical_section.items
-        ):
+        if not section_html:
             continue
         section_separator = 2 if current_html else 0
         if section_length <= limit - current_length - section_separator:
