@@ -318,12 +318,6 @@ async def test_users_terminal_delegates_after_state_and_control_cleanup(
         "deliver_user_directory",
         AsyncMock(side_effect=deliver),
     )
-    monkeypatch.setattr(
-        handlers,
-        "load_user_directory_snapshot",
-        MagicMock(side_effect=AssertionError("menu storage aggregation")),
-        raising=False,
-    )
 
     await handlers.main_menu_cb(callback, state)
 

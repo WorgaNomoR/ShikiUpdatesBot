@@ -82,6 +82,10 @@ def test_docker_build_requires_runtime_assets_in_effective_context():
         "RUN test -f /app/assets/report-poster-placeholder-v2.jpg"
         in instructions
     )
+    asset_loop_start = dockerfile.index("for asset in")
+    asset_loop_end = dockerfile.index("done;", asset_loop_start)
+    asset_loop = dockerfile[asset_loop_start:asset_loop_end]
+    assert 'test -f "/app/assets/main-menu/$asset"' in asset_loop
     for filename in MAIN_MENU_ASSETS.values():
         assert filename in dockerfile
     assert (
