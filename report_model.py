@@ -49,6 +49,13 @@ class Poster:
 
 
 @dataclass(frozen=True)
+class Gallery:
+    """Presentation-only набор обложек без ordinary HTML-содержимого."""
+
+    posters: tuple[Poster, ...]
+
+
+@dataclass(frozen=True)
 class Link:
     """Недоверенные подпись и URL одной логической ссылки."""
 
@@ -138,7 +145,7 @@ class Table:
     separate_groups: bool = False
 
 
-ReportItem = Line | Heading | Rows | Table
+ReportItem = Line | Heading | Rows | Table | Gallery
 
 
 @dataclass(frozen=True)
@@ -356,6 +363,8 @@ def _render_table_fallback(value: Table) -> tuple[str, int]:
 def _render_item(
     value: ReportItem | _CodeLines | _TableLines,
 ) -> tuple[str, int]:
+    if isinstance(value, Gallery):
+        return "", 0
     if isinstance(value, Heading):
         return (
             "".join(_render_heading_inline(part) for part in value.parts),
@@ -457,11 +466,17 @@ def _split_item(
         ]
     if isinstance(value, Table):
         return _split_table(value, limit)
+    if isinstance(value, Gallery):
+        return [value]
     return _split_rows(value, limit)
 
 
 def _render_section(value: Section) -> tuple[str, int]:
-    rendered = [_render_item(item) for item in value.items]
+    rendered = [
+        _render_item(item)
+        for item in value.items
+        if not isinstance(item, Gallery)
+    ]
     return (
         "\n".join(html for html, _ in rendered),
         sum(length for _, length in rendered) + max(0, len(rendered) - 1),
@@ -484,6 +499,8 @@ def _render_unit(value: Unit, limit: int, unit_index: int) -> list[RenderedChunk
         if not logical_section.items:
             continue
         section_html, section_length = _render_section(logical_section)
+        if not section_html:
+            continue
         section_separator = 2 if current_html else 0
         if section_length <= limit - current_length - section_separator:
             current_html += ("\n\n" if current_html else "") + section_html
@@ -497,6 +514,8 @@ def _render_unit(value: Unit, limit: int, unit_index: int) -> list[RenderedChunk
 
         flush()
         for item in logical_section.items:
+            if isinstance(item, Gallery):
+                continue
             for item_fragment in _split_item(item, limit):
                 item_html, item_length = _render_item(item_fragment)
                 item_separator = (
