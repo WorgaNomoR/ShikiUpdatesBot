@@ -13,6 +13,7 @@ from report_model import (
     Code,
     Gallery,
     Italic,
+    Line,
     Link,
     Poster,
     Report,
@@ -374,3 +375,29 @@ def test_gallery_is_invisible_to_ordinary_html_without_extra_spacing():
 
     assert [chunk.html for chunk in chunks] == ["before\nafter"]
     assert [chunk.visible_length for chunk in chunks] == [len("before\nafter")]
+
+
+def test_gallery_is_invisible_when_ordinary_section_exceeds_chunk_limit():
+    report = Report((unit(section(
+        line("before"),
+        Gallery((Poster("https://cdn.test/1.jpg"),)),
+        line("after"),
+    )),))
+
+    chunks = render_report(report, limit=6)
+
+    assert [chunk.html for chunk in chunks] == ["before", "after"]
+    assert [chunk.visible_length for chunk in chunks] == [6, 5]
+
+
+def test_empty_line_keeps_ordinary_blank_line_semantics():
+    report = Report((unit(section(
+        line("before"),
+        Line(()),
+        line("after"),
+    )),))
+
+    chunks = render_report(report)
+
+    assert [chunk.html for chunk in chunks] == ["before\n\nafter"]
+    assert [chunk.visible_length for chunk in chunks] == [len("before\n\nafter")]
