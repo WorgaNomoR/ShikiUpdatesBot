@@ -8,7 +8,10 @@ import types
 import pytest
 
 import handlers
-from report_model import rendered_html
+from report_model import (
+    Gallery,
+    rendered_html,
+)
 
 
 class DummyMessage:
@@ -170,6 +173,17 @@ async def test_nonempty_status_uses_local_posters_and_shared_rich_delivery(monke
     assert chat_id == 77
     assert kwargs == {"disable_preview": False, "notify_partial": True}
     assert "Ergo Proxy" in rendered_html(report)[0]
+    galleries = [
+        item
+        for report_unit in report.units
+        for report_section in report_unit.sections
+        for item in report_section.items
+        if isinstance(item, Gallery)
+    ]
+    assert len(galleries) == 1
+    assert [poster.url for poster in galleries[0].posters] == [
+        "https://cdn.test/ergo.jpg",
+    ]
     assert message.calls == []
 
 
