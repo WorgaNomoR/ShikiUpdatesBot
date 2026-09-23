@@ -87,7 +87,7 @@ def test_docker_build_requires_runtime_assets_in_effective_context():
     asset_loop = dockerfile[asset_loop_start:asset_loop_end]
     assert 'test -f "/app/assets/main-menu/$asset"' in asset_loop
     for filename in MAIN_MENU_ASSETS.values():
-        assert filename in dockerfile
+        assert filename in asset_loop
     assert (
         "find /app/assets/main-menu -maxdepth 1 -type f -name '*.jpg'"
         in dockerfile
