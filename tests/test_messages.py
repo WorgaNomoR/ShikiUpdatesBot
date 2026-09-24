@@ -857,14 +857,32 @@ def _snap(**over):
 
 def test_startup_snapshot_normal_state():
     txt = _snap()
-    assert txt.startswith("🟢 Бот запущен")
-    assert "Имя: Пётр" in txt and "Шики-логин: WNR" in txt
-    assert "проверка каждые 10 мин" in txt          # 600 сек -> 10 мин
-    assert "Подписчиков: 3" in txt
+    assert txt.startswith(
+        "🟢 Бот запущен\n\n"
+        "<b>⚙️ Настройки</b>\n"
+        "Имя: <b>Пётр</b>\n"
+        "Shikimori: <b>WNR</b>\n"
+        "Интервал: <b>10 мин</b>\n\n"
+        "<b>📊 Состояние</b>\n"
+        "Подписчики: 3\n"
+        "Отслеживание: история 1240 · избранное 37\n"
+        "✅ События за простой будут догнаны\n\n"
+    )
+    assert "Подписчики: 3" in txt
     assert "история 1240" in txt and "избранное 37" in txt
-    assert "события за простой догоним" in txt
-    assert "Последняя синхронизация статистики:" in txt
+    assert "События за простой будут догнаны" in txt
+    assert "🔄 Синхронизация:" in txt
+    assert "📊 Синхронизация:" not in txt
     assert "нет данных" not in txt                   # обе метки свежие
+
+
+def test_startup_snapshot_escapes_config_values_before_bold_markup():
+    txt = _snap(display_name="Имя <&>", shiki_user="WNR <&>")
+
+    assert "Имя: <b>Имя &lt;&amp;&gt;</b>" in txt
+    assert "Shikimori: <b>WNR &lt;&amp;&gt;</b>" in txt
+    assert "Имя <&>" not in txt
+    assert "WNR <&>" not in txt
 
 
 def test_startup_snapshot_full_wipe_collapses_to_banner():
@@ -873,8 +891,8 @@ def test_startup_snapshot_full_wipe_collapses_to_banner():
     assert "Чистый инстанс" in txt
     assert "не догоним" in txt
     assert "нет данных" not in txt                   # схлопнуто в один баннер
-    assert "🗂 Отслеживание:" not in txt             # обычной строки отслеживания нет
-    assert "Последняя синхронизация статистики:" not in txt
+    assert "Отслеживание:" not in txt                # обычной строки отслеживания нет
+    assert "🔄 Синхронизация:" not in txt
 
 
 def test_startup_snapshot_tracking_not_initialized_but_stats_present():
@@ -883,9 +901,10 @@ def test_startup_snapshot_tracking_not_initialized_but_stats_present():
                 last_backup_at=None)
     assert "⚠️ Отслеживание не инициализировано" in txt
     assert "уйдут в тишину" in txt
+    assert "События за простой уйдут в тишину\n\n🔄 Синхронизация:" in txt
     assert "Чистый инстанс" not in txt
-    assert "Последняя синхронизация статистики:" in txt
-    assert "💾 Последний автоматический бэкап: нет данных" in txt
+    assert "🔄 Синхронизация:" in txt
+    assert "💾 Автобэкап: нет данных" in txt
 
 
 def test_startup_snapshot_survives_bad_timestamps():

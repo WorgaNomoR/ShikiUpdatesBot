@@ -9,6 +9,7 @@ from unittest.mock import (
 )
 
 import pytest
+from aiogram.enums import ParseMode
 
 import handlers
 import runtime_status
@@ -152,7 +153,7 @@ def test_build_startup_text_renders_snapshot(monkeypatch):
     )
     txt = handlers._build_startup_text()
     assert txt.startswith("🟢 Бот запущен")
-    assert "Подписчиков: 3" in txt
+    assert "Подписчики: 3" in txt
     assert "история 1240" in txt
 
 
@@ -169,4 +170,31 @@ async def test_probe_sends_startup_snapshot(monkeypatch, fake_loop):
     monkeypatch.setattr(handlers, "_build_startup_text", lambda: "🟢 SNAP")
     bot = AsyncMock()
     await handlers.probe_owner_and_start(bot)
-    bot.send_message.assert_awaited_once_with(handlers.OWNER_ID, "🟢 SNAP", parse_mode=None)
+    bot.send_message.assert_awaited_once_with(
+        handlers.OWNER_ID,
+        "🟢 SNAP",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_sends_bare_fallback_with_html_and_starts_loop(
+    monkeypatch,
+    fake_loop,
+):
+    def boom():
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(handlers, "load_stats_all", boom)
+    bot = AsyncMock()
+
+    await handlers.probe_owner_and_start(bot)
+
+    bot.send_message.assert_awaited_once_with(
+        handlers.OWNER_ID,
+        "🟢 Бот запущен",
+        parse_mode=ParseMode.HTML,
+    )
+    assert handlers._polling_task is not None
+    await asyncio.sleep(0)
+    assert fake_loop == [bot]

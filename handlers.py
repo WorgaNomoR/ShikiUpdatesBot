@@ -2478,7 +2478,11 @@ async def probe_owner_and_start(bot: Bot) -> None:
     и т.п.) → WARNING, цикл НЕ стартуем. Апдейт-поллинг (dp.start_polling) жив всегда:
     бот отвечает на команды, владелец /start добудит цикл без рестарта контейнера."""
     try:
-        await bot.send_message(OWNER_ID, _build_startup_text(), parse_mode=None)
+        await bot.send_message(
+            OWNER_ID,
+            _build_startup_text(),
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as e:
         log.warning(
             "Владелец недоступен при старте (%s: %s) — фоновый цикл не запущен. "
