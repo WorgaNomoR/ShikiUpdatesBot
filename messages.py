@@ -1071,8 +1071,7 @@ def build_status_report(
 #  времена берутся от ПРОШЛОГО запуска — их протухлость и есть диагностика.
 #  Полный вайп (нет seen_ids И нет метки stats_all) схлопывается в один
 #  явный баннер вместо трёх «нет данных». Чистая функция: принимает
-#  значения-как-с-диска, возвращает готовый ПЛОСКИЙ текст (без HTML —
-#  шлётся как есть, тем же каналом, что и голый пинг).
+#  значения-как-с-диска и возвращает готовый короткий Telegram HTML.
 
 
 def _parse_ts(value: float | None) -> datetime | None:
@@ -1116,10 +1115,13 @@ def build_startup_snapshot(
     lines = [
         "🟢 Бот запущен",
         "",
-        f"👤 Имя: {display_name} · Шики-логин: {shiki_user} · "
-        f"⏱ проверка каждые {minutes} мин",
+        "<b>⚙️ Настройки</b>",
+        f"Имя: <b>{h(display_name)}</b>",
+        f"Shikimori: <b>{h(shiki_user)}</b>",
+        f"Интервал: <b>{minutes} мин</b>",
         "",
-        f"👥 Подписчиков: {subscriber_count}",
+        "<b>📊 Состояние</b>",
+        f"Подписчики: {subscriber_count}",
     ]
 
     stats_dt = _parse_iso_utc(stats_updated_at)
@@ -1133,17 +1135,16 @@ def build_startup_snapshot(
 
     # Строка отслеживания несёт здоровье-смысл, а не голое число.
     if seen_ids_count == 0:
-        lines.append(
-            "🗂 ⚠️ Отслеживание не инициализировано — "
-            "события за простой уйдут в тишину"
-        )
+        lines.append("⚠️ Отслеживание не инициализировано")
+        lines.append("События за простой уйдут в тишину")
     else:
         lines.append(
-            f"🗂 Отслеживание: история {seen_ids_count}, "
-            f"избранное {seen_favs_count} — события за простой догоним"
+            f"Отслеживание: история {seen_ids_count} · "
+            f"избранное {seen_favs_count}"
         )
+        lines.append("✅ События за простой будут догнаны")
 
     lines.append("")
-    lines.append(f"📊 Последняя синхронизация статистики: {_fmt_moment(stats_dt)}")
-    lines.append(f"💾 Последний автоматический бэкап: {_fmt_moment(_parse_ts(last_backup_at))}")
+    lines.append(f"🔄 Синхронизация: {_fmt_moment(stats_dt)}")
+    lines.append(f"💾 Автобэкап: {_fmt_moment(_parse_ts(last_backup_at))}")
     return "\n".join(lines)
