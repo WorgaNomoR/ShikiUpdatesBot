@@ -511,6 +511,59 @@ def _catalog_tokens(payloads: tuple[dict, ...]) -> list[str]:
     return result
 
 
+def _rich_parts_text(parts: list) -> str:
+    return "".join(
+        part if isinstance(part, str) else part.text
+        for part in parts
+    )
+
+
+def _multi_status_catalog_report(
+    first_count: int,
+    second_count: int,
+    *,
+    second_padding: int = 0,
+) -> Report:
+    def groups(prefix: str, count: int, padding: int = 0):
+        return tuple(
+            TableGroup(
+                rows=(TableRow((TableCell((Text(
+                    f"{prefix}-{index:03d}-{'x' * padding}"
+                ),)),)),),
+                fallback=(line(f"{prefix}-{index:03d}-{'x' * padding}"),),
+            )
+            for index in range(count)
+        )
+
+    return Report((unit(
+        section(heading("📺 ", Bold("АНИМЕ"), level=1)),
+        section(
+            heading(
+                "✅ ",
+                Bold(f"Первый · {first_count}"),
+                collapsible=True,
+            ),
+            Table(
+                columns=1,
+                groups=groups("first", first_count),
+                separate_groups=True,
+            ),
+        ),
+        section(
+            heading(
+                "🗑 ",
+                Bold(f"Второй · {second_count}"),
+                collapsible=True,
+            ),
+            Table(
+                columns=1,
+                groups=groups("second", second_count, second_padding),
+                separate_groups=True,
+            ),
+        ),
+    ),))
+
+
 def test_grouped_cards_paginate_immediately_after_exact_block_boundary():
     before = render_rich_report(_catalog_report(248))
     after = render_rich_report(_catalog_report(249))
@@ -523,6 +576,103 @@ def test_grouped_cards_paginate_immediately_after_exact_block_boundary():
         for index in range(249)
     ]
     assert all(fragment.fallback_unit is not None for fragment in after)
+
+
+def test_paginated_catalog_fills_tail_with_next_status_and_marks_continuation():
+    rendered = render_rich_report(_multi_status_catalog_report(249, 1))
+
+    assert len(rendered) == 2
+    assert [
+        _rich_parts_text(fragment.message.blocks[1].text)
+        for fragment in rendered
+    ] == [
+        "📺 АНИМЕ",
+        "📺 АНИМЕ · продолжение",
+    ]
+    details = [
+        [
+            _rich_parts_text(block.summary)
+            for block in fragment.message.blocks
+            if isinstance(block, InputRichBlockDetails)
+        ]
+        for fragment in rendered
+    ]
+    assert details == [
+        ["✅ Первый · 249"],
+        [
+            "✅ Первый · 249 · продолжение",
+            "🗑 Второй · 1",
+        ],
+    ]
+    payloads = tuple(fragment.payload for fragment in rendered)
+    payload_text = json.dumps(payloads, ensure_ascii=False)
+    tokens = [
+        *(f"first-{index:03d}-" for index in range(249)),
+        "second-000-",
+    ]
+    assert all(payload_text.count(token) == 1 for token in tokens)
+    assert [payload_text.index(token) for token in tokens] == sorted(
+        payload_text.index(token) for token in tokens
+    )
+    assert all(fragment.fallback_unit is not None for fragment in rendered)
+    fallback = "\n".join(
+        html
+        for fragment in rendered
+        for html in rendered_html(Report((fragment.fallback_unit,)))
+    )
+    assert all(fallback.count(token) == 1 for token in tokens)
+    assert [fallback.index(token) for token in tokens] == sorted(
+        fallback.index(token) for token in tokens
+    )
+
+
+def test_paginated_catalog_does_not_split_neighbor_into_tail():
+    rendered = render_rich_report(_multi_status_catalog_report(247, 2))
+
+    assert len(rendered) == 2
+    assert all(validate_rich_payload(fragment.payload) for fragment in rendered)
+    details = [
+        [
+            _rich_parts_text(block.summary)
+            for block in fragment.message.blocks
+            if isinstance(block, InputRichBlockDetails)
+        ]
+        for fragment in rendered
+    ]
+    assert details == [
+        ["✅ Первый · 247"],
+        ["🗑 Второй · 2"],
+    ]
+    payload_text = json.dumps(
+        tuple(fragment.payload for fragment in rendered),
+        ensure_ascii=False,
+    )
+    assert payload_text.count("second-000-") == 1
+    assert payload_text.count("second-001-") == 1
+
+
+def test_paginated_catalog_keeps_next_status_separate_when_tail_has_no_room():
+    rendered = render_rich_report(_multi_status_catalog_report(
+        249,
+        1,
+        second_padding=32_680,
+    ))
+
+    assert len(rendered) == 3
+    assert all(validate_rich_payload(fragment.payload) for fragment in rendered)
+    details = [
+        [
+            _rich_parts_text(block.summary)
+            for block in fragment.message.blocks
+            if isinstance(block, InputRichBlockDetails)
+        ]
+        for fragment in rendered
+    ]
+    assert details == [
+        ["✅ Первый · 249"],
+        ["✅ Первый · 249 · продолжение"],
+        ["🗑 Второй · 1"],
+    ]
 
 
 def test_oversized_comment_paginates_immediately_after_character_boundary():

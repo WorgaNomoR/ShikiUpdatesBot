@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 """Оркестрация публичного session-bound меню /lists."""
 
+import asyncio
 from unittest.mock import (
     AsyncMock,
     MagicMock,
@@ -170,29 +171,62 @@ async def test_media_submenu_and_back_use_generic_registry_dispatch():
 
 
 @pytest.mark.asyncio
-async def test_terminal_view_clears_and_cleans_before_shared_delivery(monkeypatch):
+async def test_terminal_view_orders_clear_ack_progress_build_and_delivery(monkeypatch):
     state = _active_state(media="anime")
     callback = _callback("lists:view:completed")
-    load = MagicMock(return_value=StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID))
-    cleanup = AsyncMock()
+    events = []
+    real_build = handlers.build_list_report
+
+    async def clear():
+        events.append("clear")
+        state.state = None
+        state.data = {}
+
+    async def answer(*args, **kwargs):
+        events.append("ack")
+
+    async def progress(*args, **kwargs):
+        events.append("progress")
+
+    def load():
+        events.append("snapshot")
+        return StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID)
+
+    def build(*args, **kwargs):
+        events.append("build")
+        return real_build(*args, **kwargs)
 
     async def deliver(*args, **kwargs):
+        events.append("delivery")
         assert state.state is None
-        cleanup.assert_awaited_once_with(callback.message)
         report_text = rendered_html(args[2])[0]
         assert "АНИМЕ" in report_text
         assert "0 тайтлов" in report_text
         assert "0 статусов" not in report_text
         return ReportDeliveryResult(True, 1, 1)
 
-    monkeypatch.setattr(handlers, "load_stats_all_snapshot", load)
-    monkeypatch.setattr(handlers, "_cleanup_inline_control", cleanup)
+    state.clear = AsyncMock(side_effect=clear)
+    callback.answer = AsyncMock(side_effect=answer)
+    callback.message.edit_text = AsyncMock(side_effect=progress)
+    monkeypatch.setattr(handlers, "load_stats_all_snapshot", MagicMock(side_effect=load))
+    monkeypatch.setattr(handlers, "build_list_report", MagicMock(side_effect=build))
     monkeypatch.setattr(handlers, "deliver_report", AsyncMock(side_effect=deliver))
 
     await handlers.lists_menu_cb(callback, state)
 
+    assert events[:6] == [
+        "clear",
+        "ack",
+        "progress",
+        "snapshot",
+        "build",
+        "delivery",
+    ]
     callback.answer.assert_awaited_once_with()
-    load.assert_called_once_with()
+    callback.message.edit_text.assert_awaited_once_with(
+        "⏳ Формирую и отправляю список…",
+        reply_markup=None,
+    )
     handlers.deliver_report.assert_awaited_once()
     delivery_call = handlers.deliver_report.await_args
     assert delivery_call.args[:2] == (callback.message.bot, 55)
@@ -200,6 +234,42 @@ async def test_terminal_view_clears_and_cleans_before_shared_delivery(monkeypatc
         "disable_preview": True,
         "notify_partial": True,
     }
+    callback.message.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_progress_stays_visible_while_delivery_is_pending(monkeypatch):
+    state = _active_state(media="anime")
+    menu = _menu()
+    callback = _callback("lists:view:all", menu=menu)
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+
+    async def deliver(*args, **kwargs):
+        delivery_started.set()
+        await release_delivery.wait()
+        return ReportDeliveryResult(True, 1, 1)
+
+    monkeypatch.setattr(
+        handlers,
+        "load_stats_all_snapshot",
+        MagicMock(return_value=StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID)),
+    )
+    monkeypatch.setattr(handlers, "deliver_report", AsyncMock(side_effect=deliver))
+
+    task = asyncio.create_task(handlers.lists_menu_cb(callback, state))
+    await delivery_started.wait()
+
+    menu.edit_text.assert_awaited_once_with(
+        "⏳ Формирую и отправляю список…",
+        reply_markup=None,
+    )
+    menu.delete.assert_not_awaited()
+
+    release_delivery.set()
+    await task
+
+    menu.delete.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -322,6 +392,10 @@ async def test_stale_forged_and_malformed_callbacks_are_side_effect_free(
     load.assert_not_called()
     delivery.assert_not_awaited()
     cleanup.assert_not_awaited()
+    for _, callback in cases:
+        callback.message.edit_text.assert_not_awaited()
+        callback.message.answer.assert_not_awaited()
+        callback.message.delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -355,6 +429,119 @@ async def test_owner_cancel_uses_common_fsm_contract_for_lists(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        ReportDeliveryResult(True, 3, 3),
+        ReportDeliveryResult(False, 0, 3, RuntimeError("complete failure")),
+        ReportDeliveryResult(False, 1, 3, RuntimeError("partial failure")),
+    ],
+    ids=("success", "complete-failure", "partial-delivery"),
+)
+async def test_progress_is_cleaned_after_every_delivery_result(
+    monkeypatch,
+    result,
+):
+    state = _active_state(media="anime")
+    menu = _menu()
+    callback = _callback("lists:view:all", menu=menu)
+    delivery = AsyncMock(return_value=result)
+    monkeypatch.setattr(
+        handlers,
+        "load_stats_all_snapshot",
+        MagicMock(return_value=StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID)),
+    )
+    monkeypatch.setattr(handlers, "deliver_report", delivery)
+
+    await handlers.lists_menu_cb(callback, state)
+
+    delivery.assert_awaited_once()
+    assert delivery.await_args.kwargs["notify_partial"] is True
+    menu.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_reused_progress_becomes_neutral_when_delete_fails(monkeypatch):
+    state = _active_state(media="anime")
+    menu = _menu()
+    events = []
+
+    async def edit_text(text, **kwargs):
+        events.append(text)
+
+    async def deliver(*args, **kwargs):
+        events.append("delivery")
+        return ReportDeliveryResult(True, 1, 1)
+
+    menu.edit_text = AsyncMock(side_effect=edit_text)
+    menu.delete = AsyncMock(side_effect=RuntimeError("message is too old"))
+    callback = _callback("lists:view:all", menu=menu)
+    monkeypatch.setattr(
+        handlers,
+        "load_stats_all_snapshot",
+        MagicMock(return_value=StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID)),
+    )
+    monkeypatch.setattr(handlers, "deliver_report", AsyncMock(side_effect=deliver))
+
+    await handlers.lists_menu_cb(callback, state)
+
+    assert events == [
+        "⏳ Формирую и отправляю список…",
+        "delivery",
+        "ℹ️ Обработка списка завершена.",
+    ]
+    menu.delete.assert_awaited_once_with()
+    menu.edit_reply_markup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_progress_edit_falls_back_to_separate_message(monkeypatch):
+    state = _active_state(media="anime")
+    menu = _menu()
+    progress = _menu(message_id=201)
+    menu.edit_text = AsyncMock(side_effect=RuntimeError("edit unavailable"))
+    menu.answer = AsyncMock(return_value=progress)
+    callback = _callback("lists:view:all", menu=menu)
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr(
+        handlers,
+        "load_stats_all_snapshot",
+        MagicMock(return_value=StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID)),
+    )
+    monkeypatch.setattr(handlers, "deliver_report", delivery)
+
+    await handlers.lists_menu_cb(callback, state)
+
+    menu.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+    menu.answer.assert_awaited_once_with("⏳ Формирую и отправляю список…")
+    delivery.assert_awaited_once()
+    progress.delete.assert_awaited_once_with()
+    menu.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_progress_presentation_failure_does_not_block_delivery(monkeypatch):
+    state = _active_state(media="anime")
+    menu = _menu()
+    menu.edit_text = AsyncMock(side_effect=RuntimeError("edit unavailable"))
+    menu.edit_reply_markup = AsyncMock(side_effect=RuntimeError("markup unavailable"))
+    menu.answer = AsyncMock(side_effect=RuntimeError("send unavailable"))
+    callback = _callback("lists:view:all", menu=menu)
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr(
+        handlers,
+        "load_stats_all_snapshot",
+        MagicMock(return_value=StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID)),
+    )
+    monkeypatch.setattr(handlers, "deliver_report", delivery)
+
+    await handlers.lists_menu_cb(callback, state)
+
+    delivery.assert_awaited_once()
+    menu.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_terminal_cleanup_failures_do_not_block_delivery(monkeypatch):
     state = _active_state(media="anime")
     command = MagicMock()
@@ -362,6 +549,10 @@ async def test_terminal_cleanup_failures_do_not_block_delivery(monkeypatch):
     menu = _menu()
     menu.reply_to_message = command
     menu.delete = AsyncMock(side_effect=RuntimeError("menu inaccessible"))
+    menu.edit_text = AsyncMock(side_effect=[
+        None,
+        RuntimeError("text inaccessible"),
+    ])
     menu.edit_reply_markup = AsyncMock(side_effect=RuntimeError("markup inaccessible"))
     callback = _callback("lists:view:all", menu=menu)
     monkeypatch.setattr(
@@ -375,6 +566,7 @@ async def test_terminal_cleanup_failures_do_not_block_delivery(monkeypatch):
     await handlers.lists_menu_cb(callback, state)
 
     delivery.assert_awaited_once()
+    assert menu.edit_text.await_count == 2
     menu.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
     command.delete.assert_not_awaited()
 
