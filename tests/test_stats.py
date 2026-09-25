@@ -1141,16 +1141,16 @@ def test_all_time_insights_reject_bad_metric_without_losing_other_facts(field, m
     lines = _insight_lines(report, 0 if media == "anime" else 1)
     text = "\n".join(map(_line_text, lines))
 
-    missing_label = {
-        "episodes_total": "Больше всего эпизодов",
-        "duration": "Самый длинный фильм",
-        "chapters_read": "Больше всего прочитанных глав",
-        "volumes_read": "Больше всего прочитанных томов",
-        "year": "Самый старый",
-    }[field]
     if field == "year":
-        assert "2001 г." not in text
+        assert "Самый старый тайтл" not in text
+        assert "Самый новый тайтл" not in text
     else:
+        missing_label = {
+            "episodes_total": "Больше всего эпизодов",
+            "duration": "Самый длинный фильм",
+            "chapters_read": "Больше всего прочитанных глав",
+            "volumes_read": "Больше всего прочитанных томов",
+        }[field]
         assert missing_label not in text
     assert len(lines) >= 1
 
