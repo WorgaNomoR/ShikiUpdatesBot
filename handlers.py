@@ -267,6 +267,7 @@ _PICK_CATEGORY_ICONS = {
 _PICK_MENU_TEXT = "text"
 _PICK_MENU_PHOTO = "photo"
 _LISTS_CALLBACK_PREFIX = "lists:"
+_LISTS_PROGRESS_TEXT = "⏳ Формирую и отправляю список…"
 _FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
 FACTS_APPLY_CALLBACK_PREFIX = "facts:apply:"
 FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
@@ -1102,42 +1103,73 @@ def _lists_snapshot_report(media_key: str, view_key: str) -> Report:
     )
 
 
+async def _lists_show_progress(message: Message) -> Message | None:
+    """Показать неинтерактивный прогресс, предпочитая прежний control message."""
+    try:
+        await message.edit_text(_LISTS_PROGRESS_TEXT, reply_markup=None)
+        return message
+    except Exception as e:
+        log.debug("lists: не удалось переиспользовать меню для прогресса: %s", e)
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception as e:
+        log.debug("lists: не удалось убрать кнопки перед прогрессом: %s", e)
+    try:
+        return await message.answer(_LISTS_PROGRESS_TEXT)
+    except Exception as e:
+        log.debug("lists: не удалось отправить отдельный прогресс: %s", e)
+        return None
+
+
+async def _lists_cleanup_progress(
+    control_message: Message,
+    progress_message: Message | None,
+) -> None:
+    """Удалить временный прогресс и прежний control message по возможности."""
+    if progress_message is not None and progress_message is not control_message:
+        await _cleanup_inline_control(progress_message)
+    await _cleanup_inline_control(control_message)
+
+
 async def _lists_deliver(
     callback: CallbackQuery,
     state: FSMContext,
     media_key: str,
     view_key: str,
 ) -> None:
-    """Завершить меню перед Rich-first доставкой выбранного отчёта."""
+    """Показать прогресс на время Rich-first доставки выбранного отчёта."""
     bot = callback.message.bot
     chat_id = callback.message.chat.id
     await state.clear()
     await callback.answer()
-    await _cleanup_inline_control(callback.message)
+    progress_message = await _lists_show_progress(callback.message)
     try:
-        report = _lists_snapshot_report(media_key, view_key)
-    except Exception as e:
-        log.error("lists: формирование (%s/%s): %s", media_key, view_key, e)
-        await callback.message.answer(
-            "⚠️ Не удалось сформировать список, попробуй позже."
+        try:
+            report = _lists_snapshot_report(media_key, view_key)
+        except Exception as e:
+            log.error("lists: формирование (%s/%s): %s", media_key, view_key, e)
+            await callback.message.answer(
+                "⚠️ Не удалось сформировать список, попробуй позже."
+            )
+            return
+        result = await deliver_report(
+            bot,
+            chat_id,
+            report,
+            disable_preview=True,
+            notify_partial=True,
         )
-        return
-    result = await deliver_report(
-        bot,
-        chat_id,
-        report,
-        disable_preview=True,
-        notify_partial=True,
-    )
-    if not result.delivered:
-        log.error(
-            "lists: доставка (%s/%s) остановлена после %d/%d частей: %s",
-            media_key,
-            view_key,
-            result.delivered_units,
-            result.total_units,
-            result.error,
-        )
+        if not result.delivered:
+            log.error(
+                "lists: доставка (%s/%s) остановлена после %d/%d частей: %s",
+                media_key,
+                view_key,
+                result.delivered_units,
+                result.total_units,
+                result.error,
+            )
+    finally:
+        await _lists_cleanup_progress(callback.message, progress_message)
 
 
 async def lists_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:

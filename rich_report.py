@@ -431,13 +431,30 @@ def _fragment_table(value: Table, groups: tuple[TableGroup, ...]) -> Table:
     )
 
 
+def _continuation_heading(value: Heading) -> Heading:
+    """Явно отличить transport-продолжение от нового логического раздела."""
+    return Heading(
+        (*value.parts, Text(" · продолжение")),
+        level=value.level,
+        collapsible=value.collapsible,
+        open=value.open,
+    )
+
+
 def _fragment_section(
     value: Section,
     table: Table,
     groups: tuple[TableGroup, ...],
+    *,
+    continuation: bool = False,
 ) -> Section:
     """Заменить единственную таблицу каталога выбранными карточками."""
-    return Section((value.items[0], _fragment_table(table, groups)))
+    heading = value.items[0]
+    if not isinstance(heading, Heading):
+        raise RichReportRenderError("render")
+    if continuation:
+        heading = _continuation_heading(heading)
+    return Section((heading, _fragment_table(table, groups)))
 
 
 def _inline_value(part: Inline) -> str:
@@ -516,51 +533,63 @@ def _paginate_rich_unit(value: Unit, unit_index: int) -> list[RenderedRichUnit]:
             raise RichReportRenderError("render")
         table_sections.append((logical_section, logical_section.items[1]))
 
-    compact_header = Section((media_heading,))
+    compact_header = Section((_continuation_heading(media_heading),))
     rendered: list[RenderedRichUnit] = []
-
-    def context_header() -> Section:
-        return header if not rendered else compact_header
+    working_groups = [list(table.groups) for _, table in table_sections]
+    FragmentPart = tuple[int, tuple[TableGroup, ...], bool]
 
     def candidate(
-        logical_section: Section,
-        table: Table,
-        groups: tuple[TableGroup, ...],
+        parts: tuple[FragmentPart, ...],
+        *,
+        message_continuation: bool | None = None,
     ) -> Unit:
-        return Unit((
-            context_header(),
-            _fragment_section(logical_section, table, groups),
-        ))
+        if message_continuation is None:
+            message_continuation = bool(rendered)
+        fragment_sections = tuple(
+            _fragment_section(
+                table_sections[section_index][0],
+                table_sections[section_index][1],
+                groups,
+                continuation=status_continuation,
+            )
+            for section_index, groups, status_continuation in parts
+        )
+        fragment_header = compact_header if message_continuation else header
+        return Unit((fragment_header, *fragment_sections))
 
     def fits(
-        logical_section: Section,
-        table: Table,
-        groups: tuple[TableGroup, ...],
+        parts: tuple[FragmentPart, ...],
+        *,
+        message_continuation: bool | None = None,
     ) -> bool:
         try:
-            _render_unit(candidate(logical_section, table, groups), unit_index)
+            _render_unit(
+                candidate(
+                    parts,
+                    message_continuation=message_continuation,
+                ),
+                unit_index,
+            )
         except RichReportRenderError as exc:
             if _limit_overflow(exc):
                 return False
             raise
         return True
 
-    def emit(
-        logical_section: Section,
-        table: Table,
-        groups: tuple[TableGroup, ...],
-    ) -> None:
-        fragment = candidate(logical_section, table, groups)
+    def emit(parts: tuple[FragmentPart, ...]) -> None:
+        fragment = candidate(parts)
         rich = _render_unit(fragment, unit_index, len(rendered))
         if rich is None:
             raise RichReportRenderError("render")
         rendered.append(rich)
 
     def largest_prefix(
-        logical_section: Section,
-        table: Table,
+        section_index: int,
         base: TableGroup,
         remaining: Line,
+        *,
+        status_continuation: bool,
+        message_continuation: bool,
     ) -> tuple[Line, Line]:
         low = 1
         high = _line_character_count(remaining)
@@ -572,7 +601,10 @@ def _paginate_rich_unit(value: Unit, unit_index: int) -> list[RenderedRichUnit]:
                 low = middle + 1
                 continue
             trial = _group_with_after(base, (*base.after, prefix))
-            if fits(logical_section, table, (trial,)):
+            if fits(
+                ((section_index, (trial,), status_continuation),),
+                message_continuation=message_continuation,
+            ):
                 best = prefix, tail
                 low = middle + 1
             else:
@@ -582,33 +614,53 @@ def _paginate_rich_unit(value: Unit, unit_index: int) -> list[RenderedRichUnit]:
         return best
 
     def split_group(
-        logical_section: Section,
-        table: Table,
+        section_index: int,
+        group_index: int,
         group: TableGroup,
     ) -> list[TableGroup]:
         card = _group_with_after(group, ())
-        if not fits(logical_section, table, (card,)):
+        status_continuation = group_index > 0
+        message_continuation = bool(rendered)
+        first_part = ((section_index, (card,), status_continuation),)
+        if not fits(
+            first_part,
+            message_continuation=message_continuation,
+        ):
             # Повторный render сохраняет точный blocks/characters reason.
-            _render_unit(candidate(logical_section, table, (card,)), unit_index)
+            _render_unit(
+                candidate(
+                    first_part,
+                    message_continuation=message_continuation,
+                ),
+                unit_index,
+            )
             raise RichReportRenderError("render")
         pieces = [card]
         for after_line in group.after:
             remaining = after_line
             while remaining.parts:
                 current = pieces[-1]
+                piece_continuation = status_continuation or len(pieces) > 1
+                piece_message_continuation = (
+                    message_continuation or len(pieces) > 1
+                )
                 complete = _group_with_after(
                     current,
                     (*current.after, remaining),
                 )
-                if fits(logical_section, table, (complete,)):
+                if fits(
+                    ((section_index, (complete,), piece_continuation),),
+                    message_continuation=piece_message_continuation,
+                ):
                     pieces[-1] = complete
                     break
                 try:
                     prefix, tail = largest_prefix(
-                        logical_section,
-                        table,
+                        section_index,
                         current,
                         remaining,
+                        status_continuation=piece_continuation,
+                        message_continuation=piece_message_continuation,
                     )
                 except RichReportRenderError as exc:
                     if exc.reason != "characters" or not (
@@ -626,41 +678,60 @@ def _paginate_rich_unit(value: Unit, unit_index: int) -> list[RenderedRichUnit]:
                     pieces.append(_after_only_group())
         return pieces
 
-    for logical_section, table in table_sections:
-        group_index = 0
-        while group_index < len(table.groups):
+    section_index = 0
+    group_index = 0
+    while section_index < len(table_sections):
+        fragment_parts: list[FragmentPart] = []
+        while section_index < len(table_sections):
+            groups = working_groups[section_index]
+            if group_index >= len(groups):
+                section_index += 1
+                group_index = 0
+                continue
+
             low = group_index + 1
-            high = len(table.groups)
+            high = len(groups)
             best_end = group_index
             while low <= high:
                 middle = (low + high) // 2
-                proposed = table.groups[group_index:middle]
-                if fits(logical_section, table, proposed):
+                proposed = tuple(groups[group_index:middle])
+                candidate_parts = (*fragment_parts, (
+                    section_index,
+                    proposed,
+                    group_index > 0,
+                ))
+                if fits(tuple(candidate_parts)):
                     best_end = middle
                     low = middle + 1
                 else:
                     high = middle - 1
+
             if best_end > group_index:
-                emit(
-                    logical_section,
-                    table,
-                    table.groups[group_index:best_end],
-                )
+                fragment_parts.append((
+                    section_index,
+                    tuple(groups[group_index:best_end]),
+                    group_index > 0,
+                ))
                 group_index = best_end
-                continue
-            for piece in split_group(
-                logical_section,
-                table,
-                table.groups[group_index],
-            ):
-                if not fits(logical_section, table, (piece,)):
-                    _render_unit(
-                        candidate(logical_section, table, (piece,)),
-                        unit_index,
-                    )
-                    raise RichReportRenderError("render")
-                emit(logical_section, table, (piece,))
-            group_index += 1
+                if group_index == len(groups):
+                    section_index += 1
+                    group_index = 0
+                    continue
+                break
+
+            if fragment_parts:
+                break
+
+            pieces = split_group(
+                section_index,
+                group_index,
+                groups[group_index],
+            )
+            groups[group_index:group_index + 1] = pieces
+
+        if not fragment_parts:
+            raise RichReportRenderError("render")
+        emit(tuple(fragment_parts))
 
     if not rendered:
         raise RichReportRenderError("render")
