@@ -268,6 +268,7 @@ _PICK_MENU_TEXT = "text"
 _PICK_MENU_PHOTO = "photo"
 _LISTS_CALLBACK_PREFIX = "lists:"
 _LISTS_PROGRESS_TEXT = "⏳ Формирую и отправляю список…"
+_LISTS_PROGRESS_FINISHED_TEXT = "ℹ️ Обработка списка завершена."
 _FACT_NEXT_CALLBACK_PREFIX = "fact:next:"
 FACTS_APPLY_CALLBACK_PREFIX = "facts:apply:"
 FACTS_ASK_CLEAR_CALLBACK_PREFIX = "facts:ask-clear:"
@@ -1125,7 +1126,24 @@ async def _lists_cleanup_progress(
     control_message: Message,
     progress_message: Message | None,
 ) -> None:
-    """Удалить временный прогресс и прежний control message по возможности."""
+    """Удалить прогресс или нейтрализовать старое переиспользованное меню."""
+    if progress_message is control_message:
+        try:
+            await control_message.delete()
+        except Exception as e:
+            log.debug("lists: не удалось удалить переиспользованный прогресс: %s", e)
+            try:
+                await control_message.edit_text(
+                    _LISTS_PROGRESS_FINISHED_TEXT,
+                    reply_markup=None,
+                )
+            except Exception as e:
+                log.debug("lists: не удалось нейтрализовать старый прогресс: %s", e)
+                try:
+                    await control_message.edit_reply_markup(reply_markup=None)
+                except Exception as e:
+                    log.debug("lists: не удалось убрать кнопки старого меню: %s", e)
+        return
     if progress_message is not None and progress_message is not control_message:
         await _cleanup_inline_control(progress_message)
     await _cleanup_inline_control(control_message)

@@ -626,6 +626,31 @@ def test_paginated_catalog_fills_tail_with_next_status_and_marks_continuation():
     )
 
 
+def test_paginated_catalog_does_not_split_neighbor_into_tail():
+    rendered = render_rich_report(_multi_status_catalog_report(247, 2))
+
+    assert len(rendered) == 2
+    assert all(validate_rich_payload(fragment.payload) for fragment in rendered)
+    details = [
+        [
+            _rich_parts_text(block.summary)
+            for block in fragment.message.blocks
+            if isinstance(block, InputRichBlockDetails)
+        ]
+        for fragment in rendered
+    ]
+    assert details == [
+        ["✅ Первый · 247"],
+        ["🗑 Второй · 2"],
+    ]
+    payload_text = json.dumps(
+        tuple(fragment.payload for fragment in rendered),
+        ensure_ascii=False,
+    )
+    assert payload_text.count("second-000-") == 1
+    assert payload_text.count("second-001-") == 1
+
+
 def test_paginated_catalog_keeps_next_status_separate_when_tail_has_no_room():
     rendered = render_rich_report(_multi_status_catalog_report(
         249,

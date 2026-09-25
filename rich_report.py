@@ -707,6 +707,9 @@ def _paginate_rich_unit(value: Unit, unit_index: int) -> list[RenderedRichUnit]:
                     high = middle - 1
 
             if best_end > group_index:
+                if fragment_parts and best_end < len(groups):
+                    # Соседний статус добавляется в хвост только целиком.
+                    break
                 fragment_parts.append((
                     section_index,
                     tuple(groups[group_index:best_end]),

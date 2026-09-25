@@ -461,6 +461,40 @@ async def test_progress_is_cleaned_after_every_delivery_result(
 
 
 @pytest.mark.asyncio
+async def test_reused_progress_becomes_neutral_when_delete_fails(monkeypatch):
+    state = _active_state(media="anime")
+    menu = _menu()
+    events = []
+
+    async def edit_text(text, **kwargs):
+        events.append(text)
+
+    async def deliver(*args, **kwargs):
+        events.append("delivery")
+        return ReportDeliveryResult(True, 1, 1)
+
+    menu.edit_text = AsyncMock(side_effect=edit_text)
+    menu.delete = AsyncMock(side_effect=RuntimeError("message is too old"))
+    callback = _callback("lists:view:all", menu=menu)
+    monkeypatch.setattr(
+        handlers,
+        "load_stats_all_snapshot",
+        MagicMock(return_value=StatsAllSnapshot(_empty_stats(), STATS_ALL_VALID)),
+    )
+    monkeypatch.setattr(handlers, "deliver_report", AsyncMock(side_effect=deliver))
+
+    await handlers.lists_menu_cb(callback, state)
+
+    assert events == [
+        "⏳ Формирую и отправляю список…",
+        "delivery",
+        "ℹ️ Обработка списка завершена.",
+    ]
+    menu.delete.assert_awaited_once_with()
+    menu.edit_reply_markup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_progress_edit_falls_back_to_separate_message(monkeypatch):
     state = _active_state(media="anime")
     menu = _menu()
@@ -515,6 +549,10 @@ async def test_terminal_cleanup_failures_do_not_block_delivery(monkeypatch):
     menu = _menu()
     menu.reply_to_message = command
     menu.delete = AsyncMock(side_effect=RuntimeError("menu inaccessible"))
+    menu.edit_text = AsyncMock(side_effect=[
+        None,
+        RuntimeError("text inaccessible"),
+    ])
     menu.edit_reply_markup = AsyncMock(side_effect=RuntimeError("markup inaccessible"))
     callback = _callback("lists:view:all", menu=menu)
     monkeypatch.setattr(
@@ -528,6 +566,7 @@ async def test_terminal_cleanup_failures_do_not_block_delivery(monkeypatch):
     await handlers.lists_menu_cb(callback, state)
 
     delivery.assert_awaited_once()
+    assert menu.edit_text.await_count == 2
     menu.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
     command.delete.assert_not_awaited()
 
