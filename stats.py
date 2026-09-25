@@ -12,12 +12,14 @@ messages/report_model; знают о нём только хендлеры.
 import json
 import math
 import random
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import (
     datetime,
     timedelta,
 )
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -1495,6 +1497,109 @@ def _title_inline(record: dict, *, poster: bool = False) -> Link | Text | Title:
     return Text(title)
 
 
+def _insight_title(record: dict, media: str) -> Link | Text:
+    """Подготовить название и только безопасную ссылку на нужный раздел Shikimori."""
+    raw_title = record.get("title")
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
+    title = title or "Без названия"
+    try:
+        title.encode("utf-8")
+    except UnicodeEncodeError:
+        title = "Без названия"
+    raw_url = record.get("url")
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        return Text(title)
+    url = raw_url.strip()
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
+        return Text(title)
+    try:
+        url.encode("utf-8")
+        parsed = urlsplit(url)
+        base = urlsplit(SHIKI_BASE_URL)
+    except (UnicodeEncodeError, ValueError):
+        return Text(title)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != base.netloc.casefold():
+            return Text(title)
+    relative = _rel_url(url)
+    try:
+        path = urlsplit(relative)
+    except ValueError:
+        return Text(title)
+    domain = "animes" if media == "anime" else "mangas"
+    if (
+        path.scheme or path.netloc
+        or not re.fullmatch(rf"/{domain}/[1-9][0-9]*(?:-[A-Za-z0-9_%\-]+)?", path.path)
+    ):
+        return Text(title)
+    return Link(title, f"{SHIKI_BASE_URL.rstrip('/')}{relative}")
+
+
+def _all_time_insights_section(titles: dict, media: str) -> Section | None:
+    """Выбрать независимые рекорды только из завершённых локальных тайтлов."""
+    completed = [
+        (str(title_id), record)
+        for title_id, record in titles.items()
+        if isinstance(record, dict) and record.get("status") == "completed"
+    ]
+    if not completed:
+        return None
+
+    def add_extreme(
+        label: str,
+        field: str,
+        word_forms: tuple[str, str, str] | None = None,
+        *,
+        kind: str | None = None,
+        oldest: bool = False,
+    ) -> None:
+        valid = []
+        for title_id, record in completed:
+            if kind is not None and record.get("kind") != kind:
+                continue
+            value = (_pick_year(record.get(field)) if field == "year"
+                     else _pick_positive_int(record.get(field)))
+            if value is not None:
+                valid.append((title_id, record, value))
+        if not valid:
+            return
+        extreme = (min if oldest else max)(value for _, _, value in valid)
+        tied = [item for item in valid if item[2] == extreme]
+        _, winner, _ = min(tied, key=lambda item: item[0])
+        suffix = " (один из нескольких)" if len(tied) > 1 else ""
+        value_text = (
+            f"{extreme} {russian_count_word(extreme, *word_forms)}"
+            if word_forms else f"{extreme} г."
+        )
+        lines.append(line(
+            f"{label}{suffix}: ",
+            _insight_title(winner, media),
+            " — ",
+            Bold(value_text),
+        ))
+
+    lines: list[Line] = []
+    if media == "anime":
+        add_extreme("📺 Больше всего эпизодов среди сериалов", "episodes_total",
+                    ("эпизод", "эпизода", "эпизодов"), kind="tv")
+        add_extreme("🎬 Самый длинный фильм", "duration",
+                    ("минута", "минуты", "минут"), kind="movie")
+    else:
+        add_extreme("📖 Больше всего прочитанных глав", "chapters_read",
+                    ("глава", "главы", "глав"))
+        add_extreme("📚 Больше всего прочитанных томов", "volumes_read",
+                    ("том", "тома", "томов"))
+    add_extreme("📅 Самый старый тайтл", "year", oldest=True)
+    add_extreme("🆕 Самый новый тайтл", "year")
+    if not lines:
+        return None
+    return section(
+        heading("✨ ", Bold("Интересное"), level=3,
+                collapsible=True, is_open=False),
+        *lines,
+    )
+
+
 def _build_quarter_sections(
     records: list[dict],
     media: str,
@@ -1741,6 +1846,7 @@ def build_favourites_messages(stats: dict) -> Report:
 def build_stats_all_messages(stats: dict) -> Report:
     """Аниме и три категории чтения; агрегаты чтения вычисляем только в памяти."""
     a_agg, unreadable_anime = _report_anime_aggregates(stats)
+    anime_titles, _ = _report_media_mapping(stats, "anime", "titles")
     manga_titles, unreadable_collection = _report_media_mapping(stats, "manga", "titles")
     manga_subsets = partition_manga_titles(manga_titles)
     manga_aggregates = {
@@ -1752,6 +1858,7 @@ def build_stats_all_messages(stats: dict) -> Report:
         not isinstance(record, dict) for record in manga_titles.values()
     )
     manga_aggregates["unknown"]["unreadable_collection"] = unreadable_collection
+    anime_insights = _all_time_insights_section(anime_titles, "anime")
 
     updated = _parse_iso_utc(stats.get("updated_at"))
     upd_str = ""
@@ -1761,6 +1868,7 @@ def build_stats_all_messages(stats: dict) -> Report:
 
     # Пустая статистика — одно короткое сообщение
     if (a_agg.get("total_completed", 0) == 0
+            and anime_insights is None
             and not any(manga_subsets.values())
             and not unreadable_collection and not unreadable_anime):
         return Report((unit(
@@ -1822,14 +1930,24 @@ def build_stats_all_messages(stats: dict) -> Report:
     ):
         if block:
             anime_sections.append(block)
+    if anime_insights:
+        anime_sections.append(anime_insights)
 
-    reading_units = [
-        _manga_all_unit(category, aggregate)
-        for category, aggregate in manga_aggregates.items()
-        if manga_subsets[category] or (
+    reading_units = []
+    for category, aggregate in manga_aggregates.items():
+        if not manga_subsets[category] and not (
             category == "unknown" and unreadable_collection
-        )
-    ]
+        ):
+            continue
+        reading_unit = _manga_all_unit(category, aggregate)
+        if category != "unknown":
+            insights = _all_time_insights_section({
+                title_id: manga_titles[title_id]
+                for title_id in manga_subsets[category]
+            }, "manga")
+            if insights:
+                reading_unit = Unit((*reading_unit.sections, insights))
+        reading_units.append(reading_unit)
     return Report((Unit(tuple(anime_sections)), *reading_units))
 
 

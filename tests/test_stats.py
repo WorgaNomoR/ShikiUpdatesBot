@@ -16,6 +16,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 from unittest.mock import (
     AsyncMock,
     call,
@@ -39,9 +40,11 @@ from report_model import (
     Report,
     Text,
     Title,
+    Unit,
     render_report,
     rendered_html,
 )
+from rich_report import render_rich_report
 
 
 def _manga_record(title, kind, status="completed", chapters_read=1):
@@ -1001,6 +1004,330 @@ def test_smoke_build_stats_all_returns_report():
     report = smod.build_stats_all_messages(_populated_stats())
     assert isinstance(report, Report)
     assert rendered_html(report)
+
+
+def _insight_section(report, unit_index):
+    return next((block for block in report.units[unit_index].sections
+                 if block.items and isinstance(block.items[0], Heading)
+                 and block.items[0].parts == (
+                     Text("✨ "), Bold("Интересное"))), None)
+
+
+def _insight_lines(report, unit_index):
+    block = _insight_section(report, unit_index)
+    assert block is not None
+    assert block.items[0].collapsible and not block.items[0].open
+    return block.items[1:]
+
+
+def _line_text(value):
+    return "".join(part.text if isinstance(part, Link) else part.value
+                   for part in value.parts)
+
+
+def test_all_time_anime_insights_select_four_independent_records():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "11": {**_anime_rec(kind="tv", year=2015), "title": "TV short",
+               "episodes_total": 12, "url": "/animes/11"},
+        "12": {**_anime_rec(kind="tv", year=2001), "title": "TV long",
+               "episodes_total": 52, "url": "https://shikimori.io/animes/12"},
+        "13": {**_anime_rec(kind="movie", year=1990), "title": "Old film",
+               "duration": 90, "url": "/animes/13"},
+        "14": {**_anime_rec(kind="movie", year=2025), "title": "Long film",
+               "duration": 125, "url": "/animes/14"},
+    }
+    stats["anime"]["aggregates"] = smod.recompute_aggregates(
+        "anime", stats["anime"]["titles"])
+
+    report = smod.build_stats_all_messages(stats)
+    lines = _insight_lines(report, 0)
+
+    assert len(lines) == 4
+    assert [part for value in lines for part in value.parts if isinstance(part, Link)] == [
+        Link("TV long", "https://shikimori.io/animes/12"),
+        Link("Long film", "https://shikimori.io/animes/14"),
+        Link("Old film", "https://shikimori.io/animes/13"),
+        Link("Long film", "https://shikimori.io/animes/14"),
+    ]
+    assert "52 эпизода" in _line_text(lines[0])
+    assert _line_text(lines[0]).startswith("📺 Больше всего эпизодов среди сериалов: ")
+    assert "125 минут" in _line_text(lines[1])
+    assert "1990 г." in _line_text(lines[2])
+    assert _line_text(lines[2]).startswith("📅 Самый старый тайтл: ")
+    assert "2025 г." in _line_text(lines[3])
+    assert _line_text(lines[3]).startswith("🆕 Самый новый тайтл: ")
+
+
+@pytest.mark.parametrize("kind,other_kind,unit_index", [
+    ("manga", "light_novel", 1),
+    ("light_novel", "manga", 2),
+])
+def test_all_time_reading_insights_select_within_each_category(kind, other_kind, unit_index):
+    stats = storage._empty_stats_all()
+    stats["manga"]["titles"] = {
+        "1": {**_manga_record("Most chapters", kind, chapters_read=91),
+              "volumes_read": 2, "year": 2012, "url": "/mangas/1"},
+        "2": {**_manga_record("Most volumes", kind, chapters_read=20),
+              "volumes_read": 14, "year": 2022, "url": "/mangas/2"},
+        "3": {**_manga_record("Oldest", kind, chapters_read=10),
+              "volumes_read": 1, "year": 1980, "url": "/mangas/3"},
+        "4": {**_manga_record("Other category", other_kind, chapters_read=999),
+              "volumes_read": 999, "year": 1900, "url": "/mangas/4"},
+    }
+
+    report = smod.build_stats_all_messages(stats)
+    lines = _insight_lines(report, unit_index)
+
+    assert len(lines) == 4
+    assert [part.text for value in lines for part in value.parts
+            if isinstance(part, Link)] == [
+                "Most chapters", "Most volumes", "Oldest", "Most volumes",
+            ]
+    assert "91 глава" in _line_text(lines[0])
+    assert "14 томов" in _line_text(lines[1])
+    assert "1980 г." in _line_text(lines[2])
+    assert _line_text(lines[2]).startswith("📅 Самый старый тайтл: ")
+    assert "2022 г." in _line_text(lines[3])
+    assert _line_text(lines[3]).startswith("🆕 Самый новый тайтл: ")
+
+
+@pytest.mark.parametrize("status", [
+    "planned", "watching", "reading", "dropped", "on_hold", "rewatching", "Completed",
+])
+def test_all_time_insights_require_exact_completed_status(status):
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "1": {**_anime_rec(), "title": "Eligible", "episodes_total": 12, "year": 2000},
+        "2": {**_anime_rec(status=status), "title": "Ineligible",
+              "episodes_total": 999, "year": 1900},
+    }
+    stats["anime"]["aggregates"] = smod.recompute_aggregates(
+        "anime", stats["anime"]["titles"])
+    stats["manga"]["titles"] = {
+        "3": _manga_record("Read", "manga", chapters_read=12),
+        "4": {**_manga_record("Ineligible", "manga", status, 999),
+              "volumes_read": 999, "year": 1900},
+    }
+
+    report = smod.build_stats_all_messages(stats)
+
+    assert "Ineligible" not in "".join(
+        _line_text(value) for index in (0, 1)
+        for value in _insight_lines(report, index))
+    assert "12 эпизодов" in _line_text(_insight_lines(report, 0)[0])
+    assert "12 глав" in _line_text(_insight_lines(report, 1)[0])
+
+
+@pytest.mark.parametrize("bad", [
+    None, 0, -3, True, False, 2.5, "12", "broken", [], {}, float("inf"),
+])
+@pytest.mark.parametrize("field,media,kind", [
+    ("episodes_total", "anime", "tv"),
+    ("duration", "anime", "movie"),
+    ("chapters_read", "manga", "manga"),
+    ("volumes_read", "manga", "light_novel"),
+    ("year", "anime", "tv"),
+])
+def test_all_time_insights_reject_bad_metric_without_losing_other_facts(field, media, kind, bad):
+    stats = storage._empty_stats_all()
+    record = {"title": "Valid other field", "status": "completed", "kind": kind,
+              "year": 2001, "episodes_total": 12, "duration": 90,
+              "chapters_read": 12, "volumes_read": 2, field: bad}
+    stats[media]["titles"] = {"1": record}
+    if media == "anime":
+        stats["anime"]["aggregates"]["total_completed"] = 1
+    report = smod.build_stats_all_messages(stats)
+    lines = _insight_lines(report, 0 if media == "anime" else 1)
+    text = "\n".join(map(_line_text, lines))
+
+    missing_label = {
+        "episodes_total": "Больше всего эпизодов",
+        "duration": "Самый длинный фильм",
+        "chapters_read": "Больше всего прочитанных глав",
+        "volumes_read": "Больше всего прочитанных томов",
+        "year": "Самый старый",
+    }[field]
+    if field == "year":
+        assert "2001 г." not in text
+    else:
+        assert missing_label not in text
+    assert len(lines) >= 1
+
+
+def test_all_time_insights_ties_are_stable_and_do_not_claim_uniqueness():
+    first = {**_manga_record("First", "manga", chapters_read=20),
+             "volumes_read": 4, "year": 2000}
+    second = {**_manga_record("Second", "manga", chapters_read=20),
+              "volumes_read": 4, "year": 2000}
+    results = []
+    for pairs in (("2", second), ("1", first)), (("1", first), ("2", second)):
+        stats = storage._empty_stats_all()
+        stats["manga"]["titles"] = dict(pairs)
+        report = smod.build_stats_all_messages(stats)
+        lines = _insight_lines(report, 1)
+        results.append(tuple(_line_text(value) for value in lines))
+        assert len(lines) == 4
+        assert all("(один из нескольких)" in value for value in results[-1])
+        assert all("First" in value and "Second" not in value for value in results[-1])
+    assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("url,linked", [
+    ("/animes/7", True),
+    ("https://shikimori.io/animes/7", True),
+    ("https://evil.example/animes/7", False),
+    ("javascript:alert(1)", False),
+    ("//evil.example/animes/7", False),
+    ("/mangas/7", False),
+    ('/animes/7" onclick="evil', False),
+    (None, False),
+    ([], False),
+])
+def test_all_time_insight_title_and_url_remain_safe_typed_values(url, linked):
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "7": {"status": "completed", "kind": "tv", "episodes_total": 7,
+              "title": '<script> & "quoted"', "url": url},
+    }
+    stats["anime"]["aggregates"]["total_completed"] = 1
+
+    report = smod.build_stats_all_messages(stats)
+    item = _insight_lines(report, 0)[0].parts[1]
+    html = "\n".join(rendered_html(report))
+
+    assert isinstance(item, Link if linked else Text)
+    assert (item.text if linked else item.value) == '<script> & "quoted"'
+    assert "&lt;script&gt; &amp; &quot;quoted&quot;" in html
+    assert "<script>" not in html
+    if linked:
+        assert item.url == "https://shikimori.io/animes/7"
+
+
+def test_all_time_insights_missing_title_is_plain_fallback():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "7": {"status": "completed", "kind": "tv", "episodes_total": 7,
+              "title": None, "url": None},
+    }
+    stats["anime"]["aggregates"]["total_completed"] = 1
+
+    assert _insight_lines(smod.build_stats_all_messages(stats), 0)[0].parts[1] == Text(
+        "Без названия")
+
+
+def test_all_time_insights_invalid_unicode_uses_plain_fallback():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "7": {"status": "completed", "kind": "tv", "episodes_total": 7,
+              "title": "\ud800", "url": "/animes/7\ud800"},
+    }
+
+    report = smod.build_stats_all_messages(stats)
+
+    assert _insight_lines(report, 0)[0].parts[1] == Text("Без названия")
+    assert "Без названия" in "\n".join(rendered_html(report))
+
+
+def test_all_time_insights_omit_empty_sections_and_unresolved():
+    stats = storage._empty_stats_all()
+    stats["anime"]["aggregates"]["total_completed"] = 1
+    stats["manga"]["titles"] = {
+        "1": {"status": "completed", "kind": "manga"},
+        "2": {"status": "completed", "kind": "light_novel"},
+        "3": {"status": "completed", "kind": "future", "chapters_read": 100,
+              "volumes_read": 10, "year": 2000},
+    }
+
+    report = smod.build_stats_all_messages(stats)
+
+    assert len(report.units) == 4
+    assert all(_insight_section(report, index) is None for index in range(4))
+
+
+def test_all_time_insights_do_not_change_empty_report_without_eligible_facts():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "1": {"status": "planned", "kind": "tv", "episodes_total": 24},
+    }
+    assert "Статистика ещё не собрана" in "\n".join(
+        rendered_html(smod.build_stats_all_messages(stats)))
+
+
+def test_all_time_insights_rich_html_semantics_match():
+    stats = storage._empty_stats_all()
+    stats["anime"]["titles"] = {
+        "1": {"title": "A <B>", "url": "/animes/1", "status": "completed",
+              "kind": "tv", "episodes_total": 24, "year": 2001},
+        "2": {"title": "Film & more", "url": "https://shikimori.io/animes/2",
+              "status": "completed", "kind": "movie", "duration": 120,
+              "year": 2024},
+    }
+    stats["anime"]["aggregates"]["total_completed"] = 2
+    section = _insight_section(smod.build_stats_all_messages(stats), 0)
+    assert section is not None
+    isolated = Report((Unit((section,)),))
+
+    class SemanticHTML(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.text = ""
+            self.links = []
+
+        def handle_data(self, data):
+            self.text += data
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "a":
+                self.links.append(dict(attrs)["href"])
+
+    html = SemanticHTML()
+    html.feed("\n".join(rendered_html(isolated)))
+    rich = render_rich_report(isolated)[0].payload
+    details = next(block for block in rich["blocks"] if block["type"] == "details")
+
+    def text_of(value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(map(text_of, value))
+        return text_of(value["text"])
+
+    assert details["is_open"] is False
+    assert text_of(details["summary"]) == html.text.splitlines()[0]
+    assert [text_of(block["text"]) for block in details["blocks"]] == html.text.splitlines()[1:]
+    assert [part["url"] for block in details["blocks"] for part in block["text"]
+            if isinstance(part, dict) and part["type"] == "url"] == html.links
+
+
+def test_all_time_insights_are_read_only_and_preserve_partial_report(monkeypatch):
+    stats = storage._empty_stats_all()
+    stats["anime"]["aggregates"] = None
+    stats["anime"]["titles"] = {
+        "1": {"status": "completed", "kind": "tv", "title": "Kept",
+              "episodes_total": 24},
+        "2": {"status": "completed", "kind": "tv", "title": "Invalid",
+              "episodes_total": 2.5},
+    }
+    stats["manga"]["titles"] = {
+        "3": [],
+        "4": {**_manga_record("Novel", "light_novel", chapters_read=10),
+              "volumes_read": 2},
+    }
+    before = copy.deepcopy(stats)
+    for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
+                   "stats.fetch_list_export", "stats.fetch_favourites"):
+        monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
+
+    report = smod.build_stats_all_messages(stats)
+    html = "\n".join(rendered_html(report))
+
+    assert "Не удалось прочитать статистику аниме" in html
+    assert "Не удалось прочитать данные тайтлов" in html
+    assert "Kept" in _line_text(_insight_lines(report, 0)[0])
+    assert "Novel" in _line_text(_insight_lines(report, 1)[0])
+    assert _insight_section(report, 2) is None
+    assert stats == before
 
 
 def test_stats_all_normalizes_aware_updated_at_to_utc_date():
