@@ -1532,3 +1532,69 @@ def test_load_update_state_bad_json_returns_defaults(monkeypatch, tmp_path):
     storage._atomic_write(path, "{broken")
     monkeypatch.setattr(storage, "UPDATE_STATE_FILE", path)
     assert storage.load_update_state() == storage._empty_update_state()
+
+
+def test_load_seen_favourites_missing_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "storage.SEEN_FAVS_FILE",
+        str(tmp_path / "missing.json"),
+    )
+
+    assert storage.load_seen_favourites() == set()
+
+
+def test_load_seen_favourites_valid_json(monkeypatch, tmp_path):
+    file = tmp_path / "favs.json"
+
+    file.write_text(
+        json.dumps(
+            {
+                "seen_favourites": [
+                    "animes_1",
+                    "mangas_2",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "storage.SEEN_FAVS_FILE",
+        str(file),
+    )
+
+    assert storage.load_seen_favourites() == {
+        "animes_1",
+        "mangas_2",
+    }
+
+
+def test_load_seen_favourites_corrupted_json(monkeypatch, tmp_path):
+    file = tmp_path / "favs.json"
+
+    file.write_text("{", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "storage.SEEN_FAVS_FILE",
+        str(file),
+    )
+
+    assert storage.load_seen_favourites() == set()
+
+
+def test_seen_favourites_roundtrip(monkeypatch, tmp_path):
+    file = tmp_path / "favs.json"
+
+    monkeypatch.setattr(
+        "storage.SEEN_FAVS_FILE",
+        str(file),
+    )
+
+    original = {
+        "animes_1",
+        "mangas_2",
+    }
+
+    storage.save_seen_favourites(original)
+
+    assert storage.load_seen_favourites() == original
