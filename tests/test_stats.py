@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 """
-Тесты модуля stats: агрегация (recompute_aggregates), сбор избранного
-(_collect_favourites), фильтр мусора по kind, metadata-retry в sync_stats_all,
+Тесты модуля stats: агрегация (recompute_aggregates),
+фильтр мусора по kind, metadata-retry в sync_stats_all,
 и smoke-тесты билдеров отчётов.
 
 Report builders тестируются здесь как чистые producers типизированной модели;
@@ -15,7 +15,10 @@ import copy
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import (
+    datetime,
+    timedelta,
+)
 from html.parser import HTMLParser
 from unittest.mock import (
     AsyncMock,
@@ -783,7 +786,7 @@ async def test_comment_sync_does_not_add_export_graphql_or_favourites_requests(
     monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: storage._empty_stats_all())
     monkeypatch.setattr("stats.fetch_list_export", fake_export)
     monkeypatch.setattr("stats.fetch_meta_batch", fake_meta)
-    monkeypatch.setattr("stats.fetch_favourites", fake_favourites)
+    monkeypatch.setattr("favourites.fetch_favourites", fake_favourites)
     monkeypatch.setattr("stats.save_stats_all", lambda value: None)
     session = object()
 
@@ -795,6 +798,88 @@ async def test_comment_sync_does_not_add_export_graphql_or_favourites_requests(
     assert favourite_calls == [session]
     assert result["anime"]["titles"]["1"]["comment"] == "anime comment"
     assert result["manga"]["titles"]["2"]["comment"] == "manga comment"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_session", [False, True])
+@pytest.mark.parametrize("input_kind", ["omitted", "unavailable", "prefetched"])
+async def test_sync_forwards_favourites_input_and_session(monkeypatch, own_session, input_kind):
+    state = storage._empty_stats_all()
+    session = object()
+    response = {"animes": []}
+    calls = []
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def collect(received_session, value, fav):
+        calls.append((received_session, value, fav))
+        return value
+
+    monkeypatch.setattr("stats.aiohttp.ClientSession", SessionContext)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(return_value=[]))
+    monkeypatch.setattr("stats._collect_favourites", collect)
+    save = AsyncMock()
+    monkeypatch.setattr("stats.save_stats_all", save)
+    kwargs = {} if own_session else {"session": session}
+    if input_kind != "omitted":
+        kwargs["fav"] = None if input_kind == "unavailable" else response
+
+    result, ok = await smod.sync_stats_all(**kwargs)
+
+    assert ok is True
+    assert len(calls) == 1
+    assert calls[0][0] is session
+    assert calls[0][1] is result and result is not state
+    expected = smod.FAVOURITES_UNSET if input_kind == "omitted" else kwargs["fav"]
+    assert calls[0][2] is expected
+    save.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["changed", "unchanged", "error", "privacy"])
+async def test_sync_retains_collection_publication_and_failure_policy(monkeypatch, outcome):
+    state = storage._empty_stats_all()
+    state["favourites"]["anime"] = [{"id": "old", "title": "Old", "url": ""}]
+    if outcome in {"error", "privacy"}:
+        state["anime"]["titles"]["1"] = _anime_rec()
+    before = copy.deepcopy(state)
+    saved = []
+
+    async def collect(session, value, fav):
+        if outcome == "privacy":
+            raise shiki_api.ProfilePrivacyError("fetch_favourites")
+        if outcome == "error":
+            raise RuntimeError("enrichment unavailable")
+        if outcome == "changed":
+            value["favourites"]["anime"] = [{"id": "new", "title": "New", "url": ""}]
+        return value
+
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(return_value=[]))
+    monkeypatch.setattr("stats._collect_favourites", collect)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: saved.append(value))
+
+    if outcome == "privacy":
+        with pytest.raises(shiki_api.ProfilePrivacyError):
+            await smod.sync_stats_all(session=object(), fav=None)
+        assert saved == []
+    else:
+        result, ok = await smod.sync_stats_all(session=object(), fav=None)
+        assert ok is True
+        assert saved == ([result] if outcome in {"changed", "error"} else [])
+        if outcome == "changed":
+            assert result["favourites"]["anime"][0]["id"] == "new"
+        else:
+            assert result["favourites"] == before["favourites"]
+        if outcome == "error":
+            assert result["anime"]["titles"] == {}
+    assert state == before
 
 
 @pytest.mark.asyncio
@@ -815,11 +900,6 @@ async def test_comment_is_excluded_from_derived_and_historical_consumers(
         "anime",
         stats["anime"]["titles"],
     )
-    stats = await smod._collect_favourites(
-        None,
-        stats,
-        fav={"animes": [{"id": 1, "russian": "Аниме", "url": "/animes/1"}]},
-    )
     cur = {
         "period": "2026-Q3",
         "events": [{
@@ -831,13 +911,11 @@ async def test_comment_is_excluded_from_derived_and_historical_consumers(
     }
 
     assert comment_marker not in json.dumps(stats["anime"]["aggregates"], ensure_ascii=False)
-    assert comment_marker not in json.dumps(stats["favourites"], ensure_ascii=False)
 
     reports = (
         smod.build_stats_all_messages(stats),
         smod.build_current_stats_messages(cur, stats),
         smod.build_quarterly_report_messages(cur, stats, None),
-        smod.build_favourites_messages(stats),
     )
     for report in reports:
         assert "COMMENT_MARKER_137" not in "".join(rendered_html(report))
@@ -908,79 +986,6 @@ async def test_comment_only_atomic_write_failure_preserves_file_cache_and_logs(
     assert stats_file.read_bytes() == before
     assert storage.load_stats_all()["anime"]["titles"]["1"]["comment"] == "previous"
     assert comment_marker not in caplog.text
-
-
-# ════════════════════════════════════════════════════════════════
-#  Избранное: _collect_favourites (джойн с titles)
-# ════════════════════════════════════════════════════════════════
-
-@pytest.mark.asyncio
-async def test_collect_favourites_join_with_titles(monkeypatch):
-    stats = storage._empty_stats_all()
-    stats["anime"]["titles"] = {
-        "790": {"title": "Эрго Прокси", "url": "/animes/790", "score": 9},
-        "5114": {"title": "ФМА", "url": "/animes/5114", "score": 0},  # без оценки
-    }
-
-    async def fake_fetch(session):
-        return {
-            "animes": [
-                {"id": 790, "russian": "Эрго Прокси", "url": "/animes/790"},
-                {"id": 5114, "russian": "ФМА", "url": "/animes/5114"},
-                {"id": 9999, "russian": "Не в списке", "url": "/animes/9999"},  # нет в titles
-            ],
-            "mangas": [], "characters": [], "people": [],
-        }
-    monkeypatch.setattr("stats.fetch_favourites", fake_fetch)
-
-    class S:
-        pass
-    stats = await smod._collect_favourites(S(), stats)
-    fa = {e["id"]: e for e in stats["favourites"]["anime"]}
-
-    assert fa["790"].get("score") == 9            # оценка из titles
-    assert "score" not in fa["5114"]              # score=0 -> не показываем
-    assert fa["9999"]["title"] == "Не в списке"   # не в titles -> имя из API
-    assert "score" not in fa["9999"]
-
-@pytest.mark.asyncio
-async def test_collect_favourites_api_fail_keeps_previous(monkeypatch):
-    stats = storage._empty_stats_all()
-    stats["favourites"]["anime"] = [{"id": "1", "title": "Старое", "url": "/animes/1"}]
-
-    async def fake_fetch(session):
-        return None  # сбой API
-    monkeypatch.setattr("stats.fetch_favourites", fake_fetch)
-
-    class S: 
-        pass
-    stats = await smod._collect_favourites(S(), stats)
-    # Прежнее избранное не затёрто
-    assert stats["favourites"]["anime"] == [{"id": "1", "title": "Старое", "url": "/animes/1"}]
-
-
-@pytest.mark.asyncio
-async def test_collect_favourites_explicit_none_keeps_previous_without_fetch(monkeypatch):
-    """Дедуп: fav=None передан ЯВНО (= «недоступно в этом цикле») → оставляем
-    прежнее БЕЗ повторного фетча. Контраст с fav не переданным (тот фетчит)."""
-    stats = storage._empty_stats_all()
-    stats["favourites"]["anime"] = [{"id": "1", "title": "Старое", "url": "/animes/1"}]
-
-    fetched = False
-
-    async def fake_fetch(session):
-        nonlocal fetched
-        fetched = True
-        return {"animes": []}
-
-    monkeypatch.setattr("stats.fetch_favourites", fake_fetch)
-
-    class S:
-        pass
-    result = await smod._collect_favourites(S(), stats, fav=None)
-
-    assert fetched is False       # повторного фетча не было
-    assert result["favourites"]["anime"] == [{"id": "1", "title": "Старое", "url": "/animes/1"}]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1316,7 +1321,7 @@ def test_all_time_insights_are_read_only_and_preserve_partial_report(monkeypatch
     }
     before = copy.deepcopy(stats)
     for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
-                   "stats.fetch_list_export", "stats.fetch_favourites"):
+                   "stats.fetch_list_export", "favourites.fetch_favourites"):
         monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
 
     report = smod.build_stats_all_messages(stats)
@@ -1351,46 +1356,6 @@ def test_stats_all_translates_ranobe_kinds(kind):
     assert "light_novel" not in manga_message
     assert "ranobe" not in manga_message
 
-def test_smoke_build_favourites_returns_report():
-    assert isinstance(smod.build_favourites_messages(_populated_stats()), Report)
-
-
-def test_favourites_use_dynamic_summary_category_counts_and_trailing_score():
-    stats = storage._empty_stats_all()
-    stats["favourites"]["anime"] = [
-        {"title": "Первое", "url": "", "score": 8},
-        {"title": "Второе", "url": ""},
-    ]
-    stats["favourites"]["ranobe"] = [{"title": "Третье", "url": ""}]
-
-    report = smod.build_favourites_messages(stats)
-
-    assert report.units[0].sections[0].items[1].parts == (
-        Italic("3 объекта  ·  2 категории"),
-    )
-    assert report.units[0].sections[1].items[0].parts == (
-        Text("🎬 "),
-        Bold("Аниме"),
-        Text(" · 2"),
-    )
-    assert "Первое — 8⭐" in rendered_html(report)[0]
-    assert "⭐8" not in rendered_html(report)[0]
-
-
-def test_favourites_keep_untrusted_values_plain_until_renderer_boundary():
-    stats = storage._empty_stats_all()
-    stats["favourites"]["anime"] = [{
-        "title": "A <B> & C",
-        "url": '/animes/1?x=1&label="quoted"',
-    }]
-
-    report = smod.build_favourites_messages(stats)
-    title_node = report.units[0].sections[1].items[1].parts[1]
-
-    assert title_node == Link(
-        "A <B> & C",
-        'https://shikimori.io/animes/1?x=1&label="quoted"',
-    )
 
 def test_smoke_build_current_returns_report():
     cur = {"period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
@@ -1515,13 +1480,6 @@ def test_quarter_top_marks_ranked_titles_with_saved_poster_slots():
     ]
 
 
-def test_title_poster_normalizes_empty_saved_url_to_missing_slot():
-    assert smod._title_inline(
-        {"title": "No poster", "poster_url": ""},
-        poster=True,
-    ) == Title("No poster", None, Poster(None))
-
-
 def test_prepare_quarter_report_collects_each_media_and_event_type():
     anime_completed = {"title": "Anime completed", "score": 2}
     anime_dropped = {"title": "Anime dropped", "score": 0}
@@ -1636,7 +1594,6 @@ def test_smoke_empty_stats_no_crash():
     # Пустая структура не должна ронять билдеры
     empty = storage._empty_stats_all()
     assert isinstance(smod.build_stats_all_messages(empty), Report)
-    assert isinstance(smod.build_favourites_messages(empty), Report)
 
 @pytest.mark.asyncio
 async def test_smoke_async_report_builders(monkeypatch):
@@ -1644,27 +1601,9 @@ async def test_smoke_async_report_builders(monkeypatch):
     monkeypatch.setattr("handlers.load_stats_current", lambda: {
         "period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
         "tracking_since": "2026-04-01T00:00:00", "events": []})
-    for builder in (handlers._stats_report_all, handlers._stats_report_current,
-                    handlers._stats_report_favourites):
+    for builder in (handlers._stats_report_all, handlers._stats_report_current):
         report = await builder()
         assert isinstance(report, Report)
-
-
-# ── Регрессия: ссылки содержат домен РОВНО один раз (нет двойного домена) ──
-
-def test_links_single_domain_in_favourites():
-    stats = storage._empty_stats_all()
-    # Полный URL из GraphQL — провокация двойного домена
-    stats["favourites"]["anime"] = [
-        {"id": "1", "title": "Тест", "url": "https://shikimori.io/animes/226", "score": 10}
-    ]
-    msg = rendered_html(smod.build_favourites_messages(stats))[0]
-    # Домен должен встречаться ровно один раз в href
-    hrefs = re.findall(r'href="([^"]*)"', msg)
-    assert hrefs, "должна быть ссылка"
-    for href in hrefs:
-        assert href.count("shikimori.io") == 1, f"двойной домен: {href}"
-        assert href.startswith("https://shikimori.io/"), href
 
 
 # ════════════════════════════════════════════════════════════════
@@ -2893,7 +2832,7 @@ def test_split_all_time_aggregates_are_independent_and_read_only(monkeypatch):
 
     monkeypatch.setattr("stats._manga_all_unit", capture)
     for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
-                   "stats.fetch_list_export", "stats.fetch_favourites"):
+                   "stats.fetch_list_export", "favourites.fetch_favourites"):
         monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
     report = smod.build_stats_all_messages(stats)
 
@@ -2940,7 +2879,7 @@ def test_current_split_keeps_missing_and_malformed_ids_visible(event_type, monke
     ]}
     before = copy.deepcopy((cur, stats))
     for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
-                   "stats.fetch_list_export", "stats.fetch_favourites"):
+                   "stats.fetch_list_export", "favourites.fetch_favourites"):
         monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
 
     data = smod._prepare_quarter_report(cur, stats)
@@ -3292,7 +3231,7 @@ def test_all_time_malformed_titles_remain_visible_without_invented_stats(monkeyp
     stats["manga"]["aggregates"] = {"total_completed": 999, "by_quarter": {"2025-Q1": {"completed": 7}}}
     before = copy.deepcopy(stats)
     for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
-                   "stats.fetch_list_export", "stats.fetch_favourites"):
+                   "stats.fetch_list_export", "favourites.fetch_favourites"):
         monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
 
     split = smod.partition_manga_titles(titles)
@@ -3354,7 +3293,7 @@ def test_all_time_non_dict_manga_titles_does_not_abort_report(monkeypatch, title
     stats["manga"]["titles"] = titles
     before = copy.deepcopy(stats)
     for target in ("stats.save_stats_all", "stats._atomic_write", "stats.fetch_meta_batch",
-                   "stats.fetch_list_export", "stats.fetch_favourites"):
+                   "stats.fetch_list_export", "favourites.fetch_favourites"):
         monkeypatch.setattr(target, lambda *a, **k: pytest.fail("Побочный I/O отчёта"))
 
     report = smod.build_stats_all_messages(stats)

@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Тесты фичи «избранное»: флоу check_and_notify_favourites + сбор
-(_collect_favourites/build_favourites_messages) + seen-хранилище.
-build_favourite_message (leaf messages) вынесен в test_messages.py."""
+"""Оркестрация уведомлений и доставки отчёта избранного."""
 
 import asyncio
-import json
+from copy import deepcopy
 from unittest.mock import (
     AsyncMock,
     MagicMock,
@@ -15,45 +13,10 @@ import pytest
 
 import handlers
 import shiki_api
-import stats as smod
 import storage
 from handlers import check_and_notify_favourites
 from report_delivery import ReportDeliveryResult
-from report_model import (
-    plain_report,
-    rendered_html,
-)
-from storage import (
-    load_seen_favourites,
-    save_seen_favourites,
-)
-
-# Срез реального ответа /favourites: все 8 категорий, url=null везде,
-# у TeddyLoid russian="" (должен фолбэкнуться на name).
-FAV_SAMPLE = {
-    "animes": [
-        {"id": 226, "name": "Elfen Lied", "russian": "Эльфийская песнь", "url": None},
-    ],
-    "mangas": [
-        {"id": 21525, "name": "Akatsuki no Yona", "russian": "Йона на заре", "url": None},
-    ],
-    "ranobe": [
-        {"id": 74697, "name": "Re:Zero", "russian": "Re:Zero. Жизнь с нуля", "url": None},
-    ],
-    "characters": [],
-    "people": [
-        {"id": 30805, "name": "TeddyLoid", "russian": "", "url": None},
-    ],
-    "mangakas": [
-        {"id": 32649, "name": "Tappei Nagatsuki", "russian": "Таппэй Нагацуки", "url": None},
-    ],
-    "seyu": [
-        {"id": 34785, "name": "Rie Takahashi", "russian": "Риэ Такахаси", "url": None},
-    ],
-    "producers": [
-        {"id": 38963, "name": "Masahiro Shinohara", "russian": "Масахиро Синохара", "url": None},
-    ],
-}
+from report_model import plain_report
 
 
 @pytest.fixture(autouse=True)
@@ -84,76 +47,6 @@ def _stats_with_titles():
                   "score": 8, "kind": "manga", "status": "completed"},
     }
     return stats
-
-
-# ============================================================
-# Storage
-# ============================================================
-
-def test_load_seen_favourites_missing_file(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        "storage.SEEN_FAVS_FILE",
-        str(tmp_path / "missing.json"),
-    )
-
-    assert load_seen_favourites() == set()
-
-
-def test_load_seen_favourites_valid_json(monkeypatch, tmp_path):
-    file = tmp_path / "favs.json"
-
-    file.write_text(
-        json.dumps(
-            {
-                "seen_favourites": [
-                    "animes_1",
-                    "mangas_2",
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(
-        "storage.SEEN_FAVS_FILE",
-        str(file),
-    )
-
-    assert load_seen_favourites() == {
-        "animes_1",
-        "mangas_2",
-    }
-
-
-def test_load_seen_favourites_corrupted_json(monkeypatch, tmp_path):
-    file = tmp_path / "favs.json"
-
-    file.write_text("{", encoding="utf-8")
-
-    monkeypatch.setattr(
-        "storage.SEEN_FAVS_FILE",
-        str(file),
-    )
-
-    assert load_seen_favourites() == set()
-
-
-def test_seen_favourites_roundtrip(monkeypatch, tmp_path):
-    file = tmp_path / "favs.json"
-
-    monkeypatch.setattr(
-        "storage.SEEN_FAVS_FILE",
-        str(file),
-    )
-
-    original = {
-        "animes_1",
-        "mangas_2",
-    }
-
-    save_seen_favourites(original)
-
-    assert load_seen_favourites() == original
 
 
 # ============================================================
@@ -401,51 +294,8 @@ async def test_untracked_category_is_ignored(monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Ветка favourites-fix: категории (ранобэ + слияние индустрии),
-#  джойн ссылок, пересборка stats["favourites"] при found_new.
+#  Джойн ссылок в уведомлениях и обновление локального отчёта.
 # ═══════════════════════════════════════════════════════════════
-
-def test_collect_favourites_merges_industry_and_adds_ranobe():
-    stats = storage._empty_stats_all()
-    out = asyncio.run(smod._collect_favourites(None, stats, fav=FAV_SAMPLE))
-    fav = out["favourites"]
-
-    # Ранобэ — отдельный блок
-    assert len(fav["ranobe"]) == 1
-    assert fav["ranobe"][0]["id"] == "74697"
-
-    # people + mangakas + seyu + producers слиты в один блок (4 человека)
-    assert len(fav["people"]) == 4
-    ids = {p["id"] for p in fav["people"]}
-    assert ids == {"30805", "32649", "34785", "38963"}
-
-    # Персонажи отдельно и пусты в этом срезе
-    assert fav["characters"] == []
-
-
-def test_collect_favourites_empty_russian_falls_back_to_name():
-    stats = storage._empty_stats_all()
-    out = asyncio.run(smod._collect_favourites(None, stats, fav=FAV_SAMPLE))
-    teddy = next(p for p in out["favourites"]["people"] if p["id"] == "30805")
-    # russian был "" — заголовок не должен быть пустым, берём name
-    assert teddy["title"] == "TeddyLoid"
-
-
-def test_collect_favourites_url_join_from_titles():
-    stats = _stats_with_titles()
-    out = asyncio.run(smod._collect_favourites(None, stats, fav=FAV_SAMPLE))
-    anime = out["favourites"]["anime"][0]
-    assert anime["url"] == "/animes/226-elfen-lied"   # ссылка подтянута из titles
-    assert anime["score"] == 9                          # и оценка
-
-
-def test_build_favourites_messages_has_ranobe_and_industry_blocks():
-    stats = storage._empty_stats_all()
-    stats["favourites"]["ranobe"] = [{"id": "1", "title": "Ранобэ-тайтл", "url": ""}]
-    stats["favourites"]["people"] = [{"id": "2", "title": "Человек", "url": ""}]
-    msg = rendered_html(smod.build_favourites_messages(stats))[0]
-    assert "Ранобэ" in msg
-    assert "Люди индустрии" in msg
 
 
 @pytest.mark.asyncio
@@ -719,3 +569,82 @@ async def test_cmd_favs_reports_error_and_skips_send(monkeypatch):
     msg.answer.assert_awaited_once()              # сообщили об ошибке
     assert "не удалось" in msg.answer.call_args.args[0].lower()
     send.assert_not_awaited()                     # отчёт НЕ ушёл
+
+
+@pytest.mark.asyncio
+async def test_favourites_report_builder_delegates_local_snapshot(monkeypatch):
+    snapshot = _stats_with_titles()
+    report = plain_report("Избранное")
+    load = MagicMock(return_value=snapshot)
+    build = MagicMock(return_value=report)
+    fetch = AsyncMock(side_effect=AssertionError("I/O отчёта"))
+    monkeypatch.setattr("handlers.load_stats_all", load)
+    monkeypatch.setattr("handlers.build_favourites_messages", build)
+    monkeypatch.setattr("handlers.fetch_favourites", fetch)
+
+    assert await handlers._stats_report_favourites() is report
+
+    load.assert_called_once_with()
+    build.assert_called_once_with(snapshot)
+    fetch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_notifications_reuse_unmodified_response_for_collection(monkeypatch):
+    snapshot = _stats_with_titles()
+    response = {"animes": [{"id": 226, "name": "API title", "url": None}]}
+    original = deepcopy(response)
+    collect = AsyncMock(return_value=snapshot)
+    save = MagicMock()
+    saved_seen = MagicMock()
+    build = MagicMock(return_value="notification")
+    fetch = AsyncMock(side_effect=AssertionError("Повторный запрос"))
+    monkeypatch.setattr("handlers.load_stats_all", lambda: snapshot)
+    monkeypatch.setattr("handlers._collect_favourites", collect)
+    monkeypatch.setattr("handlers.save_stats_all", save)
+    monkeypatch.setattr("handlers.save_seen_favourites", saved_seen)
+    monkeypatch.setattr("handlers.build_favourite_message", build)
+    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
+    monkeypatch.setattr("handlers.fetch_favourites", fetch)
+
+    seen, found_new = await handlers.check_and_notify_favourites(
+        None, {"animes_999"}, favourites=response,
+    )
+
+    assert found_new is True and seen == {"animes_999", "animes_226"}
+    assert response == original
+    notification_item = build.call_args.args[1]
+    assert notification_item is not response["animes"][0]
+    assert notification_item["url"] == "/animes/226-elfen-lied"
+    collect.assert_awaited_once_with(None, snapshot, fav=response)
+    assert collect.await_args.kwargs["fav"] is response
+    save.assert_called_once_with(snapshot)
+    saved_seen.assert_called_once_with(seen)
+    fetch.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("privacy", [False, True])
+async def test_notification_refresh_failure_keeps_seen_publication_policy(monkeypatch, privacy):
+    error = shiki_api.ProfilePrivacyError("fetch_favourites") if privacy else RuntimeError("refresh")
+    collect = AsyncMock(side_effect=error)
+    save = MagicMock()
+    saved_seen = MagicMock()
+    monkeypatch.setattr("handlers.load_stats_all", _stats_with_titles)
+    monkeypatch.setattr("handlers._collect_favourites", collect)
+    monkeypatch.setattr("handlers.save_stats_all", save)
+    monkeypatch.setattr("handlers.save_seen_favourites", saved_seen)
+    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
+    response = {"animes": [{"id": 226, "name": "API title"}]}
+    seen = {"animes_999"}
+
+    if privacy:
+        with pytest.raises(shiki_api.ProfilePrivacyError) as raised:
+            await handlers.check_and_notify_favourites(None, seen, favourites=response)
+        assert raised.value is error
+        saved_seen.assert_not_called()
+    else:
+        result, found_new = await handlers.check_and_notify_favourites(None, seen, favourites=response)
+        assert result is seen and found_new is True
+        saved_seen.assert_called_once_with(seen)
+    save.assert_not_called()

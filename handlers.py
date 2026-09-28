@@ -90,6 +90,10 @@ from fact_bank import (
     reload_fact_bank,
     serialize_fact_bank,
 )
+from favourites import (
+    _collect_favourites,
+    build_favourites_messages,
+)
 from healthcheck import heartbeat
 from inline_cards import (
     CARD_KIND_LABELS,
@@ -173,12 +177,10 @@ from stats import (
     PICK_CATEGORY_MANGA,
     PICK_CATEGORY_RANOBE,
     PickCandidate,
-    _collect_favourites,
     _load_prev_quarter_summary,
     _save_quarter_snapshot,
     _update_by_quarter,
     build_current_stats_messages,
-    build_favourites_messages,
     build_pick_catalog,
     build_quarterly_report_messages,
     build_stats_all_messages,
