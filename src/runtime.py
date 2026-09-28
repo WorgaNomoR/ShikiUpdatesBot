@@ -23,14 +23,15 @@ if os.name == "nt":
     from ctypes import wintypes
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
-RESOURCE_ROOT = Path(
-    getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
-).resolve()
+_MODULE_ROOT = Path(__file__).resolve().parent
 APP_ROOT = (
     Path(sys.executable).resolve().parent
     if IS_FROZEN
-    else Path(__file__).resolve().parent
+    else _MODULE_ROOT.parent
 )
+RESOURCE_ROOT = Path(
+    getattr(sys, "_MEIPASS", _MODULE_ROOT) if IS_FROZEN else APP_ROOT
+).resolve()
 ENV_FILE = APP_ROOT / ".env"
 ENV_EXAMPLE_FILE = APP_ROOT / ".env.example"
 LOG_DIR = APP_ROOT / "logs"

@@ -3,11 +3,42 @@
 """Консольный запуск portable exe и его диагностические режимы."""
 
 import io
+import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import launcher
+import project_meta
+
+
+def test_source_launcher_resolves_root_metadata_without_pythonpath(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    app_root = tmp_path / "application"
+    src = app_root / "src"
+    src.mkdir(parents=True)
+    shutil.copyfile(root / "project_meta.py", app_root / "project_meta.py")
+    module_root = Path(launcher.__file__).parent
+    for name in ("launcher.py", "build_info.py", "runtime.py"):
+        shutil.copyfile(module_root / name, src / name)
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+
+    process = subprocess.run(
+        [sys.executable, "-B", str(src / "launcher.py"), "--version"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert process.returncode == 0, process.stderr
+    assert process.stdout.strip() == f"ShikiUpdatesBot {project_meta.PROJECT_VERSION}"
 
 
 def test_launcher_version_does_not_load_config(monkeypatch, capsys):

@@ -17,7 +17,10 @@ from PyInstaller.utils.hooks import (
 root = Path(SPECPATH)
 sys.path.insert(0, str(root))
 
-from project_meta import PROJECT_REPOSITORY, PROJECT_VERSION  # noqa: E402
+from project_meta import (  # noqa: E402
+    PROJECT_REPOSITORY,
+    PROJECT_VERSION,
+)
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -105,8 +108,8 @@ datas.append((str(root / "assets" / "main-menu"), "assets/main-menu"))
 datas.append((str(root / "examples" / "facts.json"), "examples"))
 
 a = Analysis(
-    [str(root / "launcher.py")],
-    pathex=[str(root), str(meta_dir)],
+    [str(root / "src" / "launcher.py")],
+    pathex=[str(root / "src"), str(root), str(meta_dir)],
     binaries=[],
     datas=datas,
     hiddenimports=["_build_info"],

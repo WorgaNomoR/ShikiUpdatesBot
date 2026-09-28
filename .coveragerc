@@ -1,5 +1,7 @@
 [run]
-source = .
+source =
+    .
+    src
 omit =
     tests/*
     */__pycache__/*

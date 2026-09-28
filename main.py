@@ -7,6 +7,13 @@ Shikimori History Watcher Bot
 """
 
 import asyncio
+import sys
+from pathlib import Path
+
+# Корневая точка входа сохраняет плоские импорты без настройки хостинга.
+# В exe модули уже доступны через загрузчик PyInstaller.
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from aiogram import (
     Bot,

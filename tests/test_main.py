@@ -2,6 +2,11 @@
 # Copyright (C) 2026  WorgaNomoR
 """Сборка приложения и lifecycle frozen-запуска."""
 
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import (
     AsyncMock,
@@ -11,6 +16,70 @@ from unittest.mock import (
 import pytest
 
 import main
+import runtime
+
+
+@pytest.mark.parametrize("from_root", [True, False])
+def test_source_entrypoint_loads_flat_src_modules_without_pythonpath(tmp_path, from_root):
+    """Проверить настоящий корневой запуск без импортного пути и фикстур pytest."""
+    root = Path(__file__).resolve().parents[1]
+    app_root = tmp_path / "application"
+    src = app_root / "src"
+    src.mkdir(parents=True)
+    for name in ("main.py", "project_meta.py"):
+        shutil.copyfile(root / name, app_root / name)
+    for module in Path(runtime.__file__).parent.glob("*.py"):
+        if module.name not in {"main.py", "project_meta.py", "release_security.py"}:
+            shutil.copyfile(module, src / module.name)
+    (app_root / ".env").write_text(
+        "BOT_TOKEN=source-smoke-token\nOWNER_ID=123456\nSHIKI_USER=source-smoke\n",
+        encoding="utf-8-sig",
+    )
+    # Останавливаем процесс перед первым await приложения: импорты настоящие,
+    # но Telegram, healthcheck и фоновые задачи не запускаются.
+    script = """
+import asyncio
+import runpy
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+started = []
+def stop_startup(coro):
+    started.append(coro.cr_code.co_name)
+    coro.close()
+asyncio.run = stop_startup
+namespace = runpy.run_path(str(root / "main.py"), run_name="__main__")
+import config
+import handlers
+import project_meta
+assert started == ["main"]
+assert namespace["cmd_start"] is handlers.cmd_start
+assert Path(handlers.__file__).resolve() == root / "src" / "handlers.py"
+assert Path(project_meta.__file__).resolve() == root / "project_meta.py"
+assert config.SHIKI_USER == "source-smoke"
+assert config.OWNER_ID == 654321
+print("source-entrypoint-ok")
+"""
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"}
+    }
+    env.update(OWNER_ID="654321", DATA_DIR=str(tmp_path / "data"))
+    process = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(app_root)],
+        cwd=app_root if from_root else tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert process.returncode == 0, process.stderr
+    assert process.stdout.strip() == "source-entrypoint-ok"
 
 
 def _patch_app_dependencies(monkeypatch, *, frozen: bool):

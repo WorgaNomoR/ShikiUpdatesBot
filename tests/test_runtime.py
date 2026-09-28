@@ -3,12 +3,62 @@
 """Контракты portable runtime и Windows-интеграции."""
 
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import runtime
+
+
+def _load_runtime_roots(module_path):
+    """Вычислить настоящие константы runtime для заданного расположения файла."""
+    namespace = {"__file__": str(module_path), "__name__": "runtime_roots"}
+    source = Path(runtime.__file__).read_text(encoding="utf-8")
+    exec(compile(source, str(module_path), "exec"), namespace)
+    return namespace
+
+
+def test_source_roots_stay_above_src_independently_of_working_directory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    monkeypatch.chdir(tmp_path)
+    app_root = tmp_path / "application"
+
+    roots = _load_runtime_roots(app_root / "src" / "runtime.py")
+
+    assert roots["APP_ROOT"] == app_root
+    assert roots["RESOURCE_ROOT"] == app_root
+    assert roots["ENV_FILE"] == app_root / ".env"
+    assert roots["ENV_EXAMPLE_FILE"] == app_root / ".env.example"
+    assert roots["LOG_DIR"] == app_root / "logs"
+    assert roots["DEFAULT_DATA_DIR"] == Path("/data")
+
+
+def test_frozen_roots_separate_physical_executable_and_bundled_resources(
+    monkeypatch,
+    tmp_path,
+):
+    app_root = tmp_path / "portable"
+    resource_root = tmp_path / "extracted"
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app_root / "ShikiUpdatesBot.exe"))
+    monkeypatch.setattr(sys, "_MEIPASS", str(resource_root), raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    roots = _load_runtime_roots(resource_root / "runtime.py")
+
+    assert roots["APP_ROOT"] == app_root
+    assert roots["RESOURCE_ROOT"] == resource_root
+    assert roots["ENV_FILE"] == app_root / ".env"
+    assert roots["ENV_EXAMPLE_FILE"] == app_root / ".env.example"
+    assert roots["LOG_DIR"] == app_root / "logs"
+    assert roots["DEFAULT_DATA_DIR"] == app_root / "data"
+    assert roots["resolve_data_dir"]("custom-data") == app_root / "custom-data"
 
 
 def test_frozen_relative_data_dir_stays_beside_exe(monkeypatch, tmp_path):
