@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 """Session-bound orchestration единого меню профиля."""
 
+import asyncio
 from unittest.mock import (
     AsyncMock,
     MagicMock,
@@ -10,12 +11,20 @@ from unittest.mock import (
 import pytest
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import BufferedInputFile
+from aiogram.types import (
+    BufferedInputFile,
+    Chat,
+    InaccessibleMessage,
+)
 
 import handlers
 import main_menu
 from report_delivery import ReportDeliveryResult
 from report_model import plain_report
+from storage import (
+    STATS_ALL_VALID,
+    StatsAllSnapshot,
+)
 
 
 class _State:
@@ -408,37 +417,327 @@ async def test_facts_terminal_delegates_after_state_and_control_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_terminal_list_clears_and_cleans_before_existing_delivery(
+@pytest.mark.parametrize("has_photo", [False, True])
+@pytest.mark.parametrize(
+    ("media", "view"),
+    [("combined", "all")]
+    + [(media, view) for media in ("anime", "manga", "ranobe")
+       for view in ("completed", "planned", "all")],
+)
+async def test_terminal_list_orders_clear_ack_progress_build_and_delivery(
     monkeypatch,
+    has_photo,
+    media,
+    view,
 ):
-    state = _state(screen="lists:anime")
-    callback = _callback("menu:lists:anime:completed")
-    cleanup = AsyncMock()
-    monkeypatch.setattr(handlers, "_cleanup_inline_menu", cleanup)
-    monkeypatch.setattr(
-        handlers,
-        "_lists_snapshot_report",
-        MagicMock(return_value=plain_report("list")),
-    )
+    screen = "lists" if media == "combined" else f"lists:{media}"
+    action = "menu:lists:combined" if media == "combined" else f"menu:lists:{media}:{view}"
+    state = _state(screen=screen)
+    callback = _callback(action)
+    callback.message.photo = [MagicMock()] if has_photo else []
+    events = []
+    real_clear = state.clear
+    real_build = handlers.build_list_report
+
+    async def clear():
+        events.append("clear")
+        await real_clear()
+
+    async def ack(*args, **kwargs):
+        events.append("ack")
+
+    async def progress(*args, **kwargs):
+        events.append("progress")
+
+    async def delete_command():
+        assert state.state is None
+        events.append("command-cleanup")
+
+    def snapshot():
+        events.append("snapshot")
+        return StatsAllSnapshot({"anime": {"titles": {}}, "manga": {"titles": {}}}, STATS_ALL_VALID)
+
+    def build(*args, **kwargs):
+        events.append("build")
+        return real_build(*args, **kwargs)
 
     async def deliver(*args, **kwargs):
         assert state.state is None
-        cleanup.assert_awaited_once_with(callback.message)
+        callback.message.delete.assert_not_awaited()
+        events.append("delivery")
         return ReportDeliveryResult(True, 1, 1)
 
-    monkeypatch.setattr(
-        handlers,
-        "deliver_report",
-        AsyncMock(side_effect=deliver),
-    )
+    command = MagicMock(delete=AsyncMock(side_effect=delete_command))
+    callback.message.reply_to_message = command
+    state.clear = AsyncMock(side_effect=clear)
+    callback.answer = AsyncMock(side_effect=ack)
+    edit = callback.message.edit_caption if has_photo else callback.message.edit_text
+    edit.side_effect = progress
+    monkeypatch.setattr("handlers.load_stats_all_snapshot", MagicMock(side_effect=snapshot))
+    monkeypatch.setattr("handlers.build_list_report", MagicMock(side_effect=build))
+    monkeypatch.setattr("handlers.deliver_report", AsyncMock(side_effect=deliver))
+    forbidden = {}
+    for name in (
+        "fetch_current_rates", "fetch_favourites", "fetch_history", "sync_stats_all",
+        "save_stats_all", "load_subscribers", "send_backup", "inline_access_status",
+        "parse_inline_query",
+    ):
+        forbidden[name] = MagicMock(side_effect=AssertionError(name))
+        monkeypatch.setattr(f"handlers.{name}", forbidden[name])
 
     await handlers.main_menu_cb(callback, state)
 
-    handlers._lists_snapshot_report.assert_called_once_with(
-        "anime",
-        "completed",
-    )
+    assert events == [
+        "clear", "ack", "command-cleanup", "progress", "snapshot", "build", "delivery",
+    ]
+    if has_photo:
+        edit.assert_awaited_once_with(
+            caption="⏳ Формирую и отправляю список…",
+            reply_markup=None,
+        )
+    else:
+        edit.assert_awaited_once_with("⏳ Формирую и отправляю список…", reply_markup=None)
+    handlers.load_stats_all_snapshot.assert_called_once_with()
+    assert handlers.build_list_report.call_args.args[1:] == (media, view)
     handlers.deliver_report.assert_awaited_once()
+    assert handlers.deliver_report.await_args.kwargs == {
+        "disable_preview": True,
+        "notify_partial": True,
+    }
+    callback.message.delete.assert_awaited_once_with()
+    command.delete.assert_awaited_once_with()
+    callback.answer.assert_awaited_once_with()
+    for mock in forbidden.values():
+        mock.assert_not_called()
+
+    await handlers.main_menu_cb(callback, state)
+    handlers.load_stats_all_snapshot.assert_called_once_with()
+    handlers.deliver_report.assert_awaited_once()
+    edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_photo", [False, True])
+async def test_list_progress_stays_visible_while_delivery_is_pending(monkeypatch, has_photo):
+    state = _state(screen="lists")
+    callback = _callback("menu:lists:combined")
+    callback.message.photo = [MagicMock()] if has_photo else []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def deliver(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return ReportDeliveryResult(True, 3, 3)
+
+    monkeypatch.setattr("handlers._lists_snapshot_report", MagicMock(return_value=plain_report("list")))
+    monkeypatch.setattr("handlers.deliver_report", AsyncMock(side_effect=deliver))
+    task = asyncio.create_task(handlers.main_menu_cb(callback, state))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        edit = callback.message.edit_caption if has_photo else callback.message.edit_text
+        edit.assert_awaited_once()
+        callback.message.delete.assert_not_awaited()
+        assert state.state is None
+    finally:
+        release.set()
+        await task
+    callback.message.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_photo", [False, True])
+@pytest.mark.parametrize(
+    "result",
+    [
+        ReportDeliveryResult(True, 3, 3),
+        ReportDeliveryResult(False, 0, 3, RuntimeError("complete failure")),
+        ReportDeliveryResult(False, 1, 3, RuntimeError("partial failure")),
+    ],
+    ids=("success", "complete-failure", "partial-delivery"),
+)
+async def test_list_progress_is_cleaned_after_every_delivery_result(monkeypatch, has_photo, result):
+    state = _state(screen="lists:ranobe")
+    callback = _callback("menu:lists:ranobe:all")
+    callback.message.photo = [MagicMock()] if has_photo else []
+    monkeypatch.setattr("handlers._lists_snapshot_report", MagicMock(return_value=plain_report("list")))
+    delivery = AsyncMock(return_value=result)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+
+    await handlers.main_menu_cb(callback, state)
+
+    edit = callback.message.edit_caption if has_photo else callback.message.edit_text
+    edit.assert_awaited_once()
+    delivery.assert_awaited_once()
+    assert delivery.await_args.kwargs["notify_partial"] is True
+    callback.message.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_photo", [False, True])
+@pytest.mark.parametrize("failure", [None, "send", "cleanup"])
+async def test_list_progress_edit_failure_uses_best_effort_separate_status(
+    monkeypatch, has_photo, failure,
+):
+    state = _state(screen="lists:manga")
+    callback = _callback("menu:lists:manga:planned")
+    callback.message.photo = [MagicMock()] if has_photo else []
+    edit = callback.message.edit_caption if has_photo else callback.message.edit_text
+    edit.side_effect = RuntimeError("edit unavailable")
+    callback.message.edit_reply_markup.side_effect = RuntimeError("markup unavailable")
+    progress = MagicMock(delete=AsyncMock(), edit_reply_markup=AsyncMock())
+    callback.message.answer.return_value = progress
+    if failure == "send":
+        callback.message.answer.side_effect = RuntimeError("send unavailable")
+    elif failure == "cleanup":
+        progress.delete.side_effect = RuntimeError("delete unavailable")
+        progress.edit_reply_markup.side_effect = RuntimeError("markup unavailable")
+    monkeypatch.setattr("handlers._lists_snapshot_report", MagicMock(return_value=plain_report("list")))
+
+    async def deliver(*args, **kwargs):
+        callback.message.answer.assert_awaited_once_with("⏳ Формирую и отправляю список…")
+        progress.delete.assert_not_awaited()
+        return ReportDeliveryResult(True, 1, 1)
+
+    delivery = AsyncMock(side_effect=deliver)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+
+    await handlers.main_menu_cb(callback, state)
+
+    delivery.assert_awaited_once()
+    callback.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+    callback.message.delete.assert_awaited_once_with()
+    assert progress.delete.await_count == (0 if failure == "send" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_photo", [False, True])
+@pytest.mark.parametrize("neutral_edit_fails", [False, True])
+async def test_list_progress_cleanup_failure_neutralizes_reused_control(
+    monkeypatch, has_photo, neutral_edit_fails,
+):
+    state = _state(screen="lists:anime")
+    callback = _callback("menu:lists:anime:all")
+    callback.message.photo = [MagicMock()] if has_photo else []
+    callback.message.delete.side_effect = RuntimeError("delete unavailable")
+    command = MagicMock(delete=AsyncMock(side_effect=RuntimeError("command unavailable")))
+    callback.message.reply_to_message = command
+    edit = callback.message.edit_caption if has_photo else callback.message.edit_text
+    edit.side_effect = [None, RuntimeError("edit unavailable") if neutral_edit_fails else None]
+    callback.message.edit_reply_markup.side_effect = RuntimeError("markup unavailable")
+    monkeypatch.setattr("handlers._lists_snapshot_report", MagicMock(return_value=plain_report("list")))
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+
+    await handlers.main_menu_cb(callback, state)
+
+    delivery.assert_awaited_once()
+    command.delete.assert_awaited_once_with()
+    callback.message.delete.assert_awaited_once_with()
+    assert edit.await_count == 2
+    if has_photo:
+        assert edit.await_args.kwargs == {
+            "caption": "ℹ️ Обработка списка завершена.", "reply_markup": None,
+        }
+    else:
+        edit.assert_awaited_with("ℹ️ Обработка списка завершена.", reply_markup=None)
+    assert callback.message.edit_reply_markup.await_count == int(neutral_edit_fails)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["build", "delivery"])
+async def test_list_progress_is_cleaned_when_preparation_or_delivery_raises(monkeypatch, failure):
+    state = _state(screen="lists")
+    callback = _callback("menu:lists:combined")
+    builder = MagicMock(return_value=plain_report("list"))
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    if failure == "build":
+        builder.side_effect = RuntimeError("build unavailable")
+    else:
+        delivery.side_effect = RuntimeError("delivery unavailable")
+    monkeypatch.setattr("handlers._lists_snapshot_report", builder)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+
+    if failure == "delivery":
+        with pytest.raises(RuntimeError, match="delivery unavailable"):
+            await handlers.main_menu_cb(callback, state)
+    else:
+        await handlers.main_menu_cb(callback, state)
+        delivery.assert_not_awaited()
+        callback.message.answer.assert_awaited_once_with(
+            "⚠️ Не удалось сформировать список, попробуй позже.",
+        )
+    callback.message.edit_caption.assert_awaited_once()
+    callback.message.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_invalid_list_callbacks_never_show_progress_or_build_reports(monkeypatch):
+    snapshot = MagicMock()
+    delivery = AsyncMock()
+    monkeypatch.setattr("handlers._lists_snapshot_report", snapshot)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+    cases = [
+        (_State(), _callback("menu:lists:combined")),
+        (_state(screen="lists"), _callback("menu:lists:combined", user_id=778)),
+        (_state(screen="lists"), _callback("menu:lists:combined", chat_id=56)),
+        (_state(screen="lists"), _callback("menu:lists:combined", message_id=201)),
+        (_state(screen="home"), _callback("menu:lists:combined")),
+        (_state(screen="lists:anime"), _callback("menu:lists:manga:all")),
+        (_state(screen="lists:anime"), _callback("menu:lists:anime:bad")),
+        (_state(screen="lists:anime"), _callback("menu:lists:anime:all:extra")),
+    ]
+    missing_message = _callback("menu:lists:combined")
+    missing_message.message = None
+    cases.append((_state(screen="lists"), missing_message))
+    for state, callback in cases:
+        before = dict(state.data)
+        await handlers.main_menu_cb(callback, state)
+        assert state.data == before
+        if callback.message is not None:
+            callback.message.edit_text.assert_not_awaited()
+            callback.message.edit_caption.assert_not_awaited()
+            callback.message.answer.assert_not_awaited()
+            callback.message.delete.assert_not_awaited()
+    snapshot.assert_not_called()
+    delivery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("screen", "action"),
+    [
+        ("lists", "menu:lists:combined"),
+        ("lists:anime", "menu:lists:anime:all"),
+    ],
+)
+async def test_inaccessible_list_control_is_inert_even_with_matching_ids(
+    monkeypatch, screen, action,
+):
+    state = _state(screen=screen)
+    callback = _callback(action)
+    bot = callback.message.bot
+    callback.message = InaccessibleMessage(
+        chat=Chat(id=55, type=ChatType.PRIVATE),
+        message_id=200,
+    ).as_(bot)
+    snapshot = MagicMock(return_value=plain_report("list"))
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr("handlers._lists_snapshot_report", snapshot)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+    before = dict(state.data)
+
+    await handlers.main_menu_cb(callback, state)
+
+    assert state.data == before
+    assert handlers._main_menu_state_is_active(state.state)
+    callback.answer.assert_awaited_once_with(
+        "Меню устарело. Отправь /start ещё раз.",
+        show_alert=True,
+    )
+    snapshot.assert_not_called()
+    delivery.assert_not_awaited()
+    assert bot.mock_calls == []
 
 
 @pytest.mark.asyncio

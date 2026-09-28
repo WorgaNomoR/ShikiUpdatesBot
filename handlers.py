@@ -37,6 +37,7 @@ from aiogram.fsm.state import (
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    InaccessibleMessage,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQuery,
@@ -1107,7 +1108,10 @@ def _lists_snapshot_report(media_key: str, view_key: str) -> Report:
 async def _lists_show_progress(message: Message) -> Message | None:
     """Показать неинтерактивный прогресс, предпочитая прежний control message."""
     try:
-        await message.edit_text(_LISTS_PROGRESS_TEXT, reply_markup=None)
+        if _main_menu_message_has_photo(message):
+            await message.edit_caption(caption=_LISTS_PROGRESS_TEXT, reply_markup=None)
+        else:
+            await message.edit_text(_LISTS_PROGRESS_TEXT, reply_markup=None)
         return message
     except Exception as e:
         log.debug("lists: не удалось переиспользовать меню для прогресса: %s", e)
@@ -1133,10 +1137,16 @@ async def _lists_cleanup_progress(
         except Exception as e:
             log.debug("lists: не удалось удалить переиспользованный прогресс: %s", e)
             try:
-                await control_message.edit_text(
-                    _LISTS_PROGRESS_FINISHED_TEXT,
-                    reply_markup=None,
-                )
+                if _main_menu_message_has_photo(control_message):
+                    await control_message.edit_caption(
+                        caption=_LISTS_PROGRESS_FINISHED_TEXT,
+                        reply_markup=None,
+                    )
+                else:
+                    await control_message.edit_text(
+                        _LISTS_PROGRESS_FINISHED_TEXT,
+                        reply_markup=None,
+                    )
             except Exception as e:
                 log.debug("lists: не удалось нейтрализовать старый прогресс: %s", e)
                 try:
@@ -1154,12 +1164,16 @@ async def _lists_deliver(
     state: FSMContext,
     media_key: str,
     view_key: str,
+    *,
+    cleanup_command: bool = False,
 ) -> None:
-    """Показать прогресс на время Rich-first доставки выбранного отчёта."""
+    """Доставить список с прогрессом; вход из /start также удаляет команду."""
     bot = callback.message.bot
     chat_id = callback.message.chat.id
     await state.clear()
     await callback.answer()
+    if cleanup_command:
+        await _cleanup_inline_command(callback.message)
     progress_message = await _lists_show_progress(callback.message)
     try:
         try:
@@ -3929,7 +3943,7 @@ async def _main_menu_session(
     state: FSMContext,
 ) -> dict | None:
     """Проверить инициатора, чат, control message и живую FSM-сессию."""
-    if callback.message is None:
+    if callback.message is None or isinstance(callback.message, InaccessibleMessage):
         await callback.answer(
             "Меню устарело. Отправь /start ещё раз.",
             show_alert=True,
@@ -4380,12 +4394,12 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
             await _show_main_home(callback, state)
             return
         if action == "menu:lists:combined":
-            await _deliver_main_report(
+            await _lists_deliver(
                 callback,
                 state,
-                lambda: _lists_snapshot_report(MEDIA_COMBINED, VIEW_ALL),
-                label="lists-combined",
-                disable_preview=True,
+                MEDIA_COMBINED,
+                VIEW_ALL,
+                cleanup_command=True,
             )
             return
         media_actions = {
@@ -4416,12 +4430,12 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
         if action.startswith(prefix):
             view_key = action.removeprefix(prefix)
             if view_key in LIST_VIEW_BY_KEY:
-                await _deliver_main_report(
+                await _lists_deliver(
                     callback,
                     state,
-                    lambda: _lists_snapshot_report(media_key, view_key),
-                    label=f"lists-{media_key}-{view_key}",
-                    disable_preview=True,
+                    media_key,
+                    view_key,
+                    cleanup_command=True,
                 )
                 return
 
