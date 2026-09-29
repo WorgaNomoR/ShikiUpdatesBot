@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 import launcher
 import project_meta
 
@@ -39,6 +41,76 @@ def test_source_launcher_resolves_root_metadata_without_pythonpath(tmp_path):
 
     assert process.returncode == 0, process.stderr
     assert process.stdout.strip() == f"ShikiUpdatesBot {project_meta.PROJECT_VERSION}"
+
+
+@pytest.mark.parametrize(
+    ("shadowed_module", "args", "expected_output"),
+    [
+        (
+            "project_meta",
+            ["--version"],
+            f"ShikiUpdatesBot {project_meta.PROJECT_VERSION}",
+        ),
+        ("main", ["--check-config"], "Конфигурация корректна. DATA_DIR:"),
+        ("main", [], "root-main-ok"),
+    ],
+    ids=("version-metadata", "check-config-main", "normal-main"),
+)
+def test_source_launcher_prefers_project_modules_over_pythonpath(
+    tmp_path,
+    shadowed_module,
+    args,
+    expected_output,
+):
+    root = Path(__file__).resolve().parents[1]
+    app_root = tmp_path / "application"
+    src = app_root / "src"
+    src.mkdir(parents=True)
+    shutil.copyfile(root / "project_meta.py", app_root / "project_meta.py")
+    module_root = Path(launcher.__file__).parent
+    for name in ("launcher.py", "build_info.py", "runtime.py"):
+        shutil.copyfile(module_root / name, src / name)
+    (app_root / "main.py").write_text(
+        "async def main():\n    print('root-main-ok')\n",
+        encoding="utf-8",
+    )
+    (src / "config.py").write_text(
+        "from pathlib import Path\n"
+        "from types import SimpleNamespace\n"
+        "DATA_DIR = Path(__file__).resolve().parents[1] / 'data'\n"
+        "log = SimpleNamespace(info=lambda *args: None)\n",
+        encoding="utf-8",
+    )
+    (app_root / "runtime.py").write_text(
+        "raise AssertionError('root module must not shadow src')\n",
+        encoding="utf-8",
+    )
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / f"{shadowed_module}.py").write_text(
+        "raise AssertionError('external module must not shadow the application')\n",
+        encoding="utf-8",
+    )
+    env = {
+        name: os.environ[name]
+        for name in ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+        if name in os.environ
+    }
+    env["PYTHONPATH"] = str(external)
+
+    process = subprocess.run(
+        [sys.executable, "-B", str(src / "launcher.py"), *args],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=20,
+    )
+
+    assert process.returncode == 0, process.stderr
+    assert expected_output in process.stdout
 
 
 def test_launcher_version_does_not_load_config(monkeypatch, capsys):

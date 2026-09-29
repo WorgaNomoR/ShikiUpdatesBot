@@ -9,9 +9,9 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-# При прямом source-запуске метаданные и main остаются в корне проекта.
+# При source-запуске корень идёт после src, но перед внешними модулями.
 if not getattr(sys, "frozen", False):
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(1, str(Path(__file__).resolve().parents[1]))
 
 from build_info import APP_VERSION
 from runtime import (
