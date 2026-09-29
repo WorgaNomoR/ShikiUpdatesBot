@@ -26,14 +26,32 @@ jobs:
       - name: Build Docker image
         run: docker build -t shikiupdatesbot .
 
-      - name: Smoke-import application configuration
-        run: >-
-          docker run --rm
-          -e BOT_TOKEN
-          -e OWNER_ID
-          -e SHIKI_USER
-          shikiupdatesbot
-          python -c "import config"
+      - name: Smoke-import application and bundled resources
+        run: |
+          docker run --rm \
+            -e BOT_TOKEN \
+            -e OWNER_ID \
+            -e SHIKI_USER \
+            shikiupdatesbot \
+            python -c '
+          from pathlib import Path
+          import config
+          import main
+          import project_meta
+          import runtime
+          from main_menu import MAIN_MENU_ASSETS
+
+          assert runtime.APP_ROOT == runtime.RESOURCE_ROOT == Path("/app")
+          assert config.DATA_DIR == Path("/data")
+          required = (
+              "assets/info-preview.png",
+              "assets/report-poster-placeholder-v1.png",
+              "assets/report-poster-placeholder-v2.jpg",
+              "examples/facts.json",
+              *(f"assets/main-menu/{name}" for name in MAIN_MENU_ASSETS.values()),
+          )
+          assert all((runtime.RESOURCE_ROOT / name).is_file() for name in required)
+          '
 
   docker-compose:
     runs-on: ubuntu-latest

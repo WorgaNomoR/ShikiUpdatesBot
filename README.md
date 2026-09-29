@@ -851,6 +851,13 @@ Portable-версия для Windows пишет в консоль и `logs/bot.l
 [ARCHITECTURE.md](ARCHITECTURE.md). Процесс работы с репозиторием находится в
 [AGENTS.md](AGENTS.md).
 
+Модули приложения находятся в `src/` и используют плоские имена импортов.
+Основная точка входа `main.py` и публичный файл метаданных `project_meta.py`
+расположены в корне репозитория. Для запуска из исходников и на хостинге
+используется команда `python main.py`. `pytest.ini` подключает `src/` и корень
+для тестов; monkeypatch-цели используют плоские имена, например
+`handlers.fetch_favourites`.
+
 Установка runtime и test dependencies:
 
 ```bash

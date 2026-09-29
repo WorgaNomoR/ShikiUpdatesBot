@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
 import os
-import sys
 import tempfile
-from pathlib import Path
 
 import dotenv
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 
 # Тесты не читают локальный .env разработчика — иначе config.load_dotenv()
 # подтянет его переменные (напр. DISPLAY_NAME) и сделает тесты недетерминированными.

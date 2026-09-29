@@ -7,6 +7,11 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Sequence
+from pathlib import Path
+
+# При source-запуске корень идёт после src, но перед внешними модулями.
+if not getattr(sys, "frozen", False):
+    sys.path.insert(1, str(Path(__file__).resolve().parents[1]))
 
 from build_info import APP_VERSION
 from runtime import (

@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Прямые проверки модулей используют те же плоские импорты, что и main.py.
+ENV PYTHONPATH=/app/src:/app
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

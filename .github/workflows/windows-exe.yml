@@ -81,9 +81,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $firstRun | Out-Null
           Copy-Item .\dist\ShikiUpdatesBot.exe $firstRun
           Copy-Item .\.env.example $firstRun
-          Push-Location $firstRun
+          Push-Location $env:RUNNER_TEMP
           try {
-            & .\ShikiUpdatesBot.exe
+            & (Join-Path $firstRun "ShikiUpdatesBot.exe")
             $exitCode = $LASTEXITCODE
           } finally {
             Pop-Location
@@ -106,16 +106,19 @@ jobs:
           OWNER_ID=123456
           SHIKI_USER=test-user
           "@ | Set-Content .\dist\.env -Encoding utf8
+          $smokeExecutable = (Resolve-Path .\dist\ShikiUpdatesBot.exe).Path
+          Push-Location $env:RUNNER_TEMP
           try {
-            .\dist\ShikiUpdatesBot.exe --version
+            & $smokeExecutable --version
             if ($LASTEXITCODE -ne 0) {
               throw "--version failed (exit=$LASTEXITCODE)"
             }
-            .\dist\ShikiUpdatesBot.exe --check-config
+            & $smokeExecutable --check-config
             if ($LASTEXITCODE -ne 0) {
               throw "--check-config failed (exit=$LASTEXITCODE)"
             }
           } finally {
+            Pop-Location
             Remove-Item .\dist\.env -ErrorAction SilentlyContinue
           }
 
