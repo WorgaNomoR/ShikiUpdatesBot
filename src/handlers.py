@@ -94,7 +94,11 @@ from favourites import (
     _collect_favourites,
     build_favourites_messages,
 )
-from healthcheck import heartbeat
+from healthcheck import (
+    heartbeat,
+    polling_started,
+    polling_stopped,
+)
 from inline_cards import (
     CARD_KIND_LABELS,
     PHOTO_CAPTION_LIMIT,
@@ -606,9 +610,9 @@ async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync:
 
 
 async def _load_stats_current_transactional() -> dict:
-    """Создать fallback stats_current только под restorable-state lock."""
+    """Строго прочитать квартал; создать только отсутствующий файл под lock."""
     async with restorable_state_transaction():
-        return load_stats_current()
+        return load_stats_current(strict=True, initialize_missing=True)
 
 
 async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
@@ -910,6 +914,11 @@ async def stats_menu_cb(callback: CallbackQuery) -> None:
     # Строим и шлём отчёт
     try:
         report = await builder()
+    except QuarterDeliveryStateError as error:
+        await _quarter_state_diagnostic(callback.message.bot, error)
+        if callback.from_user.id != OWNER_ID:
+            await callback.message.answer("⚠️ Статистика за текущий квартал временно недоступна.")
+        return
     except Exception as e:
         log.error("stats_menu_cb: формирование (%s): %s", key, e)
         await callback.message.answer("⚠️ Не удалось сформировать статистику, попробуй позже.")
@@ -2135,7 +2144,7 @@ async def _fetch_history_catchup(
     return None
 
 
-async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set[int], dict]:
+async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict | None) -> tuple[set[int], dict]:
     """
     Главная функция проверки:
     1. Загружаем историю с Shikimori
@@ -2144,6 +2153,7 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
     4. Обновляем seen_ids и возвращаем его
     5. Параллельно фиксируем значимые события в cur (статистика квартала)
     """
+    cur = await _load_stats_current_transactional()
     async with aiohttp.ClientSession() as session:
         if seen_ids:
             entries = await _fetch_history_catchup(session, seen_ids)
@@ -2159,10 +2169,11 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
     # из-за 429/сети) — молча фиксируем текущую историю как baseline и
     # НИЧЕГО не шлём. Провал старта становится безобидной доинициализацией.
     if not seen_ids:
+        cur = await _load_stats_current_transactional()
         seen_ids = {e["id"] for e in entries}
         save_seen_ids(seen_ids)
         log.info("История: baseline инициализирован в цикле (%d ID), без отправки.", len(seen_ids))
-        return seen_ids, await _load_stats_current_transactional()
+        return seen_ids, cur
 
     new_entries = [e for e in entries if e["id"] not in seen_ids]
 
@@ -2174,6 +2185,9 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
 
     # Сортируем по ID: от старых к новым — хронологический порядок сообщений
     new_entries.sort(key=lambda e: e["id"])
+
+    # Не менять переданный baseline, пока квартальная дельта не опубликована.
+    seen_ids = seen_ids.copy()
 
     state_updates: list[tuple[dict, str, str, int | None]] = []
     for entry in new_entries:
@@ -2238,13 +2252,13 @@ async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict) -> tuple[set
         # Пауза между разными событиями — не спамим Telegram
         await asyncio.sleep(1)
 
-    save_seen_ids(seen_ids)
     async with restorable_state_transaction():
-        cur = load_stats_current()
+        cur = load_stats_current(strict=True)
         for entry, event_type, media_type, score in state_updates:
             cur = record_current_event(cur, entry, event_type, media_type, score)
         if state_updates:
-            save_stats_current(cur)
+            save_stats_current(cur, strict=True)
+    save_seen_ids(seen_ids)
     return seen_ids, cur
 
 
@@ -2292,7 +2306,11 @@ async def polling_loop(bot: Bot) -> None:
     """
     seen_ids  = load_seen_ids()
     seen_favs = load_seen_favourites()
-    cur = await _load_stats_current_transactional()
+    try:
+        cur = await _load_stats_current_transactional()
+    except QuarterDeliveryStateError as error:
+        cur = None
+        await _quarter_state_diagnostic(bot, error)
     log.info(
         "Бот запущен. Отображаемое имя: %s | Подписчиков: %d | Виденных ID: %d | Интервал: %d сек.",
         DISPLAY_NAME, len(load_subscribers()), len(seen_ids), CHECK_INTERVAL,
@@ -2309,7 +2327,7 @@ async def polling_loop(bot: Bot) -> None:
     # фиксированные паузы между фазами; избранное тянем ОДИН раз и переиспользуем.
     async with aiohttp.ClientSession() as session:
         try:
-            if not seen_ids:
+            if not seen_ids and cur is not None:
                 log.info("Первый запуск — инициализируем историю без отправки сообщений.")
                 entries = await fetch_history(session)
                 if entries is None:
@@ -2361,9 +2379,15 @@ async def polling_loop(bot: Bot) -> None:
 
     if privacy_error is None:
         if pending_seen_ids is not None:
-            seen_ids = pending_seen_ids
-            save_seen_ids(seen_ids)
-            log.info("Инициализировано %d ID истории.", len(seen_ids))
+            try:
+                cur = await _load_stats_current_transactional()
+            except QuarterDeliveryStateError as error:
+                cur = None
+                await _quarter_state_diagnostic(bot, error)
+            else:
+                seen_ids = pending_seen_ids
+                save_seen_ids(seen_ids)
+                log.info("Инициализировано %d ID истории.", len(seen_ids))
         if pending_seen_favs is not None:
             seen_favs = pending_seen_favs
             save_seen_favourites(seen_favs)
@@ -2381,15 +2405,19 @@ async def polling_loop(bot: Bot) -> None:
         mark_full_sync_success()
 
     # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
-    if privacy_error is None:
+    if privacy_error is None and cur is not None:
         try:
             cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
+        except QuarterDeliveryStateError as error:
+            cur = None
+            await _quarter_state_diagnostic(bot, error)
         except Exception as e:
             log.exception("Ошибка ротации квартала при старте: %s", e)
 
     try:
         await _backup_after_subscription(bot)
-        cur = await _weekly_backup_if_due(bot, cur)
+        if cur is not None:
+            cur = await _weekly_backup_if_due(bot, cur)
     except Exception as e:
         log.exception("Ошибка automatic backup при старте: %s", e)
 
@@ -2439,6 +2467,10 @@ async def polling_loop(bot: Bot) -> None:
         except asyncio.CancelledError:
             # Штатная отмена задачи — пробрасываем, не глушим
             raise
+        except QuarterDeliveryStateError as error:
+            cur = None
+            await _quarter_state_diagnostic(bot, error)
+            heartbeat()
         except ProfilePrivacyError as error:
             log.warning(
                 "Закрытый профиль обнаружен в фоновом цикле (%s); "
@@ -2491,6 +2523,7 @@ def _on_polling_done(task: "asyncio.Task") -> None:
     """Логируем, если polling_loop завершился неожиданно."""
     if task is _polling_task:
         set_polling_active(False)
+        polling_stopped()
     if task.cancelled():
         log.warning("polling_loop: задача отменена.")
     elif exc := task.exception():
@@ -2508,7 +2541,9 @@ def start_polling_loop(bot: Bot) -> bool:
         _polling_task = asyncio.create_task(polling_loop(bot))
     except Exception:
         set_polling_active(False)
+        polling_stopped()
         raise
+    polling_started()
     set_polling_active(True)
     _polling_task.add_done_callback(_on_polling_done)
     return True
@@ -4103,6 +4138,11 @@ async def _deliver_main_report(
         report = builder()
         if inspect.isawaitable(report):
             report = await report
+    except QuarterDeliveryStateError as error:
+        await _quarter_state_diagnostic(bot, error)
+        if callback.from_user.id != OWNER_ID:
+            await bot.send_message(chat_id, "⚠️ Статистика за текущий квартал временно недоступна.")
+        return
     except Exception as e:
         log.error("main-menu: формирование %s: %s", label, e)
         await bot.send_message(

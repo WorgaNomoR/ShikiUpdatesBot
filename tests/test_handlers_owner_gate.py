@@ -12,13 +12,17 @@ import pytest
 from aiogram.enums import ParseMode
 
 import handlers
+import healthcheck
 import runtime_status
 import storage
 from utils import _utcnow
 
 
 @pytest.fixture(autouse=True)
-def _reset_polling_task():
+def _reset_polling_task(monkeypatch):
+    monkeypatch.setattr(healthcheck, "_polling_started_at", None, raising=False)
+    monkeypatch.setattr(healthcheck, "_polling_stopped", False, raising=False)
+    monkeypatch.setattr("healthcheck._has_beaten", False)
     handlers._polling_task = None
     runtime_status.set_polling_active(False)
     yield
@@ -82,6 +86,7 @@ async def test_polling_runtime_status_becomes_inactive_when_task_stops(fake_loop
     await asyncio.sleep(0)
 
     assert runtime_status.get_runtime_snapshot().polling_active is False
+    assert healthcheck._is_healthy() is False
 
 
 def test_stale_polling_done_callback_does_not_hide_new_active_task(monkeypatch):
@@ -89,10 +94,12 @@ def test_stale_polling_done_callback_does_not_hide_new_active_task(monkeypatch):
     old_task.cancelled.return_value = True
     handlers._polling_task = MagicMock()
     runtime_status.set_polling_active(True)
+    healthcheck.polling_started()
 
     handlers._on_polling_done(old_task)
 
     assert runtime_status.get_runtime_snapshot().polling_active is True
+    assert healthcheck._is_healthy() is True
 
 
 @pytest.mark.asyncio
@@ -198,3 +205,36 @@ async def test_probe_sends_bare_fallback_with_html_and_starts_loop(
     assert handlers._polling_task is not None
     await asyncio.sleep(0)
     assert fake_loop == [bot]
+
+
+@pytest.mark.asyncio
+async def test_exited_first_cycle_marks_health_unhealthy(monkeypatch):
+    async def exited(bot):
+        return
+
+    monkeypatch.setattr("handlers.polling_loop", exited)
+    assert handlers.start_polling_loop(MagicMock()) is True
+    assert healthcheck._has_beaten is False
+    await handlers._polling_task
+    await asyncio.sleep(0)
+    assert healthcheck._is_healthy() is False
+
+
+@pytest.mark.asyncio
+async def test_active_task_grace_is_not_reset_by_repeated_start(fake_loop, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("healthcheck.time.monotonic", lambda: now[0])
+    assert handlers.start_polling_loop(MagicMock()) is True
+    started = healthcheck._polling_started_at
+    now[0] += 50
+    assert handlers.start_polling_loop(MagicMock()) is False
+    assert healthcheck._polling_started_at == started
+
+
+@pytest.mark.asyncio
+async def test_hung_first_cycle_expires_without_heartbeat(fake_loop, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("healthcheck.time.monotonic", lambda: now[0])
+    handlers.start_polling_loop(MagicMock())
+    now[0] += healthcheck._health_threshold
+    assert (await healthcheck._handle_health(None)).status == 503

@@ -679,7 +679,9 @@ def _publish_restore_files(pending: dict[str, str]) -> list[str]:
                 _atomic_write(new_root / name, payload)
                 existed[name] = target.is_file()
                 if existed[name]:
-                    _atomic_write(old_root / name, target.read_text(encoding="utf-8"))
+                    original = old_root / name
+                    original.parent.mkdir(parents=True, exist_ok=True)
+                    original.write_bytes(target.read_bytes())
 
             published: list[str] = []
             try:

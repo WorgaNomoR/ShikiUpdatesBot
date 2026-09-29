@@ -243,6 +243,8 @@ def parse_fact_bank_bytes(raw: bytes) -> FactBankDocument:
         raise FactBankValidationError("facts.json должен быть в UTF-8") from e
     except json.JSONDecodeError as e:
         raise FactBankValidationError("facts.json содержит некорректный JSON") from e
+    except RecursionError as e:
+        raise FactBankValidationError("facts.json содержит слишком глубоко вложенный JSON") from e
     return fact_bank_document_from_payload(payload)
 
 

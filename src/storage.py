@@ -20,6 +20,7 @@ import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 from config import (
     BLOCKED_USERS_FILE,
@@ -115,16 +116,29 @@ def _atomic_write(path: "Path | str", data: str) -> None:
 #  seen_ids — ВИДЕННЫЕ СОБЫТИЯ ИСТОРИИ
 # ═══════════════════════════════════════════════════════════════════
 
+_SeenId = TypeVar("_SeenId", int, str)
+
+
+def _load_seen_cache(path: "Path | str", key: str, id_type: type[_SeenId]) -> set[_SeenId]:
+    """Прочитать восстанавливаемый кеш, не изменяя повреждённый файл."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("кеш виденных записей должен быть объектом")
+        values = data.get(key, [])
+        if not isinstance(values, list) or any(type(value) is not id_type for value in values):
+            raise ValueError("кеш виденных записей содержит неверные идентификаторы")
+        return set(values)
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, RecursionError):
+        log.warning("Не удалось прочитать %s, начинаем с нуля.", path)
+        return set()
+
+
 def load_seen_ids() -> set[int]:
     """Загружаем уже виденные ID из JSON-файла."""
-    path = Path(SEEN_IDS_FILE)
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return set(data.get("seen_ids", []))
-        except (json.JSONDecodeError, KeyError):
-            log.warning("Не удалось прочитать %s, начинаем с нуля.", SEEN_IDS_FILE)
-    return set()
+    return _load_seen_cache(SEEN_IDS_FILE, "seen_ids", int)
 
 
 def save_seen_ids(seen_ids: set[int]) -> None:
@@ -360,7 +374,7 @@ def _legacy_weekly_anchor(now: float | None = None) -> float | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         value = payload.get("last_backup_at") if isinstance(payload, dict) else None
-    except (json.JSONDecodeError, OSError):
+    except (OSError, ValueError, RecursionError):
         return None
     if (
         not _valid_stored_timestamp(value)
@@ -1006,14 +1020,7 @@ def load_seen_favourites() -> set[str]:
     Ключи хранятся как строки вида "anime_123" — категория + ID,
     чтобы избежать коллизий между разными категориями с одинаковыми ID.
     """
-    path = Path(SEEN_FAVS_FILE)
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return set(data.get("seen_favourites", []))
-        except (json.JSONDecodeError, KeyError):
-            log.warning("Не удалось прочитать %s, начинаем с нуля.", SEEN_FAVS_FILE)
-    return set()
+    return _load_seen_cache(SEEN_FAVS_FILE, "seen_favourites", str)
 
 
 def save_seen_favourites(seen: set[str]) -> None:
@@ -1333,12 +1340,13 @@ def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict
     }
 
 
-def load_stats_current(*, strict: bool = False) -> dict:
+def load_stats_current(*, strict: bool = False, initialize_missing: bool = False) -> dict:
     """
     Загружаем события текущего квартала. При ошибке/отсутствии — пустой квартал.
 
-    strict=True используется доставкой: отсутствие или повреждение файла
-    поднимает безопасную ошибку без сброса/создания состояния.
+    strict=True сохраняет повреждённое или недоступное состояние и поднимает
+    безопасную ошибку. initialize_missing разрешает создать только отсутствующий
+    файл; вызывающий код должен удерживать restorable-state lock.
 
     Если файла ещё нет (истинно первый запуск), фиксируем tracking_since = max(
     начало квартала, сейчас). Это даёт честную дату «статистика собирается с …»,
@@ -1346,26 +1354,27 @@ def load_stats_current(*, strict: bool = False) -> dict:
     чтобы не сбрасывалась при последующих перезапусках.
     """
     try:
-        if strict and not STATS_CURRENT_FILE.exists():
-            raise QuarterDeliveryStateError("current_missing")
-        if STATS_CURRENT_FILE.exists():
-            data = json.loads(STATS_CURRENT_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "period" in data and "events" in data:
-                if strict and (not isinstance(data["period"], str) or not isinstance(data["events"], list)):
-                    raise QuarterDeliveryStateError("current_structure")
-                if strict:
-                    validate_quarter_period(data["period"])
-                # Бэкофилл для файлов, созданных до появления поля tracking_since
-                if "tracking_since" not in data:
-                    data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
-                data.setdefault("pending_quarter_delivery", None)
-                return data
-            if strict:
+        data = json.loads(STATS_CURRENT_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "period" in data and "events" in data:
+            if strict and (not isinstance(data["period"], str) or not isinstance(data["events"], list)):
                 raise QuarterDeliveryStateError("current_structure")
-            log.warning("load_stats_current: неожиданная структура, сбрасываем.")
+            if strict:
+                validate_quarter_period(data["period"])
+                validate_pending_quarter_delivery(data)
+            # Бэкофилл для файлов, созданных до появления поля tracking_since
+            if "tracking_since" not in data:
+                data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
+            data.setdefault("pending_quarter_delivery", None)
+            return data
+        if strict:
+            raise QuarterDeliveryStateError("current_structure")
+        log.warning("load_stats_current: неожиданная структура, сбрасываем.")
+    except FileNotFoundError:
+        if strict and not initialize_missing:
+            raise QuarterDeliveryStateError("current_missing") from None
     except QuarterDeliveryStateError:
         raise
-    except (json.JSONDecodeError, OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         if strict:
             raise QuarterDeliveryStateError("current_read") from None
         log.warning("load_stats_current: %s", e)

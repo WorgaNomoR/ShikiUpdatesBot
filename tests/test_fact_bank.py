@@ -15,6 +15,19 @@ from inline_facts import INLINE_FACTS
 _FACT_BANK_EXAMPLE = Path(__file__).parent.parent / "examples" / "facts.json"
 
 
+def test_nested_json_is_a_validation_error():
+    with pytest.raises(fact_bank.FactBankValidationError):
+        fact_bank.parse_fact_bank_bytes(b"[" * 5000 + b"]" * 5000)
+
+
+def test_nested_disk_bank_keeps_builtin_facts(fact_bank_env):
+    raw = b"[" * 5000 + b"]" * 5000
+    fact_bank_env.write_bytes(raw)
+    snapshot = fact_bank.reload_fact_bank()
+    assert snapshot.file_state == fact_bank.FACT_FILE_INVALID
+    assert snapshot.facts == INLINE_FACTS
+    assert fact_bank_env.read_bytes() == raw
+
 def _payload(*facts, bank_version="test-bank"):
     return {
         "schema_version": 1,

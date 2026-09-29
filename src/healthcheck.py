@@ -4,7 +4,7 @@
 Healthcheck-сервер для ShikiUpdatesBot.
 
 Изолированный модуль: ничего не импортирует из main.py.
-Связь односторонняя — main.py зовёт heartbeat() и start_health_server().
+Связь односторонняя — вызывающий код передаёт запуск/завершение цикла и пульс.
 
 Зачем:
   • Портативность: хостинги, требующие открытый порт / healthcheck endpoint
@@ -13,11 +13,20 @@ Healthcheck-сервер для ShikiUpdatesBot.
     завершил итерацию polling_loop недавно. Если пульс протух (бот завис или
     цикл умер) — отдаём 503, и хостинг перезапускает контейнер.
 
-Как пользоваться из main.py:
-    from healthcheck import heartbeat, start_health_server
+Как пользоваться из вызывающего кода:
+    from healthcheck import (
+        heartbeat,
+        polling_started,
+        polling_stopped,
+        start_health_server,
+    )
+    # после запуска задачи, без синтетического пульса:
+    polling_started()
     # в конце успешной итерации polling_loop:
     heartbeat()
-    # в main(), рядом с запуском polling_loop:
+    # при завершении текущей задачи:
+    polling_stopped()
+    # в main(), до owner-gate:
     await start_health_server(check_interval=CHECK_INTERVAL)
 
 Зависимости: только aiohttp (уже есть в проекте — используется aiohttp.web).
@@ -41,10 +50,26 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 _last_healthy_ts: float = 0.0
 _has_beaten: bool = False
+_polling_started_at: float | None = None
+_polling_stopped: bool = False
 
 # Порог живости (секунды). Выставляется в start_health_server из CHECK_INTERVAL.
 # По умолчанию 45 минут — три пропущенных цикла при интервале 15 минут.
 _health_threshold: float = 45 * 60
+
+
+def polling_started() -> None:
+    """Начать отдельный ограниченный период ожидания первого цикла."""
+    global _polling_started_at, _polling_stopped, _has_beaten
+    _polling_started_at = time.monotonic()
+    _polling_stopped = False
+    _has_beaten = False
+
+
+def polling_stopped() -> None:
+    """Завершение запущенной задачи сразу делает healthcheck нездоровым."""
+    global _polling_stopped
+    _polling_stopped = True
 
 
 def heartbeat() -> None:
@@ -65,28 +90,26 @@ def _seconds_since_heartbeat() -> float | None:
 
 
 def _is_healthy() -> bool:
-    """
-    Бот считается живым, если:
-      • пульс ещё не наступал (грейс-период старта — бот поднимается, это норма), ИЛИ
-      • с последнего пульса прошло меньше порога.
-    Грейс-период на старте важен: первая итерация (sync_stats_all + первый
-    запрос истории) может занять время, и мы не хотим, чтобы хостинг убил
-    контейнер ещё до первого пульса.
-    """
+    """Ожидание владельца допустимо; запущенный цикл ограничен порогом живости."""
+    if _polling_stopped:
+        return False
     elapsed = _seconds_since_heartbeat()
     if elapsed is None:
-        return True
+        return (
+            _polling_started_at is None
+            or time.monotonic() - _polling_started_at < _health_threshold
+        )
     return elapsed < _health_threshold
 
 
 async def _handle_health(request: web.Request) -> web.Response:
-    """GET /health — 200 если живы, 503 если пульс протух."""
+    """GET /health — 503 при остановке, зависшем старте или протухшем пульсе."""
     elapsed = _seconds_since_heartbeat()
     if _is_healthy():
         body = "ok" if elapsed is None else f"ok (last heartbeat {int(elapsed)}s ago)"
         return web.Response(status=200, text=body)
     log.warning(
-        "Healthcheck: пульс протух (%ss назад, порог %ss) — отдаём 503.",
+        "Healthcheck: цикл недоступен (последний пульс %ss назад, порог %ss) — отдаём 503.",
         int(elapsed) if elapsed is not None else "?", int(_health_threshold),
     )
     return web.Response(status=503, text="unhealthy: heartbeat stale")
@@ -120,6 +143,8 @@ async def start_health_server(
     if port is None:
         try:
             port = int(os.environ.get("PORT", "8080"))
+            if not 1 <= port <= 65535:
+                raise ValueError
         except (TypeError, ValueError):
             log.warning("start_health_server: некорректный PORT в env, берём 8080.")
             port = 8080

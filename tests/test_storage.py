@@ -475,6 +475,111 @@ def test_load_seen_ids_corrupted_json(monkeypatch, tmp_path):
     assert load_seen_ids() == set()
 
 
+@pytest.fixture(params=["history", "favourites"])
+def seen_cache_loader(request, monkeypatch, tmp_path):
+    """Изолировать оба кеша и сохранить их разные типы идентификаторов."""
+    if request.param == "history":
+        key, setting, loader, valid_id = (
+            "seen_ids", "SEEN_IDS_FILE", storage.load_seen_ids, 17,
+        )
+    else:
+        key, setting, loader, valid_id = (
+            "seen_favourites", "SEEN_FAVS_FILE", storage.load_seen_favourites,
+            "anime_17",
+        )
+    path = tmp_path / f"{key}.json"
+    monkeypatch.setattr(f"storage.{setting}", path)
+    return path, key, loader, valid_id
+
+
+@pytest.mark.parametrize("payload", [None, False, 0, "seen", []])
+def test_seen_cache_rejects_non_object_payload(seen_cache_loader, payload, caplog):
+    path, _key, loader, _valid_id = seen_cache_loader
+    raw = json.dumps(payload).encode("utf-8")
+    path.write_bytes(raw)
+
+    assert loader() == set()
+    assert path.read_bytes() == raw
+    assert "Не удалось прочитать" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "value", [None, False, 0, "12", {}, [None], [False], [1.5], [{}], [[]]],
+)
+def test_seen_cache_rejects_invalid_id_collection(seen_cache_loader, value, caplog):
+    path, key, loader, _valid_id = seen_cache_loader
+    raw = json.dumps({key: value}).encode("utf-8")
+    path.write_bytes(raw)
+
+    assert loader() == set()
+    assert path.read_bytes() == raw
+    assert "Не удалось прочитать" in caplog.text
+
+
+def test_seen_cache_rejects_whole_list_with_wrong_id_type(seen_cache_loader, caplog):
+    path, key, loader, valid_id = seen_cache_loader
+    invalid_id = str(valid_id) if isinstance(valid_id, int) else 17
+    raw = json.dumps({key: [valid_id, invalid_id]}).encode("utf-8")
+    path.write_bytes(raw)
+
+    assert loader() == set()
+    assert path.read_bytes() == raw
+    assert "Не удалось прочитать" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(b"\xff\xfe", id="invalid-utf8"),
+        pytest.param(b"[" * 5000 + b"]" * 5000, id="deep-json"),
+    ],
+)
+def test_seen_cache_contains_decode_failures(seen_cache_loader, raw, caplog):
+    path, _key, loader, _valid_id = seen_cache_loader
+    path.write_bytes(raw)
+
+    assert loader() == set()
+    assert path.read_bytes() == raw
+    assert "Не удалось прочитать" in caplog.text
+
+
+@pytest.mark.parametrize("error", [PermissionError("denied"), OSError("read failed")])
+def test_seen_cache_contains_read_failures(seen_cache_loader, monkeypatch, error, caplog):
+    path, key, loader, valid_id = seen_cache_loader
+    raw = json.dumps({key: [valid_id]}).encode("utf-8")
+    path.write_bytes(raw)
+
+    def fail_read(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr("storage.Path.read_text", fail_read)
+
+    assert loader() == set()
+    assert path.read_bytes() == raw
+    assert "Не удалось прочитать" in caplog.text
+
+
+@pytest.mark.parametrize("with_key", [False, True])
+def test_seen_cache_preserves_empty_compatibility(seen_cache_loader, with_key, caplog):
+    path, key, loader, _valid_id = seen_cache_loader
+    raw = json.dumps({key: []} if with_key else {}).encode("utf-8")
+    path.write_bytes(raw)
+
+    assert loader() == set()
+    assert path.read_bytes() == raw
+    assert "Не удалось прочитать" not in caplog.text
+
+
+def test_seen_cache_preserves_valid_duplicates(seen_cache_loader, caplog):
+    path, key, loader, valid_id = seen_cache_loader
+    raw = json.dumps({key: [valid_id, valid_id]}).encode("utf-8")
+    path.write_bytes(raw)
+
+    assert loader() == {valid_id}
+    assert path.read_bytes() == raw
+    assert "Не удалось прочитать" not in caplog.text
+
+
 def test_save_seen_ids(monkeypatch, tmp_path):
     file = tmp_path / "seen_ids.json"
 
@@ -1467,10 +1572,11 @@ def test_strict_quarter_write_failure_preserves_previous_file(backup_env, monkey
     ('{"events": []}', "current_structure"),
     ('{"period": "2026-Q3", "events": false}', "current_structure"),
 ])
-def test_strict_quarter_load_does_not_reset_unreadable_state(backup_env, raw, reason):
+@pytest.mark.parametrize("initialize_missing", [False, True])
+def test_strict_quarter_load_does_not_reset_unreadable_state(backup_env, raw, reason, initialize_missing):
     storage.STATS_CURRENT_FILE.write_text(raw, encoding="utf-8")
     with pytest.raises(storage.QuarterDeliveryStateError, match=f"^{reason}$"):
-        storage.load_stats_current(strict=True)
+        storage.load_stats_current(strict=True, initialize_missing=initialize_missing)
     assert storage.STATS_CURRENT_FILE.read_text(encoding="utf-8") == raw
 
 
@@ -1598,3 +1704,32 @@ def test_seen_favourites_roundtrip(monkeypatch, tmp_path):
     storage.save_seen_favourites(original)
 
     assert storage.load_seen_favourites() == original
+
+
+@pytest.mark.parametrize("raw", [b"\xff\xfe", b"[" * 5000 + b"]" * 5000])
+def test_legacy_backup_anchor_ignores_damaged_quarter_bytes(backup_env, raw):
+    storage.STATS_CURRENT_FILE.write_bytes(raw)
+    state = storage.subscriber_state_from_payload({"subscribers": {}})
+    assert storage.ensure_backup_schedule(state, now=123.0) is True
+    assert state.backup_schedule["weekly_started_at"] == 123.0
+    assert storage.STATS_CURRENT_FILE.read_bytes() == raw
+
+
+def test_strict_missing_quarter_initialization_propagates_write_failure(backup_env, monkeypatch):
+    def fail(*args):
+        raise OSError("disk failure")
+
+    monkeypatch.setattr("storage._atomic_write", fail)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^current_write$"):
+        storage.load_stats_current(strict=True, initialize_missing=True)
+    assert not storage.STATS_CURRENT_FILE.exists()
+
+
+def test_strict_quarter_load_rejects_damaged_pending_without_reset(backup_env):
+    cur = _quarter_state()
+    cur["pending_quarter_delivery"]["next_unit"] = True
+    storage.save_stats_current(cur)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^progress_index$"):
+        storage.load_stats_current(strict=True, initialize_missing=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original

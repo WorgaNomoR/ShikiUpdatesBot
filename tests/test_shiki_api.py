@@ -71,6 +71,25 @@ _FETCHERS = [
 ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    [], False, 0, "", {"animes": False}, {"mangas": 0},
+    {"characters": ""}, {"people": {}}, {"mangakas": [None]},
+    {"seyu": [1]}, {"producers": [[]]}, {"ranobe": [{"id": 1}, "bad"]},
+])
+async def test_favourites_rejects_invalid_response_shapes(payload):
+    session = _FakeSession(response=_FakeResponse(200, json_value=payload))
+    assert await fetch_favourites(session) is None
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, {}, {"animes": []}, {"mangas": None}])
+async def test_favourites_preserves_unavailable_and_empty_compatibility(payload):
+    session = _FakeSession(response=_FakeResponse(200, json_value=payload))
+    assert await fetch_favourites(session) == payload
+
+
 # ============================================================
 # fetch_history / fetch_favourites — сетевая граница
 # ============================================================

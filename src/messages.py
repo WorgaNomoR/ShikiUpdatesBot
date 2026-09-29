@@ -786,7 +786,7 @@ def build_message(entry: dict) -> str:
 
     # Зашиваем ссылку в название (если есть url) — кликабельно прямо в тексте
     target_url = _rel_url(target.get("url"))
-    title = (f'<a href="{SHIKI_BASE_URL}{target_url}">{title_text}</a>'
+    title = (f'<a href="{h(SHIKI_BASE_URL + target_url)}">{title_text}</a>'
              if target_url else title_text)
 
     # Одна центральная метка делает media_type явным для любого случайно
@@ -902,7 +902,7 @@ def build_favourite_message(category: str, item: dict) -> str:
 
     # Ссылку зашиваем в название — единообразно с /favs и событиями
     url = _rel_url(item.get("url"))
-    title = (f'<a href="{SHIKI_BASE_URL}{url}">{title_text}</a>'
+    title = (f'<a href="{h(SHIKI_BASE_URL + url)}">{title_text}</a>'
              if url else title_text)
     labeled_title = _label_media_title(title, bank_key)
 

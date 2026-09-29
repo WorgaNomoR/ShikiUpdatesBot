@@ -111,3 +111,24 @@ async def test_stats_menu_selection_keeps_cleanup_and_shared_delivery(monkeypatc
         report,
         notify_partial=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [False, True])
+async def test_stats_menu_handles_quarter_error_without_empty_report(monkeypatch, owner):
+    error = handlers.QuarterDeliveryStateError("current_read")
+    monkeypatch.setitem(handlers._STATS_BUILDERS, "current", AsyncMock(side_effect=error))
+    diagnostic = AsyncMock()
+    delivery = AsyncMock()
+    monkeypatch.setattr("handlers._quarter_state_diagnostic", diagnostic)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+    callback = AsyncMock()
+    callback.data = "stats:current"
+    callback.from_user.id = handlers.OWNER_ID if owner else 777
+    await handlers.stats_menu_cb(callback)
+    diagnostic.assert_awaited_once_with(callback.message.bot, error)
+    delivery.assert_not_awaited()
+    if owner:
+        callback.message.answer.assert_not_awaited()
+    else:
+        callback.message.answer.assert_awaited_once_with("⚠️ Статистика за текущий квартал временно недоступна.")

@@ -725,10 +725,22 @@ async def fetch_favourites(session: aiohttp.ClientSession) -> dict | None:
     Каждый элемент содержит хотя бы "id", "name", "russian", "url".
     Возвращает None при любой ошибке.
     """
-    return await _fetch(
+    payload = await _fetch(
         session, "GET", FAVOURITES_URL,
         parse=lambda resp: resp.json(), label="fetch_favourites", timeout=15,
     )
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or any(
+        items is not None and (
+            not isinstance(items, list)
+            or any(not isinstance(item, dict) for item in items)
+        )
+        for items in payload.values()
+    ):
+        log.warning("fetch_favourites: некорректная структура ответа, избранное недоступно.")
+        return None
+    return payload
 
 
 async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | None:

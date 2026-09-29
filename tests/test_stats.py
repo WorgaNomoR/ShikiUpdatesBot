@@ -22,6 +22,7 @@ from datetime import (
 from html.parser import HTMLParser
 from unittest.mock import (
     AsyncMock,
+    MagicMock,
     call,
 )
 
@@ -1598,7 +1599,7 @@ def test_smoke_empty_stats_no_crash():
 @pytest.mark.asyncio
 async def test_smoke_async_report_builders(monkeypatch):
     monkeypatch.setattr("handlers.load_stats_all", lambda: _populated_stats())
-    monkeypatch.setattr("handlers.load_stats_current", lambda: {
+    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: {
         "period": "2026-Q2", "period_start": "2026-04-01T00:00:00",
         "tracking_since": "2026-04-01T00:00:00", "events": []})
     for builder in (handlers._stats_report_all, handlers._stats_report_current):
@@ -3411,7 +3412,7 @@ async def test_statistics_handlers_read_corrupt_domain_without_writes(tmp_path, 
     monkeypatch.setattr("storage.STATS_ALL_FILE", path)
     monkeypatch.setattr("storage._stats_all_cache", None)
     monkeypatch.setattr("storage._atomic_write", lambda *a: pytest.fail("Запись при чтении отчёта"))
-    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: {"period": "2026-Q2", "events": []})
     monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(side_effect=AssertionError("network")))
     for report in (await handlers._stats_report_all(), await handlers._stats_report_current()):
         assert "Не удалось прочитать" in "\n".join(rendered_html(report))
@@ -3427,3 +3428,93 @@ def test_manga_all_time_scalar_damage_keeps_completion(value):
     assert "✅ <b>1</b> прочитано" in text
     assert "nan" not in text and "inf" not in text
     assert "⭐ Средняя" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", [None, [], {"aggregates": {}}, {"titles": [], "aggregates": {}}, {"titles": {}, "aggregates": []}])
+@pytest.mark.parametrize("export", [[], [{"target_id": 1, "status": "completed", "score": 8}]])
+async def test_sync_repairs_containers_only_for_successful_export(monkeypatch, broken, export):
+    state = storage._empty_stats_all()
+    state["anime"] = broken
+    state["manga"] = ["unavailable damaged domain"]
+    before = copy.deepcopy(state)
+    saved = []
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=[export, None]))
+    meta = AsyncMock(return_value={"1": {"kind": "tv", "title": "Recovered"}})
+    monkeypatch.setattr("stats.fetch_meta_batch", meta)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: saved.append(value))
+    result, ok = await smod.sync_stats_all(session=object(), fav=None)
+    assert ok is True
+    assert saved == [result]
+    assert isinstance(result["anime"]["titles"], dict)
+    assert isinstance(result["anime"]["aggregates"], dict)
+    assert set(result["anime"]["titles"]) == ({"1"} if export else set())
+    assert result["manga"] == before["manga"]
+    assert state == before
+    assert meta.await_count == (1 if export else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aggregates", [None, [], "broken"])
+async def test_sync_aggregate_only_repair_preserves_valid_title(monkeypatch, aggregates):
+    state = storage._empty_stats_all()
+    rec = _anime_rec(rewatches=0)
+    rec["meta_updated_at"] = utils._utcnow().isoformat()
+    state["anime"]["titles"] = {"1": rec}
+    state["anime"]["aggregates"] = aggregates
+    before = copy.deepcopy(state)
+    export = {"target_id": 1, "status": rec["status"], "score": rec["score"],
+              "episodes": rec["episodes_watched"], "rewatches": rec["rewatches"]}
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=[[export], None]))
+    meta = AsyncMock()
+    save = MagicMock()
+    monkeypatch.setattr("stats.fetch_meta_batch", meta)
+    monkeypatch.setattr("stats.save_stats_all", save)
+    result, ok = await smod.sync_stats_all(session=object(), fav=None)
+    assert ok is True
+    assert result["anime"]["titles"]["1"] == rec
+    save.assert_called_once_with(result)
+    meta.assert_not_awaited()
+    assert state == before
+
+
+@pytest.mark.asyncio
+async def test_sync_container_repair_is_not_published_after_privacy_failure(monkeypatch):
+    state = storage._empty_stats_all()
+    state["anime"] = None
+    before = copy.deepcopy(state)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(return_value=[]))
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=shiki_api.ProfilePrivacyError("fetch_favourites")))
+    save = AsyncMock()
+    monkeypatch.setattr("stats.save_stats_all", save)
+    with pytest.raises(shiki_api.ProfilePrivacyError):
+        await smod.sync_stats_all(session=object())
+    save.assert_not_called()
+    assert state == before
+
+
+@pytest.mark.parametrize(("count", "title_word", "times_word"), [
+    (1, "тайтл", "раз"), (2, "тайтла", "раза"), (5, "тайтлов", "раз"),
+    (11, "тайтлов", "раз"), (21, "тайтл", "раз"), (25, "тайтлов", "раз"),
+])
+def test_quarter_achievement_count_wording_and_thresholds(count, title_word, times_word):
+    stats = storage._empty_stats_all()
+    for score in (3, 10):
+        stats["anime"]["titles"] = {
+            str(i + 1): _anime_rec(score=score) for i in range(count)
+        }
+        cur = {"period": "2026-Q2", "events": [
+            {"id": str(i + 1), "media": "anime", "event": "completed", "score": score}
+            for i in range(count)
+        ]}
+        text = "\n".join(rendered_html(smod.build_quarterly_report_messages(cur, stats, None)))
+        if score == 3:
+            assert f"Домучил {count} {title_word} с оценкой" in text
+        elif count >= 3:
+            assert f"Десятку поставил {count} {times_word} —" in text
+        else:
+            assert "Десятку поставил" not in text
+            assert ("Один безоговорочный шедевр" in text) == (count == 1)
