@@ -17,11 +17,15 @@ import healthcheck
 def _reset_healthcheck_state():
     healthcheck._last_healthy_ts = 0.0
     healthcheck._has_beaten = False
+    healthcheck._polling_started_at = None
+    healthcheck._polling_stopped = False
     healthcheck._health_threshold = 45 * 60
     yield
     # Возвращаем дефолты и после теста — на всякий случай
     healthcheck._last_healthy_ts = 0.0
     healthcheck._has_beaten = False
+    healthcheck._polling_started_at = None
+    healthcheck._polling_stopped = False
     healthcheck._health_threshold = 45 * 60
 
 
@@ -140,12 +144,24 @@ async def test_port_read_from_env_when_none(fake_web, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_env_port_falls_back_to_8080(fake_web, monkeypatch):
+@pytest.mark.parametrize("value", ["not-a-number", "0", "-1", "65536"])
+async def test_invalid_env_port_falls_back_to_8080(fake_web, monkeypatch, value):
     """Некорректный PORT в env → дефолт 8080, без падения."""
-    monkeypatch.setenv("PORT", "not-a-number")
+    monkeypatch.setenv("PORT", value)
 
     await healthcheck.start_health_server(check_interval=900, port=None)
     assert fake_web["port"] == 8080
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, "1", "65535"])
+async def test_default_and_boundary_env_ports(fake_web, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("PORT", raising=False)
+    else:
+        monkeypatch.setenv("PORT", value)
+    await healthcheck.start_health_server(check_interval=900)
+    assert fake_web["port"] == (8080 if value is None else int(value))
 
 
 @pytest.mark.asyncio
@@ -207,3 +223,37 @@ async def test_health_server_disables_access_log(fake_web):
 
     assert "access_log" in fake_web["runner_kwargs"], "AppRunner вызван без access_log"
     assert fake_web["runner_kwargs"]["access_log"] is None
+
+
+@pytest.mark.asyncio
+async def test_active_first_cycle_grace_is_bounded_and_restart_is_fresh(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr("healthcheck.time.monotonic", lambda: now[0])
+    healthcheck._health_threshold = 30
+    now[0] += 10000
+    assert (await healthcheck._handle_health(None)).status == 200
+    healthcheck.polling_started()
+    now[0] += 29.999
+    assert (await healthcheck._handle_health(None)).status == 200
+    now[0] += 0.001
+    assert (await healthcheck._handle_health(None)).status == 503
+    healthcheck.polling_started()
+    assert healthcheck._seconds_since_heartbeat() is None
+    assert (await healthcheck._handle_health(None)).status == 200
+    healthcheck.heartbeat()
+    now[0] += 30
+    assert (await healthcheck._handle_health(None)).status == 503
+    healthcheck.polling_started()
+    assert (await healthcheck._handle_health(None)).status == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("beaten", [False, True])
+async def test_stopped_task_is_unhealthy_even_before_first_heartbeat(beaten):
+    healthcheck.polling_started()
+    if beaten:
+        healthcheck.heartbeat()
+    healthcheck.polling_stopped()
+    assert (await healthcheck._handle_health(None)).status == 503
+    healthcheck.polling_started()
+    assert (await healthcheck._handle_health(None)).status == 200

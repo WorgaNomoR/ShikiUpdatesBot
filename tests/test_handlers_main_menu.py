@@ -999,3 +999,25 @@ async def test_cancel_clears_main_menu_control_command_and_echo(monkeypatch):
         300,
     ]
     message.answer.assert_awaited_once_with("❌ Отменено.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [False, True])
+async def test_main_menu_handles_quarter_error_without_empty_report(monkeypatch, owner):
+    error = handlers.QuarterDeliveryStateError("current_read")
+    monkeypatch.setattr("handlers._stats_report_current", AsyncMock(side_effect=error))
+    diagnostic = AsyncMock()
+    delivery = AsyncMock()
+    monkeypatch.setattr("handlers._quarter_state_diagnostic", diagnostic)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+    user_id = handlers.OWNER_ID if owner else 777
+    callback = _callback("menu:stats:current", user_id=user_id)
+    state = _state(screen="stats", user_id=user_id)
+    await handlers.main_menu_cb(callback, state)
+    assert state.state is None
+    diagnostic.assert_awaited_once_with(callback.message.bot, error)
+    delivery.assert_not_awaited()
+    if owner:
+        callback.message.bot.send_message.assert_not_awaited()
+    else:
+        callback.message.bot.send_message.assert_awaited_once_with(55, "⚠️ Статистика за текущий квартал временно недоступна.")

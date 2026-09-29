@@ -195,13 +195,15 @@ async def test_upload_callback_enters_fsm_and_promises_preview(fact_bank_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [b"{broken", b"[" * 5000 + b"]" * 5000])
 async def test_invalid_upload_preserves_disk_snapshot_and_waiting_state(
     fact_bank_env,
     monkeypatch,
+    raw,
 ):
     before = await _publish(_payload([_fact("current")]))
     old_file = fact_bank_env.read_bytes()
-    message = _message(raw=b"{broken")
+    message = _message(raw=raw)
     state = AsyncMock()
     state.get_data.return_value = {"prompt_msg_id": 77}
     deleted = AsyncMock()

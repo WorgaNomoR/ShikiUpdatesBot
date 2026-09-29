@@ -4,6 +4,7 @@ import json
 import random
 import re
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from string import Formatter
 
@@ -808,6 +809,71 @@ def test_message_without_url(monkeypatch):
     )
 
     assert '<a href="' not in msg
+
+
+class _NotificationHTMLParser(HTMLParser):
+    """Прочитать ссылки и последовательность тегов готового уведомления."""
+
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.tags = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(("start", tag))
+        if tag == "a":
+            self.links.append(attrs)
+
+    def handle_endtag(self, tag):
+        self.tags.append(("end", tag))
+
+
+@pytest.mark.parametrize("builder", ["history", "favourite"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        '/animes/1?label="quoted"&from=<status>',
+        '/animes/1?x="><b>spoof</b>&q=1',
+        '/animes/1?x=" data-spoof="yes',
+        'https://shikimori.io/animes/1?x="quoted"&symbol=&copy;',
+    ],
+)
+def test_notification_links_escape_complete_url(monkeypatch, builder, url):
+    monkeypatch.setattr("messages.random.choice", fixed_choice)
+    monkeypatch.setattr("messages.SHIKI_BASE_URL", "https://shikimori.io")
+    title = "<Title & Name>"
+
+    def render(raw_url):
+        if builder == "history":
+            return build_message(make_entry("оценено на 8", title, raw_url))
+        return build_favourite_message("animes", {"name": title, "url": raw_url})
+
+    baseline = _NotificationHTMLParser()
+    baseline.feed(render("/animes/1"))
+    parsed = _NotificationHTMLParser()
+    rendered = render(url)
+    parsed.feed(rendered)
+    relative_url = url.removeprefix("https://shikimori.io")
+
+    assert parsed.links == [[("href", "https://shikimori.io" + relative_url)]]
+    assert parsed.tags == baseline.tags
+    assert "&lt;Title &amp; Name&gt;" in rendered
+
+
+@pytest.mark.parametrize("builder", ["history", "favourite"])
+def test_notification_links_escape_configured_base_url(monkeypatch, builder):
+    monkeypatch.setattr("messages.random.choice", fixed_choice)
+    base_url = 'https://example.test/?label="quoted"&from=<config>'
+    monkeypatch.setattr("messages.SHIKI_BASE_URL", base_url)
+    url = "/animes/1"
+    if builder == "history":
+        rendered = build_message(make_entry("оценено на 8", "Title", url))
+    else:
+        rendered = build_favourite_message("animes", {"name": "Title", "url": url})
+    parsed = _NotificationHTMLParser()
+    parsed.feed(rendered)
+
+    assert parsed.links == [[("href", base_url + url)]]
 
 
 # ── экранирование DISPLAY_NAME в HTML-шаблонах (Codacy MEDIUM) ──────

@@ -732,7 +732,19 @@ async def sync_stats_all(
             log.info("sync_stats_all: экспорт %s недоступен, пропускаем эту половину.", media)
             continue
 
-        titles = stats[media]["titles"]
+        # Чиним контейнеры только в рабочей копии успешно скачанного домена.
+        # Недоступная половина и исходный кэш остаются без изменений.
+        if not isinstance(stats.get(media), dict):
+            stats[media] = {}
+            changed = True
+        domain = stats[media]
+        if not isinstance(domain.get("titles"), dict):
+            domain["titles"] = {}
+            changed = True
+        if not isinstance(domain.get("aggregates"), dict):
+            domain["aggregates"] = {}
+            changed = True
+        titles = domain["titles"]
 
         # Релевантные строки экспорта: с валидным id и известным статусом
         valid_rows: dict[str, dict] = {}
@@ -2011,7 +2023,8 @@ def build_quarterly_report_messages(
     ach: list[str] = []
     tens = [r for r in all_comp if r.get("score") == 10]
     if len(tens) >= 3:
-        ach.append(f"💎 Десятку поставил {len(tens)} раза — строгий критик!")
+        times_word = russian_count_word(len(tens), "раз", "раза", "раз")
+        ach.append(f"💎 Десятку поставил {len(tens)} {times_word} — строгий критик!")
     elif len(tens) == 1:
         ach.append("💎 Один безоговорочный шедевр за квартал.")
     total_drops = len(anime["dropped"]) + len(manga["dropped"])
@@ -2022,7 +2035,8 @@ def build_quarterly_report_messages(
     low = [r for r in all_comp if 0 < _safe_int(r.get("score")) <= 3]
     if low:
         n = len(low)
-        ach.append(f"🧟 Домучил {n} тайтл{'а' if n < 5 else 'ов'} с оценкой ≤3 — стойкость.")
+        title_word = russian_count_word(n, "тайтл", "тайтла", "тайтлов")
+        ach.append(f"🧟 Домучил {n} {title_word} с оценкой ≤3 — стойкость.")
 
     if ach:
         extra_sections.append(section(

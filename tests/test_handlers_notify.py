@@ -99,8 +99,8 @@ def _capture_saves(monkeypatch, current=None):
     saved = []
     current = current if current is not None else _empty_cur()
     monkeypatch.setattr("handlers.save_seen_ids", lambda ids: saved.append(set(ids)))
-    monkeypatch.setattr("handlers.load_stats_current", lambda: current)
-    monkeypatch.setattr("handlers.save_stats_current", lambda cur: None)
+    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: current)
+    monkeypatch.setattr("handlers.save_stats_current", lambda cur, **kwargs: None)
     return saved
 
 

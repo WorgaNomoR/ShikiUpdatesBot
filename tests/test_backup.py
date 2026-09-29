@@ -887,21 +887,20 @@ async def test_restore_accepts_legacy_update_state_and_backfills_main(backup_env
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("original", [b"\xff\xfe\x00broken", b'{\r\n"events": []\n}\r'])
 async def test_restore_rolls_back_first_file_when_second_publish_fails(
     backup_env,
     monkeypatch,
+    original,
 ):
     storage._atomic_write(
         backup_env / "subscribers.json",
         '{"subscribers": {"1": "Old"}}',
     )
-    storage._atomic_write(
-        backup_env / "stats_current.json",
-        '{"period": "2026-Q1", "events": []}',
-    )
+    (backup_env / "stats_current.json").write_bytes(original)
     raw = _zip_bytes({
-        "subscribers.json": '{"subscribers": {"2": "New"}}',
         "stats_current.json": '{"period": "2026-Q2", "events": []}',
+        "subscribers.json": '{"subscribers": {"2": "New"}}',
     })
     real_publish = backup._publish_staged_file
     calls = 0
@@ -918,11 +917,8 @@ async def test_restore_rolls_back_first_file_when_second_publish_fails(
     with pytest.raises(ValueError, match="исходное состояние восстановлено"):
         await backup.restore_backup_zip(raw)
 
+    assert (backup_env / "stats_current.json").read_bytes() == original
     assert storage.load_subscribers() == {1: "Old"}
-    assert json.loads((backup_env / "stats_current.json").read_text(encoding="utf-8")) == {
-        "period": "2026-Q1",
-        "events": [],
-    }
 
 
 @pytest.mark.asyncio
@@ -958,6 +954,27 @@ async def test_restore_no_valid_members_raises(backup_env):
     raw = _zip_bytes({"seen_ids.json": "{}", "junk.txt": "x"})
     with pytest.raises(ValueError):
         await backup.restore_backup_zip(raw)
+
+
+@pytest.mark.asyncio
+async def test_restore_repairs_non_utf8_current_file(backup_env):
+    target = backup_env / "stats_current.json"
+    target.write_bytes(b"\xff\xfe\x00damaged")
+    candidate = {"period": "2026-Q2", "events": []}
+    await backup.restore_backup_zip(_zip_bytes({"stats_current.json": json.dumps(candidate)}))
+    assert json.loads(target.read_text(encoding="utf-8")) == candidate
+
+
+@pytest.mark.asyncio
+async def test_nested_fact_restore_preserves_good_bank(backup_env):
+    current = fact_bank.parse_fact_bank_bytes(_facts_payload("current-fact").encode())
+    fact_bank._atomic_write(backup_env / "facts.json", fact_bank.serialize_fact_bank(current))
+    before = fact_bank.activate_restored_fact_bank(current)
+    original = (backup_env / "facts.json").read_bytes()
+    with pytest.raises(ValueError, match="facts.json"):
+        await backup.restore_backup_zip(_zip_bytes({"facts.json": "[" * 5000 + "]" * 5000}))
+    assert (backup_env / "facts.json").read_bytes() == original
+    assert fact_bank.get_fact_bank_snapshot() == before
 
 
 @pytest.mark.asyncio

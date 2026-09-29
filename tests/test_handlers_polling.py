@@ -51,7 +51,7 @@ class _RendererReached(RuntimeError):
 #  load_stats_current читает файл — отдаём пустой стейт квартала.
 # ─────────────────────────────────────────────────────────────
 def _patch_stats(monkeypatch, main):
-    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: {"period": "2026-Q2", "events": []})
 
     async def fake_sync(session=None, fav=None):
         # sync_stats_all теперь возвращает кортеж (stats, ok).
@@ -72,7 +72,7 @@ async def test_polling_services_due_subscription_before_weekly(monkeypatch):
     monkeypatch.setattr("handlers.load_subscribers", lambda: {})
     monkeypatch.setattr(
         "handlers.load_stats_current",
-        lambda: {"period": "2026-Q2", "events": []},
+        lambda **kwargs: {"period": "2026-Q2", "events": []},
     )
     monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
     monkeypatch.setattr(
@@ -412,7 +412,7 @@ async def test_boot_fetches_favourites_once_and_threads_session(monkeypatch):
     monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
     monkeypatch.setattr("handlers.load_seen_favourites", lambda: set())
     monkeypatch.setattr("handlers.load_subscribers", lambda: {})
-    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: {"period": "2026-Q2", "events": []})
     monkeypatch.setattr("handlers.save_seen_favourites", lambda favs: None)
 
     fav_calls = []
@@ -463,7 +463,7 @@ async def test_cycle_fetches_favourites_once_and_threads_to_sync(monkeypatch):
     monkeypatch.setattr("handlers.load_seen_ids", lambda: {1})
     monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
     monkeypatch.setattr("handlers.load_subscribers", lambda: {})
-    monkeypatch.setattr("handlers.load_stats_current", lambda: {"period": "2026-Q2", "events": []})
+    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: {"period": "2026-Q2", "events": []})
     monkeypatch.setattr("handlers.load_stats_all", lambda: storage._empty_stats_all())
     monkeypatch.setattr("handlers.save_seen_favourites", lambda favs: None)
     monkeypatch.setattr("handlers.heartbeat", lambda: None)
@@ -548,7 +548,7 @@ async def test_failed_full_sync_does_not_advance_display_timestamp(monkeypatch):
     monkeypatch.setattr("handlers.load_subscribers", lambda: {})
     monkeypatch.setattr(
         "handlers.load_stats_current",
-        lambda: {"period": "2026-Q2", "events": []},
+        lambda **kwargs: {"period": "2026-Q2", "events": []},
     )
     monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
     monkeypatch.setattr(
@@ -586,7 +586,7 @@ async def test_startup_private_list_notifies_owner_without_saving_public_favouri
     monkeypatch.setattr("handlers.load_subscribers", lambda: {777: "subscriber"})
     monkeypatch.setattr(
         "handlers.load_stats_current",
-        lambda: {"period": "2026-Q2", "events": []},
+        lambda **kwargs: {"period": "2026-Q2", "events": []},
     )
     preserved_stats = storage._empty_stats_all()
     monkeypatch.setattr("handlers.load_stats_all", lambda: preserved_stats)
@@ -654,7 +654,7 @@ async def test_polling_private_profile_is_debounced_and_recovers(monkeypatch):
     monkeypatch.setattr("handlers.load_subscribers", lambda: {777: "subscriber"})
     monkeypatch.setattr(
         "handlers.load_stats_current",
-        lambda: {"period": "2026-Q2", "events": []},
+        lambda **kwargs: {"period": "2026-Q2", "events": []},
     )
     monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
     monkeypatch.setattr("handlers.ERROR_NOTIFY_INTERVAL", 3600)
@@ -1833,3 +1833,128 @@ async def test_split_quarter_plan_resumes_frozen_ranobe_after_reload(quarter_del
     assert storage.load_stats_current(strict=True)["last_report_sent"] == "2026-Q3"
     sync.assert_not_awaited()
     quarter_delivery_env.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [b"{bad", b"\xff\xfe", b'{"period": "2026-Q2", "events": {}}', b'{"period": "bad", "events": []}'])
+async def test_transactional_quarter_load_preserves_damaged_state(backup_env, raw):
+    storage.STATS_CURRENT_FILE.write_bytes(raw)
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        await handlers._load_stats_current_transactional()
+    assert storage.STATS_CURRENT_FILE.read_bytes() == raw
+
+
+@pytest.mark.asyncio
+async def test_transactional_quarter_load_initializes_only_missing_file(backup_env):
+    cur = await handlers._load_stats_current_transactional()
+    assert cur == storage.load_stats_current(strict=True)
+    assert cur["events"] == []
+    assert cur["tracking_since"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history", [None, [], [{"id": 2}]])
+async def test_history_does_not_acknowledge_unreadable_quarter(backup_env, monkeypatch, history):
+    cur = _frozen_quarter()
+    storage.save_stats_current(cur, strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    real_read = type(storage.STATS_CURRENT_FILE).read_text
+
+    def fail_current_read(path, *args, **kwargs):
+        if path == storage.STATS_CURRENT_FILE:
+            raise OSError("transient read failure")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(storage.STATS_CURRENT_FILE), "read_text", fail_current_read)
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=history))
+    saved = MagicMock()
+    monkeypatch.setattr("handlers.save_seen_ids", saved)
+    seen = {1}
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        await handlers.check_and_notify(AsyncMock(), seen, cur)
+    assert seen == {1}
+    saved.assert_not_called()
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_history_failed_quarter_save_does_not_acknowledge_event(backup_env, monkeypatch):
+    cur = _frozen_quarter()
+    storage.save_stats_current(cur, strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    entry = {"id": 2, "description": "Просмотрено", "target": {"id": 10, "kind": "tv"}, "target_type": "Anime"}
+    monkeypatch.setattr("handlers._fetch_history_catchup", AsyncMock(return_value=[entry]))
+    monkeypatch.setattr("handlers.classify_event", lambda description: "completed")
+    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
+    monkeypatch.setattr("handlers.build_message", lambda entry: "notification")
+    monkeypatch.setattr(handlers.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr("storage._atomic_write", MagicMock(side_effect=OSError("disk failure")))
+    saved = MagicMock()
+    monkeypatch.setattr("handlers.save_seen_ids", saved)
+    seen = {1}
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        await handlers.check_and_notify(AsyncMock(), seen, cur)
+    assert seen == {1}
+    saved.assert_not_called()
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_current_report_rejects_damaged_quarter(backup_env):
+    original = b"{broken"
+    storage.STATS_CURRENT_FILE.write_bytes(original)
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        await handlers._stats_report_current()
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+
+@pytest.mark.asyncio
+async def test_polling_quarter_failure_keeps_owner_recovery_and_retries(backup_env, monkeypatch):
+    original = b"{damaged"
+    storage.STATS_CURRENT_FILE.write_bytes(original)
+    monkeypatch.setattr("handlers._last_quarter_notice_at", None)
+    monkeypatch.setattr("handlers.load_seen_ids", lambda: set())
+    monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
+    monkeypatch.setattr("handlers.load_subscribers", lambda: {})
+    monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
+    history = AsyncMock(return_value=[{"id": 1}])
+    saved = MagicMock()
+    heartbeat = MagicMock()
+    rotate = AsyncMock(side_effect=lambda bot, cur, stats_all, **kwargs: cur)
+    weekly = AsyncMock(side_effect=lambda bot, cur: cur)
+    monkeypatch.setattr("handlers.fetch_history", history)
+    monkeypatch.setattr("handlers.save_seen_ids", saved)
+    monkeypatch.setattr("handlers.heartbeat", heartbeat)
+    monkeypatch.setattr("handlers.fetch_favourites", AsyncMock(return_value={}))
+    monkeypatch.setattr("handlers.sync_stats_all", AsyncMock(return_value=(storage._empty_stats_all(), True)))
+    monkeypatch.setattr("handlers.check_and_notify_favourites", AsyncMock(return_value=({"animes_10"}, False)))
+    monkeypatch.setattr("handlers.rotate_quarter_if_needed", rotate)
+    monkeypatch.setattr("handlers._weekly_backup_if_due", weekly)
+    monkeypatch.setattr("handlers._backup_after_subscription", AsyncMock())
+    waits = 0
+    restored = {"period": storage.current_quarter(), "events": []}
+
+    async def sleep(seconds):
+        nonlocal waits
+        if seconds != handlers.CHECK_INTERVAL:
+            return
+        waits += 1
+        if waits == 1:
+            assert storage.STATS_CURRENT_FILE.read_bytes() == original
+            saved.assert_not_called()
+            history.assert_not_awaited()
+            rotate.assert_not_awaited()
+            weekly.assert_not_awaited()
+            storage.save_stats_current(restored, strict=True)
+        else:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(handlers.asyncio, "sleep", sleep)
+    bot = AsyncMock()
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(bot)
+    saved.assert_called_once_with({1})
+    history.assert_awaited_once()
+    rotate.assert_awaited_once()
+    weekly.assert_awaited_once()
+    assert heartbeat.call_count == 2
+    bot.send_message.assert_awaited_once_with(chat_id=handlers.OWNER_ID, text=handlers._QUARTER_STATE_NOTICE)
