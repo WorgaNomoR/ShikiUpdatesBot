@@ -1859,3 +1859,58 @@ def test_strict_projection_write_rejects_bool_without_replacing_current(journal_
     with pytest.raises(storage.QuarterDeliveryStateError):
         storage.save_stats_current(candidate, strict=True)
     assert storage.STATS_CURRENT_FILE.read_bytes() == original
+
+
+@pytest.mark.parametrize("change", [
+    lambda j: j.update(version=3),
+    lambda j: j.pop("catchup"),
+    lambda j: j.update(baseline_initialized=False),
+    lambda j: j["catchup"].update(page=True),
+    lambda j: j["catchup"].update(page=0),
+    lambda j: j["catchup"].update(spanning=1),
+    lambda j: j["catchup"].update(phase=[]),
+    lambda j: j["catchup"].update(phase="unknown"),
+    lambda j: j["catchup"].update(frontier=[]),
+    lambda j: j["catchup"].update(frontier=[999]),
+    lambda j: j["catchup"].update(frontier=[True]),
+    lambda j: j["catchup"].update(head_ids=[2, 2]),
+    lambda j: j["catchup"].update(head_ids=[999]),
+    lambda j: j["catchup"]["staged"][0].update(seq=2),
+    lambda j: j["catchup"]["staged"][1].update(history_id=2),
+    lambda j: j.update(baseline_ids=[1, 2]),
+    lambda j: j.update(events=j["catchup"]["staged"], processed_seq=0),
+    lambda j: j["catchup"].update(phase="head", spanning=False),
+])
+def test_acquisition_validation_rejects_unsafe_state_without_replacing_bytes(acquisition_factory, change):
+    from event_journal_schema import EventJournalStateError
+
+    journal = acquisition_factory()
+    change(journal)
+    original = json.dumps(journal).encode("utf-8")
+    storage.EVENT_JOURNAL_FILE.write_bytes(original)
+    with pytest.raises(EventJournalStateError):
+        storage.load_event_journal()
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+
+
+def test_acquisition_shares_inclusive_member_limit_and_reserve(acquisition_factory, monkeypatch):
+    from event_journal_schema import (
+        EventJournalStateError,
+        journal_json,
+        parse_event_journal,
+    )
+
+    journal = acquisition_factory()
+    size = len(journal_json(journal).encode("utf-8"))
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", size + 16)
+    monkeypatch.setattr("storage.JOURNAL_CHECKPOINT_RESERVE", 16)
+    assert storage.save_event_journal(journal, admitting=True) == size
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    journal["catchup"]["staged"][0]["description"] += "x"
+    with pytest.raises(EventJournalStateError, match="journal_capacity"):
+        storage.save_event_journal(journal, admitting=True)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+    monkeypatch.setattr("event_journal_schema.JOURNAL_MAX_BYTES", len(original))
+    assert parse_event_journal(original)["catchup"]["page"] == 2
+    with pytest.raises(EventJournalStateError):
+        parse_event_journal(original + b" ")

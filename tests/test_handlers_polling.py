@@ -120,7 +120,6 @@ async def test_polling_services_due_subscription_before_weekly(monkeypatch):
         await handlers.polling_loop(object())
 
     assert order == [
-        "quarter",
         "subscription",
         "weekly",
         "quarter",
@@ -1883,7 +1882,7 @@ async def test_history_failed_quarter_save_does_not_acknowledge_event(backup_env
     storage.save_stats_current(cur, strict=True)
     original = storage.STATS_CURRENT_FILE.read_bytes()
     entry = {"id": 2, "description": "Просмотрено", "target": {"id": 10, "kind": "tv"}, "target_type": "Anime"}
-    monkeypatch.setattr("handlers._fetch_history_catchup", AsyncMock(return_value=[entry]))
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[entry]))
     monkeypatch.setattr("messages.classify_event", lambda description: "completed")
     monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
     monkeypatch.setattr("handlers.build_message", lambda entry, **kwargs: "notification")

@@ -2236,6 +2236,73 @@ def _recovery_zip(journal, cur):
 
 
 @pytest.mark.asyncio
+async def test_unfinished_acquisition_roundtrips_and_legacy_restore_preserves_it(backup_env, acquisition_factory):
+    journal = acquisition_factory()
+    cur = _journal_current(journal)
+    await backup.restore_backup_zip(_recovery_zip(journal, cur))
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert json.loads(archive.read("event_journal.json")) == journal
+    storage.EVENT_JOURNAL_FILE.write_bytes(b"{damaged")
+    await backup.restore_backup_zip(raw)
+    assert storage.load_event_journal() == journal
+    await backup.restore_backup_zip(_zip_bytes({"stats_current.json": json.dumps({"period": "2026-Q1", "events": []})}))
+    assert storage.load_event_journal() == journal
+    assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_acquisition_rejects_entire_restore(backup_env, acquisition_factory):
+    journal = acquisition_factory()
+    cur = _journal_current(journal)
+    storage.save_stats_current(cur, strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    journal["catchup"]["frontier"] = [999]
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(_recovery_zip(journal, cur))
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    assert storage.load_event_journal() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_kind", ["identical", "unrelated", "older", "legacy"])
+async def test_restore_during_acquisition_prevents_stale_page_publication(
+    backup_env, acquisition_factory, journal_factory, monkeypatch, restore_kind,
+):
+    import handlers
+
+    journal = acquisition_factory()
+    cur = _journal_current(journal)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    restores = []
+
+    async def fetch(_session, page=1):
+        if not restores:
+            restores.append(True)
+            if restore_kind == "identical":
+                raw = _recovery_zip(journal, cur)
+            elif restore_kind == "unrelated":
+                raw = _zip_bytes({"user_alerts.json": '{"enabled":false}'})
+            elif restore_kind == "legacy":
+                raw = _zip_bytes({"stats_current.json": '{"period":"2026-Q1","events":[]}'})
+            else:
+                old = journal_factory(count=0)
+                raw = _recovery_zip(old, _journal_current(old))
+            await backup.restore_backup_zip(raw)
+        return [{"id": 3}, {"id": 4}]
+
+    monkeypatch.setattr("handlers.fetch_history", fetch)
+    send = AsyncMock()
+    monkeypatch.setattr("handlers.send_to_all_chats", send)
+    await handlers.check_and_notify(AsyncMock(), {999}, None)
+    assert restores == [True]
+    restored = storage.load_event_journal()
+    assert restored == (journal_factory(count=0) if restore_kind == "older" else journal)
+    send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("processed,applied", [(0, 0), (0, 1), (1, 1)])
 async def test_journal_complete_recovery_roundtrip(backup_env, journal_factory, processed, applied):
     journal = journal_factory(processed=processed)

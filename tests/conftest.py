@@ -133,3 +133,17 @@ def journal_factory():
         }
 
     return factory
+
+
+@pytest.fixture
+def acquisition_factory(journal_factory):
+    """Recovery-набор с отдельными staged seq и неизменной принятой baseline."""
+    def factory():
+        journal = journal_factory(count=0)
+        journal.update(version=2, catchup={
+            "phase": "tail", "page": 2, "frontier": [2, 3], "head_ids": [2, 3],
+            "staged": journal_factory(count=2)["events"], "spanning": True,
+        })
+        return journal
+
+    return factory
