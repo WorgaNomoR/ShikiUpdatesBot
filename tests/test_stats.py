@@ -3605,6 +3605,48 @@ def test_current_calendar_report_is_independent_of_delayed_delivery_period(monke
     assert cur == before
 
 
+@pytest.mark.parametrize("media", ["anime", "manga"])
+def test_legacy_unrated_completion_keeps_export_score_until_source_removal(backup_env, media):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+        validate_event_time,
+    )
+
+    state = storage._empty_stats_all()
+    state[media]["titles"]["10"] = {"title": "Legacy title", "kind": "tv" if media == "anime" else "manga", "score": 9}
+    cur = {
+        "period": "2026-Q2",
+        "events": [{"id": "10", "media": media, "event": "completed", "score": None}],
+        "event_projection": {"journal_id": "a" * 32, "baseline_seq": 0, "applied_seq": 0},
+    }
+    before = smod._quarter_titles(cur, state, media, "completed")
+    ensure_event_time(cur)
+    assert smod._quarter_titles(cur, state, media, "completed") == before
+    smod._update_by_quarter(state, cur["period"], cur)
+    assert state[media]["aggregates"]["by_quarter"]["2026-Q2"]["avg_score"] == 9
+    smod._save_quarter_snapshot(cur["period"], cur, state)
+    snapshot = json.loads((backup_env / "quarters" / "2026-Q2.json").read_text(encoding="utf-8"))
+    assert snapshot[f"{media}_titles"][0]["score"] == 9
+
+    removal = messages.normalize_history_event(
+        {"id": 2, "created_at": "2026-04-02T00:00:00Z", "description": "Удалена оценка",
+         "target": {"id": 10, "kind": "tv", "name": "Legacy title"}},
+        "2026-04-03T00:00:00+00:00",
+    )
+    removal.update(event_type="score_removed", media=media, score=None)
+    journal = {"events": [removal]}
+    project_event(cur, journal, 1)
+    cur["event_projection"]["applied_seq"] = 1
+    validate_event_time(cur, journal)
+    assert smod._quarter_titles(cur, state, media, "completed")[0]["score"] == 0
+    assert cur["event_time"]["legacy_events"][0]["score"] is None
+    smod._update_by_quarter(state, cur["period"], cur)
+    assert state[media]["aggregates"]["by_quarter"]["2026-Q2"]["avg_score"] is None
+    storage.save_stats_current(cur, strict=True)
+    assert smod._quarter_titles(storage.load_stats_current(strict=True), state, media, "completed")[0]["score"] == 0
+
+
 def test_closed_quarter_correction_names_dropped_status():
     from event_time_stats import (
         ensure_event_time,

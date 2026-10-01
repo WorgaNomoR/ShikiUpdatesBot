@@ -89,6 +89,7 @@ from event_time_stats import (
     EVENT_TIME_KEY,
     acknowledge_revisions,
     ensure_event_time,
+    index_event_periods,
     next_period,
     project_event,
     report_revisions,
@@ -2208,7 +2209,7 @@ def _journal_seen(journal: dict) -> set[int]:
     return set(journal["baseline_ids"]) | {event["history_id"] for event in journal["events"]}
 
 
-def _history_state() -> tuple[dict | None, dict]:
+def _history_state(*, full_recovery: bool = True) -> tuple[dict | None, dict]:
     """Вызывается под lock; отсутствие привязанного файла не есть первый запуск."""
     journal = load_event_journal()
     cur = load_stats_current(strict=True, initialize_missing=journal is None)
@@ -2216,7 +2217,7 @@ def _history_state() -> tuple[dict | None, dict]:
         if PROJECTION_KEY in cur:
             raise EventJournalStateError("bound_journal_missing")
     elif PROJECTION_KEY in cur:
-        validate_recovery_set(journal, cur)
+        validate_recovery_set(journal, cur, full_recovery=full_recovery)
     elif journal["events"] or journal["processed_seq"] or journal.get("catchup") is not None:
         raise EventJournalStateError("projection_missing")
     return journal, cur
@@ -2282,6 +2283,7 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
         generation = restorable_restore_generation()
         if journal is not None and PROJECTION_KEY in cur and ensure_event_time(cur):
             save_stats_current(cur, strict=True)
+        period_events = index_event_periods(cur, journal) if journal is not None and PROJECTION_KEY in cur else {}
     while journal is not None and journal["processed_seq"] < len(journal["events"]):
         seq = journal["processed_seq"] + 1
         event = journal["events"][seq - 1]
@@ -2290,10 +2292,10 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
             if restorable_restore_generation() != generation:
                 raise _HistoryAttemptChanged
             cur = load_stats_current(strict=True)
-            validate_recovery_set(journal, cur)
+            validate_recovery_set(journal, cur, full_recovery=False)
             if cur[PROJECTION_KEY]["applied_seq"] < seq:
                 cur = deepcopy(cur)
-                project_event(cur, journal, seq)
+                project_event(cur, journal, seq, period_events=period_events)
                 cur[PROJECTION_KEY]["applied_seq"] = seq
                 save_stats_current(cur, strict=True)
                 # Кеш восстановим и при следующем полном sync; его сбой не
@@ -2317,7 +2319,7 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
                 raise _HistoryAttemptChanged
-            current_journal, cur = _history_state()
+            current_journal, cur = _history_state(full_recovery=False)
             if current_journal != journal or cur[PROJECTION_KEY]["applied_seq"] != seq:
                 raise _HistoryAttemptChanged
             journal = deepcopy(journal)

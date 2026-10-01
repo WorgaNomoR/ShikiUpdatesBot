@@ -89,6 +89,17 @@ def ensure_event_time(cur: dict) -> bool:
     return True
 
 
+def index_event_periods(cur: dict, journal: dict) -> dict[str, list[dict]]:
+    """Временный индекс применённого префикса; после сбоя/restore строится заново."""
+    groups = {}
+    for event in journal["events"][cur[EVENT_TIME_KEY]["baseline_seq"] : cur["event_projection"]["applied_seq"]]:
+        if _eligible(event):
+            period, _ = event_period(event)
+            if period is not None:
+                groups.setdefault(period, []).append(event)
+    return groups
+
+
 def _derive(
     state: dict, journal: dict, seq: int, period: str, *, source: list[dict] | None = None
 ) -> list[dict]:
@@ -102,6 +113,7 @@ def _derive(
         and isinstance(ev.get("event"), str)
         and isinstance(ev.get("id"), (str, int))
     }
+    legacy_keys = set(records)
     scores = {
         (media, tid): ev.get("score")
         for (media, tid, kind), ev in records.items()
@@ -126,7 +138,12 @@ def _derive(
             scores[key] = None if kind == "score_removed" else score
             completed = records.get((*key, "completed"))
             if completed is not None:
-                completed["score"] = scores[key]
+                # Legacy None сохраняет прежний export-fallback. Явное снятие
+                # записываем как 0, иначе None → None потеряет эту семантику.
+                completed["score"] = (
+                    0 if kind == "score_removed" and (*key, "completed") in legacy_keys
+                    else scores[key]
+                )
             continue
         if kind == "completed" and score is not None:
             scores[key] = score
@@ -148,7 +165,9 @@ def _derive(
     return result
 
 
-def project_event(cur: dict, journal: dict, seq: int) -> None:
+def project_event(
+    cur: dict, journal: dict, seq: int, *, period_events: dict[str, list[dict]] | None = None
+) -> None:
     """Caller публикует дельту и applied_seq одной заменой stats_current."""
     state = cur[EVENT_TIME_KEY]
     event = journal["events"][seq - 1]
@@ -161,7 +180,11 @@ def project_event(cur: dict, journal: dict, seq: int) -> None:
     bucket = state["periods"].setdefault(
         period, {"events": [], "revision": 0, "announced_revision": 0}
     )
-    events = _derive(state, journal, seq, period)
+    source = None
+    if period_events is not None:
+        source = period_events.setdefault(period, [])
+        source.append(event)
+    events = _derive(state, journal, seq, period, source=source)
     if events != bucket["events"]:
         bucket["events"] = events
         bucket["revision"] += 1
@@ -238,6 +261,7 @@ def validate_event_time(cur: dict, journal: dict | None = None) -> None:
         or type(projection.get("applied_seq")) is not int
         or type(state["baseline_seq"]) is not int
         or not _period(cur.get("period"))
+        or not isinstance(cur.get("events"), list)
         or not projection["baseline_seq"] <= state["baseline_seq"] <= projection["applied_seq"]
         or not _period(state["legacy_period"])
         or state["legacy_period"] > cur["period"]
@@ -277,6 +301,10 @@ def validate_event_time(cur: dict, journal: dict | None = None) -> None:
                     ev not in state["legacy_events"]
                     and ev.get("score") is not None
                     and _score(ev.get("score")) is None
+                    and not (
+                        ev.get("event") == "completed"
+                        and type(ev.get("score")) is int and ev["score"] == 0
+                    )
                 ):
                     raise EventTimeStateError("event_time_legacy_score")
                 continue

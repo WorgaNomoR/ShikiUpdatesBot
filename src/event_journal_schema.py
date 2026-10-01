@@ -187,8 +187,8 @@ def validate_acquisition(state: object, journal: dict, known: set[int]) -> None:
         raise EventJournalStateError("acquisition_cursor")
 
 
-def validate_recovery_set(journal: dict, cur: dict) -> None:
-    """Квартальная дельта может опережать попытку ровно на одно событие."""
+def validate_recovery_set(journal: dict, cur: dict, *, full_recovery: bool = True) -> None:
+    """Курсоры и структура всегда строгие; source-сверка нужна на границе drain."""
     projection = cur.get(PROJECTION_KEY)
     validate_projection(projection)
     completed = journal["processed_seq"]
@@ -199,7 +199,7 @@ def validate_recovery_set(journal: dict, cur: dict) -> None:
     ):
         raise EventJournalStateError("recovery_mismatch")
     try:
-        validate_event_time(cur, journal)
+        validate_event_time(cur, journal if full_recovery else None)
     except EventTimeStateError:
         raise EventJournalStateError("event_time_recovery") from None
 

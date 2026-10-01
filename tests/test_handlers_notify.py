@@ -438,7 +438,8 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
     assert result == {999, 125}
     assert saved == [{999, 125}]
     assert sent == []
-    assert returned_cur["events"][0]["score"] is None
+    assert returned_cur["events"][0]["score"] == 0
+    assert returned_cur["event_time"]["legacy_events"][0]["score"] == 5
     assert not caplog.messages
 
 

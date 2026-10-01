@@ -230,9 +230,9 @@ async def test_crash_during_send_replays_without_reapplying_projection(history_e
     applied = []
     real_record = handlers.project_event
 
-    def record(cur, journal, seq):
+    def record(cur, journal, seq, **kwargs):
         applied.append(journal["events"][seq - 1]["history_id"])
-        return real_record(cur, journal, seq)
+        return real_record(cur, journal, seq, **kwargs)
 
     monkeypatch.setattr("handlers.project_event", record)
     monkeypatch.setattr("messages.classify_event", lambda _: pytest.fail("переклассификация локального payload"))

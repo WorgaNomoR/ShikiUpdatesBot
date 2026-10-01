@@ -2220,7 +2220,7 @@ async def test_fact_snapshot_is_unchanged_when_restore_publication_rolls_back(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "payload", "revision_binding", "missing_state"])
+@pytest.mark.parametrize("damage", [None, "payload", "revision_binding", "missing_state", "missing_events", "null_events"])
 async def test_event_time_recovery_import_preserves_frozen_revisions_or_rejects_candidate(backup_env, journal_factory, damage):
     from event_time_stats import (
         ensure_event_time,
@@ -2248,6 +2248,10 @@ async def test_event_time_recovery_import_preserves_frozen_revisions_or_rejects_
         fresh["event_time"]["report_ack"]["revisions"]["2026-Q1"] = 0
     elif damage == "missing_state":
         fresh.pop("event_time")
+    elif damage == "missing_events":
+        fresh.pop("events")
+    elif damage == "null_events":
+        fresh["events"] = None
     archive = _zip_bytes({"event_journal.json": json.dumps(journal), "stats_current.json": json.dumps(fresh)})
     if damage is not None:
         with pytest.raises(ValueError):
@@ -2275,6 +2279,35 @@ def _recovery_zip(journal, cur):
         "event_journal.json": json.dumps(journal),
         "stats_current.json": json.dumps(cur),
     })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_score", [None, 8])
+async def test_legacy_source_score_removal_roundtrips_without_changing_base(
+    backup_env, journal_factory, legacy_score,
+):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+    )
+
+    journal = journal_factory(processed=1)
+    journal["events"][0].update(event_type="score_removed", score=None)
+    cur = _journal_current(journal, applied=0)
+    cur.update(period="2026-Q1", events=[
+        {"id": "11", "media": "anime", "event": "completed", "score": legacy_score},
+    ])
+    ensure_event_time(cur)
+    project_event(cur, journal, 1)
+    cur["event_projection"]["applied_seq"] = 1
+    assert cur["events"][0]["score"] == 0
+
+    await backup.restore_backup_zip(_recovery_zip(journal, cur))
+
+    restored = storage.load_stats_current(strict=True)
+    assert restored == cur
+    assert restored["event_time"]["legacy_events"][0]["score"] == legacy_score
+    assert storage.load_event_journal() == journal
 
 
 @pytest.mark.asyncio

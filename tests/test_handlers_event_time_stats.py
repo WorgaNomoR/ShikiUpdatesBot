@@ -13,7 +13,11 @@ import backup
 import handlers
 import stats
 import storage
-from event_time_stats import correction_periods
+from event_time_stats import (
+    correction_periods,
+    project_event,
+    validate_event_time,
+)
 from messages import normalize_history_event
 from report_model import rendered_html
 
@@ -82,6 +86,72 @@ async def test_three_missed_quarters_publish_separate_snapshots_and_plans(event_
     assert all(
         value["completed"] == 1 for value in stats_all["anime"]["aggregates"]["by_quarter"].values()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [2, 12])
+async def test_drain_scans_source_prefix_once_and_resumes_applied_event(
+    event_time_env, journal_factory, monkeypatch, pending,
+):
+    journal = journal_factory(count=20, processed=20 - pending)
+    cur = storage.load_stats_current(strict=True)
+    cur["event_projection"]["journal_id"] = journal["journal_id"]
+    for seq, event in enumerate(journal["events"], 1):
+        quarter = (seq - 1) % 3 + 1
+        source = f"2026-{3 * (quarter - 1) + 1:02d}-02T00:00:00+00:00"
+        event.update(created_at=source, event_at=source, observed_at="2026-10-01T00:00:00+00:00")
+        if seq <= journal["processed_seq"] + 1:
+            project_event(cur, journal, seq)
+            cur["event_projection"]["applied_seq"] = seq
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    prefix_reads = []
+
+    class TracedEvents(list):
+        def __getitem__(self, key):
+            result = super().__getitem__(key)
+            if isinstance(key, slice):
+                prefix_reads.append(len(result))
+            return result
+
+    real_load = storage.load_event_journal
+
+    def load():
+        published = real_load()
+        published["events"] = TracedEvents(published["events"])
+        return published
+
+    monkeypatch.setattr("handlers.load_event_journal", load)
+    await handlers._drain_history_journal(AsyncMock())
+
+    # Полная recovery-сверка и индекс читают префикс до цикла; размер
+    # очереди не добавляет повторных проходов по всей исходной истории.
+    assert len(prefix_reads) <= 2
+    published = real_load()
+    projected = storage.load_stats_current(strict=True)
+    validate_event_time(projected, published)
+    assert published["processed_seq"] == projected["event_projection"]["applied_seq"] == 20
+    assert [len(projected["event_time"]["periods"][f"2026-Q{q}"]["events"]) for q in (1, 2, 3)] == [7, 7, 6]
+    assert handlers.send_to_all_chats.await_count == pending
+
+
+@pytest.mark.asyncio
+async def test_drain_rejects_inconsistent_applied_prefix_before_publication(event_time_env):
+    _append(2, "2026-01-01T00:00:00Z")
+    await handlers._drain_history_journal(AsyncMock())
+    cur = storage.load_stats_current(strict=True)
+    cur["events"][0]["score"] = 9
+    cur["event_time"]["periods"]["2026-Q1"]["events"][0]["score"] = 9
+    storage.save_stats_current(cur, strict=True)
+    _append(3, "2026-04-01T00:00:00Z")
+    before = _archive()
+    handlers.send_to_all_chats.reset_mock()
+
+    with pytest.raises(storage.EventJournalStateError):
+        await handlers._drain_history_journal(AsyncMock())
+
+    assert _archive() == before
+    handlers.send_to_all_chats.assert_not_awaited()
 
 
 @pytest.mark.asyncio

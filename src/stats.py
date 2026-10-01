@@ -1237,7 +1237,7 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
             # score события приоритетнее (актуально на момент завершения квартала)
             if event == "completed" and ev.get("score") is not None:
                 merged["score"] = ev["score"]
-            elif event == "completed" and ("title" in ev or EVENT_TIME_KEY in cur):
+            elif event == "completed" and "title" in ev:
                 # Явное снятие/отсутствие source-оценки не заменяется export.
                 merged["score"] = 0
             if "kind" in ev:

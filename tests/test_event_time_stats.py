@@ -12,6 +12,7 @@ from event_time_stats import (
     correction_periods,
     ensure_event_time,
     event_period,
+    index_event_periods,
     next_period,
     period_start,
     project_event,
@@ -246,3 +247,47 @@ def test_projection_cursor_damage_raises_typed_state_error(field, value):
         cur["event_projection"][field] = value
     with pytest.raises(EventTimeStateError, match="event_time_structure"):
         validate_event_time(cur)
+
+
+@pytest.mark.parametrize("value", ["missing", None, {}, False, ""])
+def test_current_events_damage_raises_typed_state_error(value):
+    cur = _current()
+    if value == "missing":
+        cur.pop("events")
+    else:
+        cur["events"] = value
+    with pytest.raises(EventTimeStateError):
+        validate_event_time(cur)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_indexed_projection_resumes_prefix_and_matches_source_order(reverse):
+    events = [
+        _event(1, "2026-04-01T00:00:00Z", score=3),
+        _event(9, "2026-04-04T00:00:00Z", "score_removed"),
+        _event(3, "2026-04-02T00:00:00Z", score=8),
+        _event(7, "2026-04-03T00:00:00Z", "score_changed", 6),
+        _event(8, "2026-07-01T00:00:00Z", score=9),
+        _event(4, None),
+        _event(5, "2027-01-01T00:00:01Z"),
+    ]
+    if reverse:
+        events[1:] = reversed(events[1:])
+    cur = _current(applied=1)
+    journal = {"events": events}
+    project_event(cur, journal, 2)
+    cur["event_projection"]["applied_seq"] = 2
+    reference = deepcopy(cur)
+    before = deepcopy(journal)
+    periods = index_event_periods(cur, journal)
+    for seq in range(3, len(events) + 1):
+        project_event(cur, journal, seq, period_events=periods)
+        project_event(reference, journal, seq)
+        cur["event_projection"]["applied_seq"] = seq
+        reference["event_projection"]["applied_seq"] = seq
+        validate_event_time(cur, journal)
+        assert cur == reference
+    assert journal == before
+    assert cur["events"][0]["score"] is None
+    assert cur["event_time"]["unknown"]["missing"] == 1
+    assert cur["event_time"]["unknown"]["future"] == 1
