@@ -1552,6 +1552,42 @@ def test_quarter_partial_plan_cannot_claim_full_report_completion(legacy):
         storage.validate_pending_quarter_delivery(cur)
 
 
+@pytest.mark.parametrize("revisions", [{"2026-Q1": True}, {"2026-Q1": -1}, {"2026-Q3": 1}, {}])
+def test_v3_quarter_plan_rejects_invalid_correction_revisions(revisions):
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        storage.new_quarter_delivery_plan("2026-Q1", "2026-Q2", [], event_time_revisions=revisions)
+
+
+def test_v3_revision_map_is_hash_bound_and_survives_downgrade():
+    plan = storage.new_quarter_delivery_plan("2026-Q1", "2026-Q2", [_rich_frozen_unit("first")], event_time_revisions={"2026-Q1": 3})
+    assert plan["version"] == 3
+    downgraded = storage.downgrade_quarter_delivery(plan, 0)
+    assert downgraded["event_time_revisions"] == plan["event_time_revisions"]
+    plan["event_time_revisions"]["2026-Q1"] = 4
+    with pytest.raises(storage.QuarterDeliveryStateError, match="plan_integrity"):
+        storage.validate_pending_quarter_delivery({"period": "2026-Q2", "pending_quarter_delivery": plan})
+
+
+def test_current_capacity_reserves_actual_final_acknowledgement(backup_env, monkeypatch):
+    cur = _quarter_state()
+    storage.save_stats_current(cur, strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    current_size = storage.json_publication_size(json.dumps(cur, ensure_ascii=False, indent=2))
+    completed = json.loads(json.dumps(cur))
+    completed["last_report_sent"] = completed["period"]
+    completed["pending_quarter_delivery"]["next_unit"] = len(completed["pending_quarter_delivery"]["report_messages"])
+    final_size = storage.json_publication_size(json.dumps(completed, ensure_ascii=False, indent=2))
+    assert final_size > current_size
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", current_size)
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        storage.save_stats_current(cur, strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", final_size)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_stats_current(completed, strict=True)
+    assert storage.load_stats_current(strict=True)["last_report_sent"] == cur["period"]
+
+
 def test_strict_quarter_write_failure_preserves_previous_file(backup_env, monkeypatch, caplog):
     storage.save_stats_current(_quarter_state(), strict=True)
     original = storage.STATS_CURRENT_FILE.read_bytes()

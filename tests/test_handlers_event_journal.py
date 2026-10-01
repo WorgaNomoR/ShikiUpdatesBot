@@ -21,7 +21,7 @@ from handlers import send_to_all_chats
 def _entry(history_id=2):
     return {
         "id": history_id, "description": "Просмотрено и оценено на 8",
-        "created_at": "2026-04-01T02:00:00+03:00",
+        "created_at": "2026-04-01T03:00:00+03:00",
         "target": {"id": history_id + 10, "kind": "tv", "name": f"Title {history_id}"},
     }
 
@@ -88,6 +88,12 @@ async def test_interrupted_binding_reuses_published_identity(history_env, monkey
             await _ready()
     journal = storage.load_event_journal()
     assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    recovered, cur = await handlers._drain_history_journal(AsyncMock())
+    assert recovered == journal
+    assert "event_projection" not in cur
+    assert "event_time" not in cur
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    handlers.fetch_history.assert_not_awaited()
     await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.load_event_journal()["journal_id"] == journal["journal_id"]
     assert storage.load_stats_current(strict=True)["event_projection"]["journal_id"] == journal["journal_id"]
@@ -222,13 +228,13 @@ async def test_crash_during_send_replays_without_reapplying_projection(history_e
     assert storage.load_event_journal()["processed_seq"] == 0
     assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 1
     applied = []
-    real_record = handlers.record_current_event
+    real_record = handlers.project_event
 
-    def record(cur, entry, *args):
-        applied.append(entry["id"])
-        return real_record(cur, entry, *args)
+    def record(cur, journal, seq):
+        applied.append(journal["events"][seq - 1]["history_id"])
+        return real_record(cur, journal, seq)
 
-    monkeypatch.setattr("handlers.record_current_event", record)
+    monkeypatch.setattr("handlers.project_event", record)
     monkeypatch.setattr("messages.classify_event", lambda _: pytest.fail("переклассификация локального payload"))
     monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
@@ -522,4 +528,6 @@ async def test_journal_reads_do_not_scale_with_recipients_or_retries(history_env
     assert [call.kwargs["chat_id"] for call in bot.send_message.await_args_list] == [10, 10, 20, 30, 10, 20, 30]
     assert reads == [0, 0, 1]
     assert storage.load_event_journal()["processed_seq"] == 2
-    assert len(storage.load_stats_current(strict=True)["events"]) == 2
+    projected = storage.load_stats_current(strict=True)
+    assert projected["events"] == []
+    assert len(projected["event_time"]["periods"]["2026-Q1"]["events"]) == 2

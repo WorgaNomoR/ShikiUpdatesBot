@@ -1857,14 +1857,14 @@ async def test_history_does_not_acknowledge_unreadable_quarter(backup_env, monke
     cur = _frozen_quarter()
     storage.save_stats_current(cur, strict=True)
     original = storage.STATS_CURRENT_FILE.read_bytes()
-    real_read = type(storage.STATS_CURRENT_FILE).read_text
+    real_read = type(storage.STATS_CURRENT_FILE).open
 
     def fail_current_read(path, *args, **kwargs):
         if path == storage.STATS_CURRENT_FILE:
             raise OSError("transient read failure")
         return real_read(path, *args, **kwargs)
 
-    monkeypatch.setattr(type(storage.STATS_CURRENT_FILE), "read_text", fail_current_read)
+    monkeypatch.setattr(type(storage.STATS_CURRENT_FILE), "open", fail_current_read)
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=history))
     saved = MagicMock()
     monkeypatch.setattr("handlers.save_seen_ids", saved)
@@ -1873,7 +1873,8 @@ async def test_history_does_not_acknowledge_unreadable_quarter(backup_env, monke
         await handlers.check_and_notify(AsyncMock(), seen, cur)
     assert seen == {1}
     saved.assert_not_called()
-    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    with real_read(storage.STATS_CURRENT_FILE, "rb") as stream:
+        assert stream.read() == original
 
 
 @pytest.mark.asyncio

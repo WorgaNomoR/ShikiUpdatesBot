@@ -9,6 +9,11 @@ from datetime import (
     timezone,
 )
 
+from event_time_stats import (
+    EventTimeStateError,
+    validate_event_time,
+)
+
 JOURNAL_MAX_BYTES = 8 * 1024 * 1024
 JOURNAL_WARN_BYTES = 6 * 1024 * 1024
 JOURNAL_CHECKPOINT_RESERVE = 4096
@@ -193,6 +198,10 @@ def validate_recovery_set(journal: dict, cur: dict) -> None:
         or not completed <= projection["applied_seq"] <= min(completed + 1, len(journal["events"]))
     ):
         raise EventJournalStateError("recovery_mismatch")
+    try:
+        validate_event_time(cur, journal)
+    except EventTimeStateError:
+        raise EventJournalStateError("event_time_recovery") from None
 
 
 def journal_json(journal: dict) -> str:

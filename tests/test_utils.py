@@ -333,3 +333,12 @@ def test_normalize_pure_cyrillic_unchanged():
 
 def test_normalize_empty_string():
     assert _normalize_homoglyphs("") == ""
+
+
+def test_calendar_helpers_convert_timezone_offsets_before_selecting_quarter():
+    before = datetime.fromisoformat("2026-04-01T02:59:59+03:00")
+    after = datetime.fromisoformat("2026-03-31T20:00:00-04:00")
+    assert current_quarter(before) == "2026-Q1"
+    assert quarter_start(before) == datetime(2026, 1, 1)
+    assert current_quarter(after) == "2026-Q2"
+    assert quarter_start(after) == datetime(2026, 4, 1)

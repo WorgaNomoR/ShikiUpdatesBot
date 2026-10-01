@@ -2219,6 +2219,48 @@ async def test_fact_snapshot_is_unchanged_when_restore_publication_rolls_back(
     assert "current-fact" in (backup_env / "facts.json").read_text(encoding="utf-8")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "payload", "revision_binding", "missing_state"])
+async def test_event_time_recovery_import_preserves_frozen_revisions_or_rejects_candidate(backup_env, journal_factory, damage):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+        report_revisions,
+        rotate_event_time,
+    )
+
+    journal = journal_factory(count=2, processed=1)
+    cur = _journal_current(journal, applied=0)
+    ensure_event_time(cur)
+    project_event(cur, journal, 1)
+    cur["event_projection"]["applied_seq"] = 1
+    fresh = storage._empty_stats_current("2026-Q3")
+    fresh["event_projection"] = dict(cur["event_projection"])
+    plan = storage.new_quarter_delivery_plan("2026-Q2", "2026-Q3", [], event_time_revisions=report_revisions(cur))
+    fresh["pending_quarter_delivery"] = plan
+    rotate_event_time(cur, fresh, plan)
+    original = b'{"period":"2026-Q2","events":[]}'
+    storage.STATS_CURRENT_FILE.write_bytes(original)
+    before_generation = storage.restorable_restore_generation()
+    if damage == "payload":
+        fresh["event_time"]["periods"]["2026-Q1"]["events"][0]["score"] = 9
+    elif damage == "revision_binding":
+        fresh["event_time"]["report_ack"]["revisions"]["2026-Q1"] = 0
+    elif damage == "missing_state":
+        fresh.pop("event_time")
+    archive = _zip_bytes({"event_journal.json": json.dumps(journal), "stats_current.json": json.dumps(fresh)})
+    if damage is not None:
+        with pytest.raises(ValueError):
+            await backup.restore_backup_zip(archive)
+        assert storage.STATS_CURRENT_FILE.read_bytes() == original
+        assert storage.restorable_restore_generation() == before_generation
+        assert not storage.EVENT_JOURNAL_FILE.exists()
+    else:
+        await backup.restore_backup_zip(archive)
+        assert storage.load_stats_current(strict=True) == fresh
+        assert storage.load_event_journal() == journal
+
+
 def _journal_current(journal, applied=None):
     cur = storage._empty_stats_current("2026-Q2")
     cur["event_projection"] = {
@@ -2370,8 +2412,9 @@ async def test_legacy_quarter_restore_sets_baseline_and_preserves_unfinished_wor
     await handlers._drain_history_journal(AsyncMock())
     sent.assert_awaited_once()
     assert storage.load_event_journal()["processed_seq"] == 2
-    assert len(storage.load_stats_current(strict=True)["events"]) == 2
-    assert storage.load_stats_current(strict=True)["events"][1]["id"] == "12"
+    projected = storage.load_stats_current(strict=True)
+    assert projected["events"] == legacy["events"]
+    assert projected["event_time"]["periods"]["2026-Q1"]["events"][0]["id"] == "12"
 
 
 @pytest.mark.asyncio

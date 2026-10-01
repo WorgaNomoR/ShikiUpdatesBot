@@ -411,6 +411,7 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
     entry = {
         "id": 125,
         "description": "Отменена оценка",
+        "created_at": "2026-04-02T00:00:00+00:00",
         "target": {"id": 79, "type": "Anime", "kind": "tv"},
     }
     _patch_history(monkeypatch, [entry])
@@ -446,6 +447,7 @@ async def test_score_set_notifies_and_updates_completed_without_duplicate(monkey
     entry = {
         "id": 123,
         "description": "Оценено на <b>8</b>",
+        "created_at": "2026-04-02T00:00:00+00:00",
         "target": {"id": 77, "type": "Anime", "kind": "tv"},
     }
     _patch_history(monkeypatch, [entry])
@@ -476,11 +478,13 @@ async def test_score_change_updates_completion_through_handler(monkeypatch):
         {
             "id": 124,
             "description": "Изменена оценка c <b>3</b> на <b>9</b>",
+            "created_at": "2026-04-02T00:00:00+00:00",
             "target": {"id": 77, "type": "Anime", "kind": "tv"},
         },
         {
             "id": 123,
             "description": "Просмотрено и оценено на <b>3</b>",
+            "created_at": "2026-04-01T00:00:00+00:00",
             "target": {"id": 77, "type": "Anime", "kind": "tv"},
         },
     ]
@@ -508,6 +512,7 @@ async def test_stale_history_writer_rebases_on_imported_current_state(
     entry = {
         "id": 123,
         "description": "Просмотрено",
+        "created_at": "2026-04-01T00:00:00+00:00",
         "target": {"id": 77, "type": "Anime", "kind": "tv"},
     }
     _patch_history(monkeypatch, [entry])

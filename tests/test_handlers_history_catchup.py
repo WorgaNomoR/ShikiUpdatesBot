@@ -81,7 +81,9 @@ async def test_long_history_survives_restart_and_only_complete_batch_is_processe
     journal = await _finish(calls)
     assert [event["history_id"] for event in journal["events"]] == list(range(2, 34))
     assert journal["processed_seq"] == 32
-    assert len(storage.load_stats_current(strict=True)["events"]) == 32
+    projected = storage.load_stats_current(strict=True)
+    assert projected["events"] == []
+    assert len(projected["event_time"]["periods"]["2026-Q1"]["events"]) == 32
     assert handlers.send_to_all_chats.await_count == 32
     await _cycle(calls)
     assert handlers.send_to_all_chats.await_count == 32
@@ -246,6 +248,8 @@ async def test_v1_is_read_without_replay_and_upgrades_on_acquisition(acquisition
     storage.save_event_journal(journal)
     cur = storage.load_stats_current(strict=True)
     cur["event_projection"].update(journal_id=journal["journal_id"], applied_seq=1)
+    # Старый бинарник ещё не мог записать source-time authority.
+    cur.pop("event_time")
     storage.save_stats_current(cur, strict=True)
     _source(monkeypatch)
     await handlers.check_and_notify(AsyncMock(), set(), None)
