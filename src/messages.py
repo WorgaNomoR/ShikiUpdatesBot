@@ -766,8 +766,13 @@ def classify_event(description: str) -> str:
 
 def normalize_history_event(entry: dict, observed_at: str) -> dict:
     """Зафиксировать семантику истории без оценки сообщества target.score."""
-    media, kind = get_media_info(entry)
-    target = entry.get("target") or {}
+    target = entry.get("target")
+    target = dict(target) if isinstance(target, dict) else {}
+    # Неверные типы внешних метаданных не должны блокировать весь батч.
+    for field in ("type", "kind", "name", "russian", "url"):
+        value = target.get(field)
+        target[field] = value if isinstance(value, str) else ""
+    media, kind = get_media_info({"target": target})
     description = entry.get("description") or ""
     description = description if isinstance(description, str) else str(description)
     event_type = classify_event(description)

@@ -141,6 +141,35 @@ async def test_overlap_conflicts_keep_first_semantics(history_env, monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_malformed_metadata_is_admitted_once_without_blocking_batch(history_env, monkeypatch):
+    await _ready()
+    malformed = _entry(2)
+    malformed["target"] = "unavailable"
+    incomplete_title = _entry(3)
+    incomplete_title["target"].update(name=123, russian=["bad"], url={"bad": "url"})
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(4), malformed, incomplete_title]))
+
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+
+    journal = storage.load_event_journal()
+    assert [event["history_id"] for event in journal["events"]] == [2, 3, 4]
+    assert journal["processed_seq"] == 3
+    assert journal["events"][0]["relevant"] is False
+    assert journal["events"][1]["title"] == {"name": "???", "russian": "", "url": ""}
+    assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 3
+    assert len(storage.load_stats_current(strict=True)["events"]) == 2
+    assert handlers.send_to_all_chats.await_count == 2
+    assert "???" in handlers.send_to_all_chats.await_args_list[0].args[1]
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(2), _entry(3), _entry(4)]))
+
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+    assert handlers.send_to_all_chats.await_count == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["admission", "projection", "checkpoint"])
 async def test_failed_publication_preserves_pending_and_exact_bytes(history_env, monkeypatch, boundary):
     await _ready()

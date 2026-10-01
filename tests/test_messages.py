@@ -4,6 +4,7 @@ import json
 import random
 import re
 import time
+from copy import deepcopy
 from html.parser import HTMLParser
 from pathlib import Path
 from string import Formatter
@@ -2097,3 +2098,44 @@ def test_normalization_keeps_domain_and_exclusions(target, media, relevant):
     assert event["kind"] == target.get("kind", "")
     assert event["relevant"] is relevant
     assert set(event["title"]) == {"name", "russian", "url"}
+
+
+@pytest.mark.parametrize("target", ["bad", 123, True, ["bad"]])
+def test_normalization_treats_malformed_target_as_empty(target):
+    entry = {"id": 7, "description": "Просмотрено", "target": target}
+    before = deepcopy(entry)
+
+    event = messages.normalize_history_event(entry, "2026-04-02T00:00:00+00:00")
+
+    assert event["history_id"] == 7
+    assert event["target_id"] == ""
+    assert event["media"] == "anime"
+    assert event["kind"] == ""
+    assert event["relevant"] is False
+    assert event["title"] == {"name": "???", "russian": "", "url": ""}
+    assert entry == before
+
+
+@pytest.mark.parametrize("field", ["type", "kind", "name", "russian", "url"])
+@pytest.mark.parametrize("value", [123, True, ["bad"], {"bad": "data"}])
+def test_normalization_defaults_malformed_target_fields(field, value):
+    target = {
+        "id": 42, "type": "Anime", "kind": "tv", "name": "A <&>",
+        "russian": "Название <&>", "url": '/animes/42?x="a"&b=2',
+    }
+    expected_title = {key: target[key] for key in ("name", "russian", "url")}
+    if field in expected_title:
+        expected_title[field] = "???" if field == "name" else ""
+    target[field] = value
+    entry = {"id": 7, "description": "Просмотрено и оценено на 8", "target": target}
+    before = deepcopy(entry)
+
+    event = messages.normalize_history_event(entry, "2026-04-02T00:00:00+00:00")
+
+    assert event["history_id"] == 7
+    assert event["target_id"] == "42"
+    assert event["media"] == "anime"
+    assert event["kind"] == ("" if field == "kind" else "tv")
+    assert event["relevant"] is (field != "kind")
+    assert event["title"] == expected_title
+    assert entry == before
