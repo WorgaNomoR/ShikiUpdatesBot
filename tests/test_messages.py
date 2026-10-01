@@ -2034,3 +2034,66 @@ def test_final_render_uses_explicit_gender_for_latin_name(
     text = build_message(make_entry("добавлено в список", url=""))
 
     assert f"Alice {expected_word}" in text
+
+
+@pytest.mark.parametrize("source,utc,quality", [
+    ("2026-04-01T02:00:00+03:00", "2026-03-31T23:00:00+00:00", "aware"),
+    ("2026-03-31T22:00:00-02:00", "2026-04-01T00:00:00+00:00", "aware"),
+    ("2026-04-01T00:00:00Z", "2026-04-01T00:00:00+00:00", "aware"),
+    ("2026-04-01T00:00:00", None, "naive"),
+    ("2026-04-01", None, "naive"),
+    ("bad", None, "invalid"),
+    (123, None, "invalid"),
+    (None, None, "missing"),
+    ("", None, "missing"),
+])
+def test_normalized_history_preserves_source_time(source, utc, quality):
+    from messages import normalize_history_event
+
+    event = normalize_history_event({"id": 7, "created_at": source}, "2026-04-02T00:00:00+00:00")
+    assert event["created_at"] == source
+    assert event["event_at"] == utc
+    assert event["time_quality"] == quality
+    assert event["observed_at"] == "2026-04-02T00:00:00+00:00"
+
+
+@pytest.mark.parametrize("description", [
+    "Добавлено в список", "Смотрю", "Пересматриваю", "Отложено", "Брошено",
+    "Просмотрено и оценено на 8", "Оценено на 7", "Изменена оценка с 7 на 9",
+    "Отменена оценка", "Просмотрено 5 эпизодов", "Неизвестное действие",
+])
+def test_normalization_delegates_classification_and_rendering(description, monkeypatch):
+    import messages
+
+    entry = {
+        "id": 17, "description": description,
+        "target": {"id": 18, "kind": "tv", "name": "A & B", "url": '/animes/18?q="x"&b=2', "score": 9.7},
+    }
+    event = messages.normalize_history_event(entry, "2026-04-02T00:00:00+00:00")
+    assert event["event_type"] == messages.classify_event(description)
+    monkeypatch.setattr(messages.random, "choice", lambda choices: choices[0])
+    expected = messages.build_message(entry)
+    monkeypatch.setattr("messages.classify_event", lambda _: pytest.fail("повторная классификация"))
+    assert messages.build_message(messages.history_entry_from_event(event), normalized=event) == expected
+    if description == "Смотрю":
+        assert event["score"] is None
+    if description == "Изменена оценка с 7 на 9":
+        assert event["score_change"] == [7, 9]
+        assert event["score"] == 9
+
+
+@pytest.mark.parametrize("target,media,relevant", [
+    ({"kind": "light_novel", "name": "Book"}, "manga", True),
+    ({"type": "Manga", "kind": "ranobe"}, "manga", True),
+    ({"kind": "one_shot"}, "manga", False),
+    ({"kind": "special"}, "anime", False),
+    ({}, "anime", False),
+])
+def test_normalization_keeps_domain_and_exclusions(target, media, relevant):
+    from messages import normalize_history_event
+
+    event = normalize_history_event({"id": 7, "target": target}, "2026-04-02T00:00:00+00:00")
+    assert event["media"] == media
+    assert event["kind"] == target.get("kind", "")
+    assert event["relevant"] is relevant
+    assert set(event["title"]) == {"name", "russian", "url"}

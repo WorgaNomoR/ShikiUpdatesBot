@@ -21,6 +21,7 @@ from config import (
     DISPLAY_NAME_GENDER,
     SHIKI_BASE_URL,
 )
+from event_journal_schema import source_time
 from name_grammar import (
     build_display_name_context,
     format_name_template,
@@ -42,6 +43,7 @@ from rich_message_schema import is_safe_https_media_url
 from shiki_api import (
     RANOBE_KINDS,
     get_media_info,
+    is_relevant,
 )
 from utils import (
     _fmt_dt_short,
@@ -762,7 +764,57 @@ def classify_event(description: str) -> str:
 #  ПОСТРОЕНИЕ УВЕДОМЛЕНИЙ
 # ═══════════════════════════════════════════════════════════════════
 
-def build_message(entry: dict) -> str:
+def normalize_history_event(entry: dict, observed_at: str) -> dict:
+    """Зафиксировать семантику истории без оценки сообщества target.score."""
+    media, kind = get_media_info(entry)
+    target = entry.get("target") or {}
+    description = entry.get("description") or ""
+    description = description if isinstance(description, str) else str(description)
+    event_type = classify_event(description)
+    change = extract_score_change(description) if event_type == "score_changed" else None
+    score = (
+        change[1] if change else None
+    ) if event_type == "score_changed" else (
+        extract_score(description) if event_type in {"completed", "score_set"} else None
+    )
+    created_at = entry.get("created_at")
+    event_at, quality = source_time(created_at)
+    return {
+        "normalization_version": 1,
+        "history_id": entry["id"],
+        "created_at": created_at,
+        "event_at": event_at,
+        "observed_at": observed_at,
+        "time_quality": quality,
+        "event_type": event_type,
+        "media": media,
+        "target_id": str(target.get("id") or ""),
+        "kind": kind,
+        "relevant": is_relevant(media, kind),
+        "score": score,
+        "score_change": list(change) if change else None,
+        "description": description,
+        "title": {
+            "name": target.get("name") or "???",
+            "russian": target.get("russian") or "",
+            "url": _rel_url(target.get("url")),
+        },
+    }
+
+
+def history_entry_from_event(event: dict) -> dict:
+    """Минимальный payload для существующей квартальной проекции и renderer."""
+    return {
+        "id": event["history_id"],
+        "description": event["description"],
+        "target": {
+            **event["title"], "id": event["target_id"],
+            "type": event["media"], "kind": event["kind"],
+        },
+    }
+
+
+def build_message(entry: dict, *, normalized: dict | None = None) -> str:
     """
     Формируем итоговое сообщение для одной записи истории.
     entry — объект из API /api/users/{user}/history.
@@ -774,7 +826,10 @@ def build_message(entry: dict) -> str:
     """
     # Ранобэ остаётся мангой для фильтрации и статистики, но получает собственный
     # презентационный банк. Остальные виды сохраняют доменный media_type.
-    media_type, kind = get_media_info(entry)
+    media_type, kind = (
+        (normalized["media"], normalized["kind"])
+        if normalized is not None else get_media_info(entry)
+    )
     bank_key = "ranobe" if kind in RANOBE_KINDS else media_type
     bank = MESSAGES[bank_key]
 
@@ -794,7 +849,7 @@ def build_message(entry: dict) -> str:
     labeled_title = _label_media_title(title, bank_key)
 
     description = entry.get("description", "") or ""
-    event_type = classify_event(description)
+    event_type = normalized["event_type"] if normalized is not None else classify_event(description)
 
     if event_type in ("ignored", "score_removed"):
         return ""
@@ -802,7 +857,7 @@ def build_message(entry: dict) -> str:
     score = None
 
     if event_type == "score_changed":
-        change = extract_score_change(description)
+        change = normalized["score_change"] if normalized is not None else extract_score_change(description)
         old_score, new_score = change if change else (None, None)
         if (
             change is None
@@ -823,7 +878,7 @@ def build_message(entry: dict) -> str:
             new=new_score if new_score is not None else "?",
         )
     elif event_type == "score_set":
-        score = extract_score(description)
+        score = normalized["score"] if normalized is not None else extract_score(description)
         template = random.choice(MESSAGES["score_set"])  # nosec B311  (случайный выбор шаблона сообщения — не крипта)
         text = format_name_template(
             template,
@@ -842,7 +897,7 @@ def build_message(entry: dict) -> str:
         )
     elif event_type == "completed":
         # Завершение — уточняем по оценке
-        score = extract_score(description)
+        score = normalized["score"] if normalized is not None else extract_score(description)
         if score is None:
             key = "completed_no_score"
         elif score <= 3:

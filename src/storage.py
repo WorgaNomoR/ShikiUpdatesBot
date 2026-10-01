@@ -24,16 +24,26 @@ from typing import TypeVar
 
 from config import (
     BLOCKED_USERS_FILE,
+    EVENT_JOURNAL_FILE,
     KNOWN_USERS_FILE,
     OWNER_ID,
     SEEN_FAVS_FILE,
     SEEN_IDS_FILE,
+    SHIKI_USER,
     STATS_ALL_FILE,
     STATS_CURRENT_FILE,
     SUBS_FILE,
     UPDATE_STATE_FILE,
     USER_ALERTS_FILE,
     log,
+)
+from event_journal_schema import (
+    JOURNAL_CHECKPOINT_RESERVE,
+    JOURNAL_MAX_BYTES,
+    EventJournalStateError,
+    journal_json,
+    parse_event_journal,
+    validate_projection,
 )
 from report_plan import (
     FrozenReportPlanError,
@@ -147,6 +157,44 @@ def save_seen_ids(seen_ids: set[int]) -> None:
         SEEN_IDS_FILE,
         json.dumps({"seen_ids": list(seen_ids)}, ensure_ascii=False, indent=2),
     )
+
+
+def load_legacy_seen_ids() -> set[int] | None:
+    """Отличить валидный пустой baseline от отсутствующего/повреждённого."""
+    try:
+        data = json.loads(SEEN_IDS_FILE.read_text(encoding="utf-8"))
+        values = data.get("seen_ids", []) if isinstance(data, dict) else None
+        if not isinstance(values, list) or any(type(value) is not int for value in values):
+            return None
+        return set(values)
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def load_event_journal() -> dict | None:
+    """Отсутствие допустимо только до первой привязки; ошибки не сбрасывают файл."""
+    try:
+        with EVENT_JOURNAL_FILE.open("rb") as handle:
+            raw = handle.read(JOURNAL_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise EventJournalStateError("journal_read") from None
+    return parse_event_journal(raw, profile=SHIKI_USER)
+
+
+def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
+    """Публикация батча оставляет резерв для последующих checkpoint."""
+    payload = journal_json(journal)
+    size = len(payload.encode("utf-8"))
+    limit = JOURNAL_MAX_BYTES - JOURNAL_CHECKPOINT_RESERVE if admitting else JOURNAL_MAX_BYTES
+    if size > limit:
+        raise EventJournalStateError("journal_capacity")
+    try:
+        _atomic_write(EVENT_JOURNAL_FILE, payload)
+    except Exception:
+        raise EventJournalStateError("journal_write") from None
+    return size
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1361,6 +1409,8 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
             if strict:
                 validate_quarter_period(data["period"])
                 validate_pending_quarter_delivery(data)
+                if "event_projection" in data:
+                    validate_projection(data["event_projection"])
             # Бэкофилл для файлов, созданных до появления поля tracking_since
             if "tracking_since" not in data:
                 data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
@@ -1370,7 +1420,7 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
             raise QuarterDeliveryStateError("current_structure")
         log.warning("load_stats_current: неожиданная структура, сбрасываем.")
     except FileNotFoundError:
-        if strict and not initialize_missing:
+        if strict and (not initialize_missing or EVENT_JOURNAL_FILE.exists()):
             raise QuarterDeliveryStateError("current_missing") from None
     except QuarterDeliveryStateError:
         raise
@@ -1392,6 +1442,8 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
 def save_stats_current(data: dict, *, strict: bool = False) -> None:
     """Атомарно записать состояние; strict не скрывает ошибку acknowledgement."""
     try:
+        if strict and "event_projection" in data:
+            validate_projection(data["event_projection"])
         _atomic_write(STATS_CURRENT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception as e:
         if strict:

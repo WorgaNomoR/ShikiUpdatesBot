@@ -16,10 +16,14 @@ import io
 import math
 import re
 import time
+import weakref
+from copy import deepcopy
+from datetime import timezone
 from urllib.parse import (
     quote,
     urlsplit,
 )
+from uuid import uuid4
 
 import aiohttp
 from aiogram import Bot
@@ -73,6 +77,13 @@ from config import (
     SHIKI_BASE_URL,
     SHIKI_USER,
     log,
+)
+from event_journal_schema import (
+    JOURNAL_WARN_BYTES,
+    PROJECTION_KEY,
+    EventJournalStateError,
+    journal_json,
+    validate_recovery_set,
 )
 from fact_bank import (
     FACT_BANK_MAX_BYTES,
@@ -140,10 +151,8 @@ from messages import (
     build_message,
     build_startup_snapshot,
     build_status_report,
-    classify_event,
-    clean_description,
-    extract_score,
-    extract_score_change,
+    history_entry_from_event,
+    normalize_history_event,
 )
 from report_delivery import (
     deliver_frozen_report,
@@ -173,8 +182,6 @@ from shiki_api import (
     fetch_current_rates,
     fetch_favourites,
     fetch_history,
-    get_media_info,
-    is_relevant,
 )
 from stats import (
     PICK_CATEGORY_ANIME,
@@ -205,6 +212,8 @@ from storage import (
     add_blocked_user,
     downgrade_quarter_delivery,
     list_blocked_users,
+    load_event_journal,
+    load_legacy_seen_ids,
     load_seen_favourites,
     load_seen_ids,
     load_stats_all,
@@ -220,6 +229,7 @@ from storage import (
     remove_blocked_user,
     restorable_restore_generation,
     restorable_state_transaction,
+    save_event_journal,
     save_seen_favourites,
     save_seen_ids,
     save_stats_all,
@@ -243,6 +253,7 @@ from utils import (
     _parse_iso_utc,
     _rel_url,
     _subscriber_link,
+    _utcnow,
     current_quarter,
     h,
     previous_quarter,
@@ -603,7 +614,13 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
 async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
     """Не сбрасывать недоступное состояние и сообщить владельцу о проблеме."""
     try:
+        await _drain_history_journal(bot)
         return await _rotate_quarter_if_needed(bot, cur, stats_all, resync)
+    except _HistoryAttemptChanged:
+        return await _load_stats_current_transactional()
+    except EventJournalStateError:
+        await _journal_diagnostic(bot)
+        return cur
     except QuarterDeliveryStateError as error:
         await _quarter_state_diagnostic(bot, error)
         return cur
@@ -647,6 +664,11 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
     for attempt in range(1, _QUARTER_ROTATION_ATTEMPTS + 1):
         async with restorable_state_transaction():
             cur = load_stats_current(strict=True)
+            if PROJECTION_KEY in cur:
+                journal, cur = _history_state()
+                if journal["processed_seq"] < len(journal["events"]):
+                    return cur
+            expected_generation = restorable_restore_generation()
             if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") == now_period:
                 return cur
 
@@ -655,6 +677,8 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
                 # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
                 log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
                 fresh = _empty_stats_current(now_period)
+                if PROJECTION_KEY in cur:
+                    fresh[PROJECTION_KEY] = deepcopy(cur[PROJECTION_KEY])
                 fresh["last_report_sent"] = now_period
                 save_stats_current(fresh, strict=True)
                 return fresh
@@ -690,6 +714,12 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
 
         async with restorable_state_transaction():
             cur = load_stats_current(strict=True)
+            if restorable_restore_generation() != expected_generation:
+                return cur
+            if PROJECTION_KEY in cur:
+                journal, cur = _history_state()
+                if journal["processed_seq"] < len(journal["events"]):
+                    return cur
             if cur != expected_cur:
                 # Новое квартальное событие могло успеть опубликоваться, пока
                 # renderer работал без lock. Перестраиваем модель без потери.
@@ -712,6 +742,8 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
                 log.error("rotate_quarter: обновление by_quarter: %s", e)
 
             fresh = _empty_stats_current(now_period)
+            if PROJECTION_KEY in cur:
+                fresh[PROJECTION_KEY] = deepcopy(cur[PROJECTION_KEY])
             fresh[_PENDING_QUARTER_DELIVERY] = new_quarter_delivery_plan(
                 old_period,
                 now_period,
@@ -2047,11 +2079,13 @@ async def check_and_notify_favourites(
     return seen, found_new
 
 
-async def _unsubscribe_blocked(to_remove: list[int]) -> None:
+async def _unsubscribe_blocked(to_remove: list[int], *, generation: int | None = None) -> None:
     """Удаляет заблокировавших из subs и сохраняет актуальный список."""
     if not to_remove:
         return
     async with restorable_state_transaction():
+        if generation is not None and restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
         subs = load_subscribers()
         removed = 0
         for cid in to_remove:
@@ -2062,7 +2096,7 @@ async def _unsubscribe_blocked(to_remove: list[int]) -> None:
     log.info("Отписано %d пользователей, заблокировавших бота.", removed)
 
 
-async def send_to_all_chats(bot: Bot, text: str) -> None:
+async def send_to_all_chats(bot: Bot, text: str, *, before_send=None, generation: int | None = None) -> None:
     """
     Отправляем одно сообщение всем подписчикам.
     Список берём из файла каждый раз — чтобы подхватывать новых подписчиков
@@ -2080,14 +2114,18 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
 
     for chat_id, name in subs.items():
         try:
-            await send_with_retry(
-                lambda: bot.send_message(
+            async def send():
+                if before_send is not None:
+                    await before_send()
+                return await bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     parse_mode=ParseMode.HTML,
                 )
-            )
+            await send_with_retry(send)
             log.info("  → Отправлено подписчику %s (chat_id=%d)", name, chat_id)
+        except (_HistoryAttemptChanged, EventJournalStateError, QuarterDeliveryStateError):
+            raise
         except Exception as e:
             if _is_blocked_error(e):
                 log.warning("  ✗ %s (chat_id=%d) заблокировал бота — отписываем.", name, chat_id)
@@ -2097,7 +2135,7 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
         # Небольшая пауза между отправками — не триггерим flood control
         await asyncio.sleep(0.3)
 
-    await _unsubscribe_blocked(to_remove)
+    await _unsubscribe_blocked(to_remove, generation=generation)
 
 
 async def _fetch_history_catchup(
@@ -2105,7 +2143,7 @@ async def _fetch_history_catchup(
     seen_ids: set[int],
 ) -> list[dict] | None:
     """Собирает пропущенную историю до известного ID или конца выдачи."""
-    entries_by_id: dict[int, dict] = {}
+    collected: list[dict] = []
 
     for page in range(1, _HISTORY_CATCHUP_MAX_PAGES + 1):
         page_entries = await fetch_history(session, page=page)
@@ -2118,8 +2156,9 @@ async def _fetch_history_catchup(
 
         try:
             page_ids = {entry["id"] for entry in page_entries}
-            for entry in page_entries:
-                entries_by_id.setdefault(entry["id"], entry)
+            if any(type(entry["id"]) is not int for entry in page_entries):
+                raise TypeError("history_id")
+            collected.extend(page_entries)
         except (KeyError, TypeError) as e:
             log.warning(
                 "История: некорректная страница %d (%s), catch-up отменён без обновления seen_ids.",
@@ -2129,12 +2168,12 @@ async def _fetch_history_catchup(
             return None
 
         if page_ids & seen_ids:
-            return list(entries_by_id.values())
+            return collected
 
         # API Shikimori читает limit + 1 запись как признак следующей страницы.
         # При limit=50 короткая выдача содержит меньше 51 записи и означает конец.
         if len(page_entries) < HISTORY_PAGE_LIMIT + 1:
-            return list(entries_by_id.values())
+            return collected
 
     log.warning(
         "История: за %d страниц не найдена известная граница; "
@@ -2144,122 +2183,253 @@ async def _fetch_history_catchup(
     return None
 
 
-async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict | None) -> tuple[set[int], dict]:
-    """
-    Главная функция проверки:
-    1. Загружаем историю с Shikimori
-    2. Фильтруем новые записи (которых нет в seen_ids)
-    3. Для каждой новой — формируем сообщение и шлём во все чаты
-    4. Обновляем seen_ids и возвращаем его
-    5. Параллельно фиксируем значимые события в cur (статистика квартала)
-    """
-    cur = await _load_stats_current_transactional()
-    async with aiohttp.ClientSession() as session:
-        if seen_ids:
-            entries = await _fetch_history_catchup(session, seen_ids)
-        else:
-            # Первый baseline намеренно ограничен одной страницей.
-            entries = await fetch_history(session)
+class _HistoryAttemptChanged(RuntimeError):
+    """Restore или другая попытка отменили текущий lease истории."""
 
-    if entries is None:
-        log.info("Запрос истории не удался — пропускаем цикл.")
-        return seen_ids, await _load_stats_current_transactional()
 
-    # baseline пуст (первый запуск либо стартовая инициализация не прошла
-    # из-за 429/сети) — молча фиксируем текущую историю как baseline и
-    # НИЧЕГО не шлём. Провал старта становится безобидной доинициализацией.
-    if not seen_ids:
-        cur = await _load_stats_current_transactional()
-        seen_ids = {e["id"] for e in entries}
-        save_seen_ids(seen_ids)
-        log.info("История: baseline инициализирован в цикле (%d ID), без отправки.", len(seen_ids))
-        return seen_ids, cur
+_last_journal_notice_at: float | None = None
+_last_journal_capacity_notice_at: float | None = None
+_history_processing_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_JOURNAL_STATE_NOTICE = (
+    "⚠️ Сохранённая история временно недоступна. Новые события не обрабатываются. "
+    "Данные сохранены; восстановление доступно через /backup."
+)
+_JOURNAL_CAPACITY_NOTICE = (
+    "⚠️ Сохранённая история приближается к пределу 8 МиБ. Сделай резервную копию "
+    "через /backup. При заполнении новые события будут отложены; сохранённые не удаляются."
+)
 
-    new_entries = [e for e in entries if e["id"] not in seen_ids]
 
-    if not new_entries:
-        log.info("Новых записей нет.")
-        return seen_ids, await _load_stats_current_transactional()
-
-    log.info("Найдено новых записей: %d", len(new_entries))
-
-    # Сортируем по ID: от старых к новым — хронологический порядок сообщений
-    new_entries.sort(key=lambda e: e["id"])
-
-    # Не менять переданный baseline, пока квартальная дельта не опубликована.
-    seen_ids = seen_ids.copy()
-
-    state_updates: list[tuple[dict, str, str, int | None]] = []
-    for entry in new_entries:
-        entry_id   = entry["id"]
-        media_type, kind = get_media_info(entry)
-
-        # ── Фильтр по виду (kind) ──────────────────────────────────────
-        # ID запоминаем в любом случае — чтобы не проверять повторно.
-        # Сообщение шлём только если вид «значимый».
-        seen_ids.add(entry_id)
-
-        if not is_relevant(media_type, kind):
-            log.info(
-                "Пропускаем entry id=%d (%s / kind=%s) — не входит в список значимых.",
-                entry_id, media_type, kind or "unknown",
-            )
-            continue
-        # ──────────────────────────────────────────────────────────────
-
-        log.info(
-            "Обрабатываем entry id=%d (%s / kind=%s): %s",
-            entry_id, media_type, kind, entry.get("description", ""),
+async def _journal_diagnostic(bot: Bot, *, capacity: bool = False) -> None:
+    """Статическая owner-only диагностика без содержимого журнала."""
+    global _last_journal_notice_at, _last_journal_capacity_notice_at
+    now = time.monotonic()
+    previous = _last_journal_capacity_notice_at if capacity else _last_journal_notice_at
+    if previous is not None and now - previous < ERROR_NOTIFY_INTERVAL:
+        return
+    if capacity:
+        _last_journal_capacity_notice_at = now
+    else:
+        _last_journal_notice_at = now
+    try:
+        await bot.send_message(
+            chat_id=OWNER_ID,
+            text=_JOURNAL_CAPACITY_NOTICE if capacity else _JOURNAL_STATE_NOTICE,
         )
+    except Exception:
+        log.warning("История: диагностика владельцу не доставлена.")
 
-        # Готовим дельту квартальной статистики независимо от результата отправки.
-        description = entry.get("description", "") or ""
-        event_type  = classify_event(description)
-        if event_type == "ignored":
-            log.info(
-                "Пропускаем служебную запись истории entry id=%d: %r",
-                entry_id,
-                clean_description(description),
-            )
-            continue
-        if event_type == "score_removed":
-            state_updates.append((entry, event_type, media_type, None))
-            log.info(
-                "Отмена оценки учтена без уведомления entry id=%d: %r",
-                entry_id,
-                clean_description(description),
-            )
-            continue
-        if event_type == "unknown":
-            log.warning(
-                "Неизвестное описание истории entry id=%d: %r",
-                entry_id,
-                clean_description(description),
-            )
-        else:
-            if event_type in ("completed", "score_set"):
-                score = extract_score(description)
-            elif event_type == "score_changed":
-                chg = extract_score_change(description)
-                score = chg[1] if chg else None
-            else:
-                score = None
-            state_updates.append((entry, event_type, media_type, score))
 
-        text = build_message(entry)
-        await send_to_all_chats(bot, text)
+def _journal_seen(journal: dict) -> set[int]:
+    return set(journal["baseline_ids"]) | {event["history_id"] for event in journal["events"]}
 
-        # Пауза между разными событиями — не спамим Telegram
-        await asyncio.sleep(1)
 
+def _history_state() -> tuple[dict | None, dict]:
+    """Вызывается под lock; отсутствие привязанного файла не есть первый запуск."""
+    journal = load_event_journal()
+    cur = load_stats_current(strict=True, initialize_missing=journal is None)
+    if journal is None:
+        if PROJECTION_KEY in cur:
+            raise EventJournalStateError("bound_journal_missing")
+    elif PROJECTION_KEY in cur:
+        validate_recovery_set(journal, cur)
+    elif journal["events"] or journal["processed_seq"]:
+        raise EventJournalStateError("projection_missing")
+    return journal, cur
+
+
+async def _initialize_history_journal(ids: set[int], generation: int) -> tuple[dict, dict]:
+    """Журнал публикуется первым; оборванная пустая привязка безопасно повторяется."""
     async with restorable_state_transaction():
-        cur = load_stats_current(strict=True)
-        for entry, event_type, media_type, score in state_updates:
-            cur = record_current_event(cur, entry, event_type, media_type, score)
-        if state_updates:
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        journal, cur = _history_state()
+        if journal is None:
+            journal = {
+                "version": 1, "journal_id": uuid4().hex, "profile": SHIKI_USER,
+                "normalization_version": 1, "baseline_initialized": True,
+                "baseline_ids": sorted(ids), "events": [], "processed_seq": 0,
+            }
+            save_event_journal(journal, admitting=True)
+        elif not journal["baseline_initialized"]:
+            journal = deepcopy(journal)
+            journal["baseline_initialized"] = True
+            journal["baseline_ids"] = sorted(ids)
+            save_event_journal(journal, admitting=True)
+        if PROJECTION_KEY not in cur:
+            cur = deepcopy(cur)
+            cur[PROJECTION_KEY] = {
+                "journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0,
+            }
             save_stats_current(cur, strict=True)
-    save_seen_ids(seen_ids)
-    return seen_ids, cur
+        return journal, cur
+
+
+async def _history_attempt_state(journal_id: str, seq: int, generation: int) -> None:
+    """Проверить lease перед send/retry без разбора полного журнала."""
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        cur = load_stats_current(strict=True)
+        projection = cur.get(PROJECTION_KEY)
+        if (
+            projection is None or projection["journal_id"] != journal_id
+            or projection["baseline_seq"] >= seq
+            or projection["applied_seq"] != seq
+        ):
+            raise _HistoryAttemptChanged
+
+
+async def _drain_history_journal(bot: Bot, *, expected_generation: int | None = None) -> tuple[dict | None, dict]:
+    """Последовательно завершить локально принятые события без обращения к API."""
+    loop = asyncio.get_running_loop()
+    lock = _history_processing_locks.setdefault(loop, asyncio.Lock())
+    async with lock:
+        return await _consume_history_journal(bot, expected_generation=expected_generation)
+
+
+async def _consume_history_journal(bot: Bot, *, expected_generation: int | None = None) -> tuple[dict | None, dict]:
+    """Один потребитель удерживает очередь, но не state lock во время отправки."""
+    async with restorable_state_transaction():
+        if expected_generation is not None and restorable_restore_generation() != expected_generation:
+            raise _HistoryAttemptChanged
+        journal, cur = _history_state()
+        generation = restorable_restore_generation()
+    while journal is not None and journal["processed_seq"] < len(journal["events"]):
+        seq = journal["processed_seq"] + 1
+        event = journal["events"][seq - 1]
+        entry = history_entry_from_event(event)
+        async with restorable_state_transaction():
+            if restorable_restore_generation() != generation:
+                raise _HistoryAttemptChanged
+            cur = load_stats_current(strict=True)
+            validate_recovery_set(journal, cur)
+            if cur[PROJECTION_KEY]["applied_seq"] < seq:
+                cur = deepcopy(cur)
+                if event["relevant"]:
+                    cur = record_current_event(cur, entry, event["event_type"], event["media"], event["score"])
+                cur[PROJECTION_KEY]["applied_seq"] = seq
+                save_stats_current(cur, strict=True)
+        if event["relevant"] and event["event_type"] not in {"ignored", "score_removed"}:
+            if event["event_type"] == "unknown":
+                log.warning("Неизвестное описание истории entry id=%d.", event["history_id"])
+            text = build_message(entry, normalized=event)
+
+            async def before_send():
+                await _history_attempt_state(journal["journal_id"], seq, generation)
+
+            await before_send()
+            await send_to_all_chats(bot, text, before_send=before_send, generation=generation)
+        async with restorable_state_transaction():
+            if restorable_restore_generation() != generation:
+                raise _HistoryAttemptChanged
+            current_journal, cur = _history_state()
+            if current_journal != journal or cur[PROJECTION_KEY]["applied_seq"] != seq:
+                raise _HistoryAttemptChanged
+            journal = deepcopy(journal)
+            journal["processed_seq"] = seq
+            save_event_journal(journal)
+        if event["relevant"] and event["event_type"] not in {"ignored", "score_removed"}:
+            await asyncio.sleep(1)
+    return journal, cur
+
+
+def _export_history_seen(journal: dict) -> set[int]:
+    """Ошибка совместимого экспорта не меняет авторитет журнала."""
+    seen = _journal_seen(journal)
+    try:
+        save_seen_ids(seen)
+    except Exception:
+        log.warning("История: экспорт seen_ids недоступен; журнал сохранён.")
+    return seen
+
+
+async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict | None) -> tuple[set[int], dict]:
+    """Принять полный батч до любых отправок, затем обработать локальную очередь."""
+    try:
+        return await _check_history_journal(bot)
+    except _HistoryAttemptChanged:
+        log.info("История: restore или изменение checkpoint остановили старую попытку.")
+        async with restorable_state_transaction():
+            journal, cur = _history_state()
+        return _journal_seen(journal) if journal is not None else set(), cur
+
+
+async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
+    async with restorable_state_transaction():
+        journal, cur = _history_state()
+        generation = restorable_restore_generation()
+        legacy = load_legacy_seen_ids() if journal is None else None
+    if journal is None and legacy is not None:
+        journal, cur = await _initialize_history_journal(legacy, generation)
+    elif journal is not None and PROJECTION_KEY not in cur:
+        journal, cur = await _initialize_history_journal(set(), generation)
+    if journal is not None and len(journal_json(journal).encode("utf-8")) >= JOURNAL_WARN_BYTES:
+        await _journal_diagnostic(bot, capacity=True)
+    journal, cur = await _drain_history_journal(bot, expected_generation=generation)
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        published_journal, cur = _history_state()
+        if published_journal != journal:
+            raise _HistoryAttemptChanged
+    seen = _journal_seen(journal) if journal is not None else set()
+    async with aiohttp.ClientSession() as session:
+        entries = (
+            await _fetch_history_catchup(session, seen)
+            if journal is not None and journal["baseline_initialized"] else await fetch_history(session)
+        )
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        published_journal, cur = _history_state()
+        if published_journal != journal:
+            raise _HistoryAttemptChanged
+    if entries is None:
+        return seen, cur
+    if journal is None or not journal["baseline_initialized"]:
+        journal, cur = await _initialize_history_journal({entry["id"] for entry in entries}, generation)
+        return _export_history_seen(journal), cur
+    observed_at = _utcnow().replace(tzinfo=timezone.utc).isoformat()
+    candidate = deepcopy(journal)
+    by_id = {event["history_id"]: event for event in candidate["events"]}
+    conflicts = 0
+    baseline = set(journal["baseline_ids"])
+    for entry in sorted(entries, key=lambda item: item["id"]):
+        history_id = entry["id"]
+        if history_id in baseline:
+            continue
+        try:
+            event = normalize_history_event(entry, observed_at)
+        except (ValueError, TypeError, AttributeError, KeyError):
+            if history_id in by_id:
+                conflicts += 1
+                continue
+            raise EventJournalStateError("normalization_failed") from None
+        if history_id in by_id:
+            published = by_id[history_id]
+            semantic = {key: value for key, value in published.items() if key not in {"seq", "observed_at"}}
+            if semantic != {key: value for key, value in event.items() if key != "observed_at"}:
+                conflicts += 1
+        elif history_id not in seen:
+            event["seq"] = len(candidate["events"]) + 1
+            candidate["events"].append(event)
+            by_id[history_id] = event
+    if conflicts:
+        log.warning("История: конфликт семантики повторных ID (%d); первые записи сохранены.", conflicts)
+    if len(candidate["events"]) == len(journal["events"]):
+        return seen, cur
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        current_journal, cur = _history_state()
+        if current_journal != journal:
+            raise _HistoryAttemptChanged
+        size = save_event_journal(candidate, admitting=True)
+    if size >= JOURNAL_WARN_BYTES:
+        await _journal_diagnostic(bot, capacity=True)
+    journal, cur = await _drain_history_journal(bot, expected_generation=generation)
+    return _export_history_seen(journal), cur
 
 
 def _should_full_sync(last_full_sync: float | None, now: float, interval: float) -> bool:
@@ -2320,6 +2490,7 @@ async def polling_loop(bot: Bot) -> None:
     privacy_error: ProfilePrivacyError | None = None
     pending_seen_ids: set[int] | None = None
     pending_seen_favs: set[str] | None = None
+    startup_generation = restorable_restore_generation()
     stats_all = load_stats_all()
     synced_ok = False
 
@@ -2327,16 +2498,26 @@ async def polling_loop(bot: Bot) -> None:
     # фиксированные паузы между фазами; избранное тянем ОДИН раз и переиспользуем.
     async with aiohttp.ClientSession() as session:
         try:
-            if not seen_ids and cur is not None:
-                log.info("Первый запуск — инициализируем историю без отправки сообщений.")
-                entries = await fetch_history(session)
-                if entries is None:
-                    log.warning(
-                        "Не удалось получить историю при инициализации — "
-                        "пропускаем, повторим на следующем цикле."
-                    )
-                else:
-                    pending_seen_ids = {e["id"] for e in entries}
+            if cur is not None:
+                try:
+                    async with restorable_state_transaction():
+                        startup_journal, cur = _history_state()
+                        startup_generation = restorable_restore_generation()
+                        legacy = load_legacy_seen_ids() if startup_journal is None else None
+                    if startup_journal is None and legacy is not None:
+                        pending_seen_ids = legacy
+                    elif startup_journal is None or not startup_journal["baseline_initialized"]:
+                        entries = await fetch_history(session)
+                        if entries is not None:
+                            pending_seen_ids = {e["id"] for e in entries}
+                    elif PROJECTION_KEY not in cur:
+                        pending_seen_ids = set()
+                except EventJournalStateError:
+                    cur = None
+                    await _journal_diagnostic(bot)
+                except QuarterDeliveryStateError as error:
+                    cur = None
+                    await _quarter_state_diagnostic(bot, error)
             await asyncio.sleep(BOOT_PHASE_DELAY)
 
             # Избранное фетчим ОДИН раз: для baseline и sync (fav=).
@@ -2380,14 +2561,16 @@ async def polling_loop(bot: Bot) -> None:
     if privacy_error is None:
         if pending_seen_ids is not None:
             try:
-                cur = await _load_stats_current_transactional()
+                journal, cur = await _initialize_history_journal(pending_seen_ids, startup_generation)
+                seen_ids = _export_history_seen(journal)
+            except _HistoryAttemptChanged:
+                cur = None
+            except EventJournalStateError:
+                cur = None
+                await _journal_diagnostic(bot)
             except QuarterDeliveryStateError as error:
                 cur = None
                 await _quarter_state_diagnostic(bot, error)
-            else:
-                seen_ids = pending_seen_ids
-                save_seen_ids(seen_ids)
-                log.info("Инициализировано %d ID истории.", len(seen_ids))
         if pending_seen_favs is not None:
             seen_favs = pending_seen_favs
             save_seen_favourites(seen_favs)
@@ -2424,7 +2607,13 @@ async def polling_loop(bot: Bot) -> None:
     while True:
         try:
             log.info("Проверяем историю и избранное...")
-            seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
+            history_available = True
+            try:
+                seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
+            except EventJournalStateError as error:
+                history_available = False
+                await _journal_diagnostic(bot, capacity=str(error) == "journal_capacity")
+                cur = await _load_stats_current_transactional()
             # Избранное фетчим ОДИН раз за цикл и переиспользуем — в уведомлениях
             # и в ресинке stats_all (fav=), как на старте. Дедуп убирает второй
             # фетч избранного внутри sync_stats_all → на цикл 1 запрос вместо 2.
@@ -2454,7 +2643,8 @@ async def polling_loop(bot: Bot) -> None:
 
             # Проверяем смену квартала (раз в цикл, дёшево).
             # Внутри — защита last_report_sent от повторной отправки.
-            cur = await rotate_quarter_if_needed(bot, cur, load_stats_all())
+            if history_available:
+                cur = await rotate_quarter_if_needed(bot, cur, load_stats_all())
 
             # Subscription pending имеет приоритет над weekly fallback.
             await _backup_after_subscription(bot)
@@ -2467,6 +2657,10 @@ async def polling_loop(bot: Bot) -> None:
         except asyncio.CancelledError:
             # Штатная отмена задачи — пробрасываем, не глушим
             raise
+        except EventJournalStateError as error:
+            cur = None
+            await _journal_diagnostic(bot, capacity=str(error) == "journal_capacity")
+            heartbeat()
         except QuarterDeliveryStateError as error:
             cur = None
             await _quarter_state_diagnostic(bot, error)
@@ -2599,11 +2793,11 @@ async def probe_owner_and_start(bot: Bot) -> None:
 # ═══════════════════════════════════════════════════════════════
 #
 #  Экспорт = zip всего DATA_DIR (минус *.tmp-огрызки _atomic_write).
-#  Импорт  = по белому списку (список блокировок, subscribers, stats_current,
-#            update_state, quarters/*);
+#  Импорт  = recovery-набор журнала и квартала, политики, подписчики,
+#            факты, настройки и quarters/* (точный whitelist — в backup).
 #            всё прочее в архиве намеренно отбрасывается — seen_ids,
-#            seen_favourites и stats_all регенерируются сами, тащить их
-#            обратно незачем. Асимметрия экспорт(всё)/импорт(бел.список)
+#            seen_favourites и stats_all служат экспортными проекциями/кешами.
+#            Асимметрия экспорт(всё)/импорт(бел.список)
 #            сознательная: архив — и страховка состояния, и зонд внутрь
 #            эфемерного контейнера (apply.build без тома на /data).
 #  Доставка — всегда владельцу (OWNER_ID); в subscribers лежат chat_id.

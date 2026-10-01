@@ -38,6 +38,14 @@ def _fast_boot(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_history_state(tmp_path, monkeypatch):
+    """Новые авторитетные файлы не должны переходить между тестами."""
+    monkeypatch.setattr("storage.EVENT_JOURNAL_FILE", tmp_path / "event_journal.json")
+    monkeypatch.setattr("storage.SEEN_IDS_FILE", tmp_path / "seen_ids.json")
+    monkeypatch.setattr("storage.STATS_CURRENT_FILE", tmp_path / "stats_current.json")
+
+
+@pytest.fixture(autouse=True)
 def _no_throttle(monkeypatch):
     """shiki_api throttle: min-gap→0 + сброс лока/метки на каждый тест, чтобы
     (1) тесты не спали реальные 0.25 с между запросами и (2) asyncio.Lock не
@@ -75,6 +83,7 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "STATS_CURRENT_FILE", data / "stats_current.json")
     monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
     monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
+    monkeypatch.setattr(storage, "EVENT_JOURNAL_FILE", data / "event_journal.json")
     monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
     monkeypatch.setattr(storage, "UPDATE_STATE_FILE", data / "update_state.json")
     monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
@@ -99,3 +108,28 @@ def fact_bank_env(tmp_path, monkeypatch):
     yield facts_file
     monkeypatch.setattr(fact_bank, "FACTS_FILE", original_facts_file)
     fact_bank.reload_fact_bank()
+
+
+@pytest.fixture
+def journal_factory():
+    """Валидный recovery-набор; матрица нормализации остаётся в test_messages."""
+    from messages import normalize_history_event
+
+    def factory(count=1, processed=0):
+        events = []
+        for seq in range(1, count + 1):
+            event = normalize_history_event({
+                "id": seq + 1,
+                "created_at": "2026-04-01T02:00:00+03:00",
+                "description": "Просмотрено и оценено на 8",
+                "target": {"id": seq + 10, "kind": "tv", "name": f"Title {seq}"},
+            }, "2026-04-02T00:00:00+00:00")
+            event["seq"] = seq
+            events.append(event)
+        return {
+            "version": 1, "journal_id": "a" * 32, "profile": "WNR",
+            "normalization_version": 1, "baseline_initialized": True,
+            "baseline_ids": [1], "events": events, "processed_seq": processed,
+        }
+
+    return factory

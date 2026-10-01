@@ -1884,11 +1884,20 @@ async def test_history_failed_quarter_save_does_not_acknowledge_event(backup_env
     original = storage.STATS_CURRENT_FILE.read_bytes()
     entry = {"id": 2, "description": "Просмотрено", "target": {"id": 10, "kind": "tv"}, "target_type": "Anime"}
     monkeypatch.setattr("handlers._fetch_history_catchup", AsyncMock(return_value=[entry]))
-    monkeypatch.setattr("handlers.classify_event", lambda description: "completed")
+    monkeypatch.setattr("messages.classify_event", lambda description: "completed")
     monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
-    monkeypatch.setattr("handlers.build_message", lambda entry: "notification")
+    monkeypatch.setattr("handlers.build_message", lambda entry, **kwargs: "notification")
     monkeypatch.setattr(handlers.asyncio, "sleep", AsyncMock())
-    monkeypatch.setattr("storage._atomic_write", MagicMock(side_effect=OSError("disk failure")))
+    await handlers._initialize_history_journal({1}, storage.restorable_restore_generation())
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    real_write = storage._atomic_write
+
+    def fail_current(path, payload):
+        if path == storage.STATS_CURRENT_FILE:
+            raise OSError("disk failure")
+        return real_write(path, payload)
+
+    monkeypatch.setattr("storage._atomic_write", fail_current)
     saved = MagicMock()
     monkeypatch.setattr("handlers.save_seen_ids", saved)
     seen = {1}
