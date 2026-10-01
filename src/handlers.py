@@ -110,6 +110,11 @@ from healthcheck import (
     polling_started,
     polling_stopped,
 )
+from history_catchup import (
+    advance_acquisition,
+    new_acquisition,
+    resume_acquisition,
+)
 from inline_cards import (
     CARD_KIND_LABELS,
     PHOTO_CAPTION_LIMIT,
@@ -644,6 +649,10 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
     async with restorable_state_transaction():
         cur = load_stats_current(strict=True)
         rotation_needed = cur.get("period") != now_period
+        if PROJECTION_KEY in cur:
+            journal, cur = _history_state()
+            if journal.get("catchup") is not None and cur.get(_PENDING_QUARTER_DELIVERY) is None:
+                return cur
 
     if cur.get(_PENDING_QUARTER_DELIVERY) is not None or not rotation_needed:
         return await _deliver_pending_quarter(bot, cur)
@@ -666,7 +675,7 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
             cur = load_stats_current(strict=True)
             if PROJECTION_KEY in cur:
                 journal, cur = _history_state()
-                if journal["processed_seq"] < len(journal["events"]):
+                if journal.get("catchup") is not None or journal["processed_seq"] < len(journal["events"]):
                     return cur
             expected_generation = restorable_restore_generation()
             if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") == now_period:
@@ -718,7 +727,7 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
                 return cur
             if PROJECTION_KEY in cur:
                 journal, cur = _history_state()
-                if journal["processed_seq"] < len(journal["events"]):
+                if journal.get("catchup") is not None or journal["processed_seq"] < len(journal["events"]):
                     return cur
             if cur != expected_cur:
                 # Новое квартальное событие могло успеть опубликоваться, пока
@@ -2138,51 +2147,6 @@ async def send_to_all_chats(bot: Bot, text: str, *, before_send=None, generation
     await _unsubscribe_blocked(to_remove, generation=generation)
 
 
-async def _fetch_history_catchup(
-    session: aiohttp.ClientSession,
-    seen_ids: set[int],
-) -> list[dict] | None:
-    """Собирает пропущенную историю до известного ID или конца выдачи."""
-    collected: list[dict] = []
-
-    for page in range(1, _HISTORY_CATCHUP_MAX_PAGES + 1):
-        page_entries = await fetch_history(session, page=page)
-        if page_entries is None:
-            log.warning(
-                "История: страница %d не загрузилась, catch-up отменён без обновления seen_ids.",
-                page,
-            )
-            return None
-
-        try:
-            page_ids = {entry["id"] for entry in page_entries}
-            if any(type(entry["id"]) is not int for entry in page_entries):
-                raise TypeError("history_id")
-            collected.extend(page_entries)
-        except (KeyError, TypeError) as e:
-            log.warning(
-                "История: некорректная страница %d (%s), catch-up отменён без обновления seen_ids.",
-                page,
-                e,
-            )
-            return None
-
-        if page_ids & seen_ids:
-            return collected
-
-        # API Shikimori читает limit + 1 запись как признак следующей страницы.
-        # При limit=50 короткая выдача содержит меньше 51 записи и означает конец.
-        if len(page_entries) < HISTORY_PAGE_LIMIT + 1:
-            return collected
-
-    log.warning(
-        "История: за %d страниц не найдена известная граница; "
-        "catch-up отменён без обновления seen_ids.",
-        _HISTORY_CATCHUP_MAX_PAGES,
-    )
-    return None
-
-
 class _HistoryAttemptChanged(RuntimeError):
     """Restore или другая попытка отменили текущий lease истории."""
 
@@ -2233,7 +2197,7 @@ def _history_state() -> tuple[dict | None, dict]:
             raise EventJournalStateError("bound_journal_missing")
     elif PROJECTION_KEY in cur:
         validate_recovery_set(journal, cur)
-    elif journal["events"] or journal["processed_seq"]:
+    elif journal["events"] or journal["processed_seq"] or journal.get("catchup") is not None:
         raise EventJournalStateError("projection_missing")
     return journal, cur
 
@@ -2246,7 +2210,7 @@ async def _initialize_history_journal(ids: set[int], generation: int) -> tuple[d
         journal, cur = _history_state()
         if journal is None:
             journal = {
-                "version": 1, "journal_id": uuid4().hex, "profile": SHIKI_USER,
+                "version": 2, "catchup": None, "journal_id": uuid4().hex, "profile": SHIKI_USER,
                 "normalization_version": 1, "baseline_initialized": True,
                 "baseline_ids": sorted(ids), "events": [], "processed_seq": 0,
             }
@@ -2374,28 +2338,40 @@ async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
         if published_journal != journal:
             raise _HistoryAttemptChanged
     seen = _journal_seen(journal) if journal is not None else set()
-    async with aiohttp.ClientSession() as session:
-        entries = (
-            await _fetch_history_catchup(session, seen)
-            if journal is not None and journal["baseline_initialized"] else await fetch_history(session)
-        )
+    if journal is None or not journal["baseline_initialized"]:
+        async with aiohttp.ClientSession() as session:
+            entries = await fetch_history(session)
+        if entries is None:
+            return seen, cur
+        journal, cur = await _initialize_history_journal({entry["id"] for entry in entries}, generation)
+        return _export_history_seen(journal), cur
+    return await _acquire_history_pages(bot, journal, generation)
+
+
+async def _publish_history_candidate(expected: dict, candidate: dict, generation: int) -> dict:
+    """Публиковать только продолжение той же authority и restore generation."""
     async with restorable_state_transaction():
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
-        published_journal, cur = _history_state()
-        if published_journal != journal:
+        current, cur = _history_state()
+        if current != expected:
             raise _HistoryAttemptChanged
-    if entries is None:
-        return seen, cur
-    if journal is None or not journal["baseline_initialized"]:
-        journal, cur = await _initialize_history_journal({entry["id"] for entry in entries}, generation)
-        return _export_history_seen(journal), cur
-    observed_at = _utcnow().replace(tzinfo=timezone.utc).isoformat()
-    candidate = deepcopy(journal)
-    by_id = {event["history_id"]: event for event in candidate["events"]}
-    conflicts = 0
+        if candidate != expected:
+            save_event_journal(candidate, admitting=True)
+        return cur
+
+
+def _stage_history_page(state: dict, entries: list[dict], journal: dict) -> None:
+    """Сохранить первую семантику ID без приёма staged записей в журнал."""
     baseline = set(journal["baseline_ids"])
-    for entry in sorted(entries, key=lambda item: item["id"]):
+    by_id = {event["history_id"]: event for event in journal["events"] + state["staged"]}
+    observed_at = _utcnow().replace(tzinfo=timezone.utc).isoformat()
+    conflicts = 0
+
+    def semantic(value):
+        return {key: item for key, item in value.items() if key not in {"seq", "observed_at"}}
+
+    for entry in entries:
         history_id = entry["id"]
         if history_id in baseline:
             continue
@@ -2407,29 +2383,66 @@ async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
                 continue
             raise EventJournalStateError("normalization_failed") from None
         if history_id in by_id:
-            published = by_id[history_id]
-            semantic = {key: value for key, value in published.items() if key not in {"seq", "observed_at"}}
-            if semantic != {key: value for key, value in event.items() if key != "observed_at"}:
+            if semantic(by_id[history_id]) != semantic(event):
                 conflicts += 1
-        elif history_id not in seen:
-            event["seq"] = len(candidate["events"]) + 1
-            candidate["events"].append(event)
+        else:
+            event["seq"] = len(state["staged"]) + 1
+            state["staged"].append(event)
             by_id[history_id] = event
     if conflicts:
         log.warning("История: конфликт семантики повторных ID (%d); первые записи сохранены.", conflicts)
-    if len(candidate["events"]) == len(journal["events"]):
-        return seen, cur
-    async with restorable_state_transaction():
-        if restorable_restore_generation() != generation:
-            raise _HistoryAttemptChanged
-        current_journal, cur = _history_state()
-        if current_journal != journal:
-            raise _HistoryAttemptChanged
-        size = save_event_journal(candidate, admitting=True)
-    if size >= JOURNAL_WARN_BYTES:
-        await _journal_diagnostic(bot, capacity=True)
-    journal, cur = await _drain_history_journal(bot, expected_generation=generation)
-    return _export_history_seen(journal), cur
+
+
+async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tuple[set[int], dict]:
+    """Ограниченный связный сбор; только полный батч получает processing seq."""
+    seen = _journal_seen(journal)
+    previous = journal.get("catchup")
+    state = resume_acquisition(previous) if previous is not None else new_acquisition()
+    async with aiohttp.ClientSession() as session:
+        for _ in range(_HISTORY_CATCHUP_MAX_PAGES):
+            page = state["page"]
+            entries = await fetch_history(session, page=page)
+            if entries is not None and (
+                not isinstance(entries, list) or len(entries) > HISTORY_PAGE_LIMIT + 1
+                or any(not isinstance(entry, dict) or type(entry.get("id")) is not int for entry in entries)
+            ):
+                entries = None
+            if entries is None:
+                # Не сохранять временный rewind после неудачного запроса:
+                # повторные ошибки должны оставлять последний checkpoint.
+                # Первая ошибка создаёт пустую отметку неполноты, чтобы
+                # ротация не закрыла квартал до проверки истории.
+                candidate = journal if journal.get("catchup") is not None else {**journal, "version": 2, "catchup": state}
+                cur = await _publish_history_candidate(journal, candidate, generation)
+                log.warning("История: страница %d недоступна; незавершённый сбор сохранён.", page)
+                return seen, cur
+            connected, complete = advance_acquisition(
+                state, [entry["id"] for entry in entries], seen, HISTORY_PAGE_LIMIT,
+            )
+            if connected:
+                _stage_history_page(state, entries, journal)
+            candidate = deepcopy(journal)
+            if complete:
+                for event in sorted(state["staged"], key=lambda value: value["history_id"]):
+                    event = deepcopy(event)
+                    event["seq"] = len(candidate["events"]) + 1
+                    candidate["events"].append(event)
+                if state["staged"] or previous is not None or journal.get("catchup") is not None:
+                    candidate.update(version=2, catchup=None)
+                cur = await _publish_history_candidate(journal, candidate, generation)
+                if candidate == journal:
+                    return seen, cur
+                if len(journal_json(candidate).encode("utf-8")) >= JOURNAL_WARN_BYTES:
+                    await _journal_diagnostic(bot, capacity=True)
+                journal, cur = await _drain_history_journal(bot, expected_generation=generation)
+                return _export_history_seen(journal), cur
+            candidate.update(version=2, catchup=deepcopy(state))
+            cur = await _publish_history_candidate(journal, candidate, generation)
+            journal = candidate
+            if len(journal_json(journal).encode("utf-8")) >= JOURNAL_WARN_BYTES:
+                await _journal_diagnostic(bot, capacity=True)
+    log.warning("История: за %d страниц не найдена известная граница; сбор продолжится в следующем цикле.", _HISTORY_CATCHUP_MAX_PAGES)
+    return seen, cur
 
 
 def _should_full_sync(last_full_sync: float | None, now: float, interval: float) -> bool:
@@ -2590,7 +2603,12 @@ async def polling_loop(bot: Bot) -> None:
     # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
     if privacy_error is None and cur is not None:
         try:
-            cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
+            # Готовая baseline не доказывает, что после простоя нет длинного
+            # хвоста. Новый квартал ждёт первой проверки; frozen pending живёт.
+            async with restorable_state_transaction():
+                startup_ready = load_event_journal() is None or cur.get(_PENDING_QUARTER_DELIVERY) is not None
+            if startup_ready:
+                cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
         except QuarterDeliveryStateError as error:
             cur = None
             await _quarter_state_diagnostic(bot, error)
@@ -2609,7 +2627,9 @@ async def polling_loop(bot: Bot) -> None:
             log.info("Проверяем историю и избранное...")
             history_available = True
             try:
+                history_generation = restorable_restore_generation()
                 seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
+                history_available = restorable_restore_generation() == history_generation
             except EventJournalStateError as error:
                 history_available = False
                 await _journal_diagnostic(bot, capacity=str(error) == "journal_capacity")

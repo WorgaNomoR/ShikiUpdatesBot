@@ -69,14 +69,14 @@ def validate_projection(projection: object) -> None:
 
 
 def validate_event_journal(journal: object, *, profile: str | None = None) -> dict:
-    """Проверить v1 без повторной классификации опубликованных событий."""
+    """Проверить v1/v2 без повторной классификации опубликованных событий."""
     if (
         not isinstance(journal, dict)
         or set(journal) != {
             "version", "journal_id", "profile", "normalization_version",
             "baseline_initialized", "baseline_ids", "events", "processed_seq",
-        }
-        or type(journal["version"]) is not int or journal["version"] != 1
+        } | ({"catchup"} if journal.get("version") == 2 else set())
+        or type(journal["version"]) is not int or journal["version"] not in {1, 2}
         or type(journal["normalization_version"]) is not int
         or journal["normalization_version"] != 1
         or not _identity(journal["journal_id"])
@@ -134,12 +134,52 @@ def validate_event_journal(journal: object, *, profile: str | None = None) -> di
         or (not journal["baseline_initialized"] and (ids or journal["events"]))
     ):
         raise EventJournalStateError("journal_cursor")
+    acquisition = journal.get("catchup")
+    if acquisition is not None:
+        validate_acquisition(acquisition, journal, known)
     # Проверка кодируемости исходного created_at и запрет NaN/Infinity.
     try:
         json.dumps(journal, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (ValueError, TypeError, UnicodeError, RecursionError):
         raise EventJournalStateError("journal_encoding") from None
     return journal
+
+
+def validate_acquisition(state: object, journal: dict, known: set[int]) -> None:
+    """Staged payload имеет отдельную последовательность и не двигает authority."""
+    if (
+        not isinstance(state, dict)
+        or set(state) != {"phase", "page", "frontier", "head_ids", "staged", "spanning"}
+        or not isinstance(state["phase"], str) or state["phase"] not in {"tail", "head"}
+        or not _integer(state["page"], 1)
+        or type(state["spanning"]) is not bool
+        or not isinstance(state["staged"], list)
+        or not journal["baseline_initialized"]
+        or journal["processed_seq"] != len(journal["events"])
+    ):
+        raise EventJournalStateError("acquisition_structure")
+    # Повторно используем ту же матрицу нормализованных событий без рекурсии v2.
+    validate_event_journal({
+        **{key: value for key, value in journal.items() if key != "catchup"},
+        "version": 1, "baseline_ids": [], "events": state["staged"], "processed_seq": 0,
+    })
+    staged_ids = {event["history_id"] for event in state["staged"]}
+    if staged_ids & known:
+        raise EventJournalStateError("acquisition_already_admitted")
+    retained = known | staged_ids
+    for field in ("frontier", "head_ids"):
+        values = state[field]
+        if (
+            not isinstance(values, list) or len(values) > 51
+            or any(not _integer(value) or value not in retained for value in values)
+            or len(set(values)) != len(values)
+        ):
+            raise EventJournalStateError("acquisition_ids")
+    if (
+        (state["page"] > 1 and not state["frontier"])
+        or (state["phase"] == "head" and not state["spanning"])
+    ):
+        raise EventJournalStateError("acquisition_cursor")
 
 
 def validate_recovery_set(journal: dict, cur: dict) -> None:
