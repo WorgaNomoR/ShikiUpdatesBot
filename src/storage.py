@@ -13,11 +13,13 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
 import weakref
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
@@ -44,6 +46,10 @@ from event_journal_schema import (
     journal_json,
     parse_event_journal,
     validate_projection,
+)
+from event_time_stats import (
+    acknowledge_revisions,
+    validate_event_time,
 )
 from report_plan import (
     FrozenReportPlanError,
@@ -1215,20 +1221,24 @@ def new_quarter_delivery_plan(
     old_period: str,
     new_period: str,
     units: list[dict],
+    *,
+    event_time_revisions: dict[str, int] | None = None,
 ) -> dict:
-    """Заморозить version-2 plan с точными transport и content."""
+    """Заморозить v2 transport/content или v3 с ревизиями корректировок."""
     try:
         validate_frozen_report_units(units)
     except FrozenReportPlanError:
         raise QuarterDeliveryStateError("report_units") from None
     pending = {
-        "version": 2,
+        "version": 2 if event_time_revisions is None else 3,
         "plan_id": uuid.uuid4().hex,
         "old_period": old_period,
         "new_period": new_period,
         "report_units": json.loads(json.dumps(units, ensure_ascii=False)),
         "next_unit": 0,
     }
+    if event_time_revisions is not None:
+        pending["event_time_revisions"] = dict(event_time_revisions)
     pending["plan_hash"] = _quarter_plan_hash(pending)
     validate_pending_quarter_delivery({
         "period": new_period,
@@ -1239,7 +1249,7 @@ def new_quarter_delivery_plan(
 
 def downgrade_quarter_delivery(pending: dict, start_unit: int) -> dict:
     """После точного unsupported-ответа заморозить remaining HTML plan."""
-    if pending.get("version") != 2:
+    if pending.get("version") not in {2, 3}:
         raise QuarterDeliveryStateError("unsupported_downgrade")
     try:
         units = downgrade_rich_units(pending["report_units"], start_unit)
@@ -1248,13 +1258,15 @@ def downgrade_quarter_delivery(pending: dict, start_unit: int) -> dict:
     except (KeyError, FrozenReportPlanError):
         raise QuarterDeliveryStateError("unsupported_downgrade") from None
     downgraded = {
-        "version": 2,
+        "version": pending["version"],
         "plan_id": uuid.uuid4().hex,
         "old_period": old_period,
         "new_period": new_period,
         "report_units": units,
         "next_unit": start_unit,
     }
+    if pending["version"] == 3:
+        downgraded["event_time_revisions"] = dict(pending["event_time_revisions"])
     downgraded["plan_hash"] = _quarter_plan_hash(downgraded)
     validate_pending_quarter_delivery({
         "period": downgraded["new_period"],
@@ -1301,13 +1313,13 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
     legacy = "version" not in pending
     if not legacy and (
         type(pending.get("version")) is not int
-        or pending["version"] not in {1, 2}
+        or pending["version"] not in {1, 2, 3}
     ):
         raise QuarterDeliveryStateError("unsupported_version")
     expected_keys = (
         legacy_keys
         if legacy
-        else version1_keys if pending["version"] == 1 else version2_keys
+        else version1_keys if pending["version"] == 1 else version2_keys | ({"event_time_revisions"} if pending["version"] == 3 else set())
     )
     if set(pending) != expected_keys:
         raise QuarterDeliveryStateError("pending_fields")
@@ -1316,6 +1328,14 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
     validate_quarter_period(new)
     if old >= new or new != cur.get("period"):
         raise QuarterDeliveryStateError("period_lineage")
+    if pending.get("version") == 3:
+        revisions = pending["event_time_revisions"]
+        if not isinstance(revisions, dict) or old not in revisions:
+            raise QuarterDeliveryStateError("correction_revisions")
+        for period, revision in revisions.items():
+            validate_quarter_period(period)
+            if period > old or type(revision) is not int or revision < 0:
+                raise QuarterDeliveryStateError("correction_revisions")
     messages = pending.get("report_messages")
     units = pending.get("report_units")
     if legacy or pending.get("version") == 1:
@@ -1402,7 +1422,11 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
     чтобы не сбрасывалась при последующих перезапусках.
     """
     try:
-        data = json.loads(STATS_CURRENT_FILE.read_text(encoding="utf-8"))
+        with STATS_CURRENT_FILE.open("rb") as stream:
+            raw = stream.read(JOURNAL_MAX_BYTES + 1 if strict else -1)
+        if strict and len(raw) > JOURNAL_MAX_BYTES:
+            raise QuarterDeliveryStateError("current_size")
+        data = json.loads(raw.decode("utf-8"))
         if isinstance(data, dict) and "period" in data and "events" in data:
             if strict and (not isinstance(data["period"], str) or not isinstance(data["events"], list)):
                 raise QuarterDeliveryStateError("current_structure")
@@ -1411,6 +1435,7 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
                 validate_pending_quarter_delivery(data)
                 if "event_projection" in data:
                     validate_projection(data["event_projection"])
+                validate_event_time(data)
             # Бэкофилл для файлов, созданных до появления поля tracking_since
             if "tracking_since" not in data:
                 data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
@@ -1439,12 +1464,40 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
     return fresh
 
 
+def json_publication_size(payload: str) -> int:
+    """Path.write_text переводит JSON-переносы в системный EOL на Windows."""
+    return len(payload.replace("\n", os.linesep).encode("utf-8"))
+
+
+def stats_current_json(data: dict, *, strict: bool = True) -> str:
+    """Проверить ёмкость публикации вместе с ростом frozen acknowledgement."""
+    payload = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=not strict)
+    if strict:
+        completed = deepcopy(data)
+        pending = completed.get("pending_quarter_delivery")
+        if isinstance(pending, dict) and pending.get("version") in {1, 2, 3}:
+            key = "report_messages" if pending["version"] == 1 else "report_units"
+            pending["next_unit"] = len(pending[key])
+            completed["last_report_sent"] = pending["new_period"]
+            acknowledge_revisions(completed)
+        final_size = json_publication_size(json.dumps(completed, ensure_ascii=False, indent=2, allow_nan=False))
+        if max(json_publication_size(payload), final_size) > JOURNAL_MAX_BYTES:
+            raise QuarterDeliveryStateError("current_capacity")
+    return payload
+
+
 def save_stats_current(data: dict, *, strict: bool = False) -> None:
     """Атомарно записать состояние; strict не скрывает ошибку acknowledgement."""
     try:
         if strict and "event_projection" in data:
             validate_projection(data["event_projection"])
-        _atomic_write(STATS_CURRENT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+        if strict:
+            if "event_time" in data:
+                validate_quarter_period(data.get("period"))
+                validate_pending_quarter_delivery(data)
+            validate_event_time(data)
+        payload = stats_current_json(data, strict=strict)
+        _atomic_write(STATS_CURRENT_FILE, payload)
     except Exception as e:
         if strict:
             log.error("save_stats_current: strict-запись не удалась: %s", type(e).__name__)

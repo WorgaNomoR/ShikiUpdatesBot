@@ -20,6 +20,7 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest
 
 import handlers
+from event_time_stats import EventTimeStateError
 from storage import QuarterDeliveryStateError
 
 # ─────────────────────────────────────────────────────────────
@@ -354,6 +355,7 @@ async def test_backup_receive_download_failure(backup_env, monkeypatch):
     ValueError("битый <b>zip</b>-архив & мусор"),
     QuarterDeliveryStateError("progress_index"),
     QuarterDeliveryStateError("plan_integrity"),
+    EventTimeStateError("event_time_structure"),
 ])
 async def test_backup_receive_restore_value_error(backup_env, monkeypatch, error, caplog):
     restore = AsyncMock(side_effect=error)

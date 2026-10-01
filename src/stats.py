@@ -28,6 +28,12 @@ from config import (
     SHIKI_BASE_URL,
     log,
 )
+from event_journal_schema import JOURNAL_MAX_BYTES
+from event_time_stats import (
+    EVENT_TIME_KEY,
+    correction_periods,
+    period_start,
+)
 from favourites import (
     FAVOURITES_UNSET,
     _collect_favourites,
@@ -64,8 +70,11 @@ from shiki_api import (
     translate_origin,
 )
 from storage import (
+    QuarterDeliveryStateError,
     _atomic_write,
+    json_publication_size,
     load_stats_all,
+    load_stats_current,
     save_stats_all,
 )
 from utils import (
@@ -74,6 +83,7 @@ from utils import (
     _rel_url,
     _safe_int,
     _utcnow,
+    current_quarter,
     quarter_label,
     russian_count_word,
     tracking_period_label,
@@ -1000,6 +1010,13 @@ async def sync_stats_all(
     except Exception as e:
         log.error("sync_stats_all: сбор избранного упал: %s", e)
 
+    # by_quarter — восстановимый кеш source-quarter authority, включая
+    # поздние корректировки. Ошибка строгого квартала не сбрасывает кеш.
+    try:
+        changed = refresh_event_time_by_quarter(stats, load_stats_current(strict=True)) or changed
+    except Exception as error:
+        log.warning("sync_stats_all: by_quarter не обновлён (%s).", type(error).__name__)
+
     if changed:
         save_stats_all(stats)
         log.info("sync_stats_all: stats_all.json обновлён.")
@@ -1220,11 +1237,18 @@ def _quarter_titles(cur: dict, stats_all: dict, media: str, event: str) -> list[
             # score события приоритетнее (актуально на момент завершения квартала)
             if event == "completed" and ev.get("score") is not None:
                 merged["score"] = ev["score"]
+            elif event == "completed" and "title" in ev:
+                # Явное снятие/отсутствие source-оценки не заменяется export.
+                merged["score"] = 0
+            if "kind" in ev:
+                merged["kind"] = ev["kind"]
             out.append(merged)
         else:
             # Метаданных нет (тайтл не успел попасть в stats_all) — минимальная запись
             out.append({
-                "title": "???", "url": "", "score": ev.get("score") or 0,
+                "title": (ev.get("title") or {}).get("russian") or (ev.get("title") or {}).get("name") or "???",
+                "url": (ev.get("title") or {}).get("url") or "", "score": ev.get("score") or 0,
+                "kind": ev.get("kind", ""),
                 "genres": [], "themes": [], "demographic": [],
             })
     return out
@@ -1903,7 +1927,7 @@ def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
         if event.get("media") == "manga" and event.get("event") == "planned":
             title_id = _manga_event_id(event.get("id"))
             record = titles.get(title_id) if title_id is not None else None
-            kind = record.get("kind") if isinstance(record, dict) else None
+            kind = event.get("kind", record.get("kind") if isinstance(record, dict) else None)
             split[classify_manga_presentation_kind(kind)]["planned"] += 1
     report["manga_split"] = split
     return report
@@ -1911,6 +1935,12 @@ def _prepare_quarter_report(cur: dict, stats_all: dict) -> dict:
 
 def build_current_stats_messages(cur: dict, stats_all: dict) -> Report:
     """Типизированный текущий квартал с отдельными категориями чтения."""
+    calendar = current_quarter()
+    if EVENT_TIME_KEY in cur and cur["period"] != calendar:
+        # Доставка старого отчёта не превращает его квартал в текущий экран.
+        cur = {**cur, "period": calendar, "period_start": period_start(calendar),
+               "tracking_since": period_start(calendar),
+               "events": deepcopy(cur[EVENT_TIME_KEY]["periods"].get(calendar, {}).get("events", []))}
     title_label = tracking_period_label(cur)
 
     report = _prepare_quarter_report(cur, stats_all)
@@ -1918,6 +1948,7 @@ def build_current_stats_messages(cur: dict, stats_all: dict) -> Report:
 
     header_lines = [heading("📊 ", Bold(f"СТАТИСТИКА {title_label.upper()}"), level=1)]
     header_lines.extend(_quarter_source_notices(stats_all))
+    header_lines.extend(_event_time_notices(cur))
     if _is_partial_quarter(cur):
         header_lines.append(line(Italic(
             "⚠️ Квартал отслеживается не с самого начала — данные неполные."
@@ -1942,6 +1973,53 @@ def _quarter_source_notices(stats_all: dict) -> list[Line]:
     ]
 
 
+def _event_time_notices(cur: dict) -> list[Line]:
+    """Не объявлять доступную часть истории полной календарной статистикой."""
+    state = cur.get(EVENT_TIME_KEY)
+    if state is None:
+        return []
+    notices = [line(Italic(
+        "Границы кварталов — UTC. Учтена только доступная история; "
+        "события, отсутствующие у источника, восстановить нельзя."
+    ))]
+    if cur["period"] <= state["legacy_period"]:
+        notices.append(line(Italic(
+            "⚠️ Старые данные сохранены по прежним правилам и не пересчитаны по исходному времени."
+        )))
+    unknown = state["unknown"]
+    if sum(unknown.values()):
+        notices.append(line(Italic(
+            "⚠️ После обновления не распределены по кварталам события: "
+            f"без даты — {unknown['missing']}, без часового пояса — {unknown['naive']}, "
+            f"с неверной датой — {unknown['invalid']}, с будущей датой — {unknown['future']}."
+        )))
+    return notices
+
+
+def _correction_units(cur: dict) -> list[Unit]:
+    """Полная известная проекция поправки; исходный frozen report не меняется."""
+    if EVENT_TIME_KEY not in cur:
+        return []
+    units = []
+    for period in correction_periods(cur):
+        events = cur[EVENT_TIME_KEY]["periods"][period]["events"]
+        completed = [ev for ev in events if ev.get("event") == "completed"]
+        lines = [heading("📝 ", Bold(f"Корректировка за {quarter_label(period)}"), level=1),
+                 line(Italic("Показана учтённая часть истории с учётом поздних событий. Исходный отчёт сохранён."))]
+        for media, label in (("anime", "Аниме"), ("manga", "Манга и ранобэ")):
+            count = sum(ev.get("media") == media for ev in completed)
+            lines.append(line(f"{label}: завершено — {count}."))
+        for ev in completed:
+            title = ev.get("title") or {}
+            name = title.get("russian") or title.get("name") or f"Тайтл {ev.get('id', '?')}"
+            score = ev.get("score")
+            lines.append(line(name, f" — оценка {score}" if score else " — без оценки"))
+        for kind, label in (("dropped", "Брошено"), ("planned", "Добавлено в планы"), ("rewatching", "Начато повторно")):
+            lines.append(line(f"{label}: {sum(ev.get('event') == kind for ev in events)}."))
+        units.append(Unit((section(*lines),)))
+    return units
+
+
 def build_quarterly_report_messages(
     cur: dict,
     stats_all: dict,
@@ -1959,6 +2037,7 @@ def build_quarterly_report_messages(
         line(Bold(title_label)),
     ]
     header_lines.extend(_quarter_source_notices(stats_all))
+    header_lines.extend(_event_time_notices(cur))
     if _is_partial_quarter(cur):
         header_lines.append(line(Italic(
             "⚠️ Квартал отслеживался не с самого начала — данные неполные."
@@ -1972,6 +2051,7 @@ def build_quarterly_report_messages(
         section(*header_lines),
     )]
     units.extend(_manga_quarter_units(report))
+    units.extend(_correction_units(cur))
 
     extra_sections: list[Section] = []
     if prev_quarter is not None and not isinstance(prev_quarter, dict):
@@ -2107,16 +2187,27 @@ def _save_quarter_snapshot(period: str, cur: dict, stats_all: dict) -> None:
             "anime_titles": comp_a,
             "manga_titles": comp_m,
         }
-        _atomic_write(QUARTERS_DIR / f"{period}.json",
-                      json.dumps(snapshot, ensure_ascii=False, indent=2))
+        if EVENT_TIME_KEY in cur:
+            snapshot["time_basis"] = "UTC"
+            snapshot["history_complete"] = False
+            snapshot["legacy_data"] = period <= cur[EVENT_TIME_KEY]["legacy_period"]
+            snapshot["unallocated_times"] = deepcopy(cur[EVENT_TIME_KEY]["unknown"])
+        payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        if EVENT_TIME_KEY in cur and json_publication_size(payload) > JOURNAL_MAX_BYTES:
+            raise QuarterDeliveryStateError("snapshot_capacity")
+        _atomic_write(QUARTERS_DIR / f"{period}.json", payload)
         log.info("Снапшот квартала %s сохранён.", period)
     except Exception as e:
-        log.error("_save_quarter_snapshot(%s): %s", period, e)
+        log.error("_save_quarter_snapshot(%s): %s", period, type(e).__name__)
+        if EVENT_TIME_KEY in cur:
+            raise QuarterDeliveryStateError("snapshot_write") from None
 
 
-def _update_by_quarter(stats_all: dict, period: str, cur: dict) -> None:
+def _update_by_quarter(
+    stats_all: dict, period: str, cur: dict, *, media_types: tuple[str, ...] = ("anime", "manga")
+) -> None:
     """Добавляем сводку квартала в aggregates.by_quarter для аниме и манги."""
-    for media in ("anime", "manga"):
+    for media in media_types:
         comp = _quarter_titles(cur, stats_all, media, "completed")
         scores = [r["score"] for r in comp if _safe_int(r.get("score")) > 0]
         avg = round(sum(scores) / len(scores), 2) if scores else None
@@ -2127,4 +2218,48 @@ def _update_by_quarter(stats_all: dict, period: str, cur: dict) -> None:
         else:
             entry["chapters_read"] = sum(_safe_int(r.get("chapters_read")) for r in comp)
         bq[period] = entry
+
+
+def refresh_event_time_by_quarter(stats_all: dict, cur: dict) -> bool:
+    """Согласовать восстановимый кеш с закрытыми source-проекциями."""
+    if EVENT_TIME_KEY not in cur:
+        return False
+    media_types = tuple(
+        media
+        for media in ("anime", "manga")
+        if isinstance(stats_all.get(media), dict)
+        and not _report_media_mapping(stats_all, media, "aggregates")[1]
+        and isinstance(_report_media_mapping(stats_all, media, "aggregates")[0].get("by_quarter", {}), dict)
+    )
+    before = {
+        media: deepcopy(_report_media_mapping(stats_all, media, "aggregates")[0].get("by_quarter"))
+        for media in media_types
+    }
+    for period, bucket in cur[EVENT_TIME_KEY]["periods"].items():
+        if period < cur["period"]:
+            legacy = period < cur[EVENT_TIME_KEY]["legacy_period"]
+            if legacy and bucket["revision"] == 0:
+                continue
+            # Повреждённый legacy-итог нельзя заменить известной новой частью.
+            period_media = tuple(
+                media for media in media_types
+                if not legacy or isinstance(
+                    _report_media_mapping(stats_all, media, "aggregates")[0].get("by_quarter", {}).get(period, {}), dict
+                )
+            )
+            previous = {
+                media: deepcopy(_report_media_mapping(stats_all, media, "aggregates")[0].get("by_quarter", {}).get(period, {}))
+                for media in period_media
+            } if legacy else {}
+            _update_by_quarter(stats_all, period, {**cur, "events": bucket["events"]}, media_types=period_media)
+            if legacy:
+                # Для уже закрытой до миграции истории известна лишь новая
+                # часть. Не заменяем сохранённые legacy-итоги нулём/частью.
+                for media in period_media:
+                    by_quarter = stats_all[media]["aggregates"]["by_quarter"]
+                    by_quarter[period] = {**previous[media], "event_time_partial": by_quarter[period], "history_complete": False}
+    return any(
+        before[media] != _report_media_mapping(stats_all, media, "aggregates")[0].get("by_quarter")
+        for media in media_types
+    )
 

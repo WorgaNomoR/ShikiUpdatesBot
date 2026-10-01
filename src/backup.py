@@ -45,6 +45,7 @@ from event_journal_schema import (
     validate_projection,
     validate_recovery_set,
 )
+from event_time_stats import validate_event_time
 from fact_bank import (
     FactBankDocument,
     FactBankValidationError,
@@ -70,6 +71,7 @@ from storage import (
     restorable_restore_generation,
     restorable_state_transaction,
     save_subscriber_state,
+    stats_current_json,
     subscriber_state_from_payload,
     user_alerts_from_payload,
     validate_pending_quarter_delivery,
@@ -570,6 +572,9 @@ def _valid_import_payload(name: str, obj) -> bool:
             validate_pending_quarter_delivery(obj)
             if PROJECTION_KEY in obj:
                 validate_projection(obj[PROJECTION_KEY])
+            validate_event_time(obj)
+            if "event_time" in obj:
+                stats_current_json(obj)
             if obj.get("pending_quarter_delivery") is not None and not isinstance(obj.get("events"), list):
                 raise QuarterDeliveryStateError("current_structure")
         return (isinstance(obj, dict) and "period" in obj

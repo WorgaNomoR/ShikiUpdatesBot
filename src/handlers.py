@@ -85,6 +85,16 @@ from event_journal_schema import (
     journal_json,
     validate_recovery_set,
 )
+from event_time_stats import (
+    EVENT_TIME_KEY,
+    acknowledge_revisions,
+    ensure_event_time,
+    index_event_periods,
+    next_period,
+    project_event,
+    report_revisions,
+    rotate_event_time,
+)
 from fact_bank import (
     FACT_BANK_MAX_BYTES,
     FACT_FILE_INVALID,
@@ -200,7 +210,7 @@ from stats import (
     build_pick_catalog,
     build_quarterly_report_messages,
     build_stats_all_messages,
-    record_current_event,
+    refresh_event_time_by_quarter,
     select_contrast_pick_candidate,
     select_pick_candidate,
     sync_stats_all,
@@ -512,7 +522,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         generation = restorable_restore_generation()
         migrated = migrate_quarter_delivery(pending)
         units_key = (
-            "report_units" if migrated.get("version") == 2 else "report_messages"
+            "report_units" if migrated.get("version") in {2, 3} else "report_messages"
         )
         total_units = len(migrated[units_key])
         complete = migrated["next_unit"] == total_units
@@ -520,6 +530,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
             cur[_PENDING_QUARTER_DELIVERY] = migrated
             if complete:
                 cur["last_report_sent"] = migrated["new_period"]
+                acknowledge_revisions(cur)
             save_stats_current(cur, strict=True)
         pending = migrated
 
@@ -542,11 +553,12 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
             current[_PENDING_QUARTER_DELIVERY] = dict(pending, next_unit=index + 1)
             if index + 1 == total_units:
                 current["last_report_sent"] = pending["new_period"]
+                acknowledge_revisions(current)
             save_stats_current(current, strict=True)
 
     delivery = (
         deliver_frozen_report
-        if pending.get("version") == 2
+        if pending.get("version") in {2, 3}
         else deliver_rendered_report
     )
     result = await delivery(
@@ -563,7 +575,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
             is_rich_method_unsupported(result.error)
             or is_local_rich_asset_error(result.error)
         )
-        if pending.get("version") == 2 and safe_rich_fallback:
+        if pending.get("version") in {2, 3} and safe_rich_fallback:
             log.warning(
                 "rotate_quarter: rich transport заменён frozen HTML (%s)",
                 type(result.error).__name__,
@@ -574,6 +586,8 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
                     pending,
                     result.next_unit,
                 )
+                if EVENT_TIME_KEY in current and current[EVENT_TIME_KEY]["report_ack"] is not None:
+                    current[EVENT_TIME_KEY]["report_ack"]["plan_id"] = current[_PENDING_QUARTER_DELIVERY]["plan_id"]
                 save_stats_current(current, strict=True)
             return await _resume_pending_quarter(bot)
         # Исключения Telegram могут содержать весь запрос: логируем только тип.
@@ -612,6 +626,8 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         subscriber_state.backup_schedule["last_backup_at"] = completed_at
         save_subscriber_state(subscriber_state)
         cur[_PENDING_QUARTER_DELIVERY] = None
+        if EVENT_TIME_KEY in cur:
+            cur[EVENT_TIME_KEY]["report_ack"] = None
         save_stats_current(cur, strict=True)
     return cur
 
@@ -648,7 +664,7 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
     now_period = current_quarter()
     async with restorable_state_transaction():
         cur = load_stats_current(strict=True)
-        rotation_needed = cur.get("period") != now_period
+        rotation_needed = cur.get("period") < now_period
         if PROJECTION_KEY in cur:
             journal, cur = _history_state()
             if journal.get("catchup") is not None and cur.get(_PENDING_QUARTER_DELIVERY) is None:
@@ -678,11 +694,11 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
                 if journal.get("catchup") is not None or journal["processed_seq"] < len(journal["events"]):
                     return cur
             expected_generation = restorable_restore_generation()
-            if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") == now_period:
+            if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") >= now_period:
                 return cur
 
             old_period = cur.get("period", "???")
-            if cur.get("last_report_sent") == now_period:
+            if EVENT_TIME_KEY not in cur and cur.get("last_report_sent") == now_period:
                 # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
                 log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
                 fresh = _empty_stats_current(now_period)
@@ -750,14 +766,19 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
             except Exception as e:
                 log.error("rotate_quarter: обновление by_quarter: %s", e)
 
-            fresh = _empty_stats_current(now_period)
+            # Один отчёт за цикл оставляет время избранному и независимым backup.
+            new_period = next_period(old_period) if EVENT_TIME_KEY in cur else now_period
+            fresh = _empty_stats_current(new_period)
             if PROJECTION_KEY in cur:
                 fresh[PROJECTION_KEY] = deepcopy(cur[PROJECTION_KEY])
             fresh[_PENDING_QUARTER_DELIVERY] = new_quarter_delivery_plan(
                 old_period,
-                now_period,
+                new_period,
                 report_units,
+                event_time_revisions=report_revisions(cur) if EVENT_TIME_KEY in cur else None,
             )
+            if EVENT_TIME_KEY in cur:
+                rotate_event_time(cur, fresh, fresh[_PENDING_QUARTER_DELIVERY])
             save_stats_current(fresh, strict=True)
         break
 
@@ -2188,7 +2209,7 @@ def _journal_seen(journal: dict) -> set[int]:
     return set(journal["baseline_ids"]) | {event["history_id"] for event in journal["events"]}
 
 
-def _history_state() -> tuple[dict | None, dict]:
+def _history_state(*, full_recovery: bool = True) -> tuple[dict | None, dict]:
     """Вызывается под lock; отсутствие привязанного файла не есть первый запуск."""
     journal = load_event_journal()
     cur = load_stats_current(strict=True, initialize_missing=journal is None)
@@ -2196,7 +2217,7 @@ def _history_state() -> tuple[dict | None, dict]:
         if PROJECTION_KEY in cur:
             raise EventJournalStateError("bound_journal_missing")
     elif PROJECTION_KEY in cur:
-        validate_recovery_set(journal, cur)
+        validate_recovery_set(journal, cur, full_recovery=full_recovery)
     elif journal["events"] or journal["processed_seq"] or journal.get("catchup") is not None:
         raise EventJournalStateError("projection_missing")
     return journal, cur
@@ -2225,6 +2246,7 @@ async def _initialize_history_journal(ids: set[int], generation: int) -> tuple[d
             cur[PROJECTION_KEY] = {
                 "journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0,
             }
+            ensure_event_time(cur)
             save_stats_current(cur, strict=True)
         return journal, cur
 
@@ -2259,6 +2281,9 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
             raise _HistoryAttemptChanged
         journal, cur = _history_state()
         generation = restorable_restore_generation()
+        if journal is not None and PROJECTION_KEY in cur and ensure_event_time(cur):
+            save_stats_current(cur, strict=True)
+        period_events = index_event_periods(cur, journal) if journal is not None and PROJECTION_KEY in cur else {}
     while journal is not None and journal["processed_seq"] < len(journal["events"]):
         seq = journal["processed_seq"] + 1
         event = journal["events"][seq - 1]
@@ -2267,13 +2292,20 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
             if restorable_restore_generation() != generation:
                 raise _HistoryAttemptChanged
             cur = load_stats_current(strict=True)
-            validate_recovery_set(journal, cur)
+            validate_recovery_set(journal, cur, full_recovery=False)
             if cur[PROJECTION_KEY]["applied_seq"] < seq:
                 cur = deepcopy(cur)
-                if event["relevant"]:
-                    cur = record_current_event(cur, entry, event["event_type"], event["media"], event["score"])
+                project_event(cur, journal, seq, period_events=period_events)
                 cur[PROJECTION_KEY]["applied_seq"] = seq
                 save_stats_current(cur, strict=True)
+                # Кеш восстановим и при следующем полном sync; его сбой не
+                # отменяет уже опубликованную restorable-проекцию.
+                try:
+                    stats_all = load_stats_all()
+                    if refresh_event_time_by_quarter(stats_all, cur):
+                        save_stats_all(stats_all)
+                except Exception as error:
+                    log.warning("История: by_quarter не обновлён (%s).", type(error).__name__)
         if event["relevant"] and event["event_type"] not in {"ignored", "score_removed"}:
             if event["event_type"] == "unknown":
                 log.warning("Неизвестное описание истории entry id=%d.", event["history_id"])
@@ -2287,7 +2319,7 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
                 raise _HistoryAttemptChanged
-            current_journal, cur = _history_state()
+            current_journal, cur = _history_state(full_recovery=False)
             if current_journal != journal or cur[PROJECTION_KEY]["applied_seq"] != seq:
                 raise _HistoryAttemptChanged
             journal = deepcopy(journal)

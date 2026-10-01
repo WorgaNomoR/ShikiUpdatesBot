@@ -3456,6 +3456,66 @@ async def test_sync_repairs_containers_only_for_successful_export(monkeypatch, b
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("damaged", [None, [], "missing"])
+async def test_sync_quarter_cache_failure_keeps_successful_export(monkeypatch, caplog, damaged):
+    from event_time_stats import ensure_event_time
+
+    state = storage._empty_stats_all()
+    state["anime"]["titles"] = {"1": _anime_rec()}
+    if damaged == "missing":
+        state.pop("manga")
+    else:
+        state["manga"] = damaged
+    before = copy.deepcopy(state)
+    cur = {
+        "period": "2026-Q1",
+        "events": [{"id": "1", "media": "anime", "event": "completed", "score": 8}],
+        "event_projection": {"journal_id": "a" * 32, "baseline_seq": 0, "applied_seq": 0},
+    }
+    ensure_event_time(cur)
+    cur.update(period="2026-Q2", events=[])
+    save = MagicMock()
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.load_stats_current", lambda **kwargs: cur)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=[[], None]))
+    monkeypatch.setattr("stats.save_stats_all", save)
+
+    result, ok = await smod.sync_stats_all(session=object(), fav=None)
+
+    assert ok is True
+    assert result["anime"]["titles"] == {}
+    assert result["anime"]["aggregates"]["by_quarter"]["2026-Q1"]["completed"] == 1
+    assert result.get("manga") == before.get("manga")
+    assert ("manga" in result) == ("manga" in before)
+    assert state == before
+    save.assert_called_once_with(result)
+    assert "by_quarter не обновлён" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sync_unexpected_quarter_read_failure_keeps_export(monkeypatch, caplog):
+    state = storage._empty_stats_all()
+    state["anime"]["titles"] = {"1": _anime_rec()}
+    save = MagicMock()
+
+    def failed_read(**kwargs):
+        raise RuntimeError("private storage detail")
+
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.load_stats_current", failed_read)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=[[], None]))
+    monkeypatch.setattr("stats.save_stats_all", save)
+
+    result, ok = await smod.sync_stats_all(session=object(), fav=None)
+
+    assert ok is True
+    assert result["anime"]["titles"] == {}
+    save.assert_called_once_with(result)
+    assert "by_quarter не обновлён (RuntimeError)" in caplog.text
+    assert "private storage detail" not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("aggregates", [None, [], "broken"])
 async def test_sync_aggregate_only_repair_preserves_valid_title(monkeypatch, aggregates):
     state = storage._empty_stats_all()
@@ -3518,3 +3578,162 @@ def test_quarter_achievement_count_wording_and_thresholds(count, title_word, tim
         else:
             assert "Десятку поставил" not in text
             assert ("Один безоговорочный шедевр" in text) == (count == 1)
+
+
+def test_current_calendar_report_is_independent_of_delayed_delivery_period(monkeypatch):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+    )
+
+    cur = {"period": "2026-Q1", "events": [], "event_projection": {"journal_id": "a" * 32, "baseline_seq": 0, "applied_seq": 0}}
+    ensure_event_time(cur)
+    journal = {"events": []}
+    for seq, source in enumerate(("2026-01-01T00:00:00Z", "2026-10-01T00:00:00Z"), 1):
+        event = messages.normalize_history_event({"id": seq, "created_at": source, "description": "Просмотрено",
+                                                  "target": {"id": seq, "kind": "tv", "name": f"Source {seq}"}},
+                                                 "2026-10-02T00:00:00+00:00")
+        journal["events"].append(event)
+        event["score"] = 8
+        project_event(cur, journal, seq)
+        cur["event_projection"]["applied_seq"] = seq
+    before = copy.deepcopy(cur)
+    monkeypatch.setattr("stats.current_quarter", lambda: "2026-Q4")
+    text = "\n".join(rendered_html(smod.build_current_stats_messages(cur, storage._empty_stats_all())))
+    assert "Source 2" in text and "Source 1" not in text
+    assert "01.10.2026" in text
+    assert cur == before
+
+
+@pytest.mark.parametrize("media", ["anime", "manga"])
+def test_legacy_unrated_completion_keeps_export_score_until_source_removal(backup_env, media):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+        validate_event_time,
+    )
+
+    state = storage._empty_stats_all()
+    state[media]["titles"]["10"] = {"title": "Legacy title", "kind": "tv" if media == "anime" else "manga", "score": 9}
+    cur = {
+        "period": "2026-Q2",
+        "events": [{"id": "10", "media": media, "event": "completed", "score": None}],
+        "event_projection": {"journal_id": "a" * 32, "baseline_seq": 0, "applied_seq": 0},
+    }
+    before = smod._quarter_titles(cur, state, media, "completed")
+    ensure_event_time(cur)
+    assert smod._quarter_titles(cur, state, media, "completed") == before
+    smod._update_by_quarter(state, cur["period"], cur)
+    assert state[media]["aggregates"]["by_quarter"]["2026-Q2"]["avg_score"] == 9
+    smod._save_quarter_snapshot(cur["period"], cur, state)
+    snapshot = json.loads((backup_env / "quarters" / "2026-Q2.json").read_text(encoding="utf-8"))
+    assert snapshot[f"{media}_titles"][0]["score"] == 9
+
+    removal = messages.normalize_history_event(
+        {"id": 2, "created_at": "2026-04-02T00:00:00Z", "description": "Удалена оценка",
+         "target": {"id": 10, "kind": "tv", "name": "Legacy title"}},
+        "2026-04-03T00:00:00+00:00",
+    )
+    removal.update(event_type="score_removed", media=media, score=None)
+    journal = {"events": [removal]}
+    project_event(cur, journal, 1)
+    cur["event_projection"]["applied_seq"] = 1
+    validate_event_time(cur, journal)
+    assert smod._quarter_titles(cur, state, media, "completed")[0]["score"] == 0
+    assert cur["event_time"]["legacy_events"][0]["score"] is None
+    smod._update_by_quarter(state, cur["period"], cur)
+    assert state[media]["aggregates"]["by_quarter"]["2026-Q2"]["avg_score"] is None
+    storage.save_stats_current(cur, strict=True)
+    assert smod._quarter_titles(storage.load_stats_current(strict=True), state, media, "completed")[0]["score"] == 0
+
+
+def test_closed_quarter_correction_names_dropped_status():
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+    )
+
+    cur = {"period": "2026-Q2", "events": [], "event_projection": {"journal_id": "a" * 32, "baseline_seq": 0, "applied_seq": 0}}
+    ensure_event_time(cur)
+    event = messages.normalize_history_event(
+        {"id": 1, "created_at": "2026-01-01T00:00:00Z", "description": "Брошено",
+         "target": {"id": 1, "kind": "tv", "name": "Dropped title"}},
+        "2026-04-02T00:00:00+00:00",
+    )
+    event["event_type"] = "dropped"
+    project_event(cur, {"events": [event]}, 1)
+    cur["event_projection"]["applied_seq"] = 1
+
+    text = "\n".join(rendered_html(smod.build_quarterly_report_messages(cur, storage._empty_stats_all(), None)))
+
+    assert "Корректировка за январь — март 2026" in text
+    assert "Брошено: 1." in text
+    assert "Добавлено в планы: 0." in text
+    assert "Начато повторно: 0." in text
+
+
+@pytest.mark.parametrize("damaged_media", ["anime", "manga"])
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("damaged", [None, [], "missing", {"aggregates": []}, {"aggregates": {"by_quarter": []}}])
+def test_quarter_cache_updates_valid_media_independently(damaged_media, legacy, damaged):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+    )
+
+    valid_media = "manga" if damaged_media == "anime" else "anime"
+    state = storage._empty_stats_all()
+    if damaged == "missing":
+        state.pop(damaged_media)
+    else:
+        state[damaged_media] = copy.deepcopy(damaged)
+    previous = {"completed": 20, "avg_score": 9.0}
+    if legacy:
+        state[valid_media]["aggregates"]["by_quarter"] = {"2026-Q1": dict(previous)}
+    cur = {"period": "2026-Q2" if legacy else "2026-Q1", "events": [],
+           "event_projection": {"journal_id": "a" * 32, "baseline_seq": 0, "applied_seq": 0}}
+    ensure_event_time(cur)
+    event = messages.normalize_history_event(
+        {"id": 1, "created_at": "2026-01-01T00:00:00Z", "description": "Просмотрено",
+         "target": {"id": 1, "kind": "tv", "name": "Source title"}},
+        "2026-04-02T00:00:00+00:00",
+    )
+    event.update(media=valid_media, event_type="completed", score=8)
+    project_event(cur, {"events": [event]}, 1)
+    cur["event_projection"]["applied_seq"] = 1
+    cur.update(period="2026-Q3", events=[])
+
+    assert smod.refresh_event_time_by_quarter(state, cur)
+    assert not smod.refresh_event_time_by_quarter(state, cur)
+    assert (damaged_media in state) == (damaged != "missing")
+    assert state.get(damaged_media) == (None if damaged == "missing" else damaged)
+    cached = state[valid_media]["aggregates"]["by_quarter"]["2026-Q1"]
+    if legacy:
+        assert {key: cached[key] for key in previous} == previous
+        cached = cached["event_time_partial"]
+    assert cached["completed"] == 1
+    assert cached["avg_score"] == 8
+
+
+@pytest.mark.parametrize("damaged_media", ["anime", "manga"])
+@pytest.mark.parametrize("damaged", [None, [], "broken"])
+def test_legacy_quarter_cache_keeps_invalid_period_entry(damaged_media, damaged):
+    state = storage._empty_stats_all()
+    state[damaged_media]["aggregates"]["by_quarter"] = {"2026-Q1": damaged}
+    valid_media = "manga" if damaged_media == "anime" else "anime"
+    cur = {
+        "period": "2026-Q3", "events": [],
+        "event_time": {"legacy_period": "2026-Q2", "periods": {
+            "2026-Q1": {"revision": 1, "events": [
+                {"id": "1", "media": valid_media, "event": "completed", "score": 8}
+            ]}
+        }},
+    }
+
+    assert smod.refresh_event_time_by_quarter(state, cur)
+    assert not smod.refresh_event_time_by_quarter(state, cur)
+    assert state[damaged_media]["aggregates"]["by_quarter"]["2026-Q1"] == damaged
+    cached = state[valid_media]["aggregates"]["by_quarter"]["2026-Q1"]
+    assert "completed" not in cached
+    assert cached["event_time_partial"]["completed"] == 1
+    assert cached["event_time_partial"]["avg_score"] == 8
