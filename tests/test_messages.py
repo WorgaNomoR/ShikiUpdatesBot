@@ -4,6 +4,7 @@ import json
 import random
 import re
 import time
+from copy import deepcopy
 from html.parser import HTMLParser
 from pathlib import Path
 from string import Formatter
@@ -2034,3 +2035,107 @@ def test_final_render_uses_explicit_gender_for_latin_name(
     text = build_message(make_entry("добавлено в список", url=""))
 
     assert f"Alice {expected_word}" in text
+
+
+@pytest.mark.parametrize("source,utc,quality", [
+    ("2026-04-01T02:00:00+03:00", "2026-03-31T23:00:00+00:00", "aware"),
+    ("2026-03-31T22:00:00-02:00", "2026-04-01T00:00:00+00:00", "aware"),
+    ("2026-04-01T00:00:00Z", "2026-04-01T00:00:00+00:00", "aware"),
+    ("2026-04-01T00:00:00", None, "naive"),
+    ("2026-04-01", None, "naive"),
+    ("bad", None, "invalid"),
+    (123, None, "invalid"),
+    (None, None, "missing"),
+    ("", None, "missing"),
+])
+def test_normalized_history_preserves_source_time(source, utc, quality):
+    from messages import normalize_history_event
+
+    event = normalize_history_event({"id": 7, "created_at": source}, "2026-04-02T00:00:00+00:00")
+    assert event["created_at"] == source
+    assert event["event_at"] == utc
+    assert event["time_quality"] == quality
+    assert event["observed_at"] == "2026-04-02T00:00:00+00:00"
+
+
+@pytest.mark.parametrize("description", [
+    "Добавлено в список", "Смотрю", "Пересматриваю", "Отложено", "Брошено",
+    "Просмотрено и оценено на 8", "Оценено на 7", "Изменена оценка с 7 на 9",
+    "Отменена оценка", "Просмотрено 5 эпизодов", "Неизвестное действие",
+])
+def test_normalization_delegates_classification_and_rendering(description, monkeypatch):
+    import messages
+
+    entry = {
+        "id": 17, "description": description,
+        "target": {"id": 18, "kind": "tv", "name": "A & B", "url": '/animes/18?q="x"&b=2', "score": 9.7},
+    }
+    event = messages.normalize_history_event(entry, "2026-04-02T00:00:00+00:00")
+    assert event["event_type"] == messages.classify_event(description)
+    monkeypatch.setattr(messages.random, "choice", lambda choices: choices[0])
+    expected = messages.build_message(entry)
+    monkeypatch.setattr("messages.classify_event", lambda _: pytest.fail("повторная классификация"))
+    assert messages.build_message(messages.history_entry_from_event(event), normalized=event) == expected
+    if description == "Смотрю":
+        assert event["score"] is None
+    if description == "Изменена оценка с 7 на 9":
+        assert event["score_change"] == [7, 9]
+        assert event["score"] == 9
+
+
+@pytest.mark.parametrize("target,media,relevant", [
+    ({"kind": "light_novel", "name": "Book"}, "manga", True),
+    ({"type": "Manga", "kind": "ranobe"}, "manga", True),
+    ({"kind": "one_shot"}, "manga", False),
+    ({"kind": "special"}, "anime", False),
+    ({}, "anime", False),
+])
+def test_normalization_keeps_domain_and_exclusions(target, media, relevant):
+    from messages import normalize_history_event
+
+    event = normalize_history_event({"id": 7, "target": target}, "2026-04-02T00:00:00+00:00")
+    assert event["media"] == media
+    assert event["kind"] == target.get("kind", "")
+    assert event["relevant"] is relevant
+    assert set(event["title"]) == {"name", "russian", "url"}
+
+
+@pytest.mark.parametrize("target", ["bad", 123, True, ["bad"]])
+def test_normalization_treats_malformed_target_as_empty(target):
+    entry = {"id": 7, "description": "Просмотрено", "target": target}
+    before = deepcopy(entry)
+
+    event = messages.normalize_history_event(entry, "2026-04-02T00:00:00+00:00")
+
+    assert event["history_id"] == 7
+    assert event["target_id"] == ""
+    assert event["media"] == "anime"
+    assert event["kind"] == ""
+    assert event["relevant"] is False
+    assert event["title"] == {"name": "???", "russian": "", "url": ""}
+    assert entry == before
+
+
+@pytest.mark.parametrize("field", ["type", "kind", "name", "russian", "url"])
+@pytest.mark.parametrize("value", [123, True, ["bad"], {"bad": "data"}])
+def test_normalization_defaults_malformed_target_fields(field, value):
+    target = {
+        "id": 42, "type": "Anime", "kind": "tv", "name": "A <&>",
+        "russian": "Название <&>", "url": '/animes/42?x="a"&b=2',
+    }
+    expected_title = {key: target[key] for key in ("name", "russian", "url")}
+    if field in expected_title:
+        expected_title[field] = "???" if field == "name" else ""
+    target[field] = value
+    entry = {"id": 7, "description": "Просмотрено и оценено на 8", "target": target}
+    before = deepcopy(entry)
+
+    event = messages.normalize_history_event(entry, "2026-04-02T00:00:00+00:00")
+
+    assert event["history_id"] == 7
+    assert event["target_id"] == "42"
+    assert event["media"] == "anime"
+    assert event["kind"] == ("" if field == "kind" else "tv")
+    assert event["relevant"] is (field != "kind")
+    assert event["title"] == expected_title
+    assert entry == before

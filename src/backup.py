@@ -34,8 +34,16 @@ from aiogram.types import BufferedInputFile
 from config import (
     DATA_DIR,
     OWNER_ID,
+    SHIKI_USER,
     WEEKLY_BACKUP_INTERVAL,
     log,
+)
+from event_journal_schema import (
+    PROJECTION_KEY,
+    journal_json,
+    parse_event_journal,
+    validate_projection,
+    validate_recovery_set,
 )
 from fact_bank import (
     FactBankDocument,
@@ -56,6 +64,7 @@ from storage import (
     ensure_backup_schedule,
     known_users_from_payload,
     load_blocked_users,
+    load_event_journal,
     load_subscriber_state,
     mark_restorable_state_restored,
     restorable_restore_generation,
@@ -101,13 +110,14 @@ _automatic_backup_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, a
 
 _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
     "blocked_users.json", "facts.json", "subscribers.json", "stats_current.json",
-    "update_state.json", "known_users.json", "user_alerts.json",
+    "update_state.json", "known_users.json", "user_alerts.json", "event_journal.json",
 })
 
 _STRICT_IMPORT_FILES: frozenset[str] = frozenset({
     "facts.json",
     "known_users.json",
     "user_alerts.json",
+    "event_journal.json",
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -504,7 +514,7 @@ async def _shutdown_backup(bot: Bot) -> None:
 def _is_allowed_import_member(name: str) -> bool:
     """Разрешено ли имя из архива к восстановлению?
     Бел.список: blocked_users.json, facts.json, known_users.json,
-    subscribers.json, stats_current.json, update_state.json, user_alerts.json
+    subscribers.json, stats_current.json, event_journal.json, update_state.json, user_alerts.json
     и кварталы.
     Глушим zip-slip: '..'-сегменты, абсолютные пути и бэкслеши отвергаем."""
     if not name or name.endswith("/"):
@@ -558,6 +568,8 @@ def _valid_import_payload(name: str, obj) -> bool:
                 validate_quarter_period(obj["period"])
             # Повреждённый pending отменяет весь импорт до публикации файлов.
             validate_pending_quarter_delivery(obj)
+            if PROJECTION_KEY in obj:
+                validate_projection(obj[PROJECTION_KEY])
             if obj.get("pending_quarter_delivery") is not None and not isinstance(obj.get("events"), list):
                 raise QuarterDeliveryStateError("current_structure")
         return (isinstance(obj, dict) and "period" in obj
@@ -589,6 +601,33 @@ def _subscriber_state_from_import_payload(payload: str) -> SubscriberState:
         json.loads(payload),
         strict_schedule=True,
     )
+
+
+def _prepare_history_restore_candidate(pending: dict[str, str]) -> dict[str, str]:
+    """Полный recovery-набор либо явная граница старого квартального архива."""
+    if "event_journal.json" in pending:
+        if "stats_current.json" not in pending:
+            raise ValueError("Журнал требует соответствующий текущий квартал в архиве")
+        journal = parse_event_journal(pending["event_journal.json"].encode("utf-8"), profile=SHIKI_USER)
+        cur = json.loads(pending["stats_current.json"])
+        validate_recovery_set(journal, cur)
+    elif "stats_current.json" in pending:
+        cur = json.loads(pending["stats_current.json"])
+        if PROJECTION_KEY in cur:
+            raise ValueError("Архив с привязанным кварталом требует журнал истории")
+        journal = load_event_journal()
+        if journal is not None:
+            cur[PROJECTION_KEY] = {
+                "journal_id": journal["journal_id"],
+                "baseline_seq": journal["processed_seq"],
+                "applied_seq": journal["processed_seq"],
+            }
+            validate_recovery_set(journal, cur)
+            payload = json.dumps(cur, ensure_ascii=False, separators=(",", ":"))
+            if len(payload.encode("utf-8")) > _IMPORT_MEMBER_MAX_BYTES:
+                raise ValueError("Восстановленный квартал превышает предел размера")
+            pending = {**pending, "stats_current.json": payload}
+    return pending
 
 
 def _prepare_access_restore_candidate(pending: dict[str, str]) -> dict[str, str]:
@@ -793,12 +832,23 @@ async def restore_backup_zip(raw: bytes) -> dict:
                     ) from e
                 pending[name] = serialize_fact_bank(restored_fact_document)
                 continue
+            if name == "event_journal.json":
+                try:
+                    journal = parse_event_journal(zf.read(info), profile=SHIKI_USER)
+                except (
+                    ValueError, OSError, RuntimeError, zipfile.BadZipFile,
+                    NotImplementedError, EOFError, zlib.error, lzma.LZMAError,
+                ):
+                    raise ValueError("Журнал истории в архиве повреждён; восстановление отменено") from None
+                pending[name] = journal_json(journal)
+                continue
             try:
                 payload = zf.read(info).decode("utf-8")
                 obj = json.loads(payload)   # синтаксически валидный JSON?
             except (
                 UnicodeDecodeError,
                 json.JSONDecodeError,
+                RecursionError,
                 zipfile.BadZipFile,
                 RuntimeError,
                 NotImplementedError,
@@ -839,6 +889,7 @@ async def restore_backup_zip(raw: bytes) -> dict:
         )
 
     async with restorable_state_transaction():
+        pending = _prepare_history_restore_candidate(pending)
         pending = _prepare_access_restore_candidate(pending)
         restored = _publish_restore_files(pending)
         mark_restorable_state_restored()

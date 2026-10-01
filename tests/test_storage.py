@@ -1733,3 +1733,129 @@ def test_strict_quarter_load_rejects_damaged_pending_without_reset(backup_env):
     with pytest.raises(storage.QuarterDeliveryStateError, match="^progress_index$"):
         storage.load_stats_current(strict=True, initialize_missing=True)
     assert storage.STATS_CURRENT_FILE.read_bytes() == original
+
+
+@pytest.mark.parametrize("change", [
+    lambda j: j.update(version=True),
+    lambda j: j.update(version=2),
+    lambda j: j.update(normalization_version=2),
+    lambda j: j.update(profile="Other"),
+    lambda j: j.update(baseline_initialized=1),
+    lambda j: j.update(baseline_ids=[1, True]),
+    lambda j: j.update(baseline_ids=[1, 1]),
+    lambda j: j.update(processed_seq=True),
+    lambda j: j.update(processed_seq=-1),
+    lambda j: j.update(processed_seq=2),
+    lambda j: j["events"][0].update(seq=True),
+    lambda j: j["events"][0].update(seq=2),
+    lambda j: j["events"][0].update(history_id=True),
+    lambda j: j["events"].append(dict(j["events"][0], seq=2)),
+    lambda j: j["events"][0].update(event_type=[]),
+    lambda j: j["events"][0].update(media=[]),
+    lambda j: j["events"][0].update(score=True),
+    lambda j: j["events"][0].update(score_change=[1, False]),
+    lambda j: j["events"][0].update(event_at="2026-04-01T00:00:00+00:00"),
+    lambda j: j["events"][0].update(observed_at="2026-04-02T00:00:00"),
+    lambda j: j["events"][0].update(time_quality="missing"),
+    lambda j: j.update(baseline_initialized=False),
+])
+def test_journal_strict_validation_preserves_bad_bytes(journal_factory, change):
+    from event_journal_schema import EventJournalStateError
+
+    journal = journal_factory()
+    change(journal)
+    raw = json.dumps(journal).encode("utf-8")
+    storage.EVENT_JOURNAL_FILE.write_bytes(raw)
+    with pytest.raises(EventJournalStateError):
+        storage.load_event_journal()
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == raw
+
+
+@pytest.mark.parametrize("raw", [
+    b"{broken", b"\xff", b"[" * 1500 + b"]" * 1500,
+    b'{"version":1,"version":1}',
+])
+def test_journal_parser_rejects_invalid_encoding_depth_and_duplicate_keys(raw):
+    from event_journal_schema import EventJournalStateError
+
+    storage.EVENT_JOURNAL_FILE.write_bytes(raw)
+    with pytest.raises(EventJournalStateError):
+        storage.load_event_journal()
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == raw
+
+
+def test_journal_read_failure_is_not_absence(monkeypatch):
+    from event_journal_schema import EventJournalStateError
+
+    original = type(storage.EVENT_JOURNAL_FILE).open
+
+    def fail_read(path, *args, **kwargs):
+        if path == storage.EVENT_JOURNAL_FILE:
+            raise PermissionError("denied")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(storage.EVENT_JOURNAL_FILE), "open", fail_read)
+    with pytest.raises(EventJournalStateError, match="journal_read"):
+        storage.load_event_journal()
+
+
+def test_journal_size_and_checkpoint_reserve_are_inclusive(journal_factory, monkeypatch):
+    from event_journal_schema import (
+        EventJournalStateError,
+        journal_json,
+        parse_event_journal,
+    )
+
+    journal = journal_factory()
+    size = len(journal_json(journal).encode("utf-8"))
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", size + 16)
+    monkeypatch.setattr("storage.JOURNAL_CHECKPOINT_RESERVE", 16)
+    assert storage.save_event_journal(journal, admitting=True) == size
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    journal["events"][0]["description"] += "x"
+    with pytest.raises(EventJournalStateError, match="journal_capacity"):
+        storage.save_event_journal(journal, admitting=True)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+    journal["processed_seq"] = 1
+    storage.save_event_journal(journal)
+    raw = storage.EVENT_JOURNAL_FILE.read_bytes()
+    monkeypatch.setattr("event_journal_schema.JOURNAL_MAX_BYTES", len(raw))
+    assert parse_event_journal(raw) == journal
+    with pytest.raises(EventJournalStateError):
+        parse_event_journal(raw + b" ")
+
+
+@pytest.mark.parametrize("projection", [
+    {"journal_id": "b" * 32, "baseline_seq": 0, "applied_seq": 0},
+    {"journal_id": "a" * 32, "baseline_seq": True, "applied_seq": 0},
+    {"journal_id": "a" * 32, "baseline_seq": 1, "applied_seq": 1},
+    {"journal_id": "a" * 32, "baseline_seq": 0, "applied_seq": 2},
+])
+def test_journal_recovery_set_rejects_invalid_identity_and_cursor(journal_factory, projection):
+    from event_journal_schema import (
+        EventJournalStateError,
+        validate_recovery_set,
+    )
+
+    with pytest.raises(EventJournalStateError):
+        validate_recovery_set(journal_factory(), {"event_projection": projection})
+
+
+def test_existing_journal_prevents_fabricated_first_run_quarter(journal_factory):
+    storage.save_event_journal(journal_factory(count=0))
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_missing"):
+        storage.load_stats_current(strict=True, initialize_missing=True)
+    assert not storage.STATS_CURRENT_FILE.exists()
+
+
+def test_strict_projection_write_rejects_bool_without_replacing_current(journal_factory):
+    from copy import deepcopy
+
+    cur = {"period": "2026-Q2", "events": []}
+    storage.save_stats_current(cur, strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    candidate = deepcopy(cur)
+    candidate["event_projection"] = {"journal_id": journal_factory()["journal_id"], "baseline_seq": 0, "applied_seq": True}
+    with pytest.raises(storage.QuarterDeliveryStateError):
+        storage.save_stats_current(candidate, strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original

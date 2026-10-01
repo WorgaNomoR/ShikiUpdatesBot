@@ -276,9 +276,12 @@ async def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
 async def test_slow_restorable_capture_keeps_event_loop_live_and_blocks_writer(
     backup_env,
     monkeypatch,
+    journal_factory,
 ):
-    old = b'{"period":"2026-Q2","events":[]}'
-    new = '{"period":"2026-Q2","events":[{"id":"new"}]}'
+    journal = journal_factory()
+    storage.save_event_journal(journal)
+    old = json.dumps(_journal_current(journal)).encode("utf-8")
+    new = json.dumps({**_journal_current(journal, applied=1), "events": [{"id": "new"}]})
     (backup_env / "stats_current.json").write_bytes(old)
     started = asyncio.Event()
     release = threading.Event()
@@ -304,6 +307,7 @@ async def test_slow_restorable_capture_keeps_event_loop_live_and_blocks_writer(
     async def publish_new_state():
         async with storage.restorable_state_transaction():
             storage._atomic_write(backup_env / "stats_current.json", new)
+            storage.save_event_journal({**journal, "processed_seq": 1})
 
     writer = asyncio.create_task(publish_new_state())
     await asyncio.sleep(0.02)
@@ -316,6 +320,7 @@ async def test_slow_restorable_capture_keeps_event_loop_live_and_blocks_writer(
 
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         assert archive.read("stats_current.json") == old
+        assert json.loads(archive.read("event_journal.json")) == journal
     assert (backup_env / "stats_current.json").read_text(encoding="utf-8") == new
 
 
@@ -363,9 +368,12 @@ async def test_first_run_stats_current_waits_for_snapshot_transaction(
 async def test_slow_compression_releases_lock_and_keeps_coherent_snapshot(
     backup_env,
     monkeypatch,
+    journal_factory,
 ):
-    old = b'{"period":"2026-Q2","events":[]}'
-    new = '{"period":"2026-Q2","events":[{"id":"new"}]}'
+    journal = journal_factory()
+    storage.save_event_journal(journal)
+    old = json.dumps(_journal_current(journal)).encode("utf-8")
+    new = json.dumps({**_journal_current(journal, applied=1), "events": [{"id": "new"}]})
     (backup_env / "stats_current.json").write_bytes(old)
     started = asyncio.Event()
     release = threading.Event()
@@ -384,6 +392,7 @@ async def test_slow_compression_releases_lock_and_keeps_coherent_snapshot(
 
     async with storage.restorable_state_transaction():
         storage._atomic_write(backup_env / "stats_current.json", new)
+        storage.save_event_journal({**journal, "processed_seq": 1})
     await asyncio.sleep(0)
     assert build_task.done() is False
 
@@ -392,6 +401,7 @@ async def test_slow_compression_releases_lock_and_keeps_coherent_snapshot(
 
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         assert archive.read("stats_current.json") == old
+        assert json.loads(archive.read("event_journal.json")) == journal
     assert (backup_env / "stats_current.json").read_text(encoding="utf-8") == new
 
 
@@ -2207,3 +2217,190 @@ async def test_fact_snapshot_is_unchanged_when_restore_publication_rolls_back(
 
     assert fact_bank.get_fact_bank_snapshot() == before
     assert "current-fact" in (backup_env / "facts.json").read_text(encoding="utf-8")
+
+
+def _journal_current(journal, applied=None):
+    cur = storage._empty_stats_current("2026-Q2")
+    cur["event_projection"] = {
+        "journal_id": journal["journal_id"], "baseline_seq": 0,
+        "applied_seq": journal["processed_seq"] if applied is None else applied,
+    }
+    return cur
+
+
+def _recovery_zip(journal, cur):
+    return _zip_bytes({
+        "event_journal.json": json.dumps(journal),
+        "stats_current.json": json.dumps(cur),
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("processed,applied", [(0, 0), (0, 1), (1, 1)])
+async def test_journal_complete_recovery_roundtrip(backup_env, journal_factory, processed, applied):
+    journal = journal_factory(processed=processed)
+    cur = _journal_current(journal, applied)
+    await backup.restore_backup_zip(_recovery_zip(journal, cur))
+    assert storage.load_event_journal() == journal
+    assert storage.load_stats_current(strict=True) == cur
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert json.loads(archive.read("event_journal.json")) == journal
+        assert json.loads(archive.read("stats_current.json")) == cur
+    storage.EVENT_JOURNAL_FILE.write_bytes(b"{damaged")
+    await backup.restore_backup_zip(raw)
+    assert storage.load_event_journal()["events"][0]["created_at"] == "2026-04-01T02:00:00+03:00"
+    assert storage.load_event_journal()["events"][0]["event_at"] == "2026-03-31T23:00:00+00:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing_current", "identity", "cursor", "profile", "missing_journal", "malformed"])
+async def test_journal_import_rejects_entire_inconsistent_candidate(backup_env, journal_factory, damage):
+    journal = journal_factory()
+    cur = _journal_current(journal)
+    original = b'{"subscribers":{"10":"keep"}}\r\n'
+    storage.SUBS_FILE.write_bytes(original)
+    if damage == "identity":
+        cur["event_projection"]["journal_id"] = "b" * 32
+    if damage == "cursor":
+        cur["event_projection"]["applied_seq"] = 2
+    if damage == "profile":
+        journal["profile"] = "Another"
+    members = {
+        "subscribers.json": '{"subscribers":{"20":"replace"}}',
+        "event_journal.json": json.dumps(journal),
+        "stats_current.json": json.dumps(cur),
+    }
+    if damage == "missing_current":
+        del members["stats_current.json"]
+    if damage == "missing_journal":
+        del members["event_journal.json"]
+    if damage == "malformed":
+        members["event_journal.json"] = '{bad'
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(_zip_bytes(members))
+    assert storage.SUBS_FILE.read_bytes() == original
+    assert storage.restorable_restore_generation() == generation
+    assert not storage.EVENT_JOURNAL_FILE.exists()
+
+
+@pytest.mark.asyncio
+async def test_legacy_quarter_restore_sets_baseline_and_preserves_unfinished_work(backup_env, journal_factory, monkeypatch):
+    journal = journal_factory(count=2, processed=1)
+    cur = _journal_current(journal, applied=2)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    exact_journal = storage.EVENT_JOURNAL_FILE.read_bytes()
+    legacy = {"period": "2026-Q2", "events": [{"id": "old", "event": "planned"}]}
+    await backup.restore_backup_zip(_zip_bytes({"stats_current.json": json.dumps(legacy)}))
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == exact_journal
+    restored = storage.load_stats_current(strict=True)
+    assert restored["event_projection"] == {"journal_id": journal["journal_id"], "baseline_seq": 1, "applied_seq": 1}
+    monkeypatch.setattr("handlers.asyncio.sleep", AsyncMock())
+    sent = AsyncMock()
+    monkeypatch.setattr("handlers.send_to_all_chats", sent)
+    await handlers._drain_history_journal(AsyncMock())
+    sent.assert_awaited_once()
+    assert storage.load_event_journal()["processed_seq"] == 2
+    assert len(storage.load_stats_current(strict=True)["events"]) == 2
+    assert storage.load_stats_current(strict=True)["events"][1]["id"] == "12"
+
+
+@pytest.mark.asyncio
+async def test_journal_restore_rollback_preserves_exact_damaged_bytes(backup_env, journal_factory, monkeypatch):
+    journal_before = b"\xffbroken journal\r\n"
+    current_before = b"{ broken quarter\r\n"
+    storage.EVENT_JOURNAL_FILE.write_bytes(journal_before)
+    storage.STATS_CURRENT_FILE.write_bytes(current_before)
+    journal = journal_factory()
+    cur = _journal_current(journal)
+    raw = _zip_bytes({
+        "event_journal.json": json.dumps(journal),
+        "stats_current.json": json.dumps(cur),
+        "user_alerts.json": '{"enabled":false}',
+    })
+    real_publish = backup._publish_staged_file
+
+    def fail_third(source, target):
+        if target.name == "user_alerts.json":
+            raise OSError("replacement failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(backup, "_publish_staged_file", fail_third)
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(raw)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == journal_before
+    assert storage.STATS_CURRENT_FILE.read_bytes() == current_before
+    assert not storage.USER_ALERTS_FILE.exists()
+    assert storage.restorable_restore_generation() == generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_kind", ["identical", "unrelated", "older"])
+@pytest.mark.parametrize("phase", ["fetch", "admission", "send", "retry"])
+async def test_history_restore_invalidates_fetch_send_and_retry(
+    backup_env, journal_factory, monkeypatch, restore_kind, phase,
+):
+    from aiogram.exceptions import TelegramServerError
+    from aiogram.methods import SendMessage
+
+    journal = journal_factory(count=0)
+    cur = _journal_current(journal)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_subscribers({10: "recipient", 20: "next recipient"})
+    if phase == "admission":
+        monkeypatch.setattr("handlers.JOURNAL_WARN_BYTES", len(storage.EVENT_JOURNAL_FILE.read_bytes()) + 1)
+        monkeypatch.setattr("handlers._last_journal_capacity_notice_at", None)
+    attempts = []
+    restores = []
+
+    async def restore():
+        if restores:
+            return
+        restores.append(True)
+        if restore_kind == "unrelated":
+            raw = _zip_bytes({"user_alerts.json": '{"enabled":false}'})
+        elif restore_kind == "identical":
+            raw = _recovery_zip(storage.load_event_journal(), storage.load_stats_current(strict=True))
+        else:
+            raw = _recovery_zip(journal, cur)
+        await backup.restore_backup_zip(raw)
+
+    entry = {"id": 2, "description": "Просмотрено", "target": {"id": 11, "kind": "tv"}}
+
+    async def fetch(_session, page=1):
+        if phase == "fetch":
+            await restore()
+        return [entry]
+
+    async def send(**kwargs):
+        assert not storage._restorable_state_lock().locked()
+        if phase == "admission" and kwargs["chat_id"] == handlers.OWNER_ID:
+            await restore()
+            return
+        attempts.append(kwargs)
+        if phase == "send":
+            await restore()
+        if phase == "retry":
+            raise TelegramServerError(method=SendMessage(chat_id=10, text="event"), message="temporary")
+
+    async def sleep(_delay):
+        if phase == "retry":
+            await restore()
+
+    monkeypatch.setattr("handlers.fetch_history", fetch)
+    monkeypatch.setattr("handlers.asyncio.sleep", sleep)
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await handlers.check_and_notify(bot, {999}, cur)
+    restored_journal = storage.load_event_journal()
+    assert restored_journal["processed_seq"] == 0
+    assert len(attempts) == (0 if phase in {"fetch", "admission"} else 1)
+    if phase == "fetch" or restore_kind == "older":
+        assert restored_journal["events"] == []
+    else:
+        assert len(restored_journal["events"]) == 1
+        assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == (0 if phase == "admission" else 1)

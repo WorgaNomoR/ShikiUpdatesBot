@@ -765,12 +765,11 @@ async def test_every_pick_path_is_isolated_from_network_entitlement_and_inline_s
         "fetch_current_rates",
         "fetch_favourites",
         "fetch_history",
-        "get_media_info",
         "sync_stats_all",
         "refresh_update_state",
     ):
         monkeypatch.setattr(handlers, name, forbidden_async)
-    for name in ("load_subscribers", "inline_access_status", "parse_inline_query"):
+    for name in ("load_subscribers", "inline_access_status", "parse_inline_query", "normalize_history_event"):
         monkeypatch.setattr(handlers, name, forbidden)
     monkeypatch.setattr(handlers._inline_search_service, "debounce", forbidden_async)
     monkeypatch.setattr(handlers._inline_search_service, "get_page", forbidden_async)

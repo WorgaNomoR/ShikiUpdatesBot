@@ -6,14 +6,32 @@ ShikiUpdatesBot is an `aiogram`/`aiohttp` Telegram hub for one public Shikimori 
 
 Read [AGENTS.md](AGENTS.md) for collaboration, verification, and delivery rules. [README.md](README.md) owns user-facing behaviour, configuration, and deployment; [ideas.md](ideas.md) owns deferred and rejected proposals. Those proposals do not change the contracts below.
 
-- [Module ownership and dependency direction](#module-ownership-and-dependency-direction)
-- [Runtime, build identity, assets and state](#runtime-build-identity-assets-and-state)
-- [Access control, registration and navigation](#access-control-registration-and-navigation)
-- [Shikimori acquisition, synchronization and media semantics](#shikimori-acquisition-synchronization-and-media-semantics)
-- [Typed reports and interactive delivery](#typed-reports-and-interactive-delivery)
-- [Durable quarterly delivery](#durable-quarterly-delivery)
-- [Backup, restore and automatic scheduling](#backup-restore-and-automatic-scheduling)
-- [Facts and inline search](#facts-and-inline-search)
+- [ShikiUpdatesBot architecture](#shikiupdatesbot-architecture)
+  - [Purpose and documentation boundaries](#purpose-and-documentation-boundaries)
+  - [Module ownership and dependency direction](#module-ownership-and-dependency-direction)
+  - [Runtime, build identity, assets and state](#runtime-build-identity-assets-and-state)
+    - [Roots and lifecycle](#roots-and-lifecycle)
+    - [State ownership and transactions](#state-ownership-and-transactions)
+    - [Build identity, resources and updates](#build-identity-resources-and-updates)
+  - [Access control, registration and navigation](#access-control-registration-and-navigation)
+    - [Access, registration and subscriptions](#access-registration-and-subscriptions)
+    - [Unified menu and session boundaries](#unified-menu-and-session-boundaries)
+    - [Owner directory and local list/picker flows](#owner-directory-and-local-listpicker-flows)
+  - [Shikimori acquisition, synchronization and media semantics](#shikimori-acquisition-synchronization-and-media-semantics)
+    - [Failures, reuse and request budgets](#failures-reuse-and-request-budgets)
+    - [Synchronization, metadata and comments](#synchronization-metadata-and-comments)
+    - [History and media domains](#history-and-media-domains)
+    - [Durable history ingestion and processing](#durable-history-ingestion-and-processing)
+  - [Typed reports and interactive delivery](#typed-reports-and-interactive-delivery)
+  - [Durable quarterly delivery](#durable-quarterly-delivery)
+  - [Backup, restore and automatic scheduling](#backup-restore-and-automatic-scheduling)
+    - [Capture, limits and cancellation](#capture-limits-and-cancellation)
+    - [Restore publication](#restore-publication)
+    - [Automatic schedule and acknowledgement](#automatic-schedule-and-acknowledgement)
+  - [Facts and inline search](#facts-and-inline-search)
+    - [Local facts and bank replacement](#local-facts-and-bank-replacement)
+    - [Entitlement and query state](#entitlement-and-query-state)
+    - [Acquisition and chooser presentation](#acquisition-and-chooser-presentation)
 
 ## Module ownership and dependency direction
 
@@ -33,9 +51,10 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [report_model.py](src/report_model.py), [report_asset_ids.py](src/report_asset_ids.py) | Pure typed reports/ordinary HTML chunking; import-light versioned asset identifiers and hashes. Neither imports project modules. |
 | [rich_message_schema.py](src/rich_message_schema.py), [report_plan.py](src/report_plan.py) | Pure serialized Rich validation over asset identifiers; frozen transport-unit validation over that schema. No runtime or aiogram dependency. |
 | [rich_report.py](src/rich_report.py), [report_assets.py](src/report_assets.py), [report_delivery.py](src/report_delivery.py) | Rich rendering/pagination; hash-checked local uploads; freezing, sequential delivery, fallback and results. Producers remain outside Bot API payload construction. |
+| [event_journal_schema.py](src/event_journal_schema.py) | Pure v1 journal/time/projection validation and bounded parsing, with no runtime or project imports. |
 | [storage.py](src/storage.py) | JSON persistence, cache read states, strict validators, restorable-state transaction and restore generation; frozen-plan validation uses `report_plan`. |
 | [shiki_api.py](src/shiki_api.py) | REST/GraphQL acquisition, metadata, relevance/kind definitions, translations, throttle, HTTP-attempt budget, 429 retry and privacy classification. |
-| [messages.py](src/messages.py) | Notification banks/history parsing, display-name application, and typed `/status` content/local-poster join. Uses the media and report boundaries. |
+| [messages.py](src/messages.py) | Notification banks/history parsing and normalization, display-name application, and typed `/status` content/local-poster join. Uses the media and report boundaries. |
 | [stats.py](src/stats.py) | Synchronization/publication, aggregates, current events and quarter snapshots, statistics report construction, and pure picker logic; delegates favourites collection to `favourites`. |
 | [favourites.py](src/favourites.py) | Favourites collection/enrichment over the supplied statistics cache and typed report construction; uses `shiki_api` but owns no persistence, notification or delivery orchestration. |
 | [report_titles.py](src/report_titles.py) | Shared typed title/link/poster construction for statistics and favourites over `config`, `utils` and `report_model`; no I/O. |
@@ -82,6 +101,8 @@ graph TD
     user_directory --> report_model
     backup --> fact_bank
     fact_bank --> storage
+    storage --> event_journal_schema
+    messages --> event_journal_schema
     storage --> report_plan
     report_plan --> rich_message_schema
     report_delivery --> rich_report
@@ -114,16 +135,17 @@ Persistent JSON state lives under `DATA_DIR`; the complete file inventory is in 
 
 | State | Authority |
 |---|---|
-| `seen_ids.json`, `seen_favourites.json` | Notification baselines/deduplication; exported for inspection, excluded from restore. |
+| `event_journal.json` | Strict history ingestion authority, silent baseline and immutable normalized events; completed legacy broadcast-attempt checkpoint. |
+| `seen_ids.json`, `seen_favourites.json` | Export-only journal ID projection; separate favourites baseline/deduplication. Both excluded from restore. |
 | `stats_all.json` | Rebuildable current public lists, metadata, comments, favourites and aggregates; cached locally and excluded from restore. |
-| `stats_current.json`, `quarters/` | Current-quarter tracking/durable delivery; frozen historical snapshots. |
+| `stats_current.json`, `quarters/` | Current-quarter tracking, journal-bound projection checkpoint and durable report delivery; frozen historical snapshots. |
 | `subscribers.json` | One atomic notification-chat map plus versioned automatic-backup schedule. |
 | `blocked_users.json`, `known_users.json`, `user_alerts.json` | Access policy; immutable first-seen identity; owner alert switch. These are distinct responsibilities. |
 | `facts.json`, `update_state.json` | Optional additional fact bank; independent cached code/release identities and notification acknowledgement. |
 
 Normal JSON publication uses `_atomic_write` (temporary file plus atomic replacement); restore stages and replaces files with rollback on an in-process publication error. Neither mechanism claims a multi-file power-loss transaction.
 
-Seen-cache loading validates an object with a list of exact integer history IDs or string favourite IDs; booleans and incompatible entries invalidate the whole cache. Missing files/keys and empty lists remain valid first-run/empty states, and duplicates collapse normally. Unreadable, invalid-encoding, malformed or excessively nested input warns and returns an empty baseline without writing the original file. Existing polling initialization rebuilds these export-only caches silently; this recovery policy does not apply to strict quarterly/subscriber authority.
+Seen-cache loading validates an object with a list of exact integer history IDs or string favourite IDs; booleans and incompatible entries invalidate the whole cache. Missing files/keys and empty lists remain valid first-run/empty states, and duplicates collapse normally. Unreadable, invalid-encoding, malformed or excessively nested input warns and returns an empty baseline without writing the original file. Before journal initialization, valid legacy history IDs (including an empty list) migrate silently; missing/invalid history caches require one-page bootstrap. After initialization, `seen_ids` is only a best-effort export and cannot reset history. Favourites keep their silent cache-rebuild policy; neither policy applies to strict journal/quarterly/subscriber authority.
 
 `restorable_state_transaction` is one event-loop-local lock shared by restore and asynchronous writers of restorable state. Writers reload the published state and merge only their delta immediately before saving, so work started before a restore cannot overwrite it. First-run current-quarter initialization also enters this transaction. Coherent readers copy immutable data before releasing the lock. Rendering, Telegram awaits, retry/pacing sleeps, ZIP compression and slow delivery never hold it; backup raw capture has a bounded critical section described below. The separate automatic-delivery lock serializes automatic report/backup attempts.
 
@@ -220,7 +242,7 @@ GraphQL URLs can be absolute while REST history URLs are relative. `_rel_url` no
 
 ### History and media domains
 
-History catch-up fetches page 1 first, then older pages until a known seen-ID boundary or a short page, capped at five. Observed live responses include `limit + 1` rows and one-ID overlap; order is not guaranteed monotonic by ID/time. Deduplicate integer IDs and deliver old-to-new by ID. A required-page failure or unknown boundary at the cap aborts without partial seen-ID publication. First-run baseline uses one page and sends nothing.
+History catch-up fetches page 1 first, then older pages until an exact journal/baseline ID boundary or a short page, capped at five. Observed live responses include `limit + 1` rows and one-ID overlap; order is not guaranteed monotonic by ID/time. Deduplicate exact integer IDs and admit each complete batch in ID order; no maximum-ID/time watermark is used. A required-page failure or unknown boundary at the cap admits none of the batch. First-run bootstrap uses one page and sends nothing, including a successful empty response.
 
 History classification strips known markup then applies one scoped homoglyph normalization: mixed-script tokens and whitelisted standalone connectives fold Latin twins to Cyrillic while pure Latin words, titles and URLs remain unchanged. Completion uses anchored full description formats, never stems. Progress/reset/deletion events are seen-but-ignored; first rating is `score_set`. Score set/change updates an existing current-quarter completion without duplicating it; `score_removed` silently clears that score and never changes historical snapshots. Unknown descriptions warn and deliver cleaned source text without the internal classification label.
 
@@ -235,6 +257,24 @@ Historical manga comparison splits only with an exact nonnegative combined count
 Display-name grammar is initialized once in `messages`. Eligible Cyrillic first names may contain hyphen-separated components; `auto` requires confident gender; ambiguity, ineligibility or detector/inflection failure falls back to raw forms/masculine alternatives. Explicit male/female retains template gender even if ineligible or inflection fails; ineligible names skip morphology. `none` uses raw forms/masculine alternatives. Case forms and `{g:male|female}` are applied before HTML escaping. Exact template/name matrices live in [name_grammar.py](src/name_grammar.py) and its tests.
 
 Evidence: [API tests](tests/test_shiki_api.py), [statistics tests](tests/test_stats.py), [favourites tests](tests/test_favourites.py), [favourites orchestration tests](tests/test_handlers_favourites.py), [message tests](tests/test_messages.py), [polling tests](tests/test_handlers_polling.py), [status tests](tests/test_handlers_status.py), [name grammar tests](tests/test_name_grammar.py).
+
+### Durable history ingestion and processing
+
+`messages.normalize_history_event` owns normalization v1 by delegating classification/relevance/score parsing to the existing contracts. `event_journal_schema` owns the one strict validator used by runtime and restore; `storage` owns bounded reads and atomic publication; handlers own admission, sequential projection and broadcast attempts. Rendering uses published normalized semantics without reclassifying existing events.
+
+At the API boundary, a non-object `target` becomes empty and non-string type/kind/title/link fields receive empty defaults (missing name becomes `???`). Normalization works on a copy without changing the source response. Malformed optional metadata cannot block an otherwise valid history-ID batch; missing kind retains the existing irrelevant-event rule. Published journal validation stays strict, and previously admitted events are never rewritten with later repaired metadata.
+
+Journal v1 has a stable UUID-hex `journal_id`, configured `SHIKI_USER` profile binding, `normalization_version`, explicit `baseline_initialized`, retained `baseline_ids`, immutable `events`, and `processed_seq`. Each event carries contiguous local `seq`, exact integer `history_id`, original `created_at`, canonical UTC `event_at` only with an explicit offset, canonical UTC `observed_at`, and `time_quality` (`aware`, `naive`, `missing`, `invalid`). Unknown event time stays null. Payload retains event type, anime/manga domain, target ID, source kind, relevance, parsed owner score/change, source description and minimum name/Russian-name/normalized-link fields. Community `target.score` is never an owner score. Ignored/excluded records and silent score removal are admitted too. A repeated ID creates no record; conflicting semantic payload retains the first record with one bounded count-only diagnostic per batch.
+
+Migration publishes a silent ready baseline without fabricated events, times, statistics or delivery obligations. Valid legacy IDs, including empty state, are imported; missing/invalid legacy state defers one-page bootstrap after network failure. Startup stages all baseline publication until privacy-sensitive acquisition succeeds. Current-quarter state and frozen reports are retained. The journal is published before its empty quarter binding: failure of that second write is repaired by rebinding the same empty identity on retry. Once bound, a missing journal is a recovery error. A journal with events cannot acquire a fabricated missing projection or current quarter.
+
+One event-loop-local consumer lock serializes journal processing without blocking restore. All admitted local pending work is drained before a new history fetch or quarter rotation, even if Shikimori no longer returns those events. Rotation rechecks for newly admitted pending work before publishing its new quarter. For one event, `stats_current.event_projection = {journal_id, baseline_seq, applied_seq}` advances with its corresponding quarter delta in the same file replacement. `baseline_seq` records an explicit legacy-restore projection baseline. The journal `processed_seq` advances only after the existing broadcast attempt completes (or a silent record is handled). These exact integer cursors satisfy `baseline_seq <= processed_seq <= applied_seq <= min(processed_seq + 1, event_count)`. Quarter rotation carries the binding/checkpoint and keeps observation-quarter attribution; source-time quarters and historical backfill remain separate work in #59.
+
+Rendering, Telegram awaits/retries and pacing run outside the state lock. Each send/retry checks the current-quarter projection identity/progress and restore generation. The consumer lock serializes processing; the validated immutable journal snapshot is reused for rendering and projection, with one full reload/validation per event before acknowledgement instead of one per recipient/retry. Every successful restore, including identical/unrelated state, invalidates an in-flight attempt. Projection already published before a crash is not reapplied; the unfinished current broadcast may repeat, and later events cannot overtake it. `processed_seq` means completed legacy attempts, **not delivery to every recipient**: exhausted recipient failures still follow the existing bounded in-process policy. Telegram acceptance followed by interruption or failed checkpoint may duplicate a message. There is no per-subscriber outbox or exactly-once claim.
+
+Unreadable/invalid/deep/oversized state, unsupported versions, inconsistent recovery state and publication failures preserve original files and suspend unsafe history work with a debounced static owner notice; owner recovery remains available. A history failure defers quarter rotation for that cycle while favourites, list synchronization and subscription/weekly backups continue independently with valid current-quarter state. All admitted payloads/baseline IDs are retained. A debounced warning begins at 6 MiB; the inclusive restorable limit remains 8 MiB. New admission leaves 4096 bytes for checkpoint growth and rejects an oversized whole batch before sending or advancing authority. No eviction, automatic pruning, digest or shared retry-policy change is introduced.
+
+Evidence: [normalization tests](tests/test_messages.py), [journal validation tests](tests/test_storage.py), [history orchestration tests](tests/test_handlers_event_journal.py), [catch-up regression tests](tests/test_handlers_notify.py), [recovery import/race tests](tests/test_backup.py).
 
 ## Typed reports and interactive delivery
 
@@ -268,7 +308,7 @@ Evidence: [report model tests](tests/test_report_model.py), [shared title tests]
 
 One `storage.validate_pending_quarter_delivery` validates runtime/imported schemas. Periods are positive four-digit `YYYY-Q1` through `YYYY-Q4`, with old < new and new == current period; strict current loading/import checks the period even without pending. Skipped calendar quarters remain supported. Progress is an exact integer, excluding booleans/fractions, within its frozen sequence; empty sequences are valid. HTML/fallback strings are nonblank UTF-8-encodable; Rich passes the same schema/limits as fresh output. Partial pending cannot claim the new period fully sent. Unknown versions or invalid fields/content/progress/lineage preserve state, stop delivery and emit a debounced static owner notice; logs contain reason/type only. Recovery never rebuilds, filters, clears or declares malformed content successful.
 
-Strict current load/save raises `QuarterDeliveryStateError` on missing/unreadable state or failed publication, without recreating/resetting it or logging report content. Startup, history cycles and current-quarter reports use strict reads, including pending validation; only an actual `FileNotFoundError` permits first-run initialization under the state lock with strict publication. The legacy non-strict API retains reset/best-effort semantics. A typed failure emits the debounced safe owner diagnostic and leaves recovery available; a handled failed cycle still signals liveness. History publishes its delta into strictly reloaded current state before saving seen IDs and changes a copy of the caller's baseline, so failed read/write cannot acknowledge skipped events. Rotation/rendering and legacy migration must publish successfully before Telegram. Migration preserves exact periods/messages; `report_sent=False` maps to zero, `True` to full count and backup-only continuation. Failed migration leaves recoverable legacy state and sends neither report nor backup.
+Strict current load/save raises `QuarterDeliveryStateError` on missing/unreadable state or failed publication, without recreating/resetting it or logging report content. Startup, history cycles and current-quarter reports use strict reads, including pending validation; only an actual `FileNotFoundError` with no existing journal permits first-run initialization under the state lock with strict publication. The legacy non-strict API retains reset/best-effort semantics. A typed failure emits the debounced safe owner diagnostic and leaves recovery available; a handled failed cycle still signals liveness. History publishes its delta with its journal projection checkpoint before the broadcast-attempt checkpoint; `seen_ids` no longer acknowledges processing. Rotation/rendering and legacy migration must publish successfully before Telegram. Migration preserves exact periods/messages; `report_sent=False` maps to zero, `True` to full count and backup-only continuation. Failed migration leaves recoverable legacy state and sends neither report nor backup.
 
 Before each unit/retry, reload under the state transaction and verify authoritative plan/period/progress/generation. After Telegram success, reload and validate again, then publish only the progress delta into fresh state so concurrent quarter events survive. Changed progress, replaced plan or restore generation stops acknowledgement. Exact unsupported-method/local asset failures publish a new v2 identity/hash before HTML sending: the acknowledged prefix remains, and current/remaining Rich units become frozen fallback continuations. Ambiguous failure preserves Rich plan/index. Rendering, Telegram delivery and pacing are outside the state lock; bounded validation of published state belongs to its read/acknowledgement transaction. The automatic-delivery lock serializes attempts.
 
@@ -282,7 +322,7 @@ Evidence: [plan/strict-state tests](tests/test_storage.py), [quarter recovery te
 
 ### Capture, limits and cancellation
 
-Export covers `DATA_DIR`, excluding temporary writes and all descendants of `.restore-*.tmp`; logs live outside it. Restore is restricted to policy/identity/subscriber/fact/update/current-quarter state and quarter snapshots. The exact whitelist is in [backup.py](src/backup.py) and [README](README.md#бэкап-и-восстановление). Rebuildable `stats_all` (including comments) and seen baselines are export-only, so a later successful sync rebuilds current lists without restoring stale projection data.
+Export covers `DATA_DIR`, excluding temporary writes and all descendants of `.restore-*.tmp`; logs live outside it. Restore is restricted to policy/identity/subscriber/fact/update/journal/current-quarter state and quarter snapshots. The exact whitelist is in [backup.py](src/backup.py) and [README](README.md#бэкап-и-восстановление). Rebuildable `stats_all` (including comments), `seen_ids` and `seen_favourites` are export-only; history authority comes from the restorable journal, while a later successful sync rebuilds current lists.
 
 Export freezes one sorted manifest and captures restorable members as immutable bytes under `restorable_state_transaction`. One dedicated single-worker executor performs manifest traversal and bounded chunk reads, keeping the event loop schedulable while restorable writers wait. Later-created files are outside that manifest. After release, the same worker reads export-only members and compresses only captured bytes; compression, Telegram attempts and sleeps never hold the state lock.
 
@@ -298,6 +338,8 @@ These fixed constants bound memory in every runtime mode. Manifest/read/compress
 ### Restore publication
 
 Import validates a complete candidate before publishing. Known strict member errors, including malformed facts/registry/alerts/block-list/current schedule/quarter pending, reject the candidate; legacy subscriber/update schemas remain compatible. Other safely skippable invalid/unsupported members retain their existing rules. Path/size/schema checks remain in the importer. Reconcile candidate/current subscribers against candidate/current block-list; an old archive must never resubscribe a blocked user.
+
+Journal imports use the same bounded strict parser as disk reads. A journal member requires matching valid `stats_current` in that candidate and validated identity/cursors; malformed or incomplete recovery sets reject the entire import before publication. A bound quarter without its journal is also an incomplete new recovery archive. Legacy quarter archives without a journal/projection remain compatible and never delete/replace the local journal: their quarter receives an explicit `baseline_seq = applied_seq = local processed_seq`. Completed history is not reprojected; unfinished journal work survives and is projected into the restored quarter on its next attempt. An unrelated archive leaves the journal/quarter untouched. Restoring an older complete recovery set can roll progress back and replay notifications; callers reload journal authority instead of trusting old in-memory seen sets.
 
 Canonical payloads and exact original bytes are staged beside `DATA_DIR`, without decoding damaged current files or normalizing their line endings. A later publication error restores those bytes and removes files created by that attempt. Unreadable legacy quarter backup timestamps provide no migration anchor. The validated fact-bank runtime snapshot swaps only after all files publish; an archive without facts leaves it unchanged. Restore and writers share the state transaction, and successful publication advances the generation even for identical/unrelated restored files. This is recoverable in-process error handling, not power-loss atomicity. Existing `update_state` acknowledgement prevents repeated already-delivered release notification after migration.
 
