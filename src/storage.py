@@ -51,6 +51,12 @@ from event_time_stats import (
     acknowledge_revisions,
     validate_event_time,
 )
+from notification_outbox import (
+    OutboxStateError,
+    parse_subscriber_payload,
+    progress_reserve,
+    validate_memberships,
+)
 from report_plan import (
     FrozenReportPlanError,
     downgrade_rich_units,
@@ -87,6 +93,7 @@ class SubscriberState:
     backup_schedule: dict
     schedule_missing: bool = False
     schedule_malformed: bool = False
+    notification_memberships: dict[int, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -194,7 +201,7 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
     payload = journal_json(journal)
     size = len(payload.encode("utf-8"))
     limit = JOURNAL_MAX_BYTES - JOURNAL_CHECKPOINT_RESERVE if admitting else JOURNAL_MAX_BYTES
-    if size > limit:
+    if size + progress_reserve(journal) > limit:
         raise EventJournalStateError("journal_capacity")
     try:
         _atomic_write(EVENT_JOURNAL_FILE, payload)
@@ -338,14 +345,24 @@ def subscriber_state_from_payload(
     strict_schedule: bool = False,
 ) -> SubscriberState:
     """Разобрать подписчиков и совместимое состояние их бэкапа."""
-    subscribers = subscribers_from_payload(payload)
     if not isinstance(payload, dict):
         raise ValueError("состояние подписчиков должно быть объектом")
+    if "notification_memberships" in payload:
+        try:
+            subscribers = strict_subscribers_from_payload(payload)
+        except ValueError:
+            raise OutboxStateError("notification_subscribers") from None
+        if payload["notification_memberships"] is None:
+            raise OutboxStateError("notification_memberships")
+    else:
+        subscribers = subscribers_from_payload(payload)
+    memberships = validate_memberships(payload.get("notification_memberships"), subscribers)
     if _BACKUP_SCHEDULE_KEY not in payload:
         return SubscriberState(
             subscribers,
             _empty_backup_schedule(),
             schedule_missing=True,
+            notification_memberships=memberships,
         )
     try:
         schedule = backup_schedule_from_payload(payload.get(_BACKUP_SCHEDULE_KEY))
@@ -364,8 +381,9 @@ def subscriber_state_from_payload(
             subscribers,
             schedule,
             schedule_malformed=True,
+            notification_memberships=memberships,
         )
-    return SubscriberState(subscribers, schedule)
+    return SubscriberState(subscribers, schedule, notification_memberships=memberships)
 
 
 def load_subscriber_state(*, strict_subscribers: bool = False) -> SubscriberState:
@@ -378,7 +396,7 @@ def load_subscriber_state(*, strict_subscribers: bool = False) -> SubscriberStat
             schedule_missing=True,
         )
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = _read_subscriber_payload(path)
         return subscriber_state_from_payload(payload)
     except (json.JSONDecodeError, OSError, ValueError):
         if strict_subscribers:
@@ -400,22 +418,34 @@ def load_subscription_backup_state() -> dict:
 def subscriber_state_json(state: SubscriberState) -> str:
     """Сериализовать единый subscriber-state без потери backup metadata."""
     schedule = backup_schedule_from_payload(state.backup_schedule)
-    return json.dumps(
+    subscribers = {str(cid): label for cid, label in state.subscribers.items()}
+    try:
+        strict_subscribers_from_payload({"subscribers": subscribers})
+    except ValueError:
+        raise OutboxStateError("notification_subscribers") from None
+    previous = state.notification_memberships or {}
+    memberships = {cid: previous.get(cid) or uuid.uuid4().hex for cid in state.subscribers}
+    metadata = {"version": 1, "tokens": {str(cid): token for cid, token in memberships.items()}}
+    validate_memberships(metadata, state.subscribers)
+    payload = json.dumps(
         {
-            "subscribers": {
-                str(key): value
-                for key, value in state.subscribers.items()
-            },
+            "subscribers": subscribers,
             _BACKUP_SCHEDULE_KEY: schedule,
+            "notification_memberships": metadata,
         },
         ensure_ascii=False,
         indent=2,
     )
+    if json_publication_size(payload) > JOURNAL_MAX_BYTES:
+        raise OutboxStateError("subscribers_capacity")
+    return payload
 
 
 def save_subscriber_state(state: SubscriberState) -> None:
     """Атомарно опубликовать подписчиков и состояние их бэкапа."""
-    _atomic_write(SUBS_FILE, subscriber_state_json(state))
+    payload = subscriber_state_json(state)
+    _atomic_write(SUBS_FILE, payload)
+    state.notification_memberships = validate_memberships(json.loads(payload)["notification_memberships"], state.subscribers)
     state.schedule_missing = False
     state.schedule_malformed = False
 
@@ -468,6 +498,8 @@ async def mutate_subscription(
             state.subscribers[chat_id] = name
         else:
             state.subscribers.pop(chat_id)
+            if state.notification_memberships is not None:
+                state.notification_memberships.pop(chat_id, None)
 
         pending = state.backup_schedule.get("pending")
         if pending is None:
@@ -501,7 +533,7 @@ def load_subscribers_strict() -> dict[int, str]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = _read_subscriber_payload(path)
         subscribers = strict_subscribers_from_payload(payload)
         subscriber_state_from_payload(payload, strict_schedule=True)
         return subscribers
@@ -520,6 +552,22 @@ def load_subscribers_strict() -> dict[int, str]:
         raise SubscribersStateError(
             "состояние подписчиков недоступно или повреждено"
         ) from e
+
+
+def _read_subscriber_payload(path: Path) -> dict:
+    """Общий ограниченный reader сохраняет исходные байты при ошибках."""
+    with path.open("rb") as handle:
+        return parse_subscriber_payload(handle.read(JOURNAL_MAX_BYTES + 1), JOURNAL_MAX_BYTES)
+
+
+def notification_memberships() -> dict[int, str]:
+    """Под state lock мигрировать идентичность подписок до enqueue/dispatch."""
+    load_subscribers_strict()
+    state = load_subscriber_state(strict_subscribers=True)
+    migrated = ensure_backup_schedule(state, now=time.time())
+    if state.notification_memberships is None or migrated:
+        save_subscriber_state(state)
+    return dict(state.notification_memberships)
 
 
 def _load_subscriber_state_for_access_recovery() -> SubscriberState:
@@ -543,7 +591,7 @@ def _load_subscribers_for_access_recovery() -> dict[int, str]:
 
 def save_subscribers(subs: dict[int, str]) -> None:
     """Сохранить подписчиков, не меняя durable backup metadata."""
-    state = load_subscriber_state()
+    state = load_subscriber_state(strict_subscribers=True)
     state.subscribers = dict(subs)
     save_subscriber_state(state)
 
@@ -646,12 +694,14 @@ def save_blocked_users(blocked: set[int]) -> None:
 def _subscribers_json(
     subscribers: dict[int, str],
     backup_schedule: dict | None = None,
+    memberships: dict[int, str] | None = None,
 ) -> str:
     """Сериализовать подписчиков для общей access-control транзакции."""
     return subscriber_state_json(
         SubscriberState(
             dict(subscribers),
             backup_schedule or _empty_backup_schedule(),
+            notification_memberships=memberships,
         )
     )
 
@@ -722,6 +772,7 @@ async def add_blocked_user(user_id: int) -> tuple[bool, bool]:
             payloads[Path(SUBS_FILE)] = _subscribers_json(
                 subscribers,
                 subscriber_state.backup_schedule,
+                subscriber_state.notification_memberships,
             )
         _publish_access_state(payloads)
         return added, subscriber_removed

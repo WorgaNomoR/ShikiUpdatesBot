@@ -13,6 +13,11 @@ from event_time_stats import (
     EventTimeStateError,
     validate_event_time,
 )
+from notification_outbox import (
+    OutboxStateError,
+    progress_reserve,
+    validate_outbox,
+)
 
 JOURNAL_MAX_BYTES = 8 * 1024 * 1024
 JOURNAL_WARN_BYTES = 6 * 1024 * 1024
@@ -74,14 +79,15 @@ def validate_projection(projection: object) -> None:
 
 
 def validate_event_journal(journal: object, *, profile: str | None = None) -> dict:
-    """Проверить v1/v2 без повторной классификации опубликованных событий."""
+    """Проверить v1/v2/v3 без переклассификации опубликованных событий."""
     if (
         not isinstance(journal, dict)
         or set(journal) != {
             "version", "journal_id", "profile", "normalization_version",
             "baseline_initialized", "baseline_ids", "events", "processed_seq",
-        } | ({"catchup"} if journal.get("version") == 2 else set())
-        or type(journal["version"]) is not int or journal["version"] not in {1, 2}
+        } | ({"catchup"} if journal.get("version") in {2, 3} else set())
+        | ({"outbox"} if journal.get("version") == 3 else set())
+        or type(journal["version"]) is not int or journal["version"] not in {1, 2, 3}
         or type(journal["normalization_version"]) is not int
         or journal["normalization_version"] != 1
         or not _identity(journal["journal_id"])
@@ -142,6 +148,11 @@ def validate_event_journal(journal: object, *, profile: str | None = None) -> di
     acquisition = journal.get("catchup")
     if acquisition is not None:
         validate_acquisition(acquisition, journal, known)
+    if journal["version"] == 3:
+        try:
+            validate_outbox(journal)
+        except (OutboxStateError, ValueError, TypeError, UnicodeError):
+            raise EventJournalStateError("outbox_invalid") from None
     # Проверка кодируемости исходного created_at и запрет NaN/Infinity.
     try:
         json.dumps(journal, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -165,7 +176,7 @@ def validate_acquisition(state: object, journal: dict, known: set[int]) -> None:
         raise EventJournalStateError("acquisition_structure")
     # Повторно используем ту же матрицу нормализованных событий без рекурсии v2.
     validate_event_journal({
-        **{key: value for key, value in journal.items() if key != "catchup"},
+        **{key: value for key, value in journal.items() if key not in {"catchup", "outbox"}},
         "version": 1, "baseline_ids": [], "events": state["staged"], "processed_seq": 0,
     })
     staged_ids = {event["history_id"] for event in state["staged"]}
@@ -225,6 +236,9 @@ def parse_event_journal(raw: bytes, *, profile: str | None = None) -> dict:
         raise EventJournalStateError("journal_size")
     try:
         journal = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
-        return validate_event_journal(journal, profile=profile)
+        validate_event_journal(journal, profile=profile)
+        if len(journal_json(journal).encode("utf-8")) + progress_reserve(journal) > JOURNAL_MAX_BYTES:
+            raise EventJournalStateError("journal_capacity")
+        return journal
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         raise EventJournalStateError("journal_invalid") from None

@@ -89,9 +89,12 @@ def _patch_history_pages(monkeypatch, pages):
 
 def _capture_sends(monkeypatch):
     sent = []
-    async def _send(bot, text, **kwargs):
-        sent.append(text)
-    monkeypatch.setattr("handlers.send_to_all_chats", _send)
+    real_enqueue = handlers._enqueue_history_event
+    async def _send(journal, event, text, generation):
+        if text is not None:
+            sent.append(text)
+        return await real_enqueue(journal, event, text, generation)
+    monkeypatch.setattr("handlers._enqueue_history_event", _send)
     return sent
 
 
@@ -523,11 +526,13 @@ async def test_stale_history_writer_rebases_on_imported_current_state(
     started = asyncio.Event()
     resume = asyncio.Event()
 
-    async def pause_send(bot, text, **kwargs):
+    real_enqueue = handlers._enqueue_history_event
+    async def pause_send(*args, **kwargs):
         started.set()
         await resume.wait()
+        return await real_enqueue(*args, **kwargs)
 
-    monkeypatch.setattr("handlers.send_to_all_chats", pause_send)
+    monkeypatch.setattr("handlers._enqueue_history_event", pause_send)
     writer = asyncio.create_task(_check_legacy(DummyBot(), {999}, old_cur))
     await started.wait()
 
