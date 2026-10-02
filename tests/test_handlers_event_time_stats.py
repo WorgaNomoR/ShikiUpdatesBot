@@ -428,3 +428,45 @@ async def test_pre_migration_quarter_cache_retains_original_totals(event_time_en
     assert stats.refresh_event_time_by_quarter(current, cur)
     assert not stats.refresh_event_time_by_quarter(current, cur)
     assert "completed" not in current["anime"]["aggregates"]["by_quarter"]["2026-Q1"]
+
+
+@pytest.mark.asyncio
+async def test_uncertain_v3_plan_retains_corrections_through_restore_and_later_rejection(
+    event_time_env, monkeypatch,
+):
+    from aiogram.exceptions import TelegramNotFound
+    from aiogram.methods import SendRichMessage
+    from aiogram.types import (
+        InputRichBlockParagraph,
+        InputRichMessage,
+    )
+
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    _append(2, "2026-01-01T00:00:00Z")
+    await handlers._drain_history_journal(AsyncMock())
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = TimeoutError()
+    await handlers.rotate_quarter_if_needed(bot, {}, storage._empty_stats_all(), resync=False)
+    cur = storage.load_stats_current(strict=True)
+    plan = cur["pending_quarter_delivery"]
+    assert plan["version"] == 3 and plan["delivery_uncertain"] is True
+    assert plan["next_unit"] == 0
+    assert cur["event_time"]["periods"]["2026-Q1"]["announced_revision"] == 0
+    handlers.send_backup.assert_not_awaited()
+    captured = _archive()
+    await backup.restore_backup_zip(captured)
+    assert storage.load_stats_current(strict=True) == cur
+    bot.send_rich_message.side_effect = TelegramNotFound(
+        method=SendRichMessage(chat_id=999, rich_message=InputRichMessage(
+            blocks=[InputRichBlockParagraph(text="test")], skip_entity_detection=True,
+        )), message="Not Found",
+    )
+    await handlers._deliver_pending_quarter(bot, cur)
+    assert storage.load_stats_current(strict=True) == cur
+    bot.send_message.assert_not_awaited()
+    bot.send_rich_message.side_effect = None
+    await handlers._deliver_pending_quarter(bot, cur)
+    final = storage.load_stats_current(strict=True)
+    assert final["pending_quarter_delivery"] is None
+    assert final["event_time"]["periods"]["2026-Q1"]["announced_revision"] == 1
+    handlers.send_backup.assert_awaited_once()

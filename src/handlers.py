@@ -174,8 +174,6 @@ from report_delivery import (
     deliver_rendered_report,
     deliver_report,
     freeze_report,
-    is_local_rich_asset_error,
-    is_rich_method_unsupported,
 )
 from report_model import (
     Report,
@@ -256,8 +254,11 @@ from storage import (
     validate_pending_quarter_delivery,
     validate_telegram_user_id,
 )
+from telegram_delivery import (
+    RetryPolicy,
+    send_with_retry,
+)
 from telegram_delivery import is_blocked_error as _is_blocked_error
-from telegram_delivery import send_with_retry
 from updates import (
     build_version_keyboard,
     build_version_text,
@@ -533,6 +534,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
                 acknowledge_revisions(cur)
             save_stats_current(cur, strict=True)
         pending = migrated
+    inherited_uncertain = pending.get("delivery_uncertain", False)
 
     def read_expected(index: int) -> dict:
         # Caller держит lock; перечитываем и сохраняем чужие независимые поля.
@@ -544,17 +546,30 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         return current
 
     async def before_send(index: int) -> None:
-        async with restorable_state_transaction():
-            read_expected(index)
-
-    async def acknowledge(index: int) -> None:
+        nonlocal pending
         async with restorable_state_transaction():
             current = read_expected(index)
-            current[_PENDING_QUARTER_DELIVERY] = dict(pending, next_unit=index + 1)
+            if not pending.get("delivery_uncertain"):
+                started = dict(pending, next_unit=index, delivery_uncertain=True)
+                current[_PENDING_QUARTER_DELIVERY] = started
+                save_stats_current(current, strict=True)
+                pending = started
+
+    async def acknowledge(index: int) -> None:
+        nonlocal pending, inherited_uncertain
+        async with restorable_state_transaction():
+            current = read_expected(index)
+            confirmed = dict(pending, next_unit=index + 1)
+            confirmed.pop("delivery_uncertain", None)
+            current[_PENDING_QUARTER_DELIVERY] = confirmed
             if index + 1 == total_units:
                 current["last_report_sent"] = pending["new_period"]
                 acknowledge_revisions(current)
             save_stats_current(current, strict=True)
+            pending = confirmed
+            if inherited_uncertain:
+                log.warning("rotate_quarter: доставка подтверждена; возможен дубль прежней попытки.")
+            inherited_uncertain = False
 
     delivery = (
         deliver_frozen_report
@@ -570,11 +585,23 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         acknowledge=acknowledge,
         sleep=asyncio.sleep,
     )
+    if any(sent.duplicate_possible for sent in result.send_results):
+        log.warning("rotate_quarter: повторы могли доставить один frozen-фрагмент несколько раз.")
     if not result.delivered:
-        safe_rich_fallback = (
-            is_rich_method_unsupported(result.error)
-            or is_local_rich_asset_error(result.error)
+        uncertain = inherited_uncertain or any(
+            sent.uncertain or sent.delivered for sent in result.send_results[-1:]
         )
+        # Убираем только собственный marker доказанно неуспешной попытки.
+        # Унаследованный после restart/crash marker не опровергается новым отказом.
+        if not uncertain and pending.get("delivery_uncertain"):
+            async with restorable_state_transaction():
+                current = read_expected(result.next_unit)
+                rejected = dict(pending, next_unit=result.next_unit)
+                rejected.pop("delivery_uncertain", None)
+                current[_PENDING_QUARTER_DELIVERY] = rejected
+                save_stats_current(current, strict=True)
+                pending = rejected
+        safe_rich_fallback = not uncertain and result.safe_to_fallback
         if pending.get("version") in {2, 3} and safe_rich_fallback:
             log.warning(
                 "rotate_quarter: rich transport заменён frozen HTML (%s)",
@@ -2145,14 +2172,20 @@ async def send_to_all_chats(bot: Bot, text: str, *, before_send=None, generation
     for chat_id, name in subs.items():
         try:
             async def send():
-                if before_send is not None:
-                    await before_send()
                 return await bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     parse_mode=ParseMode.HTML,
                 )
-            await send_with_retry(send)
+            sent = await send_with_retry(
+                send,
+                policy=RetryPolicy.AT_LEAST_ONCE,
+                before_attempt=before_send,
+            )
+            if not sent.delivered:
+                raise sent.error
+            if sent.duplicate_possible:
+                log.warning("  → Доставка подтверждена; возможен дубль предыдущей попытки.")
             log.info("  → Отправлено подписчику %s (chat_id=%d)", name, chat_id)
         except (_HistoryAttemptChanged, EventJournalStateError, QuarterDeliveryStateError):
             raise
@@ -2161,7 +2194,10 @@ async def send_to_all_chats(bot: Bot, text: str, *, before_send=None, generation
                 log.warning("  ✗ %s (chat_id=%d) заблокировал бота — отписываем.", name, chat_id)
                 to_remove.append(chat_id)
             else:
-                log.error("  ✗ Не удалось отправить %s (chat_id=%d): %s", name, chat_id, e)
+                log.error(
+                    "  ✗ Отправка %s (chat_id=%d) не подтверждена: outcome=%s, attempts=%d, type=%s",
+                    name, chat_id, sent.outcome.value, len(sent.attempts), type(e).__name__,
+                )
         # Небольшая пауза между отправками — не триггерим flood control
         await asyncio.sleep(0.3)
 
