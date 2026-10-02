@@ -2377,7 +2377,12 @@ async def test_restore_during_acquisition_prevents_stale_page_publication(
     await handlers.check_and_notify(AsyncMock(), {999}, None)
     assert restores == [True]
     restored = storage.load_event_journal()
-    assert restored == (journal_factory(count=0) if restore_kind == "older" else journal)
+    from notification_outbox import migrate_outbox
+
+    expected = journal_factory(count=0) if restore_kind == "older" else journal
+    if restore_kind in {"unrelated", "legacy"}:
+        expected = migrate_outbox(expected, 0)
+    assert restored == expected
     send.assert_not_awaited()
 
 
@@ -2444,10 +2449,9 @@ async def test_legacy_quarter_restore_sets_baseline_and_preserves_unfinished_wor
     restored = storage.load_stats_current(strict=True)
     assert restored["event_projection"] == {"journal_id": journal["journal_id"], "baseline_seq": 1, "applied_seq": 1}
     monkeypatch.setattr("handlers.asyncio.sleep", AsyncMock())
-    sent = AsyncMock()
-    monkeypatch.setattr("handlers.send_to_all_chats", sent)
+    monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(wraps=handlers._enqueue_history_event))
     await handlers._drain_history_journal(AsyncMock())
-    sent.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
     assert storage.load_event_journal()["processed_seq"] == 2
     projected = storage.load_stats_current(strict=True)
     assert projected["events"] == legacy["events"]
@@ -2455,12 +2459,16 @@ async def test_legacy_quarter_restore_sets_baseline_and_preserves_unfinished_wor
 
 
 @pytest.mark.asyncio
-async def test_journal_restore_rollback_preserves_exact_damaged_bytes(backup_env, journal_factory, monkeypatch):
+@pytest.mark.parametrize("version", [1, 3])
+async def test_journal_restore_rollback_preserves_exact_damaged_bytes(backup_env, journal_factory, monkeypatch, version):
     journal_before = b"\xffbroken journal\r\n"
     current_before = b"{ broken quarter\r\n"
     storage.EVENT_JOURNAL_FILE.write_bytes(journal_before)
     storage.STATS_CURRENT_FILE.write_bytes(current_before)
     journal = journal_factory()
+    if version == 3:
+        from notification_outbox import migrate_outbox
+        journal = migrate_outbox(journal, 0)
     cur = _journal_current(journal)
     raw = _zip_bytes({
         "event_journal.json": json.dumps(journal),
@@ -2482,6 +2490,39 @@ async def test_journal_restore_rollback_preserves_exact_damaged_bytes(backup_env
     assert storage.STATS_CURRENT_FILE.read_bytes() == current_before
     assert not storage.USER_ALERTS_FILE.exists()
     assert storage.restorable_restore_generation() == generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["unsupported", "null", "subscriber", "missing_token", "huge_chat"])
+async def test_restore_rejects_invalid_notification_memberships(backup_env, damage):
+    storage.save_subscribers({10: "keep"})
+    before = storage.SUBS_FILE.read_bytes()
+    payload = json.loads(before)
+    if damage == "unsupported":
+        payload["notification_memberships"]["version"] = 2
+    elif damage == "null":
+        payload["notification_memberships"] = None
+    elif damage == "subscriber":
+        payload["subscribers"]["10"] = True
+    elif damage == "huge_chat":
+        payload["subscribers"]["1" * 5000] = "invalid"
+    else:
+        payload["notification_memberships"]["tokens"] = {}
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(_zip_bytes({"subscribers.json": json.dumps(payload), "user_alerts.json": '{"enabled":false}'}))
+    assert storage.SUBS_FILE.read_bytes() == before
+    assert not storage.USER_ALERTS_FILE.exists()
+
+
+@pytest.mark.asyncio
+async def test_restore_rechecks_capacity_after_legacy_membership_migration(backup_env, monkeypatch):
+    before = b'{"subscribers":{"10":"keep"}}\r\n'
+    storage.SUBS_FILE.write_bytes(before)
+    candidate = '{"subscribers":{"20":"new"}}'
+    monkeypatch.setattr("backup._IMPORT_MEMBER_MAX_BYTES", len(candidate.encode()) + 1)
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(_zip_bytes({"subscribers.json": candidate}))
+    assert storage.SUBS_FILE.read_bytes() == before
 
 
 @pytest.mark.asyncio
@@ -2543,8 +2584,11 @@ async def test_history_restore_invalidates_fetch_send_and_retry(
     bot = AsyncMock()
     bot.send_message.side_effect = send
     await handlers.check_and_notify(bot, {999}, cur)
+    if phase in {"send", "retry"}:
+        from notification_delivery import dispatch_notifications
+        await dispatch_notifications(bot)
     restored_journal = storage.load_event_journal()
-    assert restored_journal["processed_seq"] == 0
+    assert restored_journal["processed_seq"] == (1 if phase in {"send", "retry"} and restore_kind != "older" else 0)
     assert len(attempts) == (0 if phase in {"fetch", "admission"} else 1)
     if phase == "fetch" or restore_kind == "older":
         assert restored_journal["events"] == []

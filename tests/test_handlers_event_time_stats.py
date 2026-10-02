@@ -27,7 +27,7 @@ async def event_time_env(backup_env, monkeypatch):
     storage.save_stats_current({"period": "2026-Q1", "events": []}, strict=True)
     await handlers._initialize_history_journal({1}, storage.restorable_restore_generation())
     monkeypatch.setattr("handlers.asyncio.sleep", AsyncMock())
-    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
+    monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(wraps=handlers._enqueue_history_event))
     monkeypatch.setattr("handlers.send_backup", AsyncMock(return_value=True))
     monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q4")
     return backup_env
@@ -82,7 +82,7 @@ async def test_three_missed_quarters_publish_separate_snapshots_and_plans(event_
         assert frozen["history_complete"] is False
         assert returned["event_projection"]["applied_seq"] == 3
     assert handlers.send_backup.await_count == 3
-    assert handlers.send_to_all_chats.await_count == 3
+    assert handlers._enqueue_history_event.await_count == 3
     assert all(
         value["completed"] == 1 for value in stats_all["anime"]["aggregates"]["by_quarter"].values()
     )
@@ -132,7 +132,7 @@ async def test_drain_scans_source_prefix_once_and_resumes_applied_event(
     validate_event_time(projected, published)
     assert published["processed_seq"] == projected["event_projection"]["applied_seq"] == 20
     assert [len(projected["event_time"]["periods"][f"2026-Q{q}"]["events"]) for q in (1, 2, 3)] == [7, 7, 6]
-    assert handlers.send_to_all_chats.await_count == pending
+    assert handlers._enqueue_history_event.await_count == pending
 
 
 @pytest.mark.asyncio
@@ -145,13 +145,13 @@ async def test_drain_rejects_inconsistent_applied_prefix_before_publication(even
     storage.save_stats_current(cur, strict=True)
     _append(3, "2026-04-01T00:00:00Z")
     before = _archive()
-    handlers.send_to_all_chats.reset_mock()
+    handlers._enqueue_history_event.reset_mock()
 
     with pytest.raises(storage.EventJournalStateError):
         await handlers._drain_history_journal(AsyncMock())
 
     assert _archive() == before
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -254,7 +254,7 @@ async def test_failed_publication_keeps_source_projection_and_resumes(
 
 
 @pytest.mark.asyncio
-async def test_restore_during_projection_broadcast_preserves_new_state_without_stale_ack(
+async def test_restore_between_projection_and_enqueue_preserves_new_state_without_stale_ack(
     event_time_env,
 ):
     _append(2, "2026-01-01T00:00:00Z")
@@ -262,14 +262,15 @@ async def test_restore_during_projection_broadcast_preserves_new_state_without_s
 
     async def restore(*args, **kwargs):
         await backup.restore_backup_zip(captured)
+        raise handlers._HistoryAttemptChanged
 
-    handlers.send_to_all_chats.side_effect = restore
+    handlers._enqueue_history_event.side_effect = restore
     with pytest.raises(handlers._HistoryAttemptChanged):
         await handlers._drain_history_journal(AsyncMock())
     cur = storage.load_stats_current(strict=True)
     assert cur["event_projection"]["applied_seq"] == 0
     assert cur["event_time"]["periods"]["2026-Q1"]["events"] == []
-    handlers.send_to_all_chats.side_effect = None
+    handlers._enqueue_history_event.side_effect = None
     await handlers._drain_history_journal(AsyncMock())
     assert len(storage.load_stats_current(strict=True)["events"]) == 1
 
@@ -336,7 +337,7 @@ async def test_pending_legacy_plan_migrates_silently_without_reprojection_or_rer
     assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == ["old remaining"]
     assert returned["events"] == cur["events"]
     assert returned["event_time"]["baseline_seq"] == 0
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
 
 
 def test_removed_source_score_never_falls_back_to_today_export():

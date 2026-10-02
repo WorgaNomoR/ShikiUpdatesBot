@@ -169,6 +169,12 @@ from messages import (
     history_entry_from_event,
     normalize_history_event,
 )
+from notification_delivery import dispatch_notifications
+from notification_outbox import (
+    enqueue,
+    migrate_outbox,
+    notification_event,
+)
 from report_delivery import (
     deliver_frozen_report,
     deliver_rendered_report,
@@ -225,6 +231,7 @@ from storage import (
     add_blocked_user,
     downgrade_quarter_delivery,
     list_blocked_users,
+    load_blocked_users,
     load_event_journal,
     load_legacy_seen_ids,
     load_seen_favourites,
@@ -239,6 +246,7 @@ from storage import (
     migrate_quarter_delivery,
     mutate_subscription,
     new_quarter_delivery_plan,
+    notification_memberships,
     remove_blocked_user,
     restorable_restore_generation,
     restorable_state_transaction,
@@ -2219,9 +2227,13 @@ _JOURNAL_CAPACITY_NOTICE = (
     "⚠️ Сохранённая история приближается к пределу 8 МиБ. Сделай резервную копию "
     "через /backup. При заполнении новые события будут отложены; сохранённые не удаляются."
 )
+_NOTIFICATION_STATE_NOTICE = (
+    "⚠️ Отправка сохранённых уведомлений временно приостановлена. "
+    "Данные сохранены; восстановление доступно через /backup."
+)
 
 
-async def _journal_diagnostic(bot: Bot, *, capacity: bool = False) -> None:
+async def _journal_diagnostic(bot: Bot, *, capacity: bool = False, delivery: bool = False) -> None:
     """Статическая owner-only диагностика без содержимого журнала."""
     global _last_journal_notice_at, _last_journal_capacity_notice_at
     now = time.monotonic()
@@ -2235,7 +2247,7 @@ async def _journal_diagnostic(bot: Bot, *, capacity: bool = False) -> None:
     try:
         await bot.send_message(
             chat_id=OWNER_ID,
-            text=_JOURNAL_CAPACITY_NOTICE if capacity else _JOURNAL_STATE_NOTICE,
+            text=_JOURNAL_CAPACITY_NOTICE if capacity else _NOTIFICATION_STATE_NOTICE if delivery else _JOURNAL_STATE_NOTICE,
         )
     except Exception:
         log.warning("История: диагностика владельцу не доставлена.")
@@ -2287,21 +2299,6 @@ async def _initialize_history_journal(ids: set[int], generation: int) -> tuple[d
         return journal, cur
 
 
-async def _history_attempt_state(journal_id: str, seq: int, generation: int) -> None:
-    """Проверить lease перед send/retry без разбора полного журнала."""
-    async with restorable_state_transaction():
-        if restorable_restore_generation() != generation:
-            raise _HistoryAttemptChanged
-        cur = load_stats_current(strict=True)
-        projection = cur.get(PROJECTION_KEY)
-        if (
-            projection is None or projection["journal_id"] != journal_id
-            or projection["baseline_seq"] >= seq
-            or projection["applied_seq"] != seq
-        ):
-            raise _HistoryAttemptChanged
-
-
 async def _drain_history_journal(bot: Bot, *, expected_generation: int | None = None) -> tuple[dict | None, dict]:
     """Последовательно завершить локально принятые события без обращения к API."""
     loop = asyncio.get_running_loop()
@@ -2319,6 +2316,9 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
         generation = restorable_restore_generation()
         if journal is not None and PROJECTION_KEY in cur and ensure_event_time(cur):
             save_stats_current(cur, strict=True)
+        if journal is not None and PROJECTION_KEY in cur and journal["version"] != 3:
+            journal = migrate_outbox(journal, cur[PROJECTION_KEY]["applied_seq"])
+            save_event_journal(journal)
         period_events = index_event_periods(cur, journal) if journal is not None and PROJECTION_KEY in cur else {}
     while journal is not None and journal["processed_seq"] < len(journal["events"]):
         seq = journal["processed_seq"] + 1
@@ -2342,28 +2342,32 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
                         save_stats_all(stats_all)
                 except Exception as error:
                     log.warning("История: by_quarter не обновлён (%s).", type(error).__name__)
-        if event["relevant"] and event["event_type"] not in {"ignored", "score_removed"}:
+        text = None
+        if notification_event(event):
             if event["event_type"] == "unknown":
                 log.warning("Неизвестное описание истории entry id=%d.", event["history_id"])
             text = build_message(entry, normalized=event)
-
-            async def before_send():
-                await _history_attempt_state(journal["journal_id"], seq, generation)
-
-            await before_send()
-            await send_to_all_chats(bot, text, before_send=before_send, generation=generation)
-        async with restorable_state_transaction():
-            if restorable_restore_generation() != generation:
-                raise _HistoryAttemptChanged
-            current_journal, cur = _history_state(full_recovery=False)
-            if current_journal != journal or cur[PROJECTION_KEY]["applied_seq"] != seq:
-                raise _HistoryAttemptChanged
-            journal = deepcopy(journal)
-            journal["processed_seq"] = seq
-            save_event_journal(journal)
-        if event["relevant"] and event["event_type"] not in {"ignored", "score_removed"}:
-            await asyncio.sleep(1)
+        journal, cur = await _enqueue_history_event(journal, event, text, generation)
     return journal, cur
+
+
+async def _enqueue_history_event(journal: dict, event: dict, text: str | None, generation: int) -> tuple[dict, dict]:
+    """Единая публикация frozen audience/payload и завершённой обработки."""
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        current_journal, cur = _history_state(full_recovery=False)
+        if current_journal != journal or cur[PROJECTION_KEY]["applied_seq"] != event["seq"]:
+            raise _HistoryAttemptChanged
+        try:
+            memberships = notification_memberships() if notification_event(event) else {}
+            blocked = load_blocked_users() if memberships else set()
+        except (ValueError, OSError):
+            raise EventJournalStateError("notification_state") from None
+        memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}
+        candidate = enqueue(journal, event, text, memberships, time.time())
+        save_event_journal(candidate, admitting=True)
+        return candidate, cur
 
 
 def _export_history_seen(journal: dict) -> set[int]:
@@ -2480,7 +2484,7 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
                 # повторные ошибки должны оставлять последний checkpoint.
                 # Первая ошибка создаёт пустую отметку неполноты, чтобы
                 # ротация не закрыла квартал до проверки истории.
-                candidate = journal if journal.get("catchup") is not None else {**journal, "version": 2, "catchup": state}
+                candidate = journal if journal.get("catchup") is not None else {**journal, "version": max(2, journal["version"]), "catchup": state}
                 cur = await _publish_history_candidate(journal, candidate, generation)
                 log.warning("История: страница %d недоступна; незавершённый сбор сохранён.", page)
                 return seen, cur
@@ -2496,7 +2500,7 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
                     event["seq"] = len(candidate["events"]) + 1
                     candidate["events"].append(event)
                 if state["staged"] or previous is not None or journal.get("catchup") is not None:
-                    candidate.update(version=2, catchup=None)
+                    candidate.update(version=max(2, journal["version"]), catchup=None)
                 cur = await _publish_history_candidate(journal, candidate, generation)
                 if candidate == journal:
                     return seen, cur
@@ -2504,7 +2508,7 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
                     await _journal_diagnostic(bot, capacity=True)
                 journal, cur = await _drain_history_journal(bot, expected_generation=generation)
                 return _export_history_seen(journal), cur
-            candidate.update(version=2, catchup=deepcopy(state))
+            candidate.update(version=max(2, journal["version"]), catchup=deepcopy(state))
             cur = await _publish_history_candidate(journal, candidate, generation)
             journal = candidate
             if len(journal_json(journal).encode("utf-8")) >= JOURNAL_WARN_BYTES:
@@ -2791,6 +2795,13 @@ async def polling_loop(bot: Bot) -> None:
                         "Не удалось отправить уведомление владельцу об ошибке: %s",
                         notify_error,
                     )
+        # Уже принятые обязательства не зависят от результата нового acquisition.
+        # Telegram, ожидание и диагностика никогда не удерживают state lock.
+        try:
+            await dispatch_notifications(bot)
+        except Exception as error:
+            log.warning("Уведомления: consumer приостановлен (%s).", type(error).__name__)
+            await _journal_diagnostic(bot, delivery=True)
         await asyncio.sleep(CHECK_INTERVAL)
 
 

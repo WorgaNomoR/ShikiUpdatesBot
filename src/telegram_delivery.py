@@ -213,12 +213,15 @@ async def send_with_retry(
     policy: RetryPolicy,
     before_attempt: Callable[[], Awaitable[None]] | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    max_attempts: int = _MAX_RETRIES + 1,
 ) -> SendResult[_ResultT]:
     """Ограниченно повторить свежую операцию и сохранить исходы всех попыток.
 
     Подготовка и guards отделены от dispatch. Отмена распространяется сразу:
     caller сохраняет незавершённое обязательство, а не получает ложный успех.
     """
+    if type(max_attempts) is not int or not 1 <= max_attempts <= _MAX_RETRIES + 1:
+        raise ValueError("max_attempts")
     sleeper = sleep or _sleep
     retries = 0
     attempts = []
@@ -242,7 +245,7 @@ async def send_with_retry(
         except Exception as exc:
             # outcome присвоен во внутреннем except перед повторным raise.
             attempts.append(SendAttempt(outcome, exc))  # pylint: disable=used-before-assignment
-            if retries >= _MAX_RETRIES:
+            if retries >= max_attempts - 1:
                 return SendResult(tuple(attempts))
             delay = _retry_delay(exc, outcome, policy, retries)
             if delay is None:

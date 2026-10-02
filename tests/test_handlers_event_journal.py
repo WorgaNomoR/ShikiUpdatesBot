@@ -15,7 +15,7 @@ import backup
 import handlers
 import storage
 from event_journal_schema import EventJournalStateError
-from handlers import send_to_all_chats
+from notification_delivery import dispatch_notifications
 
 
 def _entry(history_id=2):
@@ -31,12 +31,13 @@ def history_env(backup_env, monkeypatch):
     storage.save_stats_current({"period": "2026-Q2", "events": []}, strict=True)
     monkeypatch.setattr("handlers.asyncio.sleep", AsyncMock())
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
-    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
+    monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(wraps=handlers._enqueue_history_event))
     return backup_env
 
 
 async def _ready():
-    return await handlers._initialize_history_journal({1}, storage.restorable_restore_generation())
+    await handlers._initialize_history_journal({1}, storage.restorable_restore_generation())
+    return await handlers._drain_history_journal(AsyncMock())
 
 
 @pytest.mark.asyncio
@@ -51,7 +52,7 @@ async def test_valid_legacy_migration_including_empty_is_silent(history_env, mon
     assert journal["baseline_ids"] == legacy
     assert journal["events"] == []
     assert storage.load_stats_current(strict=True)["events"] == before["events"]
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
     storage.SEEN_IDS_FILE.write_bytes(b"{corrupt")
     await handlers.check_and_notify(AsyncMock(), {999}, before)
     assert storage.load_event_journal() == journal
@@ -76,7 +77,7 @@ async def test_bootstrap_publishes_readiness_even_when_empty(history_env, monkey
     fetch.return_value = [_entry(3)]
     await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.load_event_journal()["events"][0]["history_id"] == 3
-    handlers.send_to_all_chats.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -97,7 +98,7 @@ async def test_interrupted_binding_reuses_published_identity(history_env, monkey
     await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.load_event_journal()["journal_id"] == journal["journal_id"]
     assert storage.load_stats_current(strict=True)["event_projection"]["journal_id"] == journal["journal_id"]
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -117,14 +118,17 @@ async def test_complete_batch_precedes_projection_and_all_sends(history_env, mon
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(3), _entry(2), _entry(3)]))
     order = []
 
-    async def send(_bot, _text, **kwargs):
+    real_enqueue = handlers._enqueue_history_event
+
+    async def send(journal, event, text, generation):
         journal = storage.load_event_journal()
         projection = storage.load_stats_current(strict=True)["event_projection"]
         assert [event["history_id"] for event in journal["events"]] == [2, 3]
         assert projection["applied_seq"] == journal["processed_seq"] + 1
         order.append(journal["processed_seq"] + 1)
+        return await real_enqueue(journal, event, text, generation)
 
-    monkeypatch.setattr("handlers.send_to_all_chats", send)
+    monkeypatch.setattr("handlers._enqueue_history_event", send)
     await handlers.check_and_notify(AsyncMock(), {999}, None)
     assert order == [1, 2]
     assert storage.load_event_journal()["processed_seq"] == 2
@@ -143,7 +147,7 @@ async def test_overlap_conflicts_keep_first_semantics(history_env, monkeypatch, 
     await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
     assert sum("конфликт семантики" in message for message in caplog.messages) == 1
-    handlers.send_to_all_chats.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -164,15 +168,15 @@ async def test_malformed_metadata_is_admitted_once_without_blocking_batch(histor
     assert journal["events"][1]["title"] == {"name": "???", "russian": "", "url": ""}
     assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 3
     assert len(storage.load_stats_current(strict=True)["events"]) == 2
-    assert handlers.send_to_all_chats.await_count == 2
-    assert "???" in handlers.send_to_all_chats.await_args_list[0].args[1]
+    assert handlers._enqueue_history_event.await_count == 3
+    assert "???" in handlers._enqueue_history_event.await_args_list[1].args[2]
     original = storage.EVENT_JOURNAL_FILE.read_bytes()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(2), _entry(3), _entry(4)]))
 
     await handlers.check_and_notify(AsyncMock(), set(), None)
 
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
-    assert handlers.send_to_all_chats.await_count == 2
+    assert handlers._enqueue_history_event.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -201,16 +205,16 @@ async def test_failed_publication_preserves_pending_and_exact_bytes(history_env,
     if boundary == "admission":
         assert storage.EVENT_JOURNAL_FILE.read_bytes() == old_journal
         assert storage.STATS_CURRENT_FILE.read_bytes() == old_cur
-        handlers.send_to_all_chats.assert_not_awaited()
+        handlers._enqueue_history_event.assert_not_awaited()
     else:
         assert len(storage.load_event_journal()["events"]) == 2
         assert storage.load_event_journal()["processed_seq"] == 0
         if boundary == "projection":
             assert storage.STATS_CURRENT_FILE.read_bytes() == old_cur
-            handlers.send_to_all_chats.assert_not_awaited()
+            handlers._enqueue_history_event.assert_not_awaited()
         else:
             assert len(storage.load_stats_current(strict=True)["events"]) == 1
-            handlers.send_to_all_chats.assert_awaited_once()
+            handlers._enqueue_history_event.assert_awaited_once()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
     await handlers.check_and_notify(AsyncMock(), set(), None)
     if boundary != "admission":
@@ -219,10 +223,11 @@ async def test_failed_publication_preserves_pending_and_exact_bytes(history_env,
 
 
 @pytest.mark.asyncio
-async def test_crash_during_send_replays_without_reapplying_projection(history_env, monkeypatch):
+async def test_crash_before_enqueue_replays_without_reapplying_projection(history_env, monkeypatch):
     await _ready()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(), _entry(3)]))
-    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock(side_effect=asyncio.CancelledError))
+    real_enqueue = handlers._enqueue_history_event
+    monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(side_effect=asyncio.CancelledError))
     with pytest.raises(asyncio.CancelledError):
         await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.load_event_journal()["processed_seq"] == 0
@@ -236,7 +241,7 @@ async def test_crash_during_send_replays_without_reapplying_projection(history_e
 
     monkeypatch.setattr("handlers.project_event", record)
     monkeypatch.setattr("messages.classify_event", lambda _: pytest.fail("переклассификация локального payload"))
-    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
+    monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(wraps=real_enqueue))
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
     await handlers.check_and_notify(AsyncMock(), set(), None)
     assert applied == [3]
@@ -253,7 +258,7 @@ async def test_export_failure_cannot_override_valid_journal(history_env, monkeyp
     assert seen == {1, 2}
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
     await handlers.check_and_notify(AsyncMock(), {999}, None)
-    handlers.send_to_all_chats.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -267,27 +272,29 @@ async def test_capacity_rejects_whole_new_batch_without_eviction(history_env, mo
     with pytest.raises(EventJournalStateError, match="journal_capacity"):
         await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
-    handlers.send_to_all_chats.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_rotation_drains_pending_and_carries_projection(history_env, monkeypatch):
     await _ready()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry()]))
-    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock(side_effect=asyncio.CancelledError))
+    real_enqueue = handlers._enqueue_history_event
+    monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(side_effect=asyncio.CancelledError))
     with pytest.raises(asyncio.CancelledError):
         await handlers.check_and_notify(AsyncMock(), set(), None)
     order = []
 
     async def send(*args, **kwargs):
         order.append("event")
+        return await real_enqueue(*args, **kwargs)
 
     def snapshot(_period, cur, _stats):
         order.append("snapshot")
         assert storage.load_event_journal()["processed_seq"] == 1
         assert len(cur["events"]) == 1
 
-    monkeypatch.setattr("handlers.send_to_all_chats", send)
+    monkeypatch.setattr("handlers._enqueue_history_event", send)
     monkeypatch.setattr("handlers._save_quarter_snapshot", snapshot)
     monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
     monkeypatch.setattr("handlers._deliver_pending_quarter", AsyncMock(side_effect=lambda _bot, cur: cur))
@@ -318,7 +325,7 @@ async def test_crash_after_admission_recovers_before_fetch(history_env, monkeypa
             await handlers.check_and_notify(AsyncMock(), set(), None)
     assert len(storage.load_event_journal()["events"]) == 1
     assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 0
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
 
     async def disappeared(_session, page=1):
         assert storage.load_event_journal()["processed_seq"] == 1
@@ -326,27 +333,29 @@ async def test_crash_after_admission_recovers_before_fetch(history_env, monkeypa
 
     monkeypatch.setattr("handlers.fetch_history", disappeared)
     await handlers.check_and_notify(AsyncMock(), set(), None)
-    handlers.send_to_all_chats.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_completed_attempt_does_not_claim_recipient_delivery(history_env, monkeypatch):
+async def test_enqueue_does_not_claim_recipient_delivery(history_env, monkeypatch):
     from aiogram.exceptions import TelegramBadRequest
     from aiogram.methods import SendMessage
 
     await _ready()
     storage.save_subscribers({10: "fails", 20: "works"})
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry()]))
-    monkeypatch.setattr("handlers.send_to_all_chats", send_to_all_chats)
     bot = AsyncMock()
     bot.send_message.side_effect = [
         TelegramBadRequest(method=SendMessage(chat_id=10, text="event"), message="permanent"),
         object(),
     ]
     await handlers.check_and_notify(bot, set(), None)
+    await dispatch_notifications(bot)
     assert bot.send_message.await_count == 2
     assert storage.load_event_journal()["processed_seq"] == 1
-    assert "recipients" not in storage.load_event_journal()
+    recipients = storage.load_event_journal()["outbox"]["records"][0]["recipients"]
+    assert recipients["10"]["status"] == "rejected"
+    assert recipients["20"]["status"] == "delivered"
 
 
 @pytest.mark.asyncio
@@ -367,11 +376,11 @@ async def test_baseline_bad_metadata_does_not_block_new_events(history_env, monk
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[{"id": 1, "target": "bad"}, _entry()]))
     await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.load_event_journal()["processed_seq"] == 1
-    handlers.send_to_all_chats.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_two_consumers_cannot_overtake_unfinished_broadcast(history_env, journal_factory, monkeypatch):
+async def test_two_consumers_cannot_overtake_unfinished_enqueue(history_env, journal_factory, monkeypatch):
     journal = journal_factory(count=2)
     storage.save_event_journal(journal)
     storage.save_stats_current({
@@ -382,14 +391,17 @@ async def test_two_consumers_cannot_overtake_unfinished_broadcast(history_env, j
     resume = asyncio.Event()
     sends = []
 
+    real_enqueue = handlers._enqueue_history_event
+
     async def send(*args, **kwargs):
         seq = storage.load_stats_current(strict=True)["event_projection"]["applied_seq"]
         sends.append(seq)
         if seq == 1:
             started.set()
             await resume.wait()
+        return await real_enqueue(*args, **kwargs)
 
-    monkeypatch.setattr("handlers.send_to_all_chats", send)
+    monkeypatch.setattr("handlers._enqueue_history_event", send)
     first = asyncio.create_task(handlers._drain_history_journal(AsyncMock()))
     await started.wait()
     second = asyncio.create_task(handlers._drain_history_journal(AsyncMock()))
@@ -424,7 +436,7 @@ async def test_startup_privacy_failure_does_not_publish_journal_baseline(history
     assert storage.load_event_journal() is None
     assert storage.STATS_CURRENT_FILE.read_bytes() == original
     assert storage.load_legacy_seen_ids() == (set(legacy) if legacy is not None else None)
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -479,7 +491,7 @@ async def test_corrupt_journal_suspends_history_keeps_recovery_and_resumes(histo
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
     assert storage.STATS_CURRENT_FILE.read_bytes() == original_cur
     handlers.fetch_history.assert_not_awaited()
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
     favourites.assert_awaited_once_with(bot, {"animes_10"}, favourites={})
     assert subscription.await_count == 2
     weekly.assert_awaited_once_with(bot, storage.load_stats_current(strict=True))
@@ -494,7 +506,7 @@ async def test_corrupt_journal_suspends_history_keeps_recovery_and_resumes(histo
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry()]))
     await handlers.check_and_notify(bot, {999}, None)
     assert storage.load_event_journal()["processed_seq"] == 1
-    handlers.send_to_all_chats.assert_awaited_once()
+    handlers._enqueue_history_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -509,7 +521,6 @@ async def test_journal_reads_do_not_scale_with_recipients_or_retries(history_env
         "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
     }, strict=True)
     storage.save_subscribers({10: "first", 20: "second", 30: "third"})
-    monkeypatch.setattr("handlers.send_to_all_chats", send_to_all_chats)
     real_load = storage.load_event_journal
     reads = []
 
@@ -525,7 +536,8 @@ async def test_journal_reads_do_not_scale_with_recipients_or_retries(history_env
         *[object() for _ in range(6)],
     ]
     await handlers._drain_history_journal(bot)
-    assert [call.kwargs["chat_id"] for call in bot.send_message.await_args_list] == [10, 10, 20, 30, 10, 20, 30]
+    bot.send_message.assert_not_awaited()
+    assert all(len(record["recipients"]) == 3 for record in storage.load_event_journal()["outbox"]["records"])
     assert reads == [0, 0, 1]
     assert storage.load_event_journal()["processed_seq"] == 2
     projected = storage.load_stats_current(strict=True)
@@ -534,7 +546,7 @@ async def test_journal_reads_do_not_scale_with_recipients_or_retries(history_env
 
 
 @pytest.mark.asyncio
-async def test_exhausted_uncertain_recipient_still_means_only_completed_broadcast_attempt(
+async def test_exhausted_uncertain_recipient_still_means_only_durable_enqueue(
     history_env, monkeypatch, journal_factory,
 ):
     from aiogram.exceptions import TelegramForbiddenError
@@ -547,7 +559,6 @@ async def test_exhausted_uncertain_recipient_still_means_only_completed_broadcas
         "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
     }, strict=True)
     storage.save_subscribers({7: "lost", 8: "blocked", 9: "healthy"})
-    monkeypatch.setattr("handlers.send_to_all_chats", send_to_all_chats)
     monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
     calls = []
 
@@ -561,7 +572,46 @@ async def test_exhausted_uncertain_recipient_still_means_only_completed_broadcas
     bot = AsyncMock()
     bot.send_message.side_effect = send
     await handlers._drain_history_journal(bot)
-    assert calls == [7, 7, 7, 8, 9]
+    await dispatch_notifications(bot)
+    assert calls == [7, 8, 9]
+    assert storage.load_event_journal()["outbox"]["records"][0]["recipients"]["7"]["status"] == "pending"
     assert storage.load_event_journal()["processed_seq"] == 1
     assert set(storage.load_subscribers()) == {7, 9}
     assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["migration", "membership", "enqueue_capacity"])
+async def test_outbox_publication_failure_keeps_recoverable_authority(history_env, journal_factory, monkeypatch, phase):
+    journal = journal_factory()
+    storage.save_event_journal(journal)
+    storage.save_stats_current({
+        "period": "2026-Q2", "events": [],
+        "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
+    }, strict=True)
+    storage.SUBS_FILE.write_text('{"subscribers":{"10":"legacy"}}', encoding="utf-8")
+    before_journal = storage.EVENT_JOURNAL_FILE.read_bytes()
+    before_members = storage.SUBS_FILE.read_bytes()
+    write = storage._atomic_write
+    def fail(path, payload):
+        if phase == "membership" and path == storage.SUBS_FILE:
+            raise OSError("memberships")
+        if path == storage.EVENT_JOURNAL_FILE:
+            candidate = json.loads(payload)
+            if phase == "migration" and candidate["version"] == 3:
+                raise OSError("migration")
+            if phase == "enqueue_capacity" and candidate["processed_seq"] == 1:
+                raise EventJournalStateError("journal_capacity")
+        return write(path, payload)
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", fail)
+        with pytest.raises(EventJournalStateError):
+            await handlers._drain_history_journal(AsyncMock())
+    assert storage.load_event_journal()["processed_seq"] == 0
+    if phase == "migration":
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == before_journal
+    if phase in {"migration", "membership"}:
+        assert storage.SUBS_FILE.read_bytes() == before_members
+    await handlers._drain_history_journal(AsyncMock())
+    assert storage.load_event_journal()["processed_seq"] == 1
+    assert len(storage.load_event_journal()["outbox"]["records"]) == 1

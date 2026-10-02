@@ -53,6 +53,10 @@ from fact_bank import (
     parse_fact_bank_bytes,
     serialize_fact_bank,
 )
+from notification_outbox import (
+    OutboxStateError,
+    parse_subscriber_payload,
+)
 from storage import (
     BlockedUsersStateError,
     KnownUsersStateError,
@@ -63,6 +67,7 @@ from storage import (
     _atomic_write,
     blocked_users_from_payload,
     ensure_backup_schedule,
+    json_publication_size,
     known_users_from_payload,
     load_blocked_users,
     load_event_journal,
@@ -566,6 +571,8 @@ def _valid_import_payload(name: str, obj) -> bool:
             subscriber_state_from_payload(obj, strict_schedule=True)
         except SubscriptionBackupStateError:
             raise
+        except OutboxStateError:
+            raise
         except ValueError:
             return False
         return True
@@ -867,6 +874,8 @@ async def restore_backup_zip(raw: bytes) -> dict:
             try:
                 payload = zf.read(info).decode("utf-8")
                 obj = json.loads(payload)   # синтаксически валидный JSON?
+                if name == "subscribers.json":
+                    obj = parse_subscriber_payload(payload.encode("utf-8"), _IMPORT_MEMBER_MAX_BYTES)
             except (
                 UnicodeDecodeError,
                 json.JSONDecodeError,
@@ -913,6 +922,9 @@ async def restore_backup_zip(raw: bytes) -> dict:
     async with restorable_state_transaction():
         pending = _prepare_history_restore_candidate(pending)
         pending = _prepare_access_restore_candidate(pending)
+        sizes = [json_publication_size(payload) for payload in pending.values()]
+        if any(size > _IMPORT_MEMBER_MAX_BYTES for size in sizes) or sum(sizes) > _IMPORT_TOTAL_MAX_BYTES:
+            raise ValueError("Подготовленный recovery-набор превышает предел размера")
         restored = _publish_restore_files(pending)
         mark_restorable_state_restored()
         if restored_fact_document is not None:
