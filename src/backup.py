@@ -194,8 +194,8 @@ def _valid_past_timestamp(value: object, now: float) -> float | None:
 
 
 def _prepare_schedule(state: SubscriberState, now: float) -> bool:
-    """Мигрировать расписание и сбросить недостоверные будущие метки."""
-    changed = ensure_backup_schedule(state, now=now)
+    """Подготовить миграции подписок/расписания и исправить будущие метки."""
+    changed = ensure_backup_schedule(state, now=now) or state.notification_memberships is None
     schedule = state.backup_schedule
     last = _valid_past_timestamp(schedule.get("last_backup_at"), now)
     if schedule.get("last_backup_at") is not None and last is None:
@@ -209,7 +209,7 @@ def _prepare_schedule(state: SubscriberState, now: float) -> bool:
 
 
 def prepare_backup_schedule(state: SubscriberState, now: float) -> bool:
-    """Подготовить durable-расписание для внешнего automatic backup flow."""
+    """Подготовить subscriber-state к публикации для automatic backup flow."""
     return _prepare_schedule(state, now)
 
 

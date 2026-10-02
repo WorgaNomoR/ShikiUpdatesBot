@@ -1659,6 +1659,41 @@ async def test_weekly_backup_due_send_fails_keeps_old_timestamp(backup_env, monk
 
 
 @pytest.mark.asyncio
+async def test_weekly_backup_persists_legacy_memberships_before_capture(backup_env):
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
+    cur = {"period": "2026-Q2", "events": []}
+    _save_subscriber_schedule({7: "Neo", -100: "Group"}, last_backup_at=old, weekly_started_at=old)
+    legacy = json.loads(storage.SUBS_FILE.read_text(encoding="utf-8"))
+    legacy.pop("notification_memberships")
+    storage.SUBS_FILE.write_text(json.dumps(legacy), encoding="utf-8")
+    captures = []
+
+    async def send(*args, **kwargs):
+        assert not storage._restorable_state_lock().locked()
+        with zipfile.ZipFile(io.BytesIO(kwargs["document"].data)) as archive:
+            archived = json.loads(archive.read("subscribers.json"))
+        published = storage.load_subscriber_state(strict_subscribers=True)
+        captures.append((archived, published.notification_memberships))
+
+    bot = AsyncMock()
+    bot.send_document.side_effect = send
+    assert await backup._weekly_backup_if_due(bot, cur) is cur
+    final = storage.load_subscriber_state(strict_subscribers=True)
+    assert final.backup_schedule["last_backup_at"] > old
+    assert final.backup_schedule["weekly_started_at"] == old
+    assert final.backup_schedule["pending"] is None
+    assert final.subscribers == {7: "Neo", -100: "Group"}
+    archived, published_memberships = captures[0]
+    assert published_memberships == final.notification_memberships
+    assert archived["notification_memberships"]["tokens"] == {
+        str(cid): token for cid, token in published_memberships.items()
+    }
+    assert archived["backup_schedule"] == legacy["backup_schedule"]
+    assert await backup._weekly_backup_if_due(bot, cur) is cur
+    bot.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_unrelated_restore_during_weekly_send_keeps_old_timestamp(
     backup_env,
     monkeypatch,
