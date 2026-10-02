@@ -70,9 +70,10 @@ class TelegramDeliverySession(AiohttpSession):
     """Штатный aiogram transport с наблюдением redirect, без копии dispatch."""
 
     async def create_session(self) -> aiohttp.ClientSession:
-        if self._should_reset_connector:
+        # Оба поля заранее создаёт AiohttpSession.__init__.
+        if self._should_reset_connector:  # pylint: disable=access-member-before-definition
             await self.close()
-        if self._session is None or self._session.closed:
+        if self._session is None or self._session.closed:  # pylint: disable=access-member-before-definition
             trace = aiohttp.TraceConfig()
             trace.on_request_start.append(_request_started)
             trace.on_request_redirect.append(_request_redirected)
@@ -239,7 +240,8 @@ async def send_with_retry(
             finally:
                 _request_evidence.reset(token)
         except Exception as exc:
-            attempts.append(SendAttempt(outcome, exc))
+            # outcome присвоен во внутреннем except перед повторным raise.
+            attempts.append(SendAttempt(outcome, exc))  # pylint: disable=used-before-assignment
             if retries >= _MAX_RETRIES:
                 return SendResult(tuple(attempts))
             delay = _retry_delay(exc, outcome, policy, retries)
