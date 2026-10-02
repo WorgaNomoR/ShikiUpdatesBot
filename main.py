@@ -97,6 +97,7 @@ from storage import (
     BlockedUsersStateError,
     reconcile_blocked_subscribers,
 )
+from telegram_delivery import TelegramDeliverySession
 from updates import start_update_loop
 from user_registry import (
     REGISTRATION_NEUTRAL_FLAG,
@@ -121,7 +122,7 @@ async def main() -> None:
             "доступ обычных пользователей останется закрыт."
         )
 
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, session=TelegramDeliverySession())
     dp = Dispatcher(
         storage=MemoryStorage(),
         fsm_strategy=FSMStrategy.USER_IN_CHAT,

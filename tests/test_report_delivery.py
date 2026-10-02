@@ -9,6 +9,7 @@ from unittest.mock import (
 
 import pytest
 from aiogram.exceptions import (
+    TelegramBadRequest,
     TelegramNetworkError,
     TelegramNotFound,
     TelegramServerError,
@@ -30,6 +31,7 @@ from report_assets import ReportAssetError
 from report_delivery import (
     FAILED_REPORT_NOTICE,
     PARTIAL_REPORT_NOTICE,
+    UNCERTAIN_REPORT_NOTICE,
     deliver_frozen_report,
     deliver_rendered_report,
     deliver_report,
@@ -57,6 +59,7 @@ from rich_message_schema import (
     RICH_BLOCK_LIMIT,
     RICH_TEXT_LIMIT,
 )
+from telegram_delivery import SendOutcome
 
 _METHOD = SendMessage(chat_id=1, text="test")
 _RICH_METHOD = SendRichMessage(
@@ -151,12 +154,13 @@ async def test_transient_retry_succeeds_and_delivery_continues(monkeypatch):
     assert bot.send_message.await_count == 4
     assert retry_sleep.await_count == 1
     assert gap_sleep.await_count == 2
+    assert result.send_results[0].duplicate_possible
 
 
 @pytest.mark.asyncio
 async def test_permanent_failure_stops_later_units_and_reports_partial_delivery():
     bot = MagicMock()
-    bot.send_message = AsyncMock(side_effect=[object(), RuntimeError("permanent"), object()])
+    bot.send_message = AsyncMock(side_effect=[object(), TelegramBadRequest(method=_METHOD, message="permanent"), object()])
 
     result = await deliver_report(
         bot,
@@ -197,7 +201,7 @@ async def test_exhausted_transient_failure_stops_before_next_unit(monkeypatch):
     assert result.delivered_units == 0
     assert bot.send_message.await_count == 4
     texts = [call.kwargs["text"] for call in bot.send_message.await_args_list]
-    assert texts == ["unit-0", "unit-0", "unit-0", FAILED_REPORT_NOTICE]
+    assert texts == ["unit-0", "unit-0", "unit-0", UNCERTAIN_REPORT_NOTICE]
 
 
 @pytest.mark.asyncio
@@ -752,7 +756,7 @@ async def test_nonexact_or_ambiguous_rich_failure_never_sends_html_fallback(
     bot.send_message.assert_not_awaited()
     expected_attempts = 3 if isinstance(
         error,
-        (TelegramServerError, TelegramNetworkError),
+        (TelegramServerError, TelegramNetworkError, TimeoutError),
     ) else 1
     assert bot.send_rich_message.await_count == expected_attempts
 
@@ -761,7 +765,7 @@ async def test_nonexact_or_ambiguous_rich_failure_never_sends_html_fallback(
 async def test_rich_partial_delivery_stops_at_first_permanent_failure():
     bot = MagicMock()
     bot.send_rich_message = AsyncMock(
-        side_effect=[object(), RuntimeError("permanent"), object()]
+        side_effect=[object(), TelegramBadRequest(method=_RICH_METHOD, message="permanent"), object()]
     )
     bot.send_message = AsyncMock(return_value=object())
 
@@ -824,3 +828,84 @@ async def test_disable_preview_survives_exact_unsupported_rich_fallback():
         call.kwargs["disable_web_page_preview"] is True
         for call in bot.send_message.await_args_list
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later", ["not_found", "rejection", "asset"])
+async def test_lost_rich_response_then_failure_preserves_original_format(monkeypatch, later):
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    bot = MagicMock()
+    accepted = []
+    lost = TelegramNetworkError(method=_RICH_METHOD, message="lost response")
+    final = (
+        TelegramNotFound(method=_RICH_METHOD, message="Not Found")
+        if later == "not_found" else TelegramBadRequest(method=_RICH_METHOD, message="rejected")
+    )
+
+    async def send(**kwargs):
+        if not accepted:
+            accepted.append(kwargs["rich_message"])
+            raise lost
+        raise final
+
+    bot.send_rich_message = AsyncMock(side_effect=send)
+    bot.send_message = AsyncMock()
+    frozen = freeze_report(_three_unit_rich_report())
+    if later == "asset":
+        materialize = report_delivery.materialize_rich_message
+        calls = 0
+
+        def prepare(payload):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise ReportAssetError("unavailable_after_send")
+            return materialize(payload)
+
+        monkeypatch.setattr("report_delivery.materialize_rich_message", prepare)
+    result = await deliver_frozen_report(bot, 7, frozen, sleep=AsyncMock())
+    assert not result.delivered and not result.safe_to_fallback
+    assert result.next_unit == result.delivered_units == 0
+    sent = result.send_results[-1]
+    assert sent.outcome is SendOutcome.UNCERTAIN
+    assert sent.attempts[0].error is lost
+    assert isinstance(sent.error, ReportAssetError if later == "asset" else type(final))
+    assert len(accepted) == 1
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_interactive_uncertain_not_found_never_downgrades(monkeypatch):
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    bot = MagicMock(
+        send_rich_message=AsyncMock(side_effect=[
+            TimeoutError(), TelegramNotFound(method=_RICH_METHOD, message="Not Found"),
+        ]),
+        send_message=AsyncMock(),
+    )
+    result = await deliver_report(bot, 7, _three_unit_rich_report())
+    assert not result.delivered and result.send_results[-1].uncertain
+    assert result.next_unit == 0
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lost_response_then_success_acknowledges_with_duplicate_evidence(monkeypatch):
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    bot = MagicMock(send_message=AsyncMock(side_effect=[TimeoutError(), object()]))
+    ack = AsyncMock()
+    result = await deliver_rendered_report(bot, 7, ["frozen"], acknowledge=ack)
+    assert result.delivered and result.next_unit == 1
+    assert result.send_results[0].duplicate_possible
+    ack.assert_awaited_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_uncertain_failure_notice_is_neither_acknowledged_nor_replayed(monkeypatch):
+    sleeper = AsyncMock()
+    monkeypatch.setattr("telegram_delivery._sleep", sleeper)
+    bot = MagicMock(send_message=AsyncMock(side_effect=[RuntimeError("report"), TimeoutError()]))
+    result = await deliver_report(bot, 7, _three_unit_report(), notify_partial=True)
+    assert not result.partial_notice_delivered
+    assert bot.send_message.await_count == 2
+    sleeper.assert_not_awaited()

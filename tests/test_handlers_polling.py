@@ -1275,7 +1275,9 @@ async def test_rich_ambiguous_failure_never_changes_frozen_quarter_plan(
 
     assert bot.send_rich_message.await_count == 3
     bot.send_message.assert_not_awaited()
-    assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == original
+    assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == dict(
+        original, delivery_uncertain=True,
+    )
     quarter_delivery_env.assert_not_awaited()
 
 
@@ -1286,7 +1288,9 @@ async def test_telegram_success_interrupted_before_ack_repeats_only_unacknowledg
     real_save = handlers.save_stats_current
 
     def interrupt(data, **kwargs):
-        raise asyncio.CancelledError
+        if data["pending_quarter_delivery"]["next_unit"] == 2:
+            raise asyncio.CancelledError
+        return real_save(data, **kwargs)
 
     monkeypatch.setattr("handlers.save_stats_current", interrupt)
     bot = AsyncMock()
@@ -1309,7 +1313,7 @@ async def test_ack_write_failure_retains_disk_progress_and_full_completion(quart
     original_write = storage._atomic_write
 
     def fail_ack(path, data):
-        if path == storage.STATS_CURRENT_FILE:
+        if path == storage.STATS_CURRENT_FILE and json.loads(data)["pending_quarter_delivery"]["next_unit"] == 3:
             raise OSError("PRIVATE REPORT CONTENT")
         return original_write(path, data)
 
@@ -1967,3 +1971,93 @@ async def test_polling_quarter_failure_keeps_owner_recovery_and_retries(backup_e
     weekly.assert_awaited_once()
     assert heartbeat.call_count == 2
     bot.send_message.assert_awaited_once_with(chat_id=handlers.OWNER_ID, text=handlers._QUARTER_STATE_NOTICE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rich", [False, True])
+async def test_uncertain_delivery_keeps_frozen_content_and_backup_until_restart_success(
+    quarter_delivery_env, monkeypatch, rich,
+):
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    cur = _frozen_rich_quarter() if rich else _frozen_quarter(["one", "two"])
+    original = deepcopy(cur["pending_quarter_delivery"])
+    storage.save_stats_current(cur, strict=True)
+    bot = AsyncMock()
+    send = bot.send_rich_message if rich else bot.send_message
+    send.side_effect = TimeoutError()
+    await handlers._deliver_pending_quarter(bot, cur)
+    pending = storage.load_stats_current(strict=True)["pending_quarter_delivery"]
+    assert pending == dict(original, delivery_uncertain=True)
+    assert storage.load_stats_current(strict=True)["last_report_sent"] is None
+    quarter_delivery_env.assert_not_awaited()
+    send.reset_mock(side_effect=True)
+    send.return_value = object()
+    await handlers._deliver_pending_quarter(bot, storage.load_stats_current(strict=True))
+    completed = storage.load_stats_current(strict=True)["pending_quarter_delivery"]
+    key = "report_units" if rich else "report_messages"
+    assert completed == dict(original, next_unit=len(original[key]))
+    quarter_delivery_env.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["exhaustion", "cancellation", "ack_failure"])
+async def test_later_not_found_after_restart_cannot_replace_possibly_delivered_rich(
+    quarter_delivery_env, monkeypatch, boundary,
+):
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    cur = _frozen_rich_quarter()
+    original = deepcopy(cur["pending_quarter_delivery"])
+    storage.save_stats_current(cur, strict=True)
+    bot = AsyncMock()
+    if boundary == "exhaustion":
+        bot.send_rich_message.side_effect = TimeoutError()
+        await handlers._deliver_pending_quarter(bot, cur)
+    elif boundary == "cancellation":
+        bot.send_rich_message.side_effect = asyncio.CancelledError()
+        with pytest.raises(asyncio.CancelledError):
+            await handlers._deliver_pending_quarter(bot, cur)
+    else:
+        real_save = handlers.save_stats_current
+
+        def fail_ack(data, **kwargs):
+            if data["pending_quarter_delivery"]["next_unit"] == 1:
+                raise storage.QuarterDeliveryStateError("ack_write")
+            return real_save(data, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr("handlers.save_stats_current", fail_ack)
+            await handlers._deliver_pending_quarter(bot, cur)
+        # Ошибка состояния сама отправляет отдельный статический diagnostic.
+        bot.send_message.reset_mock()
+    persisted = storage.load_stats_current(strict=True)
+    assert persisted["pending_quarter_delivery"] == dict(original, delivery_uncertain=True)
+    method = SendRichMessage(
+        chat_id=999, rich_message=InputRichMessage(
+            blocks=[InputRichBlockParagraph(text="unit-0")], skip_entity_detection=True,
+        ),
+    )
+    bot.send_rich_message.side_effect = TelegramNotFound(method=method, message="Not Found")
+    await handlers._deliver_pending_quarter(bot, persisted)
+    assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == persisted["pending_quarter_delivery"]
+    bot.send_message.assert_not_awaited()
+    quarter_delivery_env.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_marker_publication_failure_never_dispatches_report(quarter_delivery_env, monkeypatch):
+    cur = _frozen_rich_quarter()
+    storage.save_stats_current(cur, strict=True)
+    before = storage.STATS_CURRENT_FILE.read_bytes()
+    real_save = handlers.save_stats_current
+
+    def fail_marker(data, **kwargs):
+        if data["pending_quarter_delivery"].get("delivery_uncertain"):
+            raise storage.QuarterDeliveryStateError("marker_write")
+        return real_save(data, **kwargs)
+
+    monkeypatch.setattr("handlers.save_stats_current", fail_marker)
+    bot = AsyncMock()
+    await handlers._deliver_pending_quarter(bot, cur)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == before
+    bot.send_rich_message.assert_not_awaited()
+    quarter_delivery_env.assert_not_awaited()

@@ -1950,3 +1950,61 @@ def test_acquisition_shares_inclusive_member_limit_and_reserve(acquisition_facto
     assert parse_event_journal(original)["catchup"]["page"] == 2
     with pytest.raises(EventJournalStateError):
         parse_event_journal(original + b" ")
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("value", [False, True])
+def test_optional_delivery_uncertainty_preserves_old_frozen_hash(version, value):
+    cur = _quarter_state() if version == 1 else _quarter_state_v2()
+    plan = cur["pending_quarter_delivery"]
+    if version == 3:
+        plan = storage.new_quarter_delivery_plan(
+            plan["old_period"], plan["new_period"], plan["report_units"],
+            event_time_revisions={plan["old_period"]: 3},
+        )
+        cur["pending_quarter_delivery"] = plan
+    original_hash = plan["plan_hash"]
+    plan["delivery_uncertain"] = value
+    assert storage.validate_pending_quarter_delivery(cur) is plan
+    assert plan["plan_hash"] == original_hash
+    if value and version != 1:
+        with pytest.raises(storage.QuarterDeliveryStateError, match="uncertain_downgrade"):
+            storage.downgrade_quarter_delivery(plan, plan["next_unit"])
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", []])
+def test_delivery_uncertainty_rejects_nonboolean_marker(value):
+    cur = _quarter_state()
+    cur["pending_quarter_delivery"]["delivery_uncertain"] = value
+    with pytest.raises(storage.QuarterDeliveryStateError, match="delivery_uncertainty"):
+        storage.validate_pending_quarter_delivery(cur)
+
+
+def test_completed_plan_cannot_retain_unacknowledged_dispatch_marker():
+    cur = _quarter_state()
+    plan = cur["pending_quarter_delivery"]
+    plan["next_unit"] = len(plan["report_messages"])
+    plan["delivery_uncertain"] = True
+    with pytest.raises(storage.QuarterDeliveryStateError, match="completed_uncertainty"):
+        storage.validate_pending_quarter_delivery(cur)
+
+
+def test_current_capacity_reserves_dispatch_marker_before_sending(backup_env, monkeypatch):
+    cur = _quarter_state()
+    cur["last_report_sent"] = None
+    storage.save_stats_current(cur, strict=True)
+    original = storage.STATS_CURRENT_FILE.read_bytes()
+    started = json.loads(json.dumps(cur))
+    started["pending_quarter_delivery"]["delivery_uncertain"] = True
+    started_size = storage.json_publication_size(json.dumps(started, ensure_ascii=False, indent=2))
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", started_size - 1)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_capacity"):
+        storage.stats_current_json(cur)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_write"):
+        storage.save_stats_current(cur, strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", started_size)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_stats_current(started, strict=True)
+    assert json.loads(storage.STATS_CURRENT_FILE.read_bytes()) == started
+    assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == started["pending_quarter_delivery"]

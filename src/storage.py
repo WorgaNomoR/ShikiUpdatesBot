@@ -1197,7 +1197,7 @@ def mark_restorable_state_restored() -> None:
 def _quarter_plan_hash(pending: dict) -> str:
     """Связать неизменяемые поля плана, исключив только acknowledgement."""
     identity = {key: value for key, value in pending.items()
-                if key not in {"next_unit", "plan_hash"}}
+                if key not in {"next_unit", "plan_hash", "delivery_uncertain"}}
     raw = json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("ascii")).hexdigest()
 
@@ -1249,6 +1249,8 @@ def new_quarter_delivery_plan(
 
 def downgrade_quarter_delivery(pending: dict, start_unit: int) -> dict:
     """После точного unsupported-ответа заморозить remaining HTML plan."""
+    if pending.get("delivery_uncertain"):
+        raise QuarterDeliveryStateError("uncertain_downgrade")
     if pending.get("version") not in {2, 3}:
         raise QuarterDeliveryStateError("unsupported_downgrade")
     try:
@@ -1321,6 +1323,10 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
         if legacy
         else version1_keys if pending["version"] == 1 else version2_keys | ({"event_time_revisions"} if pending["version"] == 3 else set())
     )
+    if not legacy and "delivery_uncertain" in pending:
+        expected_keys = expected_keys | {"delivery_uncertain"}
+        if type(pending["delivery_uncertain"]) is not bool:
+            raise QuarterDeliveryStateError("delivery_uncertainty")
     if set(pending) != expected_keys:
         raise QuarterDeliveryStateError("pending_fields")
     old, new = pending["old_period"], pending["new_period"]
@@ -1369,6 +1375,8 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
             raise QuarterDeliveryStateError("progress_index")
         if cur.get("last_report_sent") == new and pending["next_unit"] < total_units:
             raise QuarterDeliveryStateError("premature_completion")
+        if pending.get("delivery_uncertain") and pending["next_unit"] == total_units:
+            raise QuarterDeliveryStateError("completed_uncertainty")
         if not isinstance(pending["plan_id"], str) or re.fullmatch(r"[0-9a-f]{32}", pending["plan_id"]) is None:
             raise QuarterDeliveryStateError("plan_identity")
         if pending["plan_hash"] != _quarter_plan_hash(pending):
@@ -1478,10 +1486,18 @@ def stats_current_json(data: dict, *, strict: bool = True) -> str:
         if isinstance(pending, dict) and pending.get("version") in {1, 2, 3}:
             key = "report_messages" if pending["version"] == 1 else "report_units"
             pending["next_unit"] = len(pending[key])
+            pending.pop("delivery_uncertain", None)
             completed["last_report_sent"] = pending["new_period"]
             acknowledge_revisions(completed)
         final_size = json_publication_size(json.dumps(completed, ensure_ascii=False, indent=2, allow_nan=False))
-        if max(json_publication_size(payload), final_size) > JOURNAL_MAX_BYTES:
+        started_size = json_publication_size(payload)
+        pending = data.get("pending_quarter_delivery")
+        if isinstance(pending, dict) and pending.get("version") in {1, 2, 3}:
+            key = "report_messages" if pending["version"] == 1 else "report_units"
+            if pending["next_unit"] < len(pending[key]) and "delivery_uncertain" not in pending:
+                # Новый pretty-JSON member на втором уровне; false длиннее true.
+                started_size += json_publication_size(',\n    "delivery_uncertain": true')
+        if max(json_publication_size(payload), final_size, started_size) > JOURNAL_MAX_BYTES:
             raise QuarterDeliveryStateError("current_capacity")
     return payload
 

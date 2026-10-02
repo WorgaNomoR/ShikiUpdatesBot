@@ -531,3 +531,37 @@ async def test_journal_reads_do_not_scale_with_recipients_or_retries(history_env
     projected = storage.load_stats_current(strict=True)
     assert projected["events"] == []
     assert len(projected["event_time"]["periods"]["2026-Q1"]["events"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_exhausted_uncertain_recipient_still_means_only_completed_broadcast_attempt(
+    history_env, monkeypatch, journal_factory,
+):
+    from aiogram.exceptions import TelegramForbiddenError
+    from aiogram.methods import SendMessage
+
+    journal = journal_factory()
+    storage.save_event_journal(journal, admitting=True)
+    storage.save_stats_current({
+        "period": "2026-Q2", "events": [],
+        "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
+    }, strict=True)
+    storage.save_subscribers({7: "lost", 8: "blocked", 9: "healthy"})
+    monkeypatch.setattr("handlers.send_to_all_chats", send_to_all_chats)
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    calls = []
+
+    async def send(**kwargs):
+        calls.append(kwargs["chat_id"])
+        if kwargs["chat_id"] == 7:
+            raise TimeoutError()
+        if kwargs["chat_id"] == 8:
+            raise TelegramForbiddenError(method=SendMessage(chat_id=8, text="test"), message="forbidden")
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await handlers._drain_history_journal(bot)
+    assert calls == [7, 7, 7, 8, 9]
+    assert storage.load_event_journal()["processed_seq"] == 1
+    assert set(storage.load_subscribers()) == {7, 9}
+    assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 1

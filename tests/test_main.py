@@ -130,7 +130,8 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     guard = MagicMock()
     guard_factory = MagicMock(return_value=guard)
 
-    monkeypatch.setattr(main, "Bot", lambda token: bot)
+    bot_factory = MagicMock(return_value=bot)
+    monkeypatch.setattr(main, "Bot", bot_factory)
     monkeypatch.setattr(main, "Dispatcher", dispatcher_factory)
     monkeypatch.setattr(main, "MemoryStorage", lambda: storage)
     monkeypatch.setattr(main, "reconcile_blocked_subscribers", reconcile_access)
@@ -142,6 +143,7 @@ def _patch_app_dependencies(monkeypatch, *, frozen: bool):
     monkeypatch.setattr(main, "IS_FROZEN", frozen)
     return SimpleNamespace(
         bot=bot,
+        bot_factory=bot_factory,
         storage=storage,
         dispatcher=dispatcher,
         dispatcher_factory=dispatcher_factory,
@@ -164,6 +166,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         await main.main()
 
     app.bot.set_my_commands.assert_awaited_once()
+    assert isinstance(app.bot_factory.call_args.kwargs["session"], main.TelegramDeliverySession)
     app.dispatcher_factory.assert_called_once_with(
         storage=app.storage,
         fsm_strategy=main.FSMStrategy.USER_IN_CHAT,

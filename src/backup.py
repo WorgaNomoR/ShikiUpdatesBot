@@ -78,7 +78,10 @@ from storage import (
     validate_quarter_period,
 )
 from storage import subscriber_state_json as storage_subscriber_state_json
-from telegram_delivery import send_with_retry
+from telegram_delivery import (
+    RetryPolicy,
+    send_with_retry,
+)
 from utils import _utcnow
 
 # ═══════════════════════════════════════════════════════════════════
@@ -466,8 +469,10 @@ async def send_backup(bot: Bot, caption: str) -> bool:
         return False
     filename = _backup_filename()
 
-    async def _send_document():
+    async def _before_attempt():
         _ensure_backup_generation(generation)
+
+    async def _send_document():
         return await bot.send_document(
             OWNER_ID,
             document=BufferedInputFile(data, filename=filename),
@@ -476,8 +481,20 @@ async def send_backup(bot: Bot, caption: str) -> bool:
         )
 
     try:
-        await send_with_retry(_send_document)
+        sent = await send_with_retry(
+            _send_document,
+            policy=RetryPolicy.AT_LEAST_ONCE,
+            before_attempt=_before_attempt,
+        )
+        if not sent.delivered:
+            log.warning(
+                "send_backup: отправка не подтверждена (outcome=%s, attempts=%d, type=%s).",
+                sent.outcome.value, len(sent.attempts), type(sent.error).__name__,
+            )
+            return False
         _ensure_backup_generation(generation)
+        if sent.duplicate_possible:
+            log.warning("send_backup: доставка подтверждена; возможен дубль предыдущей попытки.")
         log.info("send_backup: архив отправлен владельцу (%d байт).", len(data))
         _last_backup_sent_at = time.monotonic()
         return True

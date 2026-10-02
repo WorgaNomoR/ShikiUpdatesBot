@@ -37,8 +37,10 @@ import storage
         "legacy_pending",
         "legacy_complete",
         "current_partial",
+        "current_uncertain",
         "current_complete",
         "rich_partial",
+        "rich_uncertain",
         "rich_complete",
         "empty",
     ],
@@ -73,12 +75,14 @@ async def test_import_roundtrips_supported_quarter_delivery_plans(backup_env, sc
             "2026-Q3",
             units,
         )
-        pending["next_unit"] = 1 if schema == "rich_partial" else 2
+        pending["next_unit"] = 1 if schema in {"rich_partial", "rich_uncertain"} else 2
     else:
         pending = storage.new_quarter_delivery(
             "2026-Q2", "2026-Q3", [] if schema == "empty" else ["frozen first", "frozen second"],
         )
-        pending["next_unit"] = {"current_partial": 1, "current_complete": 2, "empty": 0}[schema]
+        pending["next_unit"] = {"current_partial": 1, "current_uncertain": 1, "current_complete": 2, "empty": 0}[schema]
+    if schema.endswith("uncertain"):
+        pending["delivery_uncertain"] = True
     cur["pending_quarter_delivery"] = pending
     generation = storage.restorable_restore_generation()
     result = await backup.restore_backup_zip(_zip_bytes({"stats_current.json": json.dumps(cur)}))
@@ -2547,3 +2551,35 @@ async def test_history_restore_invalidates_fetch_send_and_retry(
     else:
         assert len(restored_journal["events"]) == 1
         assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == (0 if phase == "admission" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["subscription", "weekly"])
+async def test_uncertain_backup_then_rejection_preserves_automatic_schedule(
+    backup_env, monkeypatch, kind,
+):
+    from aiogram.exceptions import TelegramForbiddenError
+    from aiogram.methods import SendDocument
+
+    monkeypatch.setattr("telegram_delivery._sleep", AsyncMock())
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
+    pending = {"subscriptions": 1, "unsubscriptions": 0, "counts_known": True, "token": uuid4().hex}
+    _save_subscriber_schedule(last_backup_at=old, weekly_started_at=old, pending=pending if kind == "subscription" else None)
+    original = storage.load_subscription_backup_state()
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
+    bot = AsyncMock()
+    bot.send_document.side_effect = [
+        TimeoutError(),
+        TelegramForbiddenError(method=SendDocument(chat_id=999, document="test"), message="forbidden"),
+    ]
+    cur = {"period": "2026-Q2", "events": []}
+    if kind == "subscription":
+        await backup._backup_after_subscription(bot)
+    else:
+        await backup._weekly_backup_if_due(bot, cur)
+    assert storage.load_subscription_backup_state() == original
+    assert backup._last_backup_sent_at is None
+    assert bot.send_document.await_count == 2
+    documents = [call.kwargs["document"] for call in bot.send_document.await_args_list]
+    assert documents[0] is not documents[1]
+    assert documents[0].data == documents[1].data
