@@ -564,7 +564,8 @@ def notification_memberships() -> dict[int, str]:
     """Под state lock мигрировать идентичность подписок до enqueue/dispatch."""
     load_subscribers_strict()
     state = load_subscriber_state(strict_subscribers=True)
-    if state.notification_memberships is None:
+    migrated = ensure_backup_schedule(state, now=time.time())
+    if state.notification_memberships is None or migrated:
         save_subscriber_state(state)
     return dict(state.notification_memberships)
 

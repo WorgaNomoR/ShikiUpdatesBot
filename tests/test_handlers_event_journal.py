@@ -371,6 +371,29 @@ async def test_capacity_warning_is_static_and_debounced(history_env, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_capacity_warning_counts_pending_recipient_reserve(history_env, monkeypatch):
+    from event_journal_schema import journal_json
+    from notification_outbox import progress_reserve
+
+    await _ready()
+    storage.save_subscribers({10: "pending"})
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry()]))
+    bot = AsyncMock()
+    await handlers.check_and_notify(bot, set(), None)
+    journal = storage.load_event_journal()
+    used = len(journal_json(journal).encode())
+    reserve = progress_reserve(journal)
+    assert reserve > 0
+    monkeypatch.setattr("handlers.JOURNAL_WARN_BYTES", used + reserve)
+    monkeypatch.setattr("handlers._last_journal_capacity_notice_at", None)
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
+    await handlers.check_and_notify(bot, set(), None)
+    bot.send_message.assert_awaited_once_with(
+        chat_id=handlers.OWNER_ID, text=handlers._JOURNAL_CAPACITY_NOTICE
+    )
+
+
+@pytest.mark.asyncio
 async def test_baseline_bad_metadata_does_not_block_new_events(history_env, monkeypatch):
     await _ready()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[{"id": 1, "target": "bad"}, _entry()]))

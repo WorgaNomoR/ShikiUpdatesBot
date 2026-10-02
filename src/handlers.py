@@ -174,6 +174,7 @@ from notification_outbox import (
     enqueue,
     migrate_outbox,
     notification_event,
+    progress_reserve,
 )
 from report_delivery import (
     deliver_frozen_report,
@@ -2224,7 +2225,7 @@ _JOURNAL_STATE_NOTICE = (
     "Данные сохранены; восстановление доступно через /backup."
 )
 _JOURNAL_CAPACITY_NOTICE = (
-    "⚠️ Сохранённая история приближается к пределу 8 МиБ. Сделай резервную копию "
+    "⚠️ Сохранённая история и очередь уведомлений приближаются к пределу 8 МиБ. Сделай резервную копию "
     "через /backup. При заполнении новые события будут отложены; сохранённые не удаляются."
 )
 _NOTIFICATION_STATE_NOTICE = (
@@ -2400,7 +2401,7 @@ async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
         journal, cur = await _initialize_history_journal(legacy, generation)
     elif journal is not None and PROJECTION_KEY not in cur:
         journal, cur = await _initialize_history_journal(set(), generation)
-    if journal is not None and len(journal_json(journal).encode("utf-8")) >= JOURNAL_WARN_BYTES:
+    if journal is not None and len(journal_json(journal).encode("utf-8")) + progress_reserve(journal) >= JOURNAL_WARN_BYTES:
         await _journal_diagnostic(bot, capacity=True)
     journal, cur = await _drain_history_journal(bot, expected_generation=generation)
     async with restorable_state_transaction():
@@ -2504,14 +2505,14 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
                 cur = await _publish_history_candidate(journal, candidate, generation)
                 if candidate == journal:
                     return seen, cur
-                if len(journal_json(candidate).encode("utf-8")) >= JOURNAL_WARN_BYTES:
+                if len(journal_json(candidate).encode("utf-8")) + progress_reserve(candidate) >= JOURNAL_WARN_BYTES:
                     await _journal_diagnostic(bot, capacity=True)
                 journal, cur = await _drain_history_journal(bot, expected_generation=generation)
                 return _export_history_seen(journal), cur
             candidate.update(version=max(2, journal["version"]), catchup=deepcopy(state))
             cur = await _publish_history_candidate(journal, candidate, generation)
             journal = candidate
-            if len(journal_json(journal).encode("utf-8")) >= JOURNAL_WARN_BYTES:
+            if len(journal_json(journal).encode("utf-8")) + progress_reserve(journal) >= JOURNAL_WARN_BYTES:
                 await _journal_diagnostic(bot, capacity=True)
     log.warning("История: за %d страниц не найдена известная граница; сбор продолжится в следующем цикле.", _HISTORY_CATCHUP_MAX_PAGES)
     return seen, cur

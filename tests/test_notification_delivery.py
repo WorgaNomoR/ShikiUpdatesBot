@@ -6,7 +6,9 @@ import asyncio
 import io
 import json
 import zipfile
+from contextlib import asynccontextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -26,6 +28,7 @@ from event_journal_schema import EventJournalStateError
 from notification_outbox import (
     LIFETIME,
     MAX_ATTEMPTS,
+    begin_attempt,
 )
 
 
@@ -429,6 +432,97 @@ async def test_request_timeout_is_uncertain_and_work_time_is_bounded(
     monkeypatch.setattr("notification_delivery.DISPATCH_SECONDS", 0)
     await delivery.dispatch_notifications(bot)
     assert bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining", [0.05, 9.95, 10.0])
+async def test_cycle_starts_only_with_full_request_window(
+    outbox_env, journal_factory, monkeypatch, remaining
+):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=1)
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    calls = 0
+
+    def monotonic():
+        nonlocal calls
+        calls += 1
+        return 0 if calls == 1 else delivery.DISPATCH_SECONDS - remaining
+
+    monkeypatch.setattr(
+        "notification_delivery.time",
+        SimpleNamespace(time=lambda: outbox_env[0], monotonic=monotonic),
+    )
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    if remaining < delivery.REQUEST_SECONDS:
+        bot.send_message.assert_not_awaited()
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+        assert _recipient()["attempts"] == []
+    else:
+        bot.send_message.assert_awaited_once()
+        assert _recipient()["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_guard_wait_does_not_consume_request_timeout(
+    outbox_env, journal_factory, monkeypatch
+):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=1)
+    monkeypatch.setattr("notification_delivery.REQUEST_SECONDS", 0.01)
+    transaction = delivery.restorable_state_transaction
+    gate = asyncio.Event()
+    calls = 0
+
+    @asynccontextmanager
+    async def delayed_guard():
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            asyncio.get_running_loop().call_later(0.03, gate.set)
+            await gate.wait()
+        async with transaction():
+            yield
+
+    monkeypatch.setattr("notification_delivery.restorable_state_transaction", delayed_guard)
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    assert _recipient()["attempts"][0]["outcome"] == "confirmed_success"
+    assert _recipient()["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clock_boundary", ["creation", "attempt"])
+@pytest.mark.parametrize("reason", ["unsubscribe", "block", "budget"])
+async def test_maintenance_clamps_terminal_time_after_clock_rollback(
+    outbox_env, journal_factory, clock_boundary, reason
+):
+    original_time = outbox_env[0]
+    if clock_boundary == "creation":
+        outbox_env[0] += 60
+    await _enqueue(journal_factory, count=1)
+    journal = storage.load_event_journal()
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    if clock_boundary == "attempt" or reason == "budget":
+        for _ in range(MAX_ATTEMPTS if reason == "budget" else 1):
+            begin_attempt(recipient, original_time + 60)
+        storage.save_event_journal(journal)
+    attempts = deepcopy(recipient["attempts"])
+    outbox_env[0] = original_time + 10
+    if reason == "unsubscribe":
+        await storage.mutate_subscription(10, "first", subscribed=False)
+    elif reason == "block":
+        await storage.add_blocked_user(10)
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    current = _recipient()
+    assert current["status"] == ("expired" if reason == "budget" else "cancelled")
+    assert current["terminal_at"] == original_time + 60
+    assert current["attempts"] == attempts
+    if clock_boundary == "attempt":
+        assert _recipient(cid="20")["status"] == "delivered"
 
 
 @pytest.mark.asyncio

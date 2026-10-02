@@ -796,6 +796,29 @@ def test_notification_memberships_corruption_preserves_bytes(backup_env, monkeyp
     assert storage.SUBS_FILE.read_bytes() == raw
 
 
+@pytest.mark.parametrize("has_memberships", [False, True])
+def test_membership_migration_preserves_legacy_weekly_anchor(
+    backup_env, monkeypatch, has_memberships
+):
+    now = 1800000000.0
+    anchor = now - 7 * 24 * 60 * 60 - 100
+    monkeypatch.setattr("storage.time.time", lambda: now)
+    storage.save_stats_current(
+        {"period": "2026-Q2", "events": [], "last_backup_at": anchor}, strict=True
+    )
+    payload = {"subscribers": {"10": "legacy"}}
+    if has_memberships:
+        payload["notification_memberships"] = {"version": 1, "tokens": {"10": "a" * 32}}
+    storage.SUBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    memberships = storage.notification_memberships()
+    current = storage.load_subscriber_state(strict_subscribers=True)
+    assert current.notification_memberships == memberships
+    assert current.schedule_missing is False
+    assert current.backup_schedule["weekly_started_at"] == anchor
+    assert current.backup_schedule["last_backup_at"] is None
+    assert current.backup_schedule["pending"] is None
+
+
 @pytest.mark.parametrize("label", [True, None, {}])
 def test_notification_membership_publication_rejects_invalid_labels(backup_env, label):
     storage.save_subscribers({10: "keep"})

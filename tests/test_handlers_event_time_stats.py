@@ -254,22 +254,26 @@ async def test_failed_publication_keeps_source_projection_and_resumes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restore_kind", ["older", "identical"])
 async def test_restore_between_projection_and_enqueue_preserves_new_state_without_stale_ack(
-    event_time_env,
+    event_time_env, restore_kind,
 ):
     _append(2, "2026-01-01T00:00:00Z")
     captured = _archive()
+    real_enqueue = handlers._enqueue_history_event._mock_wraps
 
     async def restore(*args, **kwargs):
-        await backup.restore_backup_zip(captured)
-        raise handlers._HistoryAttemptChanged
+        await backup.restore_backup_zip(_archive() if restore_kind == "identical" else captured)
+        return await real_enqueue(*args, **kwargs)
 
     handlers._enqueue_history_event.side_effect = restore
     with pytest.raises(handlers._HistoryAttemptChanged):
         await handlers._drain_history_journal(AsyncMock())
     cur = storage.load_stats_current(strict=True)
-    assert cur["event_projection"]["applied_seq"] == 0
-    assert cur["event_time"]["periods"]["2026-Q1"]["events"] == []
+    expected = 1 if restore_kind == "identical" else 0
+    assert cur["event_projection"]["applied_seq"] == expected
+    assert len(cur["event_time"]["periods"]["2026-Q1"]["events"]) == expected
+    assert storage.load_event_journal()["processed_seq"] == 0
     handlers._enqueue_history_event.side_effect = None
     await handlers._drain_history_journal(AsyncMock())
     assert len(storage.load_stats_current(strict=True)["events"]) == 1

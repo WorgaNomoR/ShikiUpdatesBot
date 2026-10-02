@@ -41,9 +41,6 @@ from storage import (
 )
 from telegram_delivery import (
     RetryPolicy,
-    SendAttempt,
-    SendOutcome,
-    SendResult,
     is_blocked_error,
     send_with_retry,
 )
@@ -82,12 +79,16 @@ def _maintenance(journal, memberships, blocked, now):
         for cid, recipient in record["recipients"].items():
             if recipient["status"] != "pending":
                 continue
+            terminal_at = max(
+                now, record["created_at"],
+                recipient["attempts"][-1]["at"] if recipient["attempts"] else 0,
+            )
             if int(cid) in blocked or memberships.get(int(cid)) != recipient["membership"]:
-                finish(recipient, "cancelled", "ineligible", now)
+                finish(recipient, "cancelled", "ineligible", terminal_at)
             elif now >= record["expires_at"]:
-                finish(recipient, "expired", "lifetime", now)
+                finish(recipient, "expired", "lifetime", terminal_at)
             elif len(recipient["attempts"]) >= MAX_ATTEMPTS:
-                finish(recipient, "expired", "attempt_budget", now)
+                finish(recipient, "expired", "attempt_budget", terminal_at)
             else:
                 continue
             changed = True
@@ -156,7 +157,7 @@ async def _dispatch(bot):
                 save_event_journal(journal)
             due = _next_due(journal, now)
             remaining = DISPATCH_SECONDS - (time.monotonic() - started)
-            if due is None or remaining <= 0:
+            if due is None or remaining < REQUEST_SECONDS:
                 return
             record, cid = due
             seq = record["seq"]
@@ -177,18 +178,14 @@ async def _dispatch(bot):
                     raise _DeliveryChanged
 
         async def send():
-            return await bot.send_message(chat_id=int(cid), **payload)
-
-        try:
-            result = await asyncio.wait_for(
-                send_with_retry(
-                    send, policy=RetryPolicy.AT_LEAST_ONCE, before_attempt=guard, max_attempts=1
-                ),
-                timeout=min(REQUEST_SECONDS, remaining),
+            # Deadline относится только к Telegram, а не к ожиданию state lock.
+            return await asyncio.wait_for(
+                bot.send_message(chat_id=int(cid), **payload), timeout=REQUEST_SECONDS
             )
-        except TimeoutError as error:
-            # Dispatch мог быть принят до отмены по deadline; marker сохраняется.
-            result = SendResult((SendAttempt(SendOutcome.UNCERTAIN, error),))
+
+        result = await send_with_retry(
+            send, policy=RetryPolicy.AT_LEAST_ONCE, before_attempt=guard, max_attempts=1
+        )
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
                 raise _DeliveryChanged
