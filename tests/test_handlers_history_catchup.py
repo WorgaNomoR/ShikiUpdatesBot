@@ -29,7 +29,7 @@ async def acquisition_env(backup_env, monkeypatch):
     await handlers._initialize_history_journal({1}, storage.restorable_restore_generation())
     monkeypatch.setattr("handlers.HISTORY_PAGE_LIMIT", 3)
     monkeypatch.setattr("handlers.asyncio.sleep", AsyncMock())
-    monkeypatch.setattr("handlers.send_to_all_chats", AsyncMock())
+    monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(wraps=handlers._enqueue_history_event))
     return backup_env
 
 
@@ -73,20 +73,20 @@ async def test_long_history_survives_restart_and_only_complete_batch_is_processe
     assert seen == {1}
     assert cur["event_projection"]["applied_seq"] == 0
     assert storage.load_seen_ids() != {row["id"] for row in rows}
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
     # Следующий вызов строит всё из диска, без процесса/cursor из прошлого цикла.
     await _cycle(calls)
     assert calls[0] == 5
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
     journal = await _finish(calls)
     assert [event["history_id"] for event in journal["events"]] == list(range(2, 34))
     assert journal["processed_seq"] == 32
     projected = storage.load_stats_current(strict=True)
     assert projected["events"] == []
     assert len(projected["event_time"]["periods"]["2026-Q1"]["events"]) == 32
-    assert handlers.send_to_all_chats.await_count == 32
+    assert handlers._enqueue_history_event.await_count == 32
     await _cycle(calls)
-    assert handlers.send_to_all_chats.await_count == 32
+    assert handlers._enqueue_history_event.await_count == 32
 
 
 @pytest.mark.asyncio
@@ -126,7 +126,7 @@ async def test_disconnected_short_known_boundary_does_not_admit(acquisition_env,
     await _cycle(calls)
     assert storage.load_event_journal()["events"] == []
     assert storage.load_event_journal()["catchup"] is not None
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -156,7 +156,7 @@ async def test_saved_acquisition_survives_failures_without_sending(acquisition_e
                 assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
     assert storage.load_event_journal()["catchup"]["staged"] == before
     assert storage.load_event_journal()["events"] == []
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
     journal = await _finish(calls)
     assert journal["processed_seq"] == len(rows) - 1
 
@@ -210,7 +210,7 @@ async def test_polling_startup_waits_and_other_duties_continue(acquisition_env, 
     assert sync.await_count == 2
     assert subscription.await_count == 2
     assert weekly.await_count == 2
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -237,7 +237,7 @@ async def test_final_admission_failure_keeps_staged_payload_and_sends_nothing(ac
     assert storage.load_event_journal()["catchup"]["phase"] == "head"
     assert storage.load_event_journal()["events"] == []
     assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 0
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
     journal = await _finish(calls)
     assert journal["processed_seq"] == len(rows) - 1
 
@@ -255,11 +255,11 @@ async def test_v1_is_read_without_replay_and_upgrades_on_acquisition(acquisition
     await handlers.check_and_notify(AsyncMock(), set(), None)
     # ID 2 на первой странице — точная граница; остальные ID принимаются.
     upgraded = storage.load_event_journal()
-    assert upgraded["version"] == 2
+    assert upgraded["version"] == 3
     assert upgraded["events"][0] == journal["events"][0]
     assert upgraded["baseline_ids"] == [1]
     assert [event["history_id"] for event in upgraded["events"]] == [2, 4, 6, 8]
-    assert handlers.send_to_all_chats.await_count == 3
+    assert handlers._enqueue_history_event.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -268,7 +268,7 @@ async def test_static_gap_beyond_budget_eventually_delivers(acquisition_env, mon
     for _ in range(3):
         await _cycle(calls)
     assert storage.load_seen_ids() == {row["id"] for row in rows}
-    assert handlers.send_to_all_chats.await_count == len(rows) - 1
+    assert handlers._enqueue_history_event.await_count == len(rows) - 1
 
 
 @pytest.mark.asyncio
@@ -331,10 +331,10 @@ async def test_failed_first_page_defers_rotation_until_history_is_verified(acqui
     cur = await handlers.rotate_quarter_if_needed(AsyncMock(), returned, storage._empty_stats_all(), resync=False)
     assert cur["period"] == "2026-Q2"
     snapshot.assert_not_called()
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()
     pending = storage.load_event_journal()
-    assert {key: value for key, value in pending.items() if key not in {"version", "catchup"}} == {
-        key: value for key, value in journal.items() if key not in {"version", "catchup"}
+    assert {key: value for key, value in pending.items() if key not in {"version", "catchup", "outbox"}} == {
+        key: value for key, value in journal.items() if key not in {"version", "catchup", "outbox"}
     }
     assert pending["catchup"]["staged"] == []
     assert fetch.await_count == 1
@@ -345,4 +345,4 @@ async def test_failed_first_page_defers_rotation_until_history_is_verified(acqui
     assert cur["period"] == "2026-Q3"
     snapshot.assert_called_once()
     assert storage.load_event_journal()["catchup"] is None
-    handlers.send_to_all_chats.assert_not_awaited()
+    handlers._enqueue_history_event.assert_not_awaited()

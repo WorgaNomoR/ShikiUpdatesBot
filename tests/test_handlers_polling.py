@@ -1557,6 +1557,55 @@ async def test_unrelated_restore_during_quarter_backup_does_not_clear_pending(
 
 
 @pytest.mark.asyncio
+async def test_quarter_backup_persists_legacy_memberships_before_capture(
+    quarter_delivery_env, monkeypatch,
+):
+    cur = _frozen_quarter(["done"], next_unit=1)
+    cur["last_report_sent"] = "2026-Q3"
+    storage.save_stats_current(cur, strict=True)
+    pending = {
+        "subscriptions": 2, "unsubscriptions": 1,
+        "counts_known": True, "token": uuid4().hex,
+    }
+    legacy = {
+        "subscribers": {"7": "Neo", "-100": "Group"},
+        "backup_schedule": {
+            "version": 1, "last_backup_at": 100.0,
+            "weekly_started_at": 100.0, "pending": pending,
+        },
+    }
+    storage.SUBS_FILE.write_text(json.dumps(legacy), encoding="utf-8")
+    monkeypatch.setattr("handlers.send_backup", backup.send_backup)
+    captures = []
+
+    async def send(*args, **kwargs):
+        assert not storage._restorable_state_lock().locked()
+        with zipfile.ZipFile(io.BytesIO(kwargs["document"].data)) as archive:
+            archived = json.loads(archive.read("subscribers.json"))
+        published = storage.load_subscriber_state(strict_subscribers=True)
+        captures.append((archived, published.notification_memberships))
+
+    bot = AsyncMock()
+    bot.send_document.side_effect = send
+    result = await handlers._deliver_pending_quarter(bot, cur)
+    assert result["pending_quarter_delivery"] is None
+    final = storage.load_subscriber_state(strict_subscribers=True)
+    assert final.backup_schedule["last_backup_at"] > 100.0
+    assert final.backup_schedule["weekly_started_at"] == 100.0
+    assert final.backup_schedule["pending"] == pending
+    assert final.subscribers == {7: "Neo", -100: "Group"}
+    archived, published_memberships = captures[0]
+    assert published_memberships == final.notification_memberships
+    assert archived["notification_memberships"]["tokens"] == {
+        str(cid): token for cid, token in published_memberships.items()
+    }
+    assert archived["backup_schedule"] == legacy["backup_schedule"]
+    await handlers._deliver_pending_quarter(bot, result)
+    bot.send_document.assert_awaited_once()
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_changed_plan_followup_read_failure_keeps_owner_diagnostic(quarter_delivery_env, monkeypatch):
     cur = _frozen_quarter(["done"], next_unit=1)
     cur["last_report_sent"] = "2026-Q3"

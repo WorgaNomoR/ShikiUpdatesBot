@@ -423,14 +423,14 @@ async def test_startup_reconciliation_converts_subscriber_read_failure(
     _blocked_path, subscribers_path = access_state_env
     save_blocked_users({77})
     save_subscribers({77: "Target"})
-    original_read_text = storage.Path.read_text
+    original_open = storage.Path.open
 
     def fail_subscriber_read(path, *args, **kwargs):
         if path == subscribers_path:
             raise OSError("read failure")
-        return original_read_text(path, *args, **kwargs)
+        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(storage.Path, "read_text", fail_subscriber_read)
+    monkeypatch.setattr(storage.Path, "open", fail_subscriber_read)
 
     with pytest.raises(BlockedUsersStateError):
         await reconcile_blocked_subscribers()
@@ -746,10 +746,107 @@ def test_load_subscribers_strict_rejects_read_error(monkeypatch, tmp_path):
     def fail_read(*_args, **_kwargs):
         raise OSError("read failure")
 
-    monkeypatch.setattr(storage.Path, "read_text", fail_read)
+    monkeypatch.setattr(storage.Path, "open", fail_read)
 
     with pytest.raises(storage.SubscribersStateError):
         storage.load_subscribers_strict()
+
+
+@pytest.mark.asyncio
+async def test_notification_membership_migration_and_mutations_preserve_backup_contract(backup_env):
+    storage.SUBS_FILE.write_text('{"subscribers":{"10":"legacy","-100":"group"}}', encoding="utf-8")
+    async with storage.restorable_state_transaction():
+        first = storage.notification_memberships()
+        second = storage.notification_memberships()
+    assert first == second
+    assert set(first) == {10, -100}
+    assert storage.load_subscriber_state().backup_schedule["pending"] is None
+    storage.save_subscribers({10: "rename", -100: "group"})
+    assert storage.load_subscriber_state().notification_memberships == first
+    await storage.mutate_subscription(10, "rename", subscribed=False)
+    await storage.mutate_subscription(10, "rename", subscribed=True)
+    current = storage.load_subscriber_state()
+    assert current.notification_memberships[10] != first[10]
+    assert current.notification_memberships[-100] == first[-100]
+    assert current.backup_schedule["pending"]["subscriptions"] == 1
+    assert current.backup_schedule["pending"]["unsubscriptions"] == 1
+
+
+@pytest.mark.parametrize("damage", ["unsupported", "missing", "token", "duplicate", "oversized"])
+def test_notification_memberships_corruption_preserves_bytes(backup_env, monkeypatch, damage):
+    storage.save_subscribers({10: "keep"})
+    payload = json.loads(storage.SUBS_FILE.read_text(encoding="utf-8"))
+    if damage == "unsupported":
+        payload["notification_memberships"]["version"] = 2
+    elif damage == "missing":
+        payload["notification_memberships"]["tokens"] = {}
+    elif damage == "token":
+        payload["notification_memberships"]["tokens"]["10"] = True
+    if damage == "duplicate":
+        raw = b'{"subscribers":{"10":"keep","10":"replace"}}'
+    else:
+        raw = json.dumps(payload).encode()
+    storage.SUBS_FILE.write_bytes(raw)
+    if damage == "oversized":
+        monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", len(raw) - 1)
+    with pytest.raises(storage.SubscribersStateError):
+        storage.load_subscribers_strict()
+    with pytest.raises(ValueError):
+        storage.notification_memberships()
+    assert storage.SUBS_FILE.read_bytes() == raw
+
+
+@pytest.mark.parametrize("has_memberships", [False, True])
+def test_membership_migration_preserves_legacy_weekly_anchor(
+    backup_env, monkeypatch, has_memberships
+):
+    now = 1800000000.0
+    anchor = now - 7 * 24 * 60 * 60 - 100
+    monkeypatch.setattr("storage.time.time", lambda: now)
+    storage.save_stats_current(
+        {"period": "2026-Q2", "events": [], "last_backup_at": anchor}, strict=True
+    )
+    payload = {"subscribers": {"10": "legacy"}}
+    if has_memberships:
+        payload["notification_memberships"] = {"version": 1, "tokens": {"10": "a" * 32}}
+    storage.SUBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    memberships = storage.notification_memberships()
+    current = storage.load_subscriber_state(strict_subscribers=True)
+    assert current.notification_memberships == memberships
+    assert current.schedule_missing is False
+    assert current.backup_schedule["weekly_started_at"] == anchor
+    assert current.backup_schedule["last_backup_at"] is None
+    assert current.backup_schedule["pending"] is None
+
+
+@pytest.mark.parametrize("label", [True, None, {}])
+def test_notification_membership_publication_rejects_invalid_labels(backup_env, label):
+    storage.save_subscribers({10: "keep"})
+    before = storage.SUBS_FILE.read_bytes()
+    state = storage.load_subscriber_state(strict_subscribers=True)
+    state.subscribers[10] = label
+    with pytest.raises(ValueError):
+        storage.save_subscriber_state(state)
+    assert storage.SUBS_FILE.read_bytes() == before
+
+
+def test_outbox_capacity_includes_all_remaining_progress(backup_env, journal_factory, monkeypatch):
+    from event_journal_schema import journal_json
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+        progress_reserve,
+    )
+    journal = migrate_outbox(journal_factory(), 0)
+    journal = enqueue(journal, journal["events"][0], "frozen", {10: "b" * 32}, 1000)
+    limit = len(journal_json(journal).encode()) + progress_reserve(journal)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", limit)
+    storage.save_event_journal(journal)
+    before = storage.EVENT_JOURNAL_FILE.read_bytes()
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", limit - 1)
+    with pytest.raises(storage.EventJournalStateError, match="capacity"):
+        storage.save_event_journal(journal)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
 
 
 def test_load_subscribers_strict_rejects_malformed_present_schedule(
