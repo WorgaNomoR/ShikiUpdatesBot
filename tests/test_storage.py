@@ -849,6 +849,32 @@ def test_outbox_capacity_includes_all_remaining_progress(backup_env, journal_fac
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
 
 
+@pytest.mark.parametrize("failure", ["write", "interruption", "generation", "newer_state"])
+def test_compaction_publication_guards_and_exact_bytes(backup_env, journal_factory, monkeypatch, failure):
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+    )
+
+    journal = migrate_outbox(journal_factory(count=2), 0)
+    journal = enqueue(journal, journal["events"][0], "empty audience", {}, 1000)
+    storage.save_event_journal(journal)
+    generation = storage.restorable_restore_generation()
+    if failure == "generation":
+        monkeypatch.setattr("storage._restorable_restore_generation", generation + 1)
+    elif failure == "newer_state":
+        current = enqueue(journal, journal["events"][1], "new pending", {10: "b" * 32}, 1000)
+        storage.save_event_journal(current)
+    elif failure == "write":
+        monkeypatch.setattr("storage._atomic_write", lambda *a: (_ for _ in ()).throw(OSError("write")))
+    else:
+        monkeypatch.setattr("storage._atomic_write", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    before = storage.EVENT_JOURNAL_FILE.read_bytes()
+    with pytest.raises(KeyboardInterrupt if failure == "interruption" else storage.EventJournalStateError):
+        storage.compact_event_journal(journal, expected_generation=generation)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
+
+
 def test_load_subscribers_strict_rejects_malformed_present_schedule(
     monkeypatch,
     tmp_path,

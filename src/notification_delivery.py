@@ -16,7 +16,10 @@ from aiogram.exceptions import (
 )
 
 from config import log
-from event_journal_schema import validate_recovery_set
+from event_journal_schema import (
+    EventJournalStateError,
+    validate_recovery_set,
+)
 from notification_outbox import (
     BACKOFF,
     DISPATCH_SECONDS,
@@ -29,6 +32,7 @@ from notification_outbox import (
     possible_delivery,
 )
 from storage import (
+    compact_event_journal,
     load_blocked_users,
     load_event_journal,
     load_stats_current,
@@ -50,7 +54,7 @@ _locks = weakref.WeakKeyDictionary()
 
 def _recipient(journal, seq, cid):
     box = journal["outbox"]
-    return box["records"][seq - box["baseline_seq"] - 1]["recipients"][cid]
+    return box["records"][seq - box["baseline_seq"] - 1].get("recipients", {}).get(cid)
 
 
 def _retry_delay(error):
@@ -76,7 +80,7 @@ def _maintenance(journal, memberships, blocked, now):
     """Cancellation/expiry — явная публикация, также для неготового head."""
     changed = False
     for record in journal["outbox"]["records"]:
-        for cid, recipient in record["recipients"].items():
+        for cid, recipient in record.get("recipients", {}).items():
             if recipient["status"] != "pending":
                 continue
             terminal_at = max(
@@ -105,7 +109,7 @@ def _next_due(journal, now):
     """Только первый pending для чата; старейший due обеспечивает fairness."""
     heads = {}
     for record in journal["outbox"]["records"]:
-        for cid, recipient in record["recipients"].items():
+        for cid, recipient in record.get("recipients", {}).items():
             if recipient["status"] == "pending":
                 heads.setdefault(cid, (record, recipient))
     ready = [
@@ -141,6 +145,18 @@ async def _dispatch(bot):
             return
         validate_recovery_set(journal, load_stats_current(strict=True))
         generation = restorable_restore_generation()
+        try:
+            compact_event_journal(journal, expected_generation=generation)
+        except EventJournalStateError as exc:
+            if str(exc) == "compaction_changed":
+                journal = load_event_journal()
+                if journal is None or journal["version"] != 3:
+                    return
+                validate_recovery_set(journal, load_stats_current(strict=True))
+                generation = restorable_restore_generation()
+            elif str(exc) != "journal_write":
+                raise
+            log.warning("Уведомления: сжатие журнала отложено (%s).", exc)
         identity = journal["journal_id"]
     for _ in range(MAX_DISPATCHES):
         async with restorable_state_transaction():

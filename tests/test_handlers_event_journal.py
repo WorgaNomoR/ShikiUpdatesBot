@@ -16,6 +16,7 @@ import handlers
 import storage
 from event_journal_schema import EventJournalStateError
 from notification_delivery import dispatch_notifications
+from notification_outbox import progress_reserve
 
 
 def _entry(history_id=2):
@@ -140,6 +141,7 @@ async def test_overlap_conflicts_keep_first_semantics(history_env, monkeypatch, 
     source = _entry()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[source]))
     await handlers.check_and_notify(AsyncMock(), set(), None)
+    await handlers._drain_history_journal(AsyncMock())
     original = storage.EVENT_JOURNAL_FILE.read_bytes()
     changed = deepcopy(source)
     changed["description"] = "Брошено"
@@ -170,6 +172,7 @@ async def test_malformed_metadata_is_admitted_once_without_blocking_batch(histor
     assert len(storage.load_stats_current(strict=True)["events"]) == 2
     assert handlers._enqueue_history_event.await_count == 3
     assert "???" in handlers._enqueue_history_event.await_args_list[1].args[2]
+    await handlers._drain_history_journal(AsyncMock())
     original = storage.EVENT_JOURNAL_FILE.read_bytes()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(2), _entry(3), _entry(4)]))
 
@@ -266,6 +269,7 @@ async def test_capacity_rejects_whole_new_batch_without_eviction(history_env, mo
     await _ready()
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry()]))
     await handlers.check_and_notify(AsyncMock(), set(), None)
+    await handlers._drain_history_journal(AsyncMock())
     original = storage.EVENT_JOURNAL_FILE.read_bytes()
     monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", len(original) + storage.JOURNAL_CHECKPOINT_RESERVE)
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(), _entry(3)]))
@@ -638,3 +642,84 @@ async def test_outbox_publication_failure_keeps_recoverable_authority(history_en
     await handlers._drain_history_journal(AsyncMock())
     assert storage.load_event_journal()["processed_seq"] == 1
     assert len(storage.load_event_journal()["outbox"]["records"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fits_after_compaction", [True, False])
+@pytest.mark.parametrize("resume_failure", [None, "write", "interruption"])
+async def test_real_enqueue_capacity_after_projection_recovers_without_reprojection(
+    history_env, monkeypatch, fits_after_compaction, resume_failure,
+):
+    await _ready()
+    storage.save_subscribers({10: "recipient"})
+    monkeypatch.setattr("handlers.build_message", lambda *a, **k: "x" * 8000)
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(2)]))
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+    before = storage.load_event_journal()
+    # Admission помещается, enqueue с payload и резервом следующего события — нет.
+    limit = len(storage.EVENT_JOURNAL_FILE.read_bytes()) + progress_reserve(before) + 5000
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", limit)
+    monkeypatch.setattr(
+        "handlers.build_message", lambda *a, **k: "y" * (7000 if fits_after_compaction else 30000),
+    )
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(3)]))
+    with pytest.raises(EventJournalStateError, match="journal_capacity"):
+        await handlers.check_and_notify(AsyncMock(), set(), None)
+    admitted = storage.load_event_journal()
+    projected = storage.STATS_CURRENT_FILE.read_bytes()
+    assert len(admitted["events"]) == 2
+    assert admitted["processed_seq"] == admitted["outbox"]["enqueued_seq"] == 1
+    assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 2
+    assert len(storage.load_stats_current(strict=True)["events"]) == 2
+    # Доставка и её maintenance доступны при заблокированном drain.
+    bot = AsyncMock()
+    await dispatch_notifications(bot)
+    await dispatch_notifications(bot)
+    compacted = storage.load_event_journal()
+    assert compacted["outbox"]["records"][0]["summary_version"] == 1
+    assert compacted["events"] == admitted["events"]
+    assert compacted["baseline_ids"] == admitted["baseline_ids"]
+    assert compacted["processed_seq"] == 1
+    # Новый drain использует только опубликованные файлы, как после restart.
+    project = handlers.project_event
+    monkeypatch.setattr("handlers.project_event", lambda *a, **k: pytest.fail("delta repeated"))
+    if fits_after_compaction:
+        if resume_failure is not None:
+            exact = storage.EVENT_JOURNAL_FILE.read_bytes()
+            write = storage._atomic_write
+
+            def fail(path, payload):
+                if path == storage.EVENT_JOURNAL_FILE and json.loads(payload)["processed_seq"] == 2:
+                    if resume_failure == "interruption":
+                        raise asyncio.CancelledError
+                    raise OSError("enqueue publication")
+                return write(path, payload)
+
+            with monkeypatch.context() as patch:
+                patch.setattr("storage._atomic_write", fail)
+                with pytest.raises(asyncio.CancelledError if resume_failure == "interruption" else EventJournalStateError):
+                    await handlers._drain_history_journal(bot)
+            assert storage.EVENT_JOURNAL_FILE.read_bytes() == exact
+            assert storage.STATS_CURRENT_FILE.read_bytes() == projected
+        await handlers._drain_history_journal(bot)
+        assert storage.STATS_CURRENT_FILE.read_bytes() == projected
+        recovered = storage.load_event_journal()
+        assert recovered["processed_seq"] == recovered["outbox"]["enqueued_seq"] == 2
+        assert [r["seq"] for r in recovered["outbox"]["records"]] == [1, 2]
+        assert recovered["outbox"]["records"][1]["payload"]["text"] == "y" * 7000
+        await handlers._drain_history_journal(bot)
+        monkeypatch.setattr("handlers.project_event", project)
+        monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
+        current = await handlers.rotate_quarter_if_needed(
+            bot, {}, storage._empty_stats_all(), resync=False,
+        )
+        assert current["period"] == "2026-Q3"
+    else:
+        exact = storage.EVENT_JOURNAL_FILE.read_bytes()
+        with pytest.raises(EventJournalStateError, match="journal_capacity"):
+            await handlers._drain_history_journal(bot)
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == exact
+        assert storage.load_event_journal()["processed_seq"] == 1
+    if not fits_after_compaction:
+        assert storage.STATS_CURRENT_FILE.read_bytes() == projected
+    assert bot.send_message.await_count >= 1

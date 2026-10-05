@@ -230,6 +230,7 @@ from storage import (
     UserAlertsStateError,
     _empty_stats_current,
     add_blocked_user,
+    compact_event_journal,
     downgrade_quarter_delivery,
     list_blocked_users,
     load_blocked_users,
@@ -2320,6 +2321,8 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
         if journal is not None and PROJECTION_KEY in cur and journal["version"] != 3:
             journal = migrate_outbox(journal, cur[PROJECTION_KEY]["applied_seq"])
             save_event_journal(journal)
+        if journal is not None:
+            journal = compact_event_journal(journal, expected_generation=generation)
         period_events = index_event_periods(cur, journal) if journal is not None and PROJECTION_KEY in cur else {}
     while journal is not None and journal["processed_seq"] < len(journal["events"]):
         seq = journal["processed_seq"] + 1
@@ -2358,7 +2361,7 @@ async def _enqueue_history_event(journal: dict, event: dict, text: str | None, g
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
         current_journal, cur = _history_state(full_recovery=False)
-        if current_journal != journal or cur[PROJECTION_KEY]["applied_seq"] != event["seq"]:
+        if not _same_history_authority(current_journal, journal) or cur[PROJECTION_KEY]["applied_seq"] != event["seq"]:
             raise _HistoryAttemptChanged
         try:
             memberships = notification_memberships() if notification_event(event) else {}
@@ -2366,9 +2369,34 @@ async def _enqueue_history_event(journal: dict, event: dict, text: str | None, g
         except (ValueError, OSError):
             raise EventJournalStateError("notification_state") from None
         memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}
-        candidate = enqueue(journal, event, text, memberships, time.time())
-        save_event_journal(candidate, admitting=True)
+        candidate = enqueue(current_journal, event, text, memberships, time.time())
+        candidate = _save_history_progress(current_journal, candidate, generation)
         return candidate, cur
+
+
+def _same_history_authority(current: dict | None, expected: dict) -> bool:
+    """Подтверждение получателя и сжатие не меняют принятую историю."""
+    return current is not None and {
+        key: value for key, value in current.items() if key != "outbox"
+    } == {key: value for key, value in expected.items() if key != "outbox"}
+
+
+def _save_history_progress(current: dict, candidate: dict, generation: int) -> dict:
+    """При нехватке места сначала сжать принятые данные, затем повторить публикацию."""
+    try:
+        save_event_journal(candidate, admitting=True)
+        return candidate
+    except EventJournalStateError as error:
+        if str(error) != "journal_capacity":
+            raise
+        reclaimed = compact_event_journal(current, expected_generation=generation)
+        if reclaimed == current:
+            raise
+    candidate = deepcopy(candidate)
+    candidate["outbox"]["version"] = reclaimed["outbox"]["version"]
+    candidate["outbox"]["records"][:len(reclaimed["outbox"]["records"])] = reclaimed["outbox"]["records"]
+    save_event_journal(candidate, admitting=True)
+    return candidate
 
 
 def _export_history_seen(journal: dict) -> set[int]:
@@ -2408,8 +2436,9 @@ async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
         published_journal, cur = _history_state()
-        if published_journal != journal:
+        if published_journal != journal and not _same_history_authority(published_journal, journal):
             raise _HistoryAttemptChanged
+        journal = published_journal
     seen = _journal_seen(journal) if journal is not None else set()
     if journal is None or not journal["baseline_initialized"]:
         async with aiohttp.ClientSession() as session:
@@ -2421,17 +2450,22 @@ async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
     return await _acquire_history_pages(bot, journal, generation)
 
 
-async def _publish_history_candidate(expected: dict, candidate: dict, generation: int) -> dict:
+async def _publish_history_candidate(expected: dict, candidate: dict, generation: int) -> tuple[dict, dict]:
     """Публиковать только продолжение той же authority и restore generation."""
     async with restorable_state_transaction():
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
         current, cur = _history_state()
-        if current != expected:
+        if not _same_history_authority(current, expected):
             raise _HistoryAttemptChanged
         if candidate != expected:
-            save_event_journal(candidate, admitting=True)
-        return cur
+            candidate = deepcopy(candidate)
+            if current.get("outbox") is not None:
+                candidate["outbox"] = deepcopy(current["outbox"])
+            candidate = _save_history_progress(current, candidate, generation)
+        else:
+            candidate = current
+        return candidate, cur
 
 
 def _stage_history_page(state: dict, entries: list[dict], journal: dict) -> None:
@@ -2486,7 +2520,7 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
                 # Первая ошибка создаёт пустую отметку неполноты, чтобы
                 # ротация не закрыла квартал до проверки истории.
                 candidate = journal if journal.get("catchup") is not None else {**journal, "version": max(2, journal["version"]), "catchup": state}
-                cur = await _publish_history_candidate(journal, candidate, generation)
+                candidate, cur = await _publish_history_candidate(journal, candidate, generation)
                 log.warning("История: страница %d недоступна; незавершённый сбор сохранён.", page)
                 return seen, cur
             connected, complete = advance_acquisition(
@@ -2502,7 +2536,7 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
                     candidate["events"].append(event)
                 if state["staged"] or previous is not None or journal.get("catchup") is not None:
                     candidate.update(version=max(2, journal["version"]), catchup=None)
-                cur = await _publish_history_candidate(journal, candidate, generation)
+                candidate, cur = await _publish_history_candidate(journal, candidate, generation)
                 if candidate == journal:
                     return seen, cur
                 if len(journal_json(candidate).encode("utf-8")) + progress_reserve(candidate) >= JOURNAL_WARN_BYTES:
@@ -2510,7 +2544,7 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
                 journal, cur = await _drain_history_journal(bot, expected_generation=generation)
                 return _export_history_seen(journal), cur
             candidate.update(version=max(2, journal["version"]), catchup=deepcopy(state))
-            cur = await _publish_history_candidate(journal, candidate, generation)
+            candidate, cur = await _publish_history_candidate(journal, candidate, generation)
             journal = candidate
             if len(journal_json(journal).encode("utf-8")) + progress_reserve(journal) >= JOURNAL_WARN_BYTES:
                 await _journal_diagnostic(bot, capacity=True)

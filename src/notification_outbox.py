@@ -13,6 +13,7 @@ BACKOFF = (60, 300, 1800, 7200, 21600)
 MAX_DISPATCHES = 20
 DISPATCH_SECONDS = 20
 REQUEST_SECONDS = 10
+MAX_COMPACTIONS = 128
 OUTCOMES = {"confirmed_success", "confirmed_rejection", "not_dispatched", "uncertain"}
 TERMINAL = {"delivered", "cancelled", "expired", "rejected"}
 
@@ -191,9 +192,80 @@ def progress_reserve(journal: dict) -> int:
     return sum(
         512 + (MAX_ATTEMPTS - len(recipient["attempts"])) * 96
         for record in box["records"]
-        for recipient in record["recipients"].values()
+        for recipient in record.get("recipients", {}).values()
         if recipient["status"] == "pending"
     )
+
+
+def _serialized_size(value: dict) -> int:
+    return len(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8"))
+
+
+def compact_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
+    """Enqueue завершён, pending нет: оба потребителя больше не меняют запись.
+
+    Сохраняем seq/history_id и счётчики исходов, возможного принятия и дублей.
+    Полная запись с хотя бы одним pending не меняется, включая terminal соседей.
+    Не более limit замен за публикацию; исходный журнал остаётся неизменным.
+    """
+    if journal.get("outbox") is None:
+        return journal
+    validate_outbox(journal)
+    replacements = {}
+    for index, record in enumerate(journal["outbox"]["records"]):
+        if len(replacements) >= limit:
+            break
+        if "summary_version" in record or any(
+            r["status"] == "pending" for r in record["recipients"].values()
+        ):
+            continue
+        outcomes = {}
+        for recipient in record["recipients"].values():
+            counts = outcomes.setdefault(
+                recipient["status"], {"count": 0, "possible_delivery": 0, "duplicate_possible": 0},
+            )
+            possibilities = int(recipient["prior_possible"]) + sum(
+                a["outcome"] in {"uncertain", "confirmed_success"} for a in recipient["attempts"]
+            )
+            counts["count"] += 1
+            counts["possible_delivery"] += int(possibilities > 0)
+            counts["duplicate_possible"] += int(possibilities > 1)
+        summary = {
+            "summary_version": 1, "seq": record["seq"],
+            "history_id": record["history_id"], "outcomes": outcomes,
+        }
+        # Версии 1 и 2 имеют ту же длину; резерв pending остаётся точным.
+        if _serialized_size(summary) <= _serialized_size(record):
+            replacements[index] = summary
+    if not replacements:
+        return journal
+    result = deepcopy(journal)
+    result["outbox"]["version"] = 2
+    for index, summary in replacements.items():
+        result["outbox"]["records"][index] = summary
+    return result
+
+
+def _validate_summary(record: dict, event: dict) -> None:
+    """Summary не содержит dispatch-полей; неизвестные/ложные итоги запрещены."""
+    if (
+        set(record) != {"summary_version", "seq", "history_id", "outcomes"}
+        or type(record["summary_version"]) is not int or record["summary_version"] != 1
+        or not isinstance(record["outcomes"], dict)
+        or not set(record["outcomes"]) <= TERMINAL
+        or (not notification_event(event) and record["outcomes"])
+    ):
+        raise OutboxStateError("outbox_summary")
+    for status, counts in record["outcomes"].items():
+        if (
+            not isinstance(counts, dict)
+            or set(counts) != {"count", "possible_delivery", "duplicate_possible"}
+            or any(type(n) is not int for n in counts.values())
+            or not 0 <= counts["duplicate_possible"] <= counts["possible_delivery"] <= counts["count"]
+            or counts["count"] <= 0
+            or (status == "delivered" and counts["possible_delivery"] != counts["count"])
+        ):
+            raise OutboxStateError("outbox_summary_outcome")
 
 
 def validate_outbox(journal: dict) -> None:
@@ -204,7 +276,7 @@ def validate_outbox(journal: dict) -> None:
         or set(box)
         != {"version", "baseline_seq", "enqueued_seq", "legacy_uncertain_seq", "records"}
         or type(box["version"]) is not int
-        or box["version"] != 1
+        or box["version"] not in {1, 2}
         or type(box["baseline_seq"]) is not int
         or not 0 <= box["baseline_seq"] <= journal["processed_seq"]
         or type(box["enqueued_seq"]) is not int
@@ -223,6 +295,17 @@ def validate_outbox(journal: dict) -> None:
         raise OutboxStateError("outbox_structure")
     for seq, record in enumerate(box["records"], box["baseline_seq"] + 1):
         event = journal["events"][seq - 1]
+        if (
+            not isinstance(record, dict)
+            or type(record.get("seq")) is not int or record["seq"] != seq
+            or type(record.get("history_id")) is not int or record["history_id"] != event["history_id"]
+        ):
+            raise OutboxStateError("outbox_record_identity")
+        if "summary_version" in record:
+            if box["version"] != 2:
+                raise OutboxStateError("outbox_summary_version")
+            _validate_summary(record, event)
+            continue
         if (
             not isinstance(record, dict)
             or set(record)
