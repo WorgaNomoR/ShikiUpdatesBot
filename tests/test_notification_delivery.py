@@ -594,6 +594,89 @@ async def test_polling_dispatches_accepted_work_despite_acquisition_failure(outb
 
 
 @pytest.mark.asyncio
+async def test_compaction_write_failure_does_not_delay_due_delivery(
+    outbox_env, journal_factory, monkeypatch,
+):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory)
+    journal = storage.load_event_journal()
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    begin_attempt(recipient, outbox_env[0])
+    complete_attempt(recipient, "confirmed_success", outbox_env[0])
+    storage.save_event_journal(journal)
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    write = storage._atomic_write
+    failures = []
+
+    def fail_compaction(path, payload):
+        if path == storage.EVENT_JOURNAL_FILE and "summary_version" in payload:
+            failures.append(True)
+            assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+            raise OSError("compaction write")
+        return write(path, payload)
+
+    monkeypatch.setattr("storage._atomic_write", fail_compaction)
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    assert failures == [True]
+    bot.send_message.assert_awaited_once_with(
+        chat_id=10, **journal["outbox"]["records"][1]["payload"],
+    )
+    current = storage.load_event_journal()
+    assert current["outbox"]["records"][0] == journal["outbox"]["records"][0]
+    recipient = current["outbox"]["records"][1]["recipients"]["10"]
+    assert recipient["status"] == "delivered"
+    assert [attempt["outcome"] for attempt in recipient["attempts"]] == ["confirmed_success"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coherent", [True, False])
+async def test_compaction_changed_revalidates_restored_authority_before_delivery(
+    outbox_env, journal_factory, monkeypatch, coherent,
+):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory)
+    journal = storage.load_event_journal()
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    begin_attempt(recipient, outbox_env[0])
+    complete_attempt(recipient, "confirmed_success", outbox_env[0])
+    storage.save_event_journal(journal)
+    compact = storage.compact_event_journal
+    published = []
+
+    def replace_authority(snapshot, *, expected_generation):
+        restored = deepcopy(snapshot)
+        restored["journal_id"] = "f" * 32
+        restored["outbox"]["records"][1]["payload"]["text"] = "restored payload"
+        storage.save_event_journal(restored)
+        cur = storage.load_stats_current(strict=True)
+        if coherent:
+            cur["event_projection"]["journal_id"] = restored["journal_id"]
+            storage.save_stats_current(cur, strict=True)
+        storage.mark_restorable_state_restored()
+        published.append(storage.EVENT_JOURNAL_FILE.read_bytes())
+        # Реальная защита отвергает старый snapshot; следующий проход берёт новый.
+        return compact(snapshot, expected_generation=expected_generation)
+
+    monkeypatch.setattr("notification_delivery.compact_event_journal", replace_authority)
+    bot = AsyncMock()
+    if coherent:
+        await delivery.dispatch_notifications(bot)
+        bot.send_message.assert_awaited_once_with(
+            chat_id=10, **{**journal["outbox"]["records"][1]["payload"], "text": "restored payload"},
+        )
+        current = storage.load_event_journal()
+        assert current["journal_id"] == "f" * 32
+        assert current["outbox"]["records"][0] == journal["outbox"]["records"][0]
+        assert current["outbox"]["records"][1]["recipients"]["10"]["status"] == "delivered"
+    else:
+        with pytest.raises(EventJournalStateError, match="^recovery_mismatch$"):
+            await delivery.dispatch_notifications(bot)
+        bot.send_message.assert_not_awaited()
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == published[0]
+
+
+@pytest.mark.asyncio
 async def test_compaction_and_admission_during_send_preserve_exact_ack_lease(
     outbox_env, journal_factory, monkeypatch,
 ):

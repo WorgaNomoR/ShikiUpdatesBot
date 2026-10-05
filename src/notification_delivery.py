@@ -16,7 +16,10 @@ from aiogram.exceptions import (
 )
 
 from config import log
-from event_journal_schema import validate_recovery_set
+from event_journal_schema import (
+    EventJournalStateError,
+    validate_recovery_set,
+)
 from notification_outbox import (
     BACKOFF,
     DISPATCH_SECONDS,
@@ -142,8 +145,19 @@ async def _dispatch(bot):
             return
         validate_recovery_set(journal, load_stats_current(strict=True))
         generation = restorable_restore_generation()
+        try:
+            compact_event_journal(journal, expected_generation=generation)
+        except EventJournalStateError as exc:
+            if str(exc) == "compaction_changed":
+                journal = load_event_journal()
+                if journal is None or journal["version"] != 3:
+                    return
+                validate_recovery_set(journal, load_stats_current(strict=True))
+                generation = restorable_restore_generation()
+            elif str(exc) != "journal_write":
+                raise
+            log.warning("Уведомления: сжатие журнала отложено (%s).", exc)
         identity = journal["journal_id"]
-        compact_event_journal(journal, expected_generation=generation)
     for _ in range(MAX_DISPATCHES):
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
