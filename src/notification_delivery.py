@@ -29,6 +29,7 @@ from notification_outbox import (
     possible_delivery,
 )
 from storage import (
+    compact_event_journal,
     load_blocked_users,
     load_event_journal,
     load_stats_current,
@@ -50,7 +51,7 @@ _locks = weakref.WeakKeyDictionary()
 
 def _recipient(journal, seq, cid):
     box = journal["outbox"]
-    return box["records"][seq - box["baseline_seq"] - 1]["recipients"][cid]
+    return box["records"][seq - box["baseline_seq"] - 1].get("recipients", {}).get(cid)
 
 
 def _retry_delay(error):
@@ -76,7 +77,7 @@ def _maintenance(journal, memberships, blocked, now):
     """Cancellation/expiry — явная публикация, также для неготового head."""
     changed = False
     for record in journal["outbox"]["records"]:
-        for cid, recipient in record["recipients"].items():
+        for cid, recipient in record.get("recipients", {}).items():
             if recipient["status"] != "pending":
                 continue
             terminal_at = max(
@@ -105,7 +106,7 @@ def _next_due(journal, now):
     """Только первый pending для чата; старейший due обеспечивает fairness."""
     heads = {}
     for record in journal["outbox"]["records"]:
-        for cid, recipient in record["recipients"].items():
+        for cid, recipient in record.get("recipients", {}).items():
             if recipient["status"] == "pending":
                 heads.setdefault(cid, (record, recipient))
     ready = [
@@ -142,6 +143,7 @@ async def _dispatch(bot):
         validate_recovery_set(journal, load_stats_current(strict=True))
         generation = restorable_restore_generation()
         identity = journal["journal_id"]
+        compact_event_journal(journal, expected_generation=generation)
     for _ in range(MAX_DISPATCHES):
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:

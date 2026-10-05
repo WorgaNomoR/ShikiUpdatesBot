@@ -2527,6 +2527,154 @@ async def test_journal_restore_rollback_preserves_exact_damaged_bytes(backup_env
     assert storage.restorable_restore_generation() == generation
 
 
+def _compacted_recovery(journal_factory):
+    from notification_outbox import (
+        begin_attempt,
+        compact_outbox,
+        complete_attempt,
+        enqueue,
+        migrate_outbox,
+    )
+
+    journal = migrate_outbox(journal_factory(count=2), 0)
+    for event in journal["events"]:
+        journal = enqueue(journal, event, "frozen", {10: "b" * 32}, 1000)
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    begin_attempt(recipient, 1000)
+    complete_attempt(recipient, "confirmed_success", 1001)
+    begin_attempt(journal["outbox"]["records"][1]["recipients"]["10"], 1000)
+    return compact_outbox(journal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan_version", [1, 2, 3])
+async def test_compacted_coherent_backup_preserves_plans_corrections_and_schedule(
+    backup_env, journal_factory, plan_version,
+):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+        report_revisions,
+        rotate_event_time,
+    )
+
+    journal = _compacted_recovery(journal_factory)
+    cur = _journal_current(journal, applied=0)
+    ensure_event_time(cur)
+    for seq in (1, 2):
+        project_event(cur, journal, seq)
+        cur["event_projection"]["applied_seq"] = seq
+    fresh = storage._empty_stats_current("2026-Q3")
+    fresh["event_projection"] = dict(cur["event_projection"])
+    units = [{"transport": "html", "content": "frozen report", "disable_preview": False}]
+    if plan_version == 1:
+        plan = storage.new_quarter_delivery("2026-Q2", "2026-Q3", ["frozen report"])
+    else:
+        plan = storage.new_quarter_delivery_plan(
+            "2026-Q2", "2026-Q3", units,
+            event_time_revisions=report_revisions(cur) if plan_version == 3 else None,
+        )
+    fresh["pending_quarter_delivery"] = plan
+    rotation_plan = plan if plan_version == 3 else storage.new_quarter_delivery_plan(
+        "2026-Q2", "2026-Q3", [], event_time_revisions=report_revisions(cur),
+    )
+    rotate_event_time(cur, fresh, rotation_plan)
+    if plan_version != 3:
+        fresh["event_time"]["report_ack"] = None
+    storage.save_event_journal(journal)
+    storage.save_stats_current(fresh, strict=True)
+    await storage.mutate_subscription(10, "active", subscribed=True)
+    schedule = storage.load_subscriber_state(strict_subscribers=True)
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert json.loads(archive.read("event_journal.json")) == journal
+        assert json.loads(archive.read("stats_current.json")) == fresh
+    await backup.restore_backup_zip(raw)
+    assert storage.load_event_journal() == journal
+    assert storage.load_stats_current(strict=True) == fresh
+    restored = storage.load_subscriber_state(strict_subscribers=True)
+    assert restored.backup_schedule == schedule.backup_schedule
+    assert restored.notification_memberships == schedule.notification_memberships
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["identical", "older", "full", "unrelated", "legacy"])
+async def test_restore_invalidates_compaction_snapshot_and_preserves_authority(
+    backup_env, journal_factory, kind,
+):
+    from notification_outbox import enqueue
+
+    journal = _compacted_recovery(journal_factory)
+    # Добавляем ещё одну compactable decision; предыдущая summary уже опубликована.
+    recipient = journal["outbox"]["records"][1]["recipients"]["10"]
+    recipient.update(status="cancelled", reason="ineligible", terminal_at=1001)
+    storage.save_event_journal(journal)
+    cur = _journal_current(journal)
+    storage.save_stats_current(cur, strict=True)
+    generation = storage.restorable_restore_generation()
+    if kind == "unrelated":
+        raw = _zip_bytes({"user_alerts.json": '{"enabled":false}'})
+    elif kind == "legacy":
+        raw = _zip_bytes({"stats_current.json": json.dumps(storage._empty_stats_current("2026-Q2"))})
+    elif kind == "older":
+        older = journal_factory(count=0)
+        raw = _recovery_zip(older, _journal_current(older))
+    elif kind == "full":
+        replacement = journal_factory(count=1)
+        replacement["journal_id"] = "c" * 32
+        from notification_outbox import migrate_outbox
+        replacement = migrate_outbox(replacement, 0)
+        replacement = enqueue(replacement, replacement["events"][0], "replacement", {}, 1000)
+        raw = _recovery_zip(replacement, _journal_current(replacement))
+    else:
+        raw = _recovery_zip(journal, cur)
+    await backup.restore_backup_zip(raw)
+    exact = storage.EVENT_JOURNAL_FILE.read_bytes()
+    async with storage.restorable_state_transaction():
+        with pytest.raises(storage.EventJournalStateError, match="compaction_changed"):
+            storage.compact_event_journal(journal, expected_generation=generation)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == exact
+    if kind in {"legacy", "unrelated", "identical"}:
+        assert storage.load_event_journal() == journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["invalid", "oversized", "publication"])
+async def test_compacted_import_rejection_and_exact_byte_rollback(
+    backup_env, journal_factory, monkeypatch, damage,
+):
+    journal = _compacted_recovery(journal_factory)
+    cur = _journal_current(journal)
+    before_journal = b"\xffbroken journal\r\n"
+    before_current = b"{ broken quarter\r\n"
+    storage.EVENT_JOURNAL_FILE.write_bytes(before_journal)
+    storage.STATS_CURRENT_FILE.write_bytes(before_current)
+    if damage == "invalid":
+        journal["outbox"]["records"][0]["outcomes"]["pending"] = {"count": 1}
+    elif damage == "oversized":
+        monkeypatch.setattr("backup._IMPORT_MEMBER_MAX_BYTES", len(json.dumps(journal).encode()) - 1)
+    else:
+        publish = backup._publish_staged_file
+
+        def fail(source, target):
+            if target.name == "user_alerts.json":
+                raise OSError("publication")
+            return publish(source, target)
+
+        monkeypatch.setattr("backup._publish_staged_file", fail)
+    raw = _zip_bytes({
+        "event_journal.json": json.dumps(journal), "stats_current.json": json.dumps(cur),
+        "user_alerts.json": '{"enabled":false}',
+    })
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(raw)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == before_journal
+    assert storage.STATS_CURRENT_FILE.read_bytes() == before_current
+    assert not storage.USER_ALERTS_FILE.exists()
+    assert storage.restorable_restore_generation() == generation
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["unsupported", "null", "subscriber", "missing_token", "huge_chat"])
 async def test_restore_rejects_invalid_notification_memberships(backup_env, damage):

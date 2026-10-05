@@ -53,6 +53,7 @@ from event_time_stats import (
 )
 from notification_outbox import (
     OutboxStateError,
+    compact_outbox,
     parse_subscriber_payload,
     progress_reserve,
     validate_memberships,
@@ -208,6 +209,20 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
     except Exception:
         raise EventJournalStateError("journal_write") from None
     return size
+
+
+def compact_event_journal(journal: dict, *, expected_generation: int) -> dict:
+    """Под общей транзакцией: ограниченно сжать свежий журнал отдельной публикацией."""
+    candidate = compact_outbox(journal)
+    if candidate == journal:
+        return journal
+    if (
+        restorable_restore_generation() != expected_generation
+        or load_event_journal() != journal
+    ):
+        raise EventJournalStateError("compaction_changed")
+    save_event_journal(candidate)
+    return candidate
 
 
 # ═══════════════════════════════════════════════════════════════════
