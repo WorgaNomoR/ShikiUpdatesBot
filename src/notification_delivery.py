@@ -28,6 +28,7 @@ from notification_outbox import (
     REQUEST_SECONDS,
     begin_attempt,
     complete_attempt,
+    completed_seq,
     finish,
     possible_delivery,
 )
@@ -54,7 +55,9 @@ _locks = weakref.WeakKeyDictionary()
 
 def _recipient(journal, seq, cid):
     box = journal["outbox"]
-    return box["records"][seq - box["baseline_seq"] - 1].get("recipients", {}).get(cid)
+    if not completed_seq(box) < seq <= box["enqueued_seq"]:
+        return None
+    return box["records"][seq - completed_seq(box) - 1].get("recipients", {}).get(cid)
 
 
 def _retry_delay(error):
@@ -156,7 +159,7 @@ async def _dispatch(bot):
                 generation = restorable_restore_generation()
             elif str(exc) != "journal_write":
                 raise
-            log.warning("Уведомления: сжатие журнала отложено (%s).", exc)
+            log.warning("Уведомления: очистка/сжатие журнала отложены (%s).", exc)
         identity = journal["journal_id"]
     for _ in range(MAX_DISPATCHES):
         async with restorable_state_transaction():

@@ -201,6 +201,46 @@ def _serialized_size(value: dict) -> int:
     return len(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8"))
 
 
+def completed_seq(box: dict) -> int:
+    """Граница отсутствующих записей: завершение, без доказательства доставки."""
+    return box.get("completed_seq", box["baseline_seq"])
+
+
+def retain_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
+    """Удалить завершённый префикс; оставшийся бюджет отдать сжатию.
+
+    Checkpoint и удаление публикуются вместе. Итоги удалённых записей неизвестны;
+    quiet baseline, абсолютные seq и полные pending-обязательства сохраняются.
+    """
+    if journal.get("outbox") is None:
+        return journal
+    validate_outbox(journal)
+    box = journal["outbox"]
+    count = 0
+    for record in box["records"]:
+        if count >= limit or any(
+            r["status"] == "pending" for r in record.get("recipients", {}).values()
+        ):
+            break
+        count += 1
+    result = journal
+    if count:
+        result = deepcopy(journal)
+        result["outbox"].update(
+            version=3,
+            completed_seq=completed_seq(box) + count,
+            records=result["outbox"]["records"][count:],
+        )
+    if count < limit:
+        result = compact_outbox(result, limit=limit - count)
+    if result is journal:
+        return journal
+    # Новое поле checkpoint тоже входит в прежний сериализованный бюджет.
+    if _serialized_size(result["outbox"]) > _serialized_size(box):
+        raise OutboxStateError("retention_growth")
+    return result
+
+
 def compact_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
     """Enqueue завершён, pending нет: оба потребителя больше не меняют запись.
 
@@ -240,7 +280,7 @@ def compact_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
     if not replacements:
         return journal
     result = deepcopy(journal)
-    result["outbox"]["version"] = 2
+    result["outbox"]["version"] = max(2, result["outbox"]["version"])
     for index, summary in replacements.items():
         result["outbox"]["records"][index] = summary
     return result
@@ -275,12 +315,15 @@ def validate_outbox(journal: dict) -> None:
         not isinstance(box, dict)
         or set(box)
         != {"version", "baseline_seq", "enqueued_seq", "legacy_uncertain_seq", "records"}
+        | ({"completed_seq"} if box.get("version") == 3 else set())
         or type(box["version"]) is not int
-        or box["version"] not in {1, 2}
+        or box["version"] not in {1, 2, 3}
         or type(box["baseline_seq"]) is not int
         or not 0 <= box["baseline_seq"] <= journal["processed_seq"]
         or type(box["enqueued_seq"]) is not int
         or box["enqueued_seq"] != journal["processed_seq"]
+        or type(completed_seq(box)) is not int
+        or not box["baseline_seq"] <= completed_seq(box) <= box["enqueued_seq"]
         or (
             box["legacy_uncertain_seq"] is not None
             and (
@@ -290,10 +333,10 @@ def validate_outbox(journal: dict) -> None:
             )
         )
         or not isinstance(box["records"], list)
-        or len(box["records"]) != box["enqueued_seq"] - box["baseline_seq"]
+        or len(box["records"]) != box["enqueued_seq"] - completed_seq(box)
     ):
         raise OutboxStateError("outbox_structure")
-    for seq, record in enumerate(box["records"], box["baseline_seq"] + 1):
+    for seq, record in enumerate(box["records"], completed_seq(box) + 1):
         event = journal["events"][seq - 1]
         if (
             not isinstance(record, dict)
@@ -302,7 +345,7 @@ def validate_outbox(journal: dict) -> None:
         ):
             raise OutboxStateError("outbox_record_identity")
         if "summary_version" in record:
-            if box["version"] != 2:
+            if box["version"] not in {2, 3}:
                 raise OutboxStateError("outbox_summary_version")
             _validate_summary(record, event)
             continue
