@@ -850,14 +850,18 @@ def test_outbox_capacity_includes_all_remaining_progress(backup_env, journal_fac
 
 
 @pytest.mark.parametrize("failure", ["write", "interruption", "generation", "newer_state"])
-def test_compaction_publication_guards_and_exact_bytes(backup_env, journal_factory, monkeypatch, failure):
+@pytest.mark.parametrize("summarized", [False, True])
+def test_compaction_publication_guards_and_exact_bytes(backup_env, journal_factory, monkeypatch, failure, summarized):
     from notification_outbox import (
+        compact_outbox,
         enqueue,
         migrate_outbox,
     )
 
     journal = migrate_outbox(journal_factory(count=2), 0)
     journal = enqueue(journal, journal["events"][0], "empty audience", {}, 1000)
+    if summarized:
+        journal = compact_outbox(journal)
     storage.save_event_journal(journal)
     generation = storage.restorable_restore_generation()
     if failure == "generation":
@@ -873,6 +877,29 @@ def test_compaction_publication_guards_and_exact_bytes(backup_env, journal_facto
     with pytest.raises(KeyboardInterrupt if failure == "interruption" else storage.EventJournalStateError):
         storage.compact_event_journal(journal, expected_generation=generation)
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
+
+
+def test_retention_retires_summaries_with_absolute_completion_checkpoint(backup_env, journal_factory):
+    from notification_outbox import (
+        compact_outbox,
+        enqueue,
+        migrate_outbox,
+    )
+
+    journal = migrate_outbox(journal_factory(count=3), 0)
+    journal = enqueue(journal, journal["events"][0], "empty audience", {}, 1000)
+    journal = enqueue(journal, journal["events"][1], "pending", {10: "b" * 32}, 1000)
+    journal = compact_outbox(journal)
+    storage.save_event_journal(journal)
+    current = storage.compact_event_journal(
+        journal, expected_generation=storage.restorable_restore_generation(),
+    )
+    assert current["outbox"]["records"] == journal["outbox"]["records"][1:]
+    assert current["outbox"]["completed_seq"] == 1
+    assert current["outbox"]["baseline_seq"] == 0
+    assert current["processed_seq"] == current["outbox"]["enqueued_seq"] == 2
+    assert current["events"] == journal["events"]
+    assert storage.load_event_journal() == current
 
 
 def test_load_subscribers_strict_rejects_malformed_present_schedule(

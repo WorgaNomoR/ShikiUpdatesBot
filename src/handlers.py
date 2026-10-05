@@ -2375,14 +2375,14 @@ async def _enqueue_history_event(journal: dict, event: dict, text: str | None, g
 
 
 def _same_history_authority(current: dict | None, expected: dict) -> bool:
-    """Подтверждение получателя и сжатие не меняют принятую историю."""
+    """Подтверждение получателя и очистка outbox не меняют принятую историю."""
     return current is not None and {
         key: value for key, value in current.items() if key != "outbox"
     } == {key: value for key, value in expected.items() if key != "outbox"}
 
 
 def _save_history_progress(current: dict, candidate: dict, generation: int) -> dict:
-    """При нехватке места сначала сжать принятые данные, затем повторить публикацию."""
+    """При нехватке места освободить принятый outbox, затем повторить публикацию."""
     try:
         save_event_journal(candidate, admitting=True)
         return candidate
@@ -2393,8 +2393,13 @@ def _save_history_progress(current: dict, candidate: dict, generation: int) -> d
         if reclaimed == current:
             raise
     candidate = deepcopy(candidate)
-    candidate["outbox"]["version"] = reclaimed["outbox"]["version"]
-    candidate["outbox"]["records"][:len(reclaimed["outbox"]["records"])] = reclaimed["outbox"]["records"]
+    suffix = [
+        record for record in candidate["outbox"]["records"]
+        if record["seq"] > reclaimed["outbox"]["enqueued_seq"]
+    ]
+    candidate["outbox"] = deepcopy(reclaimed["outbox"])
+    candidate["outbox"]["records"].extend(suffix)
+    candidate["outbox"]["enqueued_seq"] = candidate["processed_seq"]
     save_event_journal(candidate, admitting=True)
     return candidate
 

@@ -75,7 +75,7 @@ async def _enqueue(factory, count=2):
 
 
 def _recipient(seq=1, cid="10"):
-    return storage.load_event_journal()["outbox"]["records"][seq - 1]["recipients"][cid]
+    return delivery._recipient(storage.load_event_journal(), seq, cid)
 
 
 @pytest.mark.asyncio
@@ -328,6 +328,116 @@ async def test_restore_during_dispatch_invalidates_ack(outbox_env, journal_facto
         r["status"] == "pending"
         for r in storage.load_event_journal()["outbox"]["records"][0]["recipients"].values()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["identical", "older", "unrelated", "legacy_quarter", "legacy_subscribers", "journal_current"])
+async def test_retained_restart_restore_keeps_pending_and_generation_guards(
+    outbox_env, journal_factory, kind,
+):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory)
+    journal = storage.load_event_journal()
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    begin_attempt(recipient, outbox_env[0])
+    complete_attempt(recipient, "confirmed_success", outbox_env[0])
+    pending = journal["outbox"]["records"][1]["recipients"]["10"]
+    begin_attempt(pending, outbox_env[0])
+    complete_attempt(pending, "uncertain", outbox_env[0], retry_delay=60)
+    storage.save_event_journal(journal)
+    older = _recovery()
+    async with storage.restorable_state_transaction():
+        retained = storage.compact_event_journal(
+            journal, expected_generation=storage.restorable_restore_generation(),
+        )
+    assert delivery._recipient(retained, 1, "10") is None
+    assert delivery._recipient(retained, 0, "10") is None
+    assert delivery._recipient(retained, 3, "10") is None
+    assert delivery._recipient(retained, 2, "10") == pending
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    bot.send_message.assert_not_awaited()
+    exact = storage.EVENT_JOURNAL_FILE.read_bytes()
+    outbox_env[0] += 60
+
+    async def send(**kwargs):
+        if kind == "identical":
+            raw = _recovery()
+        elif kind == "older":
+            raw = older
+        elif kind == "legacy_quarter":
+            raw = _zip({"stats_current.json": {"period": "2026-Q2", "events": []}})
+        elif kind == "legacy_subscribers":
+            raw = _zip({"subscribers.json": {"subscribers": {"10": "replacement"}}})
+        elif kind == "journal_current":
+            raw = _zip({
+                "event_journal.json": storage.load_event_journal(),
+                "stats_current.json": storage.load_stats_current(strict=True),
+            })
+        else:
+            raw = _zip({"user_alerts.json": {"enabled": False}})
+        await backup.restore_backup_zip(raw)
+
+    bot.send_message.side_effect = send
+    await delivery.dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    restored = storage.load_event_journal()
+    pending_restored = delivery._recipient(restored, 2, "10")
+    assert pending_restored["status"] == "pending"
+    assert pending_restored["attempts"][-1]["outcome"] == "uncertain"
+    assert restored["processed_seq"] == 2
+    if kind == "older":
+        assert "completed_seq" not in restored["outbox"]
+        assert pending_restored == pending
+    else:
+        assert restored["outbox"]["completed_seq"] == 1
+        assert len(pending_restored["attempts"]) == 2
+    bot.send_message.side_effect = None
+    outbox_env[0] = pending_restored["next_attempt_at"]
+    await delivery.dispatch_notifications(bot)
+    if kind == "legacy_subscribers":
+        bot.send_message.assert_awaited_once()
+        assert _recipient(2)["status"] == "cancelled"
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() != exact
+    else:
+        assert bot.send_message.await_count == 2
+        assert _recipient(2)["status"] == "delivered"
+        assert _recipient(2)["duplicate_possible"]
+
+
+@pytest.mark.asyncio
+async def test_prefix_retired_during_send_preserves_suffix_acknowledgement(
+    outbox_env, journal_factory, monkeypatch,
+):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory)
+    journal = storage.load_event_journal()
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    begin_attempt(recipient, outbox_env[0])
+    complete_attempt(recipient, "confirmed_success", outbox_env[0])
+    storage.save_event_journal(journal)
+    monkeypatch.setattr("notification_delivery.compact_event_journal", lambda journal, **k: journal)
+
+    async def send(**kwargs):
+        assert not storage._restorable_state_lock().locked()
+        async with storage.restorable_state_transaction():
+            current = storage.load_event_journal()
+            lease = deepcopy(current["outbox"]["records"][1])
+            retired = storage.compact_event_journal(
+                current, expected_generation=storage.restorable_restore_generation(),
+            )
+            assert retired["outbox"]["completed_seq"] == 1
+            assert retired["outbox"]["records"] == [lease]
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await delivery.dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    current = storage.load_event_journal()
+    assert current["outbox"]["completed_seq"] == 1
+    assert current["outbox"]["records"][0]["seq"] == 2
+    assert _recipient(2)["status"] == "delivered"
+    assert [a["outcome"] for a in _recipient(2)["attempts"]] == ["confirmed_success"]
 
 
 @pytest.mark.asyncio
@@ -609,7 +719,7 @@ async def test_compaction_write_failure_does_not_delay_due_delivery(
     failures = []
 
     def fail_compaction(path, payload):
-        if path == storage.EVENT_JOURNAL_FILE and "summary_version" in payload:
+        if path == storage.EVENT_JOURNAL_FILE and json.loads(payload)["outbox"].get("completed_seq") == 1:
             failures.append(True)
             assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
             raise OSError("compaction write")
@@ -699,8 +809,8 @@ async def test_compaction_and_admission_during_send_preserve_exact_ack_lease(
     consumer = asyncio.create_task(delivery.dispatch_notifications(bot))
     await started.wait()
     during = storage.load_event_journal()
-    assert during["outbox"]["records"][0]["summary_version"] == 1
-    lease = deepcopy(during["outbox"]["records"][1])
+    assert during["outbox"]["completed_seq"] == 1
+    lease = deepcopy(during["outbox"]["records"][0])
     assert lease["payload"] == pending["payload"]
     assert lease["expires_at"] == pending["expires_at"]
     assert len(lease["recipients"]["10"]["attempts"]) == 1
@@ -712,9 +822,10 @@ async def test_compaction_and_admission_during_send_preserve_exact_ack_lease(
     await consumer
     current = storage.load_event_journal()
     assert current["processed_seq"] == 3
-    assert current["outbox"]["records"][1]["recipients"]["10"]["status"] == "delivered"
-    assert len(current["outbox"]["records"][1]["recipients"]["10"]["attempts"]) == 1
-    assert current["outbox"]["records"][2]["history_id"] == 4
+    assert current["outbox"]["records"][0]["seq"] == 2
+    assert current["outbox"]["records"][0]["recipients"]["10"]["status"] == "delivered"
+    assert len(current["outbox"]["records"][0]["recipients"]["10"]["attempts"]) == 1
+    assert current["outbox"]["records"][1]["history_id"] == 4
 
 
 @pytest.mark.asyncio
@@ -737,8 +848,9 @@ async def test_enqueue_merges_ack_and_compaction_since_render_snapshot(
     await handlers.check_and_notify(AsyncMock(), set(), None)
     current = storage.load_event_journal()
     assert current["processed_seq"] == 2
-    assert current["outbox"]["records"][0]["outcomes"]["delivered"]["count"] == 1
-    assert current["outbox"]["records"][1]["recipients"]["10"]["status"] == "pending"
+    assert current["outbox"]["completed_seq"] == 1
+    assert current["outbox"]["records"][0]["seq"] == 2
+    assert current["outbox"]["records"][0]["recipients"]["10"]["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -755,15 +867,17 @@ async def test_terminal_compaction_during_inflight_send_rejects_stale_ack(outbox
             current = storage.compact_event_journal(
                 journal, expected_generation=storage.restorable_restore_generation(),
             )
-            assert current["outbox"]["records"][0]["outcomes"]["cancelled"]["possible_delivery"] == 1
+            assert current["outbox"]["completed_seq"] == 1
+            assert current["outbox"]["records"] == []
             assert lease["recipients"]["10"]["attempts"][-1]["outcome"] == "uncertain"
 
     bot = AsyncMock()
     bot.send_message.side_effect = send
     await delivery.dispatch_notifications(bot)
     bot.send_message.assert_awaited_once()
-    summary = storage.load_event_journal()["outbox"]["records"][0]
-    assert set(summary["outcomes"]) == {"cancelled"}
+    current = storage.load_event_journal()
+    assert current["outbox"]["records"] == []
+    assert current["outbox"]["completed_seq"] == 1
     storage.save_subscribers({})
     storage.save_subscribers({10: "resubscribed", 20: "new"})
     await delivery.dispatch_notifications(bot)

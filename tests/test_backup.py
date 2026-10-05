@@ -2527,6 +2527,33 @@ async def test_journal_restore_rollback_preserves_exact_damaged_bytes(backup_env
     assert storage.restorable_restore_generation() == generation
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2])
+async def test_legacy_journal_restore_over_retained_state_migrates_quietly(
+    backup_env, journal_factory, monkeypatch, version,
+):
+    from notification_outbox import retain_outbox
+
+    current = retain_outbox(_compacted_recovery(journal_factory))
+    storage.save_event_journal(current)
+    storage.save_stats_current(_journal_current(current), strict=True)
+    storage.save_subscribers({10: "active"})
+    legacy = journal_factory(count=2, processed=1)
+    if version == 2:
+        legacy.update(version=2, catchup=None)
+    await backup.restore_backup_zip(_recovery_zip(legacy, _journal_current(legacy)))
+    monkeypatch.setattr("handlers.asyncio.sleep", AsyncMock())
+    bot = AsyncMock()
+    await handlers._drain_history_journal(bot)
+    bot.send_message.assert_not_awaited()
+    recovered = storage.load_event_journal()
+    assert recovered["outbox"]["baseline_seq"] == 1
+    assert recovered["outbox"]["enqueued_seq"] == recovered["processed_seq"] == 2
+    assert [r["seq"] for r in recovered["outbox"]["records"]] == [2]
+    assert recovered["outbox"]["records"][0]["recipients"]["10"]["status"] == "pending"
+    assert not recovered["outbox"]["records"][0]["recipients"]["10"]["prior_possible"]
+
+
 def _compacted_recovery(journal_factory):
     from notification_outbox import (
         begin_attempt,
@@ -2548,8 +2575,9 @@ def _compacted_recovery(journal_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("plan_version", [1, 2, 3])
+@pytest.mark.parametrize("retained", [False, True])
 async def test_compacted_coherent_backup_preserves_plans_corrections_and_schedule(
-    backup_env, journal_factory, plan_version,
+    backup_env, journal_factory, plan_version, retained,
 ):
     from event_time_stats import (
         ensure_event_time,
@@ -2559,6 +2587,9 @@ async def test_compacted_coherent_backup_preserves_plans_corrections_and_schedul
     )
 
     journal = _compacted_recovery(journal_factory)
+    if retained:
+        from notification_outbox import retain_outbox
+        journal = retain_outbox(journal)
     cur = _journal_current(journal, applied=0)
     ensure_event_time(cur)
     for seq in (1, 2):
@@ -2599,14 +2630,18 @@ async def test_compacted_coherent_backup_preserves_plans_corrections_and_schedul
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["identical", "older", "full", "unrelated", "legacy"])
+@pytest.mark.parametrize("retained", [False, True])
 async def test_restore_invalidates_compaction_snapshot_and_preserves_authority(
-    backup_env, journal_factory, kind,
+    backup_env, journal_factory, kind, retained,
 ):
     from notification_outbox import enqueue
 
     journal = _compacted_recovery(journal_factory)
+    if retained:
+        from notification_outbox import retain_outbox
+        journal = retain_outbox(journal)
     # Добавляем ещё одну compactable decision; предыдущая summary уже опубликована.
-    recipient = journal["outbox"]["records"][1]["recipients"]["10"]
+    recipient = journal["outbox"]["records"][-1]["recipients"]["10"]
     recipient.update(status="cancelled", reason="ineligible", terminal_at=1001)
     storage.save_event_journal(journal)
     cur = _journal_current(journal)
@@ -2640,17 +2675,24 @@ async def test_restore_invalidates_compaction_snapshot_and_preserves_authority(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["invalid", "oversized", "publication"])
+@pytest.mark.parametrize("retained", [False, True])
 async def test_compacted_import_rejection_and_exact_byte_rollback(
-    backup_env, journal_factory, monkeypatch, damage,
+    backup_env, journal_factory, monkeypatch, damage, retained,
 ):
     journal = _compacted_recovery(journal_factory)
+    if retained:
+        from notification_outbox import retain_outbox
+        journal = retain_outbox(journal)
     cur = _journal_current(journal)
     before_journal = b"\xffbroken journal\r\n"
     before_current = b"{ broken quarter\r\n"
     storage.EVENT_JOURNAL_FILE.write_bytes(before_journal)
     storage.STATS_CURRENT_FILE.write_bytes(before_current)
     if damage == "invalid":
-        journal["outbox"]["records"][0]["outcomes"]["pending"] = {"count": 1}
+        if retained:
+            journal["outbox"]["completed_seq"] = True
+        else:
+            journal["outbox"]["records"][0]["outcomes"]["pending"] = {"count": 1}
     elif damage == "oversized":
         monkeypatch.setattr("backup._IMPORT_MEMBER_MAX_BYTES", len(json.dumps(journal).encode()) - 1)
     else:

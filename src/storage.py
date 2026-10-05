@@ -53,9 +53,9 @@ from event_time_stats import (
 )
 from notification_outbox import (
     OutboxStateError,
-    compact_outbox,
     parse_subscriber_payload,
     progress_reserve,
+    retain_outbox,
     validate_memberships,
 )
 from report_plan import (
@@ -212,8 +212,8 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
 
 
 def compact_event_journal(journal: dict, *, expected_generation: int) -> dict:
-    """Под общей транзакцией: ограниченно сжать свежий журнал отдельной публикацией."""
-    candidate = compact_outbox(journal)
+    """Под общей транзакцией: удалить префикс/сжать свежий журнал одной публикацией."""
+    candidate = retain_outbox(journal)
     if candidate == journal:
         return journal
     if (

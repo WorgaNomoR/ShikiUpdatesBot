@@ -676,7 +676,8 @@ async def test_real_enqueue_capacity_after_projection_recovers_without_reproject
     await dispatch_notifications(bot)
     await dispatch_notifications(bot)
     compacted = storage.load_event_journal()
-    assert compacted["outbox"]["records"][0]["summary_version"] == 1
+    assert compacted["outbox"]["records"] == []
+    assert compacted["outbox"]["completed_seq"] == 1
     assert compacted["events"] == admitted["events"]
     assert compacted["baseline_ids"] == admitted["baseline_ids"]
     assert compacted["processed_seq"] == 1
@@ -705,8 +706,9 @@ async def test_real_enqueue_capacity_after_projection_recovers_without_reproject
         assert storage.STATS_CURRENT_FILE.read_bytes() == projected
         recovered = storage.load_event_journal()
         assert recovered["processed_seq"] == recovered["outbox"]["enqueued_seq"] == 2
-        assert [r["seq"] for r in recovered["outbox"]["records"]] == [1, 2]
-        assert recovered["outbox"]["records"][1]["payload"]["text"] == "y" * 7000
+        assert [r["seq"] for r in recovered["outbox"]["records"]] == [2]
+        assert recovered["outbox"]["completed_seq"] == 1
+        assert recovered["outbox"]["records"][0]["payload"]["text"] == "y" * 7000
         await handlers._drain_history_journal(bot)
         monkeypatch.setattr("handlers.project_event", project)
         monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q3")
@@ -723,3 +725,67 @@ async def test_real_enqueue_capacity_after_projection_recovers_without_reproject
     if not fits_after_compaction:
         assert storage.STATS_CURRENT_FILE.read_bytes() == projected
     assert bot.send_message.await_count >= 1
+
+
+@pytest.mark.parametrize("boundary", ["enqueue", "admission"])
+@pytest.mark.parametrize("failure", [None, "write", "interruption", "decision_write", "decision_interruption"])
+def test_capacity_retry_merges_retired_prefix_by_absolute_seq(
+    backup_env, journal_factory, monkeypatch, boundary, failure,
+):
+    from event_journal_schema import journal_json
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+        retain_outbox,
+    )
+
+    journal = migrate_outbox(journal_factory(count=3), 0)
+    journal = enqueue(journal, journal["events"][0], "x" * 7000, {}, 1000)
+    journal = enqueue(journal, journal["events"][1], "pending", {10: "b" * 32}, 1000)
+    if boundary == "enqueue":
+        candidate = enqueue(journal, journal["events"][2], "new" * 1000, {10: "b" * 32}, 1100)
+    else:
+        candidate = deepcopy(journal)
+        event = deepcopy(journal["events"][-1])
+        event.update(seq=4, history_id=5, description="new" * 1500)
+        candidate["events"].append(event)
+    storage.save_event_journal(journal)
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", len(original) + progress_reserve(journal) + 4096 + 500)
+    with pytest.raises(EventJournalStateError, match="journal_capacity"):
+        storage.save_event_journal(candidate, admitting=True)
+    write = storage._atomic_write
+
+    def fail(path, payload):
+        if path == storage.EVENT_JOURNAL_FILE and json.loads(payload).get("outbox", {}).get("completed_seq") == 1:
+            state = json.loads(payload)
+            decision = state["processed_seq"] == 3 if boundary == "enqueue" else len(state["events"]) == 4
+            if failure in {"decision_write", "decision_interruption"} and not decision:
+                return write(path, payload)
+            if failure in {"interruption", "decision_interruption"}:
+                raise asyncio.CancelledError
+            if failure in {"write", "decision_write"}:
+                raise OSError("retention publication")
+        return write(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", fail)
+        if failure:
+            with pytest.raises(asyncio.CancelledError if "interruption" in failure else EventJournalStateError):
+                handlers._save_history_progress(journal, candidate, storage.restorable_restore_generation())
+            if failure.startswith("decision_"):
+                assert storage.load_event_journal() == retain_outbox(journal)
+            else:
+                assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+        else:
+            result = handlers._save_history_progress(journal, candidate, storage.restorable_restore_generation())
+            assert result["outbox"]["completed_seq"] == 1
+            assert result["outbox"]["records"][0] == journal["outbox"]["records"][1]
+            if boundary == "enqueue":
+                assert result["processed_seq"] == 3
+                assert [r["seq"] for r in result["outbox"]["records"]] == [2, 3]
+                assert result["outbox"]["records"][1] == candidate["outbox"]["records"][2]
+            else:
+                assert result["processed_seq"] == 2
+                assert result["events"] == candidate["events"]
+            assert storage.EVENT_JOURNAL_FILE.read_bytes() == journal_json(result).encode()

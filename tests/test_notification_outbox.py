@@ -19,11 +19,13 @@ from notification_outbox import (
     begin_attempt,
     compact_outbox,
     complete_attempt,
+    completed_seq,
     enqueue,
     finish,
     migrate_outbox,
     possible_delivery,
     progress_reserve,
+    retain_outbox,
     validate_memberships,
 )
 
@@ -235,6 +237,14 @@ def test_compaction_retains_honest_outcome_and_duplicate_counts(journal_factory,
     assert len(journal_json(compacted).encode()) + progress_reserve(compacted) <= len(journal_json(before).encode()) + progress_reserve(before)
     assert compact_outbox(compacted) is compacted
     assert parse_event_journal(journal_json(compacted).encode()) == compacted
+    retired = retain_outbox(journal)
+    assert retain_outbox(compacted) == retired
+    assert retired["outbox"]["completed_seq"] == 1
+    assert retired["outbox"]["records"] == []
+    assert "outcomes" not in retired["outbox"]
+    assert retired["events"] == before["events"]
+    assert retired["baseline_ids"] == before["baseline_ids"]
+    assert parse_event_journal(journal_json(retired).encode()) == retired
 
 
 def test_compaction_preserves_mixed_record_and_all_pending_budgets(journal_factory):
@@ -251,6 +261,7 @@ def test_compaction_preserves_mixed_record_and_all_pending_budgets(journal_facto
     assert compact_outbox(journal) is journal
     assert journal_json(journal) == before
     assert progress_reserve(journal) == reserve
+    assert retain_outbox(journal) is journal
 
 
 @pytest.mark.parametrize("silent", [True, False])
@@ -263,6 +274,10 @@ def test_compaction_silent_and_empty_audiences_remain_completed(journal_factory,
     assert result["processed_seq"] == result["outbox"]["enqueued_seq"] == 1
     assert result["outbox"]["records"][0]["outcomes"] == {}
     validate_event_journal(result)
+    retired = retain_outbox(result)
+    assert retired["outbox"]["records"] == []
+    assert retired["outbox"]["completed_seq"] == 1
+    assert retired["events"] == journal["events"]
 
 
 def test_compaction_inherited_possible_broadcast_survives_terminal_summary(journal_factory):
@@ -273,6 +288,10 @@ def test_compaction_inherited_possible_broadcast_survives_terminal_summary(journ
     complete_attempt(recipient, "confirmed_success", 1001)
     counts = compact_outbox(journal)["outbox"]["records"][0]["outcomes"]["delivered"]
     assert counts == {"count": 1, "possible_delivery": 1, "duplicate_possible": 1}
+    result = retain_outbox(journal)
+    assert result["outbox"]["legacy_uncertain_seq"] == 1
+    assert result["outbox"]["records"] == []
+    validate_event_journal(result)
 
 
 def test_compaction_is_bounded_and_keeps_record_order(journal_factory):
@@ -341,3 +360,107 @@ def test_compaction_keeps_silent_legacy_baselines_and_unfinished_acquisition(acq
     journal = migrate_outbox(acquisition_factory(), 0)
     before = deepcopy(journal)
     assert compact_outbox(journal) == before
+    assert retain_outbox(journal) is journal
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_retention_quiet_baseline_and_absolute_enqueue(journal_factory, version):
+    journal = migrate_outbox(journal_factory(count=4, processed=2), 3)
+    journal["outbox"]["version"] = version
+    journal = enqueue(journal, journal["events"][2], "legacy uncertainty", {}, 1000)
+    result = retain_outbox(journal)
+    assert result["outbox"]["baseline_seq"] == 2
+    assert result["outbox"]["completed_seq"] == 3
+    assert result["outbox"]["legacy_uncertain_seq"] == 3
+    result = enqueue(result, result["events"][3], "next", {10: "b" * 32}, 1100)
+    assert result["outbox"]["records"][0]["seq"] == 4
+    assert not result["outbox"]["records"][0]["recipients"]["10"]["prior_possible"]
+    assert result["processed_seq"] == 4
+    assert parse_event_journal(journal_json(result).encode()) == result
+
+
+@pytest.mark.parametrize("summarized", [False, True])
+def test_retention_is_bounded_idempotent_and_non_increasing(journal_factory, summarized):
+    journal = migrate_outbox(journal_factory(count=130), 0)
+    for event in journal["events"]:
+        journal = enqueue(journal, event, "empty audience", {}, 1000)
+    if summarized:
+        journal = compact_outbox(compact_outbox(journal))
+    before = deepcopy(journal)
+    once = retain_outbox(journal)
+    assert journal == before
+    assert once["outbox"]["completed_seq"] == 128
+    assert [r["seq"] for r in once["outbox"]["records"]] == [129, 130]
+    assert len(journal_json(once).encode()) + progress_reserve(once) <= len(journal_json(before).encode()) + progress_reserve(before)
+    twice = retain_outbox(once)
+    assert twice["outbox"]["records"] == []
+    assert twice["outbox"]["completed_seq"] == twice["processed_seq"] == 130
+    assert retain_outbox(twice) is twice
+
+
+def _retention_suffix(factory):
+    journal = migrate_outbox(factory(count=4), 0)
+    for event in journal["events"]:
+        memberships = {10: "b" * 32, 20: "c" * 32} if event["seq"] == 2 else {}
+        journal = enqueue(journal, event, "frozen", memberships, 1000)
+    mixed = journal["outbox"]["records"][1]["recipients"]
+    finish(mixed["20"], "cancelled", "ineligible", 1001)
+    begin_attempt(mixed["10"], 1000)
+    complete_attempt(mixed["10"], "uncertain", 1001, retry_delay=300)
+    return journal
+
+
+def test_pending_barrier_preserves_full_record_and_shared_maintenance_budget(journal_factory):
+    journal = _retention_suffix(journal_factory)
+    exact = json.dumps(journal["outbox"]["records"][1], sort_keys=True)
+    result = retain_outbox(journal, limit=2)
+    assert completed_seq(result["outbox"]) == 1
+    assert json.dumps(result["outbox"]["records"][0], sort_keys=True) == exact
+    assert result["outbox"]["records"][1]["summary_version"] == 1
+    assert "summary_version" not in result["outbox"]["records"][2]
+    assert progress_reserve(result) == progress_reserve(journal)
+    twice = retain_outbox(result)
+    assert twice["outbox"]["version"] == 3
+    assert completed_seq(twice["outbox"]) == 1
+    assert [r["seq"] for r in twice["outbox"]["records"]] == [2, 3, 4]
+    assert retain_outbox(twice) is twice
+
+
+@pytest.mark.parametrize("damage", [
+    "missing_checkpoint", "bool_checkpoint", "negative", "before_baseline", "after_enqueue",
+    "unsupported", "legacy_extra_checkpoint", "retained_prefix", "missing_suffix", "seq",
+    "history_id", "missing_summary", "pending_summary", "extra_outcomes",
+])
+def test_retained_runtime_import_schema_rejects_inconsistent_checkpoint(journal_factory, damage):
+    journal = retain_outbox(_retention_suffix(journal_factory))
+    box = journal["outbox"]
+    if damage == "missing_checkpoint":
+        del box["completed_seq"]
+    elif damage == "bool_checkpoint":
+        box["completed_seq"] = True
+    elif damage == "negative":
+        box["completed_seq"] = -1
+    elif damage == "before_baseline":
+        box["baseline_seq"] = 2
+    elif damage == "after_enqueue":
+        box["completed_seq"] = 5
+    elif damage == "unsupported":
+        box["version"] = 4
+    elif damage == "legacy_extra_checkpoint":
+        box["version"] = 2
+    elif damage == "retained_prefix":
+        box["completed_seq"] = 2
+    elif damage == "missing_suffix":
+        box["records"].pop()
+    elif damage == "seq":
+        box["records"][0]["seq"] = 1
+    elif damage == "history_id":
+        box["records"][0]["history_id"] = 2
+    elif damage == "missing_summary":
+        del box["records"][1]["summary_version"]
+    elif damage == "pending_summary":
+        box["records"][1]["outcomes"] = {"pending": {"count": 1}}
+    else:
+        box["outcomes"] = {"delivered": 1}
+    with pytest.raises(EventJournalStateError):
+        parse_event_journal(json.dumps(journal).encode())
