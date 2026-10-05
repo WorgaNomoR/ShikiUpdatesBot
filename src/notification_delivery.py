@@ -126,14 +126,15 @@ def _next_due(journal, now):
     return record, cid
 
 
-async def dispatch_notifications(bot):
-    """Одна очередь consumer на loop; restore не ждёт Telegram или pacing."""
+async def dispatch_notifications(bot) -> bool:
+    """Одна порция; True просит продолжение, restore не ждёт Telegram."""
     lock = _locks.setdefault(asyncio.get_running_loop(), asyncio.Lock())
     async with lock:
         try:
             return await _dispatch(bot)
         except _DeliveryChanged:
             log.info("Уведомления: restore остановил старую попытку.")
+            return True
 
 
 class _DeliveryChanged(RuntimeError):
@@ -145,7 +146,7 @@ async def _dispatch(bot):
     async with restorable_state_transaction():
         journal = load_event_journal()
         if journal is None or journal["version"] != 3:
-            return
+            return False
         validate_recovery_set(journal, load_stats_current(strict=True))
         generation = restorable_restore_generation()
         try:
@@ -154,7 +155,7 @@ async def _dispatch(bot):
             if str(exc) == "compaction_changed":
                 journal = load_event_journal()
                 if journal is None or journal["version"] != 3:
-                    return
+                    return False
                 validate_recovery_set(journal, load_stats_current(strict=True))
                 generation = restorable_restore_generation()
             elif str(exc) != "journal_write":
@@ -177,7 +178,7 @@ async def _dispatch(bot):
             due = _next_due(journal, now)
             remaining = DISPATCH_SECONDS - (time.monotonic() - started)
             if due is None or remaining < REQUEST_SECONDS:
-                return
+                return _has_pending(journal)
             record, cid = due
             seq = record["seq"]
             recipient = record["recipients"][cid]
@@ -242,3 +243,13 @@ async def _dispatch(bot):
         remaining = DISPATCH_SECONDS - (time.monotonic() - started)
         if remaining > 0:
             await asyncio.sleep(min(0.3, remaining))
+    return _has_pending(journal)
+
+
+def _has_pending(journal: dict) -> bool:
+    """Подсказка планировщику; следующая порция заново читает authority."""
+    return any(
+        recipient["status"] == "pending"
+        for record in journal["outbox"]["records"]
+        for recipient in record.get("recipients", {}).values()
+    )
