@@ -61,6 +61,7 @@ async def test_delivery_error_retries_without_resetting_deadline(wait_clock, mon
 
     async def dispatch(_bot):
         starts.append(wait_clock[0])
+        wait_clock[0] += 0.25
         raise OSError("publication")
 
     diagnostic = AsyncMock()

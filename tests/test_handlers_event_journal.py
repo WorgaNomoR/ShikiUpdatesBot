@@ -508,7 +508,8 @@ async def test_corrupt_journal_suspends_history_keeps_recovery_and_resumes(histo
     monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
 
     async def sleep(delay):
-        if delay >= handlers._NOTIFICATION_INTERVAL:
+        # Стартовые паузы обнулены; время порции вычитается из ожидания.
+        if delay > 0:
             raise asyncio.CancelledError
 
     monkeypatch.setattr("handlers.asyncio.sleep", sleep)
