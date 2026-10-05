@@ -693,7 +693,7 @@ async def test_polling_dispatches_accepted_work_despite_acquisition_failure(outb
     monkeypatch.setattr("handlers._backup_after_subscription", AsyncMock())
     monkeypatch.setattr("handlers._weekly_backup_if_due", AsyncMock(side_effect=lambda bot, cur: cur))
     async def sleep(delay):
-        if delay == handlers.CHECK_INTERVAL:
+        if delay >= handlers._NOTIFICATION_INTERVAL:
             raise asyncio.CancelledError()
     monkeypatch.setattr("handlers.asyncio.sleep", sleep)
     bot = AsyncMock()
@@ -701,6 +701,31 @@ async def test_polling_dispatches_accepted_work_despite_acquisition_failure(outb
         await handlers.polling_loop(bot)
     assert _recipient()["status"] == "delivered"
     assert storage.load_event_journal()["processed_seq"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audience", [20, 100, 500, 1000])
+async def test_dispatch_continuation_tracks_pending_authority(outbox_env, journal_factory, audience):
+    storage.save_subscribers({cid: str(cid) for cid in range(1, audience + 1)})
+    await _enqueue(journal_factory, count=1)
+    bot = AsyncMock()
+    assert await delivery.dispatch_notifications(bot) is (audience > 20)
+    assert bot.send_message.await_count == 20
+    recipients = storage.load_event_journal()["outbox"]["records"][0]["recipients"]
+    assert sum(r["status"] == "pending" for r in recipients.values()) == audience - 20
+
+
+@pytest.mark.asyncio
+async def test_summaries_and_legacy_state_need_no_continuation(outbox_env, journal_factory):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=1)
+    bot = AsyncMock()
+    assert await delivery.dispatch_notifications(bot) is False
+    assert await delivery.dispatch_notifications(bot) is False
+    assert storage.load_event_journal()["outbox"]["completed_seq"] == 1
+    storage.save_event_journal(journal_factory(count=0))
+    assert await delivery.dispatch_notifications(bot) is False
+    bot.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

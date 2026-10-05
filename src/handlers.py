@@ -2835,14 +2835,35 @@ async def polling_loop(bot: Bot) -> None:
                         "Не удалось отправить уведомление владельцу об ошибке: %s",
                         notify_error,
                     )
-        # Уже принятые обязательства не зависят от результата нового acquisition.
-        # Telegram, ожидание и диагностика никогда не удерживают state lock.
+        await _wait_and_dispatch_notifications(bot)
+
+
+_NOTIFICATION_INTERVAL = 60
+
+
+async def _wait_and_dispatch_notifications(bot: Bot) -> None:
+    """Обслуживать очередь в паузе, не перезапуская срок следующего acquisition."""
+    deadline = time.monotonic() + CHECK_INTERVAL
+    while True:
+        started = time.monotonic()
         try:
-            await dispatch_notifications(bot)
+            pending = await dispatch_notifications(bot)
         except Exception as error:
             log.warning("Уведомления: consumer приостановлен (%s).", type(error).__name__)
             await _journal_diagnostic(bot, delivery=True)
-        await asyncio.sleep(CHECK_INTERVAL)
+            pending = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if not pending:
+            await asyncio.sleep(remaining)
+            return
+        # Даже после медленной порции отдаём управление event loop; уже
+        # начатый bounded dispatch не отменяем по сроку acquisition.
+        delay = min(remaining, max(1.0, _NOTIFICATION_INTERVAL - (time.monotonic() - started)))
+        await asyncio.sleep(delay)
+        if delay == remaining or time.monotonic() >= deadline:
+            return
 
 
 # ───────────────────────────────────────────────────────────────

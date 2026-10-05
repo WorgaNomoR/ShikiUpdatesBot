@@ -508,7 +508,7 @@ async def test_corrupt_journal_suspends_history_keeps_recovery_and_resumes(histo
     monkeypatch.setattr("handlers.load_seen_favourites", lambda: {"animes_10"})
 
     async def sleep(delay):
-        if delay == handlers.CHECK_INTERVAL:
+        if delay >= handlers._NOTIFICATION_INTERVAL:
             raise asyncio.CancelledError
 
     monkeypatch.setattr("handlers.asyncio.sleep", sleep)

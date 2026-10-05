@@ -197,7 +197,7 @@ async def test_polling_startup_waits_and_other_duties_continue(acquisition_env, 
     monkeypatch.setattr("handlers._weekly_backup_if_due", weekly)
 
     async def sleep(delay):
-        if delay == handlers.CHECK_INTERVAL:
+        if delay >= handlers._NOTIFICATION_INTERVAL:
             raise asyncio.CancelledError
 
     monkeypatch.setattr("handlers.asyncio.sleep", sleep)

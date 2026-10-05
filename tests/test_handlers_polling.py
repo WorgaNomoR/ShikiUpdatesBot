@@ -1997,7 +1997,7 @@ async def test_polling_quarter_failure_keeps_owner_recovery_and_retries(backup_e
 
     async def sleep(seconds):
         nonlocal waits
-        if seconds != handlers.CHECK_INTERVAL:
+        if seconds < handlers._NOTIFICATION_INTERVAL:
             return
         waits += 1
         if waits == 1:
