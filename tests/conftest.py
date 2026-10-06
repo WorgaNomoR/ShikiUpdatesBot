@@ -136,6 +136,36 @@ def journal_factory():
 
 
 @pytest.fixture
+def outbox_capacity_factory(journal_factory):
+    """Повторяемый контроль ёмкости штатным logical serializer, без I/O."""
+    from event_journal_schema import journal_json
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+    )
+    from notification_progress_schema import compact_json
+
+    def factory(audience=7000, count=1):
+        journal = journal_factory(count=count)
+        journal["profile"] = "capacity-probe"
+        for event in journal["events"]:
+            padding = 494 - len(compact_json(event).encode("utf-8"))
+            assert padding >= 0
+            event["description"] += "x" * padding
+            assert len(compact_json(event).encode("utf-8")) == 494
+        journal = migrate_outbox(journal, 0)
+        for event in journal["events"]:
+            journal = enqueue(
+                journal, event, "x" * 500,
+                {100000000 + i: "b" * 32 for i in range(audience)}, 1000,
+            )
+        journal_json(journal)
+        return journal
+
+    return factory
+
+
+@pytest.fixture
 def acquisition_factory(journal_factory):
     """Recovery-набор с отдельными staged seq и неизменной принятой baseline."""
     def factory():

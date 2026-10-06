@@ -3,6 +3,7 @@
 """Формат обязательств, честные исходы и строгие устойчивые budgets."""
 
 import json
+import math
 from copy import deepcopy
 
 import pytest
@@ -14,6 +15,7 @@ from event_journal_schema import (
     validate_event_journal,
 )
 from notification_outbox import (
+    BACKOFF,
     LIFETIME,
     MAX_ATTEMPTS,
     begin_attempt,
@@ -87,6 +89,105 @@ def test_remaining_growth_reserve_shrinks_without_resetting_budget(journal_facto
     assert recipient["reason"] == "attempt_budget"
     assert progress_reserve(journal) < before
     validate_event_journal(journal)
+
+
+def test_capacity_control_fits_with_bounded_reserve(outbox_capacity_factory):
+    journal = outbox_capacity_factory()
+    actual = len(journal_json(journal).encode("utf-8"))
+    assert actual == 1_408_450
+    assert progress_reserve(journal) == 441 * 7000
+    assert actual + progress_reserve(journal) <= 8 * 1024 * 1024
+    assert parse_event_journal(journal_json(journal).encode("utf-8")) == journal
+
+
+@pytest.mark.parametrize("count", range(MAX_ATTEMPTS + 1))
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("outcome", ["uncertain", "not_dispatched", "confirmed_rejection"])
+@pytest.mark.parametrize("created", [0, 1000, 10**12 - LIFETIME])
+def test_future_recipient_transitions_never_increase_reserved_budget(
+    journal_factory, count, inherited, outcome, created,
+):
+    journal = migrate_outbox(journal_factory(), int(inherited))
+    journal = enqueue(journal, journal["events"][0], "frozen", {10: "b" * 32}, created)
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    for _ in range(count):
+        begin_attempt(recipient, created)
+        recipient["attempts"][-1]["outcome"] = outcome
+
+    def budget(state):
+        return len(journal_json(state).encode("utf-8")) + progress_reserve(state)
+
+    ceiling = budget(journal)
+
+    def check(change):
+        candidate = deepcopy(journal)
+        change(candidate["outbox"]["records"][0]["recipients"]["10"])
+        assert budget(candidate) <= ceiling
+        # Реальный parser обязан принять transition, не только size helper.
+        assert parse_event_journal(journal_json(candidate).encode()) == candidate
+
+    for now in [created, float(created), 10**12 - 0.0001, 10**12]:
+        check(lambda r: finish(r, "cancelled", "ineligible", now))
+        check(lambda r: finish(r, "expired", "lifetime", max(now, created + LIFETIME)))
+        if count == MAX_ATTEMPTS:
+            check(lambda r: finish(r, "expired", "attempt_budget", now))
+        if count:
+            for result in ["confirmed_success", "confirmed_rejection", "not_dispatched", "uncertain"]:
+                delay = None if result in {"confirmed_success", "confirmed_rejection"} else 0
+                retry_now = now if delay is None else min(now, 10**12 - BACKOFF[-1])
+                check(lambda r: complete_attempt(r, result, retry_now, retry_delay=delay))
+            check(lambda r: (
+                complete_attempt(r, "confirmed_rejection", now),
+                finish(r, "rejected", "forbidden", now),
+            ))
+    # Marker и ack повторяются до исходного budget, включая шестой marker.
+    for _ in range(count, MAX_ATTEMPTS):
+        previous = budget(journal)
+        begin_attempt(recipient, created)
+        assert budget(journal) <= previous <= ceiling
+        complete_attempt(recipient, "uncertain", created, retry_delay=0)
+        assert budget(journal) <= previous
+    assert recipient["status"] == ("pending" if count == MAX_ATTEMPTS else "expired")
+
+
+@pytest.mark.parametrize("due", [
+    0, -0.0, 5e-324, 1.2345678901234568e-300, 0.00012345678901234567,
+    0.0001, 0.00001, 1000, 1000.0, 10**12 - 0.0001, 10**12, float(10**12),
+])
+def test_reserve_covers_numeric_json_boundaries_and_latest_marker(journal_factory, due):
+    journal = migrate_outbox(journal_factory(), 1)
+    journal = enqueue(journal, journal["events"][0], "frozen", {10: "b" * 32}, 0)
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    for _ in range(MAX_ATTEMPTS):
+        begin_attempt(recipient, 0)
+    recipient["next_attempt_at"] = due
+    before = len(journal_json(journal).encode()) + progress_reserve(journal)
+    # Последняя публикация ещё uncertain: attempts больше не добавятся, ack растёт.
+    complete_attempt(recipient, "confirmed_rejection", float(10**12))
+    assert len(journal_json(journal).encode()) <= before
+    assert progress_reserve(journal) == 0
+
+
+@pytest.mark.parametrize("created,attempt_at", [
+    (0, -0.0), (0, 5e-324), (0, 1.2345678901234568e-300),
+    (0, 0.00012345678901234567), (0, 123456.78901234567),
+    (10**12 - LIFETIME, math.nextafter(float(10**12), 0)),
+])
+def test_reserved_slots_cover_float_attempt_times(journal_factory, created, attempt_at):
+    journal = migrate_outbox(journal_factory(), 0)
+    journal = enqueue(journal, journal["events"][0], "frozen", {10: "b" * 32}, created)
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    ceiling = len(journal_json(journal).encode()) + progress_reserve(journal)
+    for _ in range(MAX_ATTEMPTS):
+        begin_attempt(recipient, attempt_at)
+        # Проверяем длинный attempt.at вместе с предельным допустимым due.
+        recipient["next_attempt_at"] = float(10**12)
+        current = len(journal_json(journal).encode()) + progress_reserve(journal)
+        assert current <= ceiling
+        ceiling = current
+    complete_attempt(recipient, "confirmed_success", float(10**12))
+    assert len(journal_json(journal).encode()) <= ceiling
+    assert parse_event_journal(journal_json(journal).encode()) == journal
 
 
 @pytest.mark.parametrize(

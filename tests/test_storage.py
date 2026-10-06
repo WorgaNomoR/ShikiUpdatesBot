@@ -850,6 +850,80 @@ def test_outbox_capacity_includes_all_remaining_progress(backup_env, journal_fac
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
 
 
+@pytest.mark.parametrize("phase", ["marker", "ack", "terminal"])
+@pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("after", [False, True])
+def test_bounded_capacity_survives_every_publication_and_restart(
+    backup_env, outbox_capacity_factory, monkeypatch, phase, interrupt, after,
+):
+    from event_journal_schema import journal_json
+    from notification_outbox import (
+        MAX_ATTEMPTS,
+        begin_attempt,
+        complete_attempt,
+        finish,
+    )
+    journal = outbox_capacity_factory(audience=20)
+    monkeypatch.setattr("storage.SHIKI_USER", journal["profile"])
+    limit = len(journal_json(journal).encode()) + 441 * 20
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", limit)
+    storage.save_event_journal(journal)
+    history_bytes = storage.EVENT_JOURNAL_FILE.read_bytes()
+    write = storage._atomic_write
+    failed = False
+
+    def publish(candidate, boundary):
+        nonlocal failed
+        progress = storage.notification_progress_file()
+        original = progress.read_bytes()
+
+        def fail(path, payload):
+            if path == progress:
+                if after:
+                    write(path, payload)
+                if interrupt:
+                    raise KeyboardInterrupt
+                raise OSError("publication")
+            write(path, payload)
+
+        if boundary == phase and not failed:
+            with monkeypatch.context() as patch:
+                patch.setattr("storage._atomic_write", fail)
+                with pytest.raises(KeyboardInterrupt if interrupt else storage.EventJournalStateError):
+                    storage.save_event_journal(candidate)
+            if not after:
+                assert progress.read_bytes() == original
+            else:
+                assert storage.load_event_journal() == candidate
+            failed = True
+        storage.save_event_journal(candidate)
+        # Только опубликованная authority, включая cold history после restart.
+        monkeypatch.setattr("storage._journal_history_cache", None)
+        assert storage.load_event_journal() == candidate
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == history_bytes
+        return storage.load_event_journal()
+
+    for index in range(MAX_ATTEMPTS):
+        journal = storage.load_event_journal()
+        recipient = journal["outbox"]["records"][0]["recipients"]["100000000"]
+        now = recipient["next_attempt_at"]
+        begin_attempt(recipient, now)
+        journal = publish(journal, "marker")
+        recipient = journal["outbox"]["records"][0]["recipients"]["100000000"]
+        if index < MAX_ATTEMPTS - 1:
+            complete_attempt(recipient, "uncertain", now, retry_delay=0)
+            journal = publish(journal, "ack")
+        else:
+            finish(recipient, "expired", "attempt_budget", now)
+            journal = publish(journal, "terminal")
+    assert failed
+    assert journal["processed_seq"] == journal["outbox"]["enqueued_seq"] == 1
+    recipient = journal["outbox"]["records"][0]["recipients"]["100000000"]
+    assert recipient["status"] == "expired"
+    assert len(recipient["attempts"]) == MAX_ATTEMPTS
+    assert all(a["outcome"] == "uncertain" for a in recipient["attempts"])
+
+
 @pytest.mark.parametrize("failure", ["write", "interruption", "generation", "newer_state"])
 @pytest.mark.parametrize("summarized", [False, True])
 def test_compaction_publication_guards_and_exact_bytes(backup_env, journal_factory, monkeypatch, failure, summarized):

@@ -2872,6 +2872,57 @@ def _split_recovery_members(journal_factory):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("split", [False, True])
+async def test_capacity_control_coherent_restore_and_exact_rollback(
+    backup_env, outbox_capacity_factory, monkeypatch, split,
+):
+    from notification_progress_schema import (
+        compact_json,
+        history_document,
+        parse_recovery_journal,
+        progress_document,
+    )
+    journal = outbox_capacity_factory()
+    monkeypatch.setattr("backup.SHIKI_USER", journal["profile"])
+    monkeypatch.setattr("storage.SHIKI_USER", journal["profile"])
+    members = {"stats_current.json": json.dumps(_journal_current(journal))}
+    if split:
+        members["event_journal.json"] = compact_json(history_document(journal, "d" * 32))
+        members["notification_progress.json"] = compact_json(progress_document(journal, "d" * 32))
+    else:
+        members["event_journal.json"] = compact_json(journal)
+    originals = {
+        storage.EVENT_JOURNAL_FILE: b"\xffdamaged history\r\n",
+        storage.notification_progress_file(): b"\xffdamaged progress\r\n",
+        storage.STATS_CURRENT_FILE: b"damaged quarter\r\n",
+    }
+    for path, raw in originals.items():
+        path.write_bytes(raw)
+    generation = storage.restorable_restore_generation()
+
+    def fail_publication(*args):
+        raise OSError("publish")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("backup._publish_staged_file", fail_publication)
+        with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+            await backup.restore_backup_zip(_zip_bytes(members))
+    for path, raw in originals.items():
+        assert path.read_bytes() == raw
+    assert storage.restorable_restore_generation() == generation
+    await backup.restore_backup_zip(_zip_bytes(members))
+    assert storage.load_event_journal() == journal
+    assert storage.restorable_restore_generation() == generation + 1
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        restored = parse_recovery_journal(
+            archive.read("event_journal.json"),
+            archive.read("notification_progress.json") if split else None,
+        )
+    assert restored == journal
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["missing_progress", "missing_history", "missing_current", "lineage", "bad", "bad_history", "orphan"])
 async def test_split_recovery_rejects_missing_or_incompatible_members_before_publication(
     backup_env, journal_factory, damage,
