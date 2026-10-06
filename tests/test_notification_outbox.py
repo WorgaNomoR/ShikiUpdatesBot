@@ -18,6 +18,7 @@ from notification_outbox import (
     BACKOFF,
     LIFETIME,
     MAX_ATTEMPTS,
+    OutboxStateError,
     begin_attempt,
     compact_outbox,
     complete_attempt,
@@ -27,6 +28,7 @@ from notification_outbox import (
     migrate_outbox,
     possible_delivery,
     progress_reserve,
+    replace_recipients,
     retain_outbox,
     validate_memberships,
 )
@@ -37,6 +39,34 @@ def _box(factory):
     return enqueue(
         journal, journal["events"][0], "<b>frozen</b>", {10: "b" * 32, -100: "c" * 32}, 1000
     )
+
+
+def test_recipient_replacement_owns_deltas_and_copies_only_affected_branches(journal_factory):
+    journal = migrate_outbox(journal_factory(count=2), 0)
+    for event in journal["events"]:
+        journal = enqueue(journal, event, "frozen", {10: "b" * 32, 20: "c" * 32}, 1000)
+    before = deepcopy(journal)
+    assert replace_recipients(journal, {}) is journal
+    delta = deepcopy(journal["outbox"]["records"][0]["recipients"]["10"])
+    begin_attempt(delta, 1000)
+    updated = replace_recipients(journal, {(1, "10"): delta})
+    assert journal == before
+    assert updated["events"] is journal["events"]
+    assert updated["outbox"]["records"][1] is journal["outbox"]["records"][1]
+    assert updated["outbox"]["records"][0]["payload"] is journal["outbox"]["records"][0]["payload"]
+    assert updated["outbox"]["records"][0]["recipients"]["20"] is journal["outbox"]["records"][0]["recipients"]["20"]
+    delta["attempts"][0]["outcome"] = "not_dispatched"
+    assert updated["outbox"]["records"][0]["recipients"]["10"]["attempts"] == [{"at": 1000, "outcome": "uncertain"}]
+    validate_event_journal(updated)
+
+
+@pytest.mark.parametrize("seq,cid", [(0, "10"), (2, "10"), (1, "missing")])
+def test_recipient_replacement_rejects_absent_obligation(journal_factory, seq, cid):
+    journal = _box(journal_factory)
+    before = deepcopy(journal)
+    with pytest.raises(OutboxStateError, match="recipient_changed"):
+        replace_recipients(journal, {(seq, cid): {}})
+    assert journal == before
 
 
 def test_enqueued_identity_payload_and_creation_clock(journal_factory):

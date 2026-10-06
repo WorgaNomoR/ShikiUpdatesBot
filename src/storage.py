@@ -55,6 +55,7 @@ from notification_outbox import (
     OutboxStateError,
     parse_subscriber_payload,
     progress_reserve,
+    replace_recipients,
     retain_outbox,
     validate_memberships,
 )
@@ -197,6 +198,7 @@ def load_legacy_seen_ids() -> set[int] | None:
 
 
 _journal_history_cache = None
+_journal_progress_cache = None
 
 
 def notification_progress_file() -> Path:
@@ -213,11 +215,12 @@ def _read_journal_member(path: Path) -> bytes:
 
 def _published_history() -> tuple[dict | None, int]:
     """Кеш только immutable history: stat и restore generation проверяются всегда."""
-    global _journal_history_cache
+    global _journal_history_cache, _journal_progress_cache
     try:
         stat = EVENT_JOURNAL_FILE.stat()
     except FileNotFoundError:
         _journal_history_cache = None
+        _journal_progress_cache = None
         if notification_progress_file().exists():
             raise EventJournalStateError("progress_orphan")
         return None, 0
@@ -225,7 +228,7 @@ def _published_history() -> tuple[dict | None, int]:
         raise EventJournalStateError("journal_read") from None
     revision = (
         EVENT_JOURNAL_FILE, stat.st_dev, stat.st_ino, stat.st_size,
-        stat.st_mtime_ns, stat.st_ctime_ns, restorable_restore_generation(),
+        stat.st_mtime_ns, stat.st_ctime_ns, restorable_restore_generation(), SHIKI_USER,
     )
     if _journal_history_cache is not None and _journal_history_cache[0] == revision:
         return _journal_history_cache[1:]
@@ -239,10 +242,30 @@ def _published_history() -> tuple[dict | None, int]:
         return history, size
     # Legacy содержит mutable progress, поэтому не кешируется.
     _journal_history_cache = None
+    _journal_progress_cache = None
     return history, 0
 
 
+def _progress_revision() -> tuple:
+    """Проверять оба member, policy и generation даже при тёплом progress."""
+    path = notification_progress_file()
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        raise EventJournalStateError("progress_missing") from None
+    except OSError:
+        raise EventJournalStateError("progress_read") from None
+    return (
+        _journal_history_cache[0], path, stat.st_dev, stat.st_ino, stat.st_size,
+        stat.st_mtime_ns, stat.st_ctime_ns, restorable_restore_generation(), JOURNAL_MAX_BYTES,
+    )
+
+
 def _published_progress(history: dict, history_size: int) -> tuple[dict, int]:
+    global _journal_progress_cache
+    revision = _progress_revision()
+    if _journal_progress_cache is not None and _journal_progress_cache[0] == revision:
+        return _journal_progress_cache[1:]
     try:
         progress = parse_progress_member(_read_journal_member(notification_progress_file()))
     except FileNotFoundError:
@@ -253,11 +276,12 @@ def _published_progress(history: dict, history_size: int) -> tuple[dict, int]:
     size = history_size + progress_budget_size(progress, compact_json(progress))
     if size + progress_reserve(journal) > JOURNAL_MAX_BYTES:
         raise EventJournalStateError("journal_capacity")
+    _journal_progress_cache = (revision, journal, size)
     return journal, size
 
 
 def load_notification_journal() -> dict | None:
-    """Внутренний delivery snapshot: history заимствована и не изменяется."""
+    """Внутренний snapshot: history и progress заимствованы строго read-only."""
     history, size = _published_history()
     if history is None or history["version"] != 4:
         return history
@@ -271,6 +295,7 @@ def load_event_journal() -> dict | None:
 
 def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
     """Progress атомарен отдельно; admission оставляет прежний checkpoint валидным."""
+    global _journal_progress_cache
     if not isinstance(journal, dict):
         raise EventJournalStateError("journal_structure")
     limit = JOURNAL_MAX_BYTES - JOURNAL_CHECKPOINT_RESERVE if admitting else JOURNAL_MAX_BYTES
@@ -279,6 +304,7 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
         size = len(payload.encode("utf-8"))
         if size > limit:
             raise EventJournalStateError("journal_capacity")
+        _journal_progress_cache = None
         try:
             _atomic_write(EVENT_JOURNAL_FILE, payload)
         except Exception:
@@ -305,6 +331,8 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
     history_payload = compact_json(history) if history_changed else None
     if history_payload is not None and len(history_payload.encode("utf-8")) > JOURNAL_MAX_BYTES:
         raise EventJournalStateError("journal_capacity")
+    # Общий caller владеет candidate и может менять его после save: не кешируем aliases.
+    _journal_progress_cache = None
     try:
         if not activated:
             # До activation старый member остаётся единственной authority.
@@ -338,6 +366,26 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
     except Exception:
         raise EventJournalStateError("journal_write") from None
     return size
+
+
+def save_notification_recipient(journal: dict, seq: int, cid: str, recipient: dict) -> dict:
+    """Под state transaction: приватная дельта поверх точной свежей authority.
+
+    Общий save полностью проверяет каждую ревизию. Только этот узкий путь
+    передаёт владение своими ветвями кешу после успешного atomic replacement.
+    """
+    global _journal_progress_cache
+    current = load_notification_journal()
+    cached = _journal_progress_cache is not None and current is _journal_progress_cache[1]
+    if current is not journal and (cached or current != journal):
+        raise EventJournalStateError("recipient_changed")
+    candidate = replace_recipients(current, {(seq, cid): recipient})
+    size = save_event_journal(candidate)
+    if cached:
+        _journal_progress_cache = (_progress_revision(), candidate, size)
+        return candidate
+    # Legacy activation: заново прочитать новые members, не заимствовать caller aliases.
+    return load_notification_journal()
 
 
 def compact_event_journal(journal: dict, *, expected_generation: int) -> dict:

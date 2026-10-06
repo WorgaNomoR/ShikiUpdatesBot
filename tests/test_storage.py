@@ -2267,14 +2267,143 @@ def test_recipient_publications_never_rewrite_or_reparse_retained_history(
     monkeypatch.setattr("storage._atomic_write", observe)
     monkeypatch.setattr("storage.parse_history_member", lambda *a, **k: pytest.fail("history reparsed"))
     journal = storage.load_notification_journal()
-    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    recipient = deepcopy(journal["outbox"]["records"][0]["recipients"]["10"])
     begin_attempt(recipient, 1000)
-    storage.save_event_journal(journal)
+    journal = storage.save_notification_recipient(journal, 1, "10", recipient)
     complete_attempt(recipient, "confirmed_success", 1001)
-    storage.save_event_journal(journal)
+    storage.save_notification_recipient(journal, 1, "10", recipient)
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
     assert writes == [storage.notification_progress_file()] * 2
     assert storage.load_notification_journal()["outbox"]["records"][0]["recipients"]["10"]["status"] == "delivered"
+
+
+def test_warm_progress_reads_and_recipient_updates_do_not_repeat_read_validation(
+    backup_env, journal_factory, monkeypatch,
+):
+    from notification_outbox import begin_attempt
+
+    storage.save_event_journal(_progress_journal(journal_factory))
+    original_join = storage.join_history_progress
+    joins = []
+
+    def join(*args):
+        joins.append(args)
+        return original_join(*args)
+
+    monkeypatch.setattr("storage.join_history_progress", join)
+    journal = storage.load_notification_journal()
+    assert len(joins) == 1
+    monkeypatch.setattr("storage._read_journal_member", lambda *a: pytest.fail("warm read"))
+    for _ in range(3):
+        assert storage.load_notification_journal() is journal
+    recipient = deepcopy(journal["outbox"]["records"][0]["recipients"]["10"])
+    begin_attempt(recipient, 1000)
+    marked = storage.save_notification_recipient(journal, 1, "10", recipient)
+    assert len(joins) == 2  # Новая публикация всё равно проходит общий validator.
+    for _ in range(3):
+        assert storage.load_notification_journal() is marked
+    assert len(joins) == 2
+    assert journal["outbox"]["records"][0]["recipients"]["10"]["attempts"] == []
+    recipient["attempts"].clear()
+    assert len(marked["outbox"]["records"][0]["recipients"]["10"]["attempts"]) == 1
+
+
+def test_general_progress_read_and_save_cannot_lend_mutable_aliases(
+    backup_env, journal_factory,
+):
+    journal = _progress_journal(journal_factory)
+    storage.save_event_journal(journal)
+    borrowed = storage.load_notification_journal()
+    snapshot = storage.load_event_journal()
+    snapshot["outbox"]["records"][0]["payload"]["text"] = "different"
+    snapshot["outbox"]["records"][0]["recipients"]["10"]["attempts"].append({})
+    assert storage.load_notification_journal() is borrowed
+    assert borrowed == journal
+    storage.save_event_journal(journal)
+    journal["outbox"]["records"].clear()
+    assert storage.load_notification_journal() == borrowed
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("after", [False, True])
+def test_owned_recipient_publication_adopts_only_successful_published_state(
+    backup_env, journal_factory, monkeypatch, interrupt, after,
+):
+    from notification_outbox import begin_attempt
+
+    storage.save_event_journal(_progress_journal(journal_factory))
+    journal = storage.load_notification_journal()
+    before = storage.notification_progress_file().read_bytes()
+    recipient = deepcopy(journal["outbox"]["records"][0]["recipients"]["10"])
+    begin_attempt(recipient, 1000)
+    write = storage._atomic_write
+
+    def fail(path, payload):
+        if after:
+            write(path, payload)
+        raise KeyboardInterrupt if interrupt else OSError("publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", fail)
+        with pytest.raises(KeyboardInterrupt if interrupt else storage.EventJournalStateError):
+            storage.save_notification_recipient(journal, 1, "10", recipient)
+    assert journal["outbox"]["records"][0]["recipients"]["10"]["attempts"] == []
+    restored = storage.load_notification_journal()
+    actual = restored["outbox"]["records"][0]["recipients"]["10"]
+    assert actual["attempts"] == (recipient["attempts"] if after else [])
+    assert actual["status"] == "pending"
+    if not after:
+        assert storage.notification_progress_file().read_bytes() == before
+
+
+def test_owned_recipient_publication_still_rejects_invalid_delta(
+    backup_env, journal_factory,
+):
+    storage.save_event_journal(_progress_journal(journal_factory))
+    journal = storage.load_notification_journal()
+    before = storage.notification_progress_file().read_bytes()
+    recipient = deepcopy(journal["outbox"]["records"][0]["recipients"]["10"])
+    recipient["attempts"] = [{"at": 1000, "outcome": "confirmed_success"}]
+    with pytest.raises(storage.EventJournalStateError, match="progress_invalid"):
+        storage.save_notification_recipient(journal, 1, "10", recipient)
+    assert storage.notification_progress_file().read_bytes() == before
+    assert storage.load_notification_journal() == journal
+
+
+@pytest.mark.parametrize("change", ["replacement", "generation", "cold"])
+def test_warm_progress_revision_change_runs_full_parser_and_rejects_old_borrow(
+    backup_env, journal_factory, monkeypatch, change,
+):
+    storage.save_event_journal(_progress_journal(journal_factory))
+    old = storage.load_notification_journal()
+    path = storage.notification_progress_file()
+    if change == "replacement":
+        stat = path.stat()
+        value = json.loads(path.read_bytes())
+        value["outbox"]["records"][0]["payload"]["text"] = "change"
+        storage._atomic_write(path, storage.compact_json(value))
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assert path.stat().st_size == stat.st_size
+    elif change == "generation":
+        storage.mark_restorable_state_restored()
+    else:
+        monkeypatch.setattr("storage._journal_history_cache", None)
+        monkeypatch.setattr("storage._journal_progress_cache", None)
+    parse = storage.parse_progress_member
+    parsed = []
+
+    def observe(raw):
+        parsed.append(raw)
+        return parse(raw)
+
+    monkeypatch.setattr("storage.parse_progress_member", observe)
+    current = storage.load_notification_journal()
+    assert len(parsed) == 1
+    assert current is not old
+    if change == "replacement":
+        assert current["outbox"]["records"][0]["payload"]["text"] == "change"
+    with pytest.raises(storage.EventJournalStateError, match="recipient_changed"):
+        storage.save_notification_recipient(old, 1, "10", old["outbox"]["records"][0]["recipients"]["10"])
 
 
 @pytest.mark.parametrize("phase", ["prepare", "activate"])
