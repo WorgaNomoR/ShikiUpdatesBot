@@ -7,6 +7,7 @@ from copy import deepcopy
 import pytest
 
 from event_journal_schema import (
+    JOURNAL_MAX_BYTES,
     EventJournalStateError,
     journal_json,
 )
@@ -100,3 +101,31 @@ def test_invalid_split_recovery_rejects_entire_pair(journal_factory, damage):
         progress_raw = b" " * (8 * 1024 * 1024 + 1)
     with pytest.raises(EventJournalStateError):
         parse_recovery_journal(history_raw, progress_raw)
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("split", [False, True])
+def test_legacy_and_activated_capacity_share_exact_inclusive_bound(
+    outbox_capacity_factory, version, split,
+):
+    journal = outbox_capacity_factory()
+    journal["outbox"]["version"] = version
+    if version == 3:
+        journal["outbox"]["completed_seq"] = 0
+    record = journal["outbox"]["records"][0]
+    # Граница рассчитана независимо от helper: 441 байт на fresh recipient.
+    actual = len(journal_json(journal).encode())
+    record["payload"]["text"] += "x" * (JOURNAL_MAX_BYTES - actual - 441 * 7000)
+
+    def parse():
+        if split:
+            return parse_recovery_journal(
+                compact_json(history_document(journal, "c" * 32)).encode(),
+                compact_json(progress_document(journal, "c" * 32)).encode(),
+            )
+        return parse_recovery_journal(journal_json(journal).encode(), None)
+
+    assert parse() == journal
+    record["payload"]["text"] += "x"
+    with pytest.raises(EventJournalStateError):
+        parse()

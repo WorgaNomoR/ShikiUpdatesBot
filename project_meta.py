@@ -2,7 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 """Стабильные публичные метаданные проекта для всех режимов запуска."""
 
-PROJECT_VERSION = "v1.8.2"
+PROJECT_VERSION = "v1.8.3"
 PROJECT_REPOSITORY = "WorgaNomoR/ShikiUpdatesBot"
 PROJECT_SUMMARY = (
     "Открывает в Telegram единый хаб публичного профиля Shikimori: показывает "

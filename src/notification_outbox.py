@@ -16,6 +16,24 @@ REQUEST_SECONDS = 10
 MAX_COMPACTIONS = 128
 OUTCOMES = {"confirmed_success", "confirmed_rejection", "not_dispatched", "uncertain"}
 TERMINAL = {"delivered", "cancelled", "expired", "rejected"}
+_TERMINAL_REASONS = {
+    "delivered": {"confirmed_success"},
+    "cancelled": {"ineligible"},
+    "expired": {"lifetime", "attempt_budget"},
+    "rejected": {"permanent_rejection", "forbidden"},
+}
+# JSON использует int/float repr. Для binary64: <=17 значащих цифр,
+# точка, знак, e, знак exponent и <=3 его цифр дают <=24 ASCII-байт.
+# Fixed repr до перехода в exponent требует <=4 ведущих нулей и тоже короче;
+# int в разрешённом диапазоне 0..10**12 требует <=13 байт; -0.0 допустим.
+_TIME_JSON_BYTES = 24
+_OUTCOME_JSON_BYTES = max(len(outcome) + 2 for outcome in OUTCOMES)
+_ATTEMPT_JSON_BYTES = len('{"at":,"outcome":}') + _TIME_JSON_BYTES + _OUTCOME_JSON_BYTES
+_TERMINAL_JSON_BYTES = max(
+    len(status) + len(reason) + 4
+    for status, reasons in _TERMINAL_REASONS.items()
+    for reason in reasons
+)
 
 
 class OutboxStateError(ValueError):
@@ -185,16 +203,37 @@ def complete_attempt(
 
 
 def progress_reserve(journal: dict) -> int:
-    """Резерв на все оставшиеся попытки и terminal поля, без увеличения лимита."""
+    """Граница будущего роста валидного pending в штатном compact UTF-8 JSON.
+
+    Immutable поля/старые попытки уже оплачены фактическим размером. Последний
+    outcome может замениться после marker даже при шести попытках. Новые
+    attempts оплачены вместе с запятыми, первая не нужна для пустого списка.
+    Status/reason берём одной разрешённой парой; terminal_at и next_attempt_at
+    ограничены числовой схемой. prior_possible неизменен, false -> true у
+    duplicate_possible только уменьшает размер. Terminal больше не меняется.
+
+    При marker прежний последний outcome становится immutable; ack тратит
+    его резерв, terminal освобождает остаток. Поэтому bytes + reserve не растёт
+    на любом recipient transition; это граница, а не средний размер попытки.
+    """
     box = journal.get("outbox")
     if box is None:
         return 0
-    return sum(
-        512 + (MAX_ATTEMPTS - len(recipient["attempts"])) * 96
-        for record in box["records"]
-        for recipient in record.get("recipients", {}).values()
-        if recipient["status"] == "pending"
-    )
+    reserve = 0
+    for record in box["records"]:
+        for recipient in record.get("recipients", {}).values():
+            if recipient["status"] != "pending":
+                continue
+            attempts = recipient["attempts"]
+            remaining = MAX_ATTEMPTS - len(attempts)
+            # pending/null и terminal_at=null уже входят в фактические байты.
+            reserve += _TERMINAL_JSON_BYTES - len('"pending"null')
+            reserve += _TIME_JSON_BYTES - len("null")
+            reserve += _TIME_JSON_BYTES - len(repr(recipient["next_attempt_at"]))
+            reserve += remaining * (_ATTEMPT_JSON_BYTES + 1) - int(not attempts)
+            if attempts:
+                reserve += _OUTCOME_JSON_BYTES - (len(attempts[-1]["outcome"]) + 2)
+    return reserve
 
 
 def _serialized_size(value: dict) -> int:
@@ -424,12 +463,6 @@ def validate_outbox(journal: dict) -> None:
                 or recipient["attempts"][-1]["outcome"] != "confirmed_rejection"
             ):
                 raise OutboxStateError("outbox_rejection")
-            reasons = {
-                "delivered": {"confirmed_success"},
-                "cancelled": {"ineligible"},
-                "expired": {"lifetime", "attempt_budget"},
-                "rejected": {"permanent_rejection", "forbidden"},
-            }
             if status == "pending":
                 if recipient["terminal_at"] is not None or recipient["reason"] is not None:
                     raise OutboxStateError("outbox_pending")
@@ -437,7 +470,7 @@ def validate_outbox(journal: dict) -> None:
                 not _time(recipient["terminal_at"])
                 or recipient["terminal_at"] < previous
                 or not isinstance(recipient["reason"], str)
-                or recipient["reason"] not in reasons[status]
+                or recipient["reason"] not in _TERMINAL_REASONS[status]
             ):
                 raise OutboxStateError("outbox_terminal")
             if status == "expired" and (
