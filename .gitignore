@@ -220,6 +220,8 @@ __marimo__/
 
 # Bot specific — файлы состояния и статистики (не коммитить!)
 seen_ids.json
+event_journal.json
+notification_progress.json
 subscribers.json
 known_users.json
 user_alerts.json

@@ -52,7 +52,10 @@ def _append(history_id, source, event_type="completed", score=8, target=None):
 def _archive():
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w") as zf:
-        zf.writestr("event_journal.json", storage.EVENT_JOURNAL_FILE.read_bytes())
+        history = storage.EVENT_JOURNAL_FILE.read_bytes()
+        zf.writestr("event_journal.json", history)
+        if json.loads(history)["version"] == 4:
+            zf.writestr("notification_progress.json", storage.notification_progress_file().read_bytes())
         zf.writestr("stats_current.json", storage.STATS_CURRENT_FILE.read_bytes())
     return stream.getvalue()
 
