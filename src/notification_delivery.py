@@ -35,7 +35,6 @@ from notification_outbox import (
 from storage import (
     compact_event_journal,
     load_blocked_users,
-    load_event_journal,
     load_stats_current,
     load_subscriber_state,
     notification_memberships,
@@ -44,6 +43,7 @@ from storage import (
     save_event_journal,
     save_subscriber_state,
 )
+from storage import load_notification_journal as load_event_journal
 from telegram_delivery import (
     RetryPolicy,
     is_blocked_error,
@@ -169,7 +169,7 @@ async def _dispatch(bot):
             journal = load_event_journal()
             if journal is None or journal["journal_id"] != identity:
                 raise _DeliveryChanged
-            journal = deepcopy(journal)
+            journal = {**journal, "outbox": deepcopy(journal["outbox"])}
             now = time.time()
             memberships = notification_memberships()
             blocked = load_blocked_users()
@@ -216,7 +216,7 @@ async def _dispatch(bot):
                 or _recipient(journal, seq, cid) != lease
             ):
                 raise _DeliveryChanged
-            journal = deepcopy(journal)
+            journal = {**journal, "outbox": deepcopy(journal["outbox"])}
             recipient = _recipient(journal, seq, cid)
             outcome = result.attempts[-1].outcome.value
             delay = _retry_delay(result.error)

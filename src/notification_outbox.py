@@ -102,7 +102,7 @@ def enqueue(
     journal: dict, event: dict, text: str | None, memberships: dict[int, str], now: float
 ) -> dict:
     """Состав получателей и payload замораживаются с processing checkpoint."""
-    result = deepcopy(journal)
+    result = {**journal, "outbox": deepcopy(journal["outbox"])}
     box = result["outbox"]
     seq = event["seq"]
     if seq != box["enqueued_seq"] + 1 or seq != journal["processed_seq"] + 1:
@@ -225,7 +225,7 @@ def retain_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
         count += 1
     result = journal
     if count:
-        result = deepcopy(journal)
+        result = {**journal, "outbox": deepcopy(journal["outbox"])}
         result["outbox"].update(
             version=3,
             completed_seq=completed_seq(box) + count,
@@ -279,7 +279,7 @@ def compact_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
             replacements[index] = summary
     if not replacements:
         return journal
-    result = deepcopy(journal)
+    result = {**journal, "outbox": deepcopy(journal["outbox"])}
     result["outbox"]["version"] = max(2, result["outbox"]["version"])
     for index, summary in replacements.items():
         result["outbox"]["records"][index] = summary

@@ -44,7 +44,8 @@ def _zip(members):
 def _recovery():
     return _zip(
         {
-            "event_journal.json": storage.load_event_journal(),
+            "event_journal.json": json.loads(storage.EVENT_JOURNAL_FILE.read_bytes()),
+            "notification_progress.json": json.loads(storage.notification_progress_file().read_bytes()),
             "stats_current.json": storage.load_stats_current(strict=True),
             "subscribers.json": json.loads(storage.SUBS_FILE.read_text(encoding="utf-8")),
         }
@@ -76,6 +77,18 @@ async def _enqueue(factory, count=2):
 
 def _recipient(seq=1, cid="10"):
     return delivery._recipient(storage.load_event_journal(), seq, cid)
+
+
+@pytest.mark.asyncio
+async def test_recipient_dispatch_keeps_retained_history_bytes(outbox_env, journal_factory):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=1)
+    before = storage.EVENT_JOURNAL_FILE.read_bytes()
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    assert _recipient()["status"] == "delivered"
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
 
 
 @pytest.mark.asyncio
@@ -147,16 +160,22 @@ async def test_accepted_lost_response_then_late_outcome(outbox_env, journal_fact
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["marker", "ack"])
+@pytest.mark.parametrize("legacy", [False, True])
 async def test_failed_publication_never_loses_or_falsely_confirms(
-    outbox_env, journal_factory, monkeypatch, phase
+    outbox_env, journal_factory, monkeypatch, phase, legacy,
 ):
     storage.save_subscribers({10: "only"})
     await _enqueue(journal_factory, count=1)
+    if legacy:
+        journal = storage.load_event_journal()
+        storage.EVENT_JOURNAL_FILE.write_text(json.dumps(journal), encoding="utf-8")
+        storage.notification_progress_file().unlink()
     original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    progress_before = storage.notification_progress_file().read_bytes() if not legacy else None
     write = storage._atomic_write
 
     def fail(path, payload):
-        if path == storage.EVENT_JOURNAL_FILE:
+        if path == storage.notification_progress_file():
             recipient = json.loads(payload)["outbox"]["records"][0]["recipients"]["10"]
             if (
                 phase == "marker"
@@ -176,6 +195,8 @@ async def test_failed_publication_never_loses_or_falsely_confirms(
     assert _recipient()["status"] == "pending"
     if phase == "marker":
         assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+        if progress_before is not None:
+            assert storage.notification_progress_file().read_bytes() == progress_before
     else:
         assert _recipient()["attempts"] == [{"at": 1800000000.0, "outcome": "uncertain"}]
     outbox_env[0] += 60
@@ -398,7 +419,7 @@ async def test_retained_restart_restore_keeps_pending_and_generation_guards(
     if kind == "legacy_subscribers":
         bot.send_message.assert_awaited_once()
         assert _recipient(2)["status"] == "cancelled"
-        assert storage.EVENT_JOURNAL_FILE.read_bytes() != exact
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == exact
     else:
         assert bot.send_message.await_count == 2
         assert _recipient(2)["status"] == "delivered"
@@ -744,7 +765,7 @@ async def test_compaction_write_failure_does_not_delay_due_delivery(
     failures = []
 
     def fail_compaction(path, payload):
-        if path == storage.EVENT_JOURNAL_FILE and json.loads(payload)["outbox"].get("completed_seq") == 1:
+        if path == storage.notification_progress_file() and json.loads(payload)["outbox"].get("completed_seq") == 1:
             failures.append(True)
             assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
             raise OSError("compaction write")
@@ -783,7 +804,8 @@ async def test_compaction_changed_revalidates_restored_authority_before_delivery
         restored = deepcopy(snapshot)
         restored["journal_id"] = "f" * 32
         restored["outbox"]["records"][1]["payload"]["text"] = "restored payload"
-        storage.save_event_journal(restored)
+        # Имитация внешнего restore заменяет authority, а не admission delta.
+        storage._atomic_write(storage.EVENT_JOURNAL_FILE, json.dumps(restored))
         cur = storage.load_stats_current(strict=True)
         if coherent:
             cur["event_projection"]["journal_id"] = restored["journal_id"]

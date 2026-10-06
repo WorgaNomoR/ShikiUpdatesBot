@@ -107,7 +107,7 @@ async def test_missing_previously_bound_journal_stops_history(history_env):
     await _ready()
     before = storage.STATS_CURRENT_FILE.read_bytes()
     storage.EVENT_JOURNAL_FILE.unlink()
-    with pytest.raises(EventJournalStateError, match="bound_journal_missing"):
+    with pytest.raises(EventJournalStateError, match="progress_orphan"):
         await handlers.check_and_notify(AsyncMock(), set(), None)
     assert storage.STATS_CURRENT_FILE.read_bytes() == before
     handlers.fetch_history.assert_not_awaited()
@@ -195,7 +195,7 @@ async def test_failed_publication_preserves_pending_and_exact_bytes(history_env,
         should_fail = (
             boundary == "admission" and path == storage.EVENT_JOURNAL_FILE
             or boundary == "projection" and path == storage.STATS_CURRENT_FILE
-            or boundary == "checkpoint" and path == storage.EVENT_JOURNAL_FILE and json.loads(payload)["processed_seq"] == 1
+            or boundary == "checkpoint" and path == storage.notification_progress_file() and json.loads(payload)["processed_seq"] == 1
         )
         if should_fail:
             raise OSError("disk failure")
@@ -624,11 +624,11 @@ async def test_outbox_publication_failure_keeps_recoverable_authority(history_en
     def fail(path, payload):
         if phase == "membership" and path == storage.SUBS_FILE:
             raise OSError("memberships")
-        if path == storage.EVENT_JOURNAL_FILE:
+        if path in {storage.EVENT_JOURNAL_FILE, storage.notification_progress_file()}:
             candidate = json.loads(payload)
-            if phase == "migration" and candidate["version"] == 3:
+            if phase == "migration" and path == storage.EVENT_JOURNAL_FILE and candidate["version"] == 4:
                 raise OSError("migration")
-            if phase == "enqueue_capacity" and candidate["processed_seq"] == 1:
+            if phase == "enqueue_capacity" and path == storage.notification_progress_file() and candidate["processed_seq"] == 1:
                 raise EventJournalStateError("journal_capacity")
         return write(path, payload)
     with monkeypatch.context() as patch:
@@ -658,7 +658,7 @@ async def test_real_enqueue_capacity_after_projection_recovers_without_reproject
     await handlers.check_and_notify(AsyncMock(), set(), None)
     before = storage.load_event_journal()
     # Admission помещается, enqueue с payload и резервом следующего события — нет.
-    limit = len(storage.EVENT_JOURNAL_FILE.read_bytes()) + progress_reserve(before) + 5000
+    limit = len(handlers.journal_json(before).encode()) + progress_reserve(before) + 5000
     monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", limit)
     monkeypatch.setattr(
         "handlers.build_message", lambda *a, **k: "y" * (7000 if fits_after_compaction else 30000),
@@ -691,7 +691,7 @@ async def test_real_enqueue_capacity_after_projection_recovers_without_reproject
             write = storage._atomic_write
 
             def fail(path, payload):
-                if path == storage.EVENT_JOURNAL_FILE and json.loads(payload)["processed_seq"] == 2:
+                if path == storage.notification_progress_file() and json.loads(payload)["processed_seq"] == 2:
                     if resume_failure == "interruption":
                         raise asyncio.CancelledError
                     raise OSError("enqueue publication")
@@ -752,15 +752,18 @@ def test_capacity_retry_merges_retired_prefix_by_absolute_seq(
         candidate["events"].append(event)
     storage.save_event_journal(journal)
     original = storage.EVENT_JOURNAL_FILE.read_bytes()
-    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", len(original) + progress_reserve(journal) + 4096 + 500)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", len(journal_json(journal).encode()) + progress_reserve(journal) + 4096 + 500)
     with pytest.raises(EventJournalStateError, match="journal_capacity"):
         storage.save_event_journal(candidate, admitting=True)
     write = storage._atomic_write
 
     def fail(path, payload):
-        if path == storage.EVENT_JOURNAL_FILE and json.loads(payload).get("outbox", {}).get("completed_seq") == 1:
+        if path in {storage.EVENT_JOURNAL_FILE, storage.notification_progress_file()} and (
+            json.loads(payload).get("outbox", {}).get("completed_seq") == 1
+            or boundary == "admission" and path == storage.EVENT_JOURNAL_FILE
+        ):
             state = json.loads(payload)
-            decision = state["processed_seq"] == 3 if boundary == "enqueue" else len(state["events"]) == 4
+            decision = state.get("processed_seq") == 3 if boundary == "enqueue" else path == storage.EVENT_JOURNAL_FILE
             if failure in {"decision_write", "decision_interruption"} and not decision:
                 return write(path, payload)
             if failure in {"interruption", "decision_interruption"}:
@@ -789,4 +792,6 @@ def test_capacity_retry_merges_retired_prefix_by_absolute_seq(
             else:
                 assert result["processed_seq"] == 2
                 assert result["events"] == candidate["events"]
-            assert storage.EVENT_JOURNAL_FILE.read_bytes() == journal_json(result).encode()
+            assert storage.load_event_journal() == result
+            if boundary == "enqueue":
+                assert storage.EVENT_JOURNAL_FILE.read_bytes() == original

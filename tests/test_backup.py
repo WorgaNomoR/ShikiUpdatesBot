@@ -2618,7 +2618,10 @@ async def test_compacted_coherent_backup_preserves_plans_corrections_and_schedul
     schedule = storage.load_subscriber_state(strict_subscribers=True)
     raw, _ = await backup._build_backup_zip()
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        assert json.loads(archive.read("event_journal.json")) == journal
+        from notification_progress_schema import parse_recovery_journal
+        assert parse_recovery_journal(
+            archive.read("event_journal.json"), archive.read("notification_progress.json"),
+        ) == journal
         assert json.loads(archive.read("stats_current.json")) == fresh
     await backup.restore_backup_zip(raw)
     assert storage.load_event_journal() == journal
@@ -2852,3 +2855,156 @@ async def test_uncertain_backup_then_rejection_preserves_automatic_schedule(
     documents = [call.kwargs["document"] for call in bot.send_document.await_args_list]
     assert documents[0] is not documents[1]
     assert documents[0].data == documents[1].data
+
+
+def _split_recovery_members(journal_factory):
+    from notification_progress_schema import (
+        compact_json,
+        history_document,
+        progress_document,
+    )
+    journal = _compacted_recovery(journal_factory)
+    return journal, {
+        "event_journal.json": compact_json(history_document(journal, "d" * 32)),
+        "notification_progress.json": compact_json(progress_document(journal, "d" * 32)),
+        "stats_current.json": json.dumps(_journal_current(journal)),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing_progress", "missing_history", "missing_current", "lineage", "bad", "bad_history", "orphan"])
+async def test_split_recovery_rejects_missing_or_incompatible_members_before_publication(
+    backup_env, journal_factory, damage,
+):
+    _, members = _split_recovery_members(journal_factory)
+    if damage.startswith("missing_"):
+        member = {"missing_progress": "notification_progress.json", "missing_history": "event_journal.json", "missing_current": "stats_current.json"}[damage]
+        del members[member]
+    elif damage == "lineage":
+        obj = json.loads(members["notification_progress.json"])
+        obj["progress_id"] = "e" * 32
+        members["notification_progress.json"] = json.dumps(obj)
+    elif damage in {"bad", "bad_history"}:
+        member = "event_journal.json" if damage == "bad_history" else "notification_progress.json"
+        members[member] = '{"version":1,"version":1}'
+    else:
+        members["event_journal.json"] = json.dumps(journal_factory())
+    storage.USER_ALERTS_FILE.write_bytes(b'{"enabled":true}\r\n')
+    members["user_alerts.json"] = '{"enabled":false}'
+    before = storage.USER_ALERTS_FILE.read_bytes()
+    with pytest.raises(ValueError) as error:
+        await backup.restore_backup_zip(_zip_bytes(members))
+    if damage in {"bad", "bad_history"}:
+        assert str(error.value) == f"Файл {member} в архиве повреждён; восстановление отменено"
+    assert storage.USER_ALERTS_FILE.read_bytes() == before
+    assert not storage.EVENT_JOURNAL_FILE.exists()
+    assert not storage.notification_progress_file().exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_progress", [False, True])
+@pytest.mark.parametrize("failure_at", [1, 2, 3])
+async def test_split_restore_rolls_back_exact_bytes_and_removes_created_members(
+    backup_env, journal_factory, monkeypatch, existing_progress, failure_at,
+):
+    _, members = _split_recovery_members(journal_factory)
+    originals = {
+        storage.EVENT_JOURNAL_FILE: b"\xffdamaged history\r\n",
+        storage.STATS_CURRENT_FILE: b"damaged quarter\r\n",
+    }
+    if existing_progress:
+        originals[storage.notification_progress_file()] = b"\xffdamaged progress\r\n"
+    for path, value in originals.items():
+        path.write_bytes(value)
+    publish = backup._publish_staged_file
+    calls = []
+
+    def fail(source, target):
+        calls.append(target)
+        if len(calls) == failure_at:
+            raise OSError("publication")
+        publish(source, target)
+
+    monkeypatch.setattr("backup._publish_staged_file", fail)
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        await backup.restore_backup_zip(_zip_bytes(members))
+    for path, value in originals.items():
+        assert path.read_bytes() == value
+    if not existing_progress:
+        assert not storage.notification_progress_file().exists()
+
+
+@pytest.mark.asyncio
+async def test_unactivated_migration_preparation_is_not_exported(backup_env, journal_factory):
+    journal = _compacted_recovery(journal_factory)
+    storage.EVENT_JOURNAL_FILE.write_text(json.dumps(journal), encoding="utf-8")
+    storage.save_stats_current(_journal_current(journal), strict=True)
+    # Неактивированные данные не занимают ни member, ни общий бюджет capture.
+    storage.notification_progress_file().write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert "notification_progress.json" not in archive.namelist()
+        assert json.loads(archive.read("event_journal.json")) == journal
+    await backup.restore_backup_zip(raw)
+    assert not storage.notification_progress_file().exists()
+    assert storage.load_event_journal() == journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("version", "has_progress"), [(True, True), (1.0, True), (4.0, False)])
+async def test_backup_preserves_damaged_history_without_interpreting_noninteger_version(
+    backup_env, journal_factory, version, has_progress,
+):
+    history_raw = json.dumps({**journal_factory(), "version": version}).encode("utf-8")
+    storage.EVENT_JOURNAL_FILE.write_bytes(history_raw)
+    progress_raw = b'{"diagnostic":true}\r\n'
+    if has_progress:
+        storage.notification_progress_file().write_bytes(progress_raw)
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert archive.read("event_journal.json") == history_raw
+        assert ("notification_progress.json" in archive.namelist()) is has_progress
+        if has_progress:
+            assert archive.read("notification_progress.json") == progress_raw
+
+
+@pytest.mark.asyncio
+async def test_split_backup_capture_freezes_progress_before_concurrent_writer(
+    backup_env, journal_factory, monkeypatch,
+):
+    from notification_outbox import complete_attempt
+    from notification_progress_schema import parse_recovery_journal
+
+    journal = _compacted_recovery(journal_factory)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(_journal_current(journal), strict=True)
+    capture_started, capture_resume = threading.Event(), threading.Event()
+    writer_done = asyncio.Event()
+    capture = backup._read_backup_members
+
+    def pause(*args):
+        if not capture_started.is_set():
+            capture_started.set()
+            assert capture_resume.wait(5)
+        return capture(*args)
+
+    async def writer():
+        async with storage.restorable_state_transaction():
+            current = storage.load_event_journal()
+            complete_attempt(current["outbox"]["records"][1]["recipients"]["10"], "confirmed_success", 1001)
+            storage.save_event_journal(current)
+        writer_done.set()
+
+    monkeypatch.setattr("backup._read_backup_members", pause)
+    task = asyncio.create_task(backup._build_backup_zip())
+    while not capture_started.is_set():
+        await asyncio.sleep(0)
+    writer_task = asyncio.create_task(writer())
+    await asyncio.sleep(0)
+    assert not writer_done.is_set()
+    capture_resume.set()
+    raw, _ = await task
+    await writer_task
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert parse_recovery_journal(archive.read("event_journal.json"), archive.read("notification_progress.json")) == journal
+    assert storage.load_event_journal()["outbox"]["records"][1]["recipients"]["10"]["status"] == "delivered"

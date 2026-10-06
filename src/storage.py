@@ -44,7 +44,7 @@ from event_journal_schema import (
     JOURNAL_MAX_BYTES,
     EventJournalStateError,
     journal_json,
-    parse_event_journal,
+    validate_event_journal,
     validate_projection,
 )
 from event_time_stats import (
@@ -57,6 +57,17 @@ from notification_outbox import (
     progress_reserve,
     retain_outbox,
     validate_memberships,
+)
+from notification_progress_schema import (
+    PROGRESS_FILE_NAME,
+    compact_json,
+    history_budget_size,
+    history_document,
+    join_history_progress,
+    parse_history_member,
+    parse_progress_member,
+    progress_budget_size,
+    progress_document,
 )
 from report_plan import (
     FrozenReportPlanError,
@@ -185,27 +196,145 @@ def load_legacy_seen_ids() -> set[int] | None:
         return None
 
 
-def load_event_journal() -> dict | None:
-    """Отсутствие допустимо только до первой привязки; ошибки не сбрасывают файл."""
+_journal_history_cache = None
+
+
+def notification_progress_file() -> Path:
+    """Оба member всегда рядом, в том числе при перенаправлении DATA_DIR в тестах."""
+    return EVENT_JOURNAL_FILE.with_name(PROGRESS_FILE_NAME)
+
+
+def _read_journal_member(path: Path) -> bytes:
+    with path.open("rb") as handle:
+        # read(limit) заранее выделял 8 МиБ даже для небольшого progress.
+        size = os.fstat(handle.fileno()).st_size
+        return handle.read(min(size, JOURNAL_MAX_BYTES) + 1)
+
+
+def _published_history() -> tuple[dict | None, int]:
+    """Кеш только immutable history: stat и restore generation проверяются всегда."""
+    global _journal_history_cache
     try:
-        with EVENT_JOURNAL_FILE.open("rb") as handle:
-            raw = handle.read(JOURNAL_MAX_BYTES + 1)
+        stat = EVENT_JOURNAL_FILE.stat()
     except FileNotFoundError:
-        return None
+        _journal_history_cache = None
+        if notification_progress_file().exists():
+            raise EventJournalStateError("progress_orphan")
+        return None, 0
     except OSError:
         raise EventJournalStateError("journal_read") from None
-    return parse_event_journal(raw, profile=SHIKI_USER)
+    revision = (
+        EVENT_JOURNAL_FILE, stat.st_dev, stat.st_ino, stat.st_size,
+        stat.st_mtime_ns, stat.st_ctime_ns, restorable_restore_generation(),
+    )
+    if _journal_history_cache is not None and _journal_history_cache[0] == revision:
+        return _journal_history_cache[1:]
+    try:
+        history = parse_history_member(_read_journal_member(EVENT_JOURNAL_FILE), profile=SHIKI_USER)
+    except OSError:
+        raise EventJournalStateError("journal_read") from None
+    if history["version"] == 4:
+        size = history_budget_size(history)
+        _journal_history_cache = (revision, history, size)
+        return history, size
+    # Legacy содержит mutable progress, поэтому не кешируется.
+    _journal_history_cache = None
+    return history, 0
+
+
+def _published_progress(history: dict, history_size: int) -> tuple[dict, int]:
+    try:
+        progress = parse_progress_member(_read_journal_member(notification_progress_file()))
+    except FileNotFoundError:
+        raise EventJournalStateError("progress_missing") from None
+    except OSError:
+        raise EventJournalStateError("progress_read") from None
+    journal = join_history_progress(history, progress)
+    size = history_size + progress_budget_size(progress, compact_json(progress))
+    if size + progress_reserve(journal) > JOURNAL_MAX_BYTES:
+        raise EventJournalStateError("journal_capacity")
+    return journal, size
+
+
+def load_notification_journal() -> dict | None:
+    """Внутренний delivery snapshot: history заимствована и не изменяется."""
+    history, size = _published_history()
+    if history is None or history["version"] != 4:
+        return history
+    return _published_progress(history, size)[0]
+
+
+def load_event_journal() -> dict | None:
+    """Общий caller получает свою копию; опубликованный кеш ему недоступен."""
+    return deepcopy(load_notification_journal())
 
 
 def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
-    """Публикация батча оставляет резерв для последующих checkpoint."""
-    payload = journal_json(journal)
-    size = len(payload.encode("utf-8"))
+    """Progress атомарен отдельно; admission оставляет прежний checkpoint валидным."""
+    if not isinstance(journal, dict):
+        raise EventJournalStateError("journal_structure")
     limit = JOURNAL_MAX_BYTES - JOURNAL_CHECKPOINT_RESERVE if admitting else JOURNAL_MAX_BYTES
+    if type(journal.get("version")) is not int or journal.get("version") != 3:
+        payload = journal_json(journal)
+        size = len(payload.encode("utf-8"))
+        if size > limit:
+            raise EventJournalStateError("journal_capacity")
+        try:
+            _atomic_write(EVENT_JOURNAL_FILE, payload)
+        except Exception:
+            raise EventJournalStateError("journal_write") from None
+        return size
+    if not {"processed_seq", "outbox"} <= journal.keys():
+        raise EventJournalStateError("journal_structure")
+    published, history_size = _published_history()
+    activated = published is not None and published["version"] == 4
+    progress_id = published["progress_id"] if activated else uuid.uuid4().hex
+    history = history_document(journal, progress_id)
+    history_changed = not activated or history != published
+    if history_changed:
+        validate_event_journal(journal, profile=SHIKI_USER)
+        history_size = history_budget_size(history)
+    progress = progress_document(journal, progress_id)
+    join_history_progress(history, progress)
+    payload = compact_json(progress)
+    size = history_size + progress_budget_size(progress, payload)
     if size + progress_reserve(journal) > limit:
         raise EventJournalStateError("journal_capacity")
+    if len(payload.encode("utf-8")) > JOURNAL_MAX_BYTES:
+        raise EventJournalStateError("journal_capacity")
+    history_payload = compact_json(history) if history_changed else None
+    if history_payload is not None and len(history_payload.encode("utf-8")) > JOURNAL_MAX_BYTES:
+        raise EventJournalStateError("journal_capacity")
     try:
-        _atomic_write(EVENT_JOURNAL_FILE, payload)
+        if not activated:
+            # До activation старый member остаётся единственной authority.
+            _atomic_write(notification_progress_file(), payload)
+            _atomic_write(EVENT_JOURNAL_FILE, history_payload)
+        elif history_changed:
+            current, _ = _published_progress(published, history_budget_size(published))
+            initializing = (
+                not current["baseline_initialized"] and journal["baseline_initialized"]
+                and not current["events"] and current["processed_seq"] == 0
+            )
+            if (
+                journal["journal_id"] != current["journal_id"]
+                or journal["profile"] != current["profile"]
+                or not initializing and (
+                    journal["baseline_ids"] != current["baseline_ids"]
+                    or journal["baseline_initialized"] != current["baseline_initialized"]
+                )
+                or journal["events"][:len(current["events"])] != current["events"]
+                or len(journal["events"]) < len(current["events"])
+                or journal["processed_seq"] != current["processed_seq"]
+                or journal["outbox"] != current["outbox"]
+            ):
+                raise EventJournalStateError("history_changed")
+            join_history_progress(history, progress_document(current, progress_id))
+            _atomic_write(EVENT_JOURNAL_FILE, history_payload)
+        else:
+            _atomic_write(notification_progress_file(), payload)
+    except EventJournalStateError:
+        raise
     except Exception:
         raise EventJournalStateError("journal_write") from None
     return size
@@ -218,7 +347,7 @@ def compact_event_journal(journal: dict, *, expected_generation: int) -> dict:
         return journal
     if (
         restorable_restore_generation() != expected_generation
-        or load_event_journal() != journal
+        or load_notification_journal() != journal
     ):
         raise EventJournalStateError("compaction_changed")
     save_event_journal(candidate)

@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 import asyncio
 import json
+import os
 from copy import deepcopy
 from uuid import uuid4
 
@@ -1980,6 +1981,7 @@ def test_journal_read_failure_is_not_absence(monkeypatch):
             raise PermissionError("denied")
         return original(path, *args, **kwargs)
 
+    storage.EVENT_JOURNAL_FILE.write_bytes(b"{}")
     monkeypatch.setattr(type(storage.EVENT_JOURNAL_FILE), "open", fail_read)
     with pytest.raises(EventJournalStateError, match="journal_read"):
         storage.load_event_journal()
@@ -2158,3 +2160,181 @@ def test_current_capacity_reserves_dispatch_marker_before_sending(backup_env, mo
     storage.save_stats_current(started, strict=True)
     assert json.loads(storage.STATS_CURRENT_FILE.read_bytes()) == started
     assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == started["pending_quarter_delivery"]
+
+
+def _progress_journal(factory):
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+    )
+    journal = migrate_outbox(factory(), 0)
+    return enqueue(journal, journal["events"][0], "frozen", {10: "b" * 32}, 1000)
+
+
+def test_recipient_publications_never_rewrite_or_reparse_retained_history(
+    backup_env, journal_factory, monkeypatch,
+):
+    from notification_outbox import (
+        begin_attempt,
+        complete_attempt,
+    )
+    journal = _progress_journal(journal_factory)
+    storage.save_event_journal(journal)
+    # Прогреваем revision cache до начала измеряемой recipient работы.
+    storage.load_notification_journal()
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    writes = []
+    write = storage._atomic_write
+
+    def observe(path, payload):
+        writes.append(path)
+        write(path, payload)
+
+    monkeypatch.setattr("storage._atomic_write", observe)
+    monkeypatch.setattr("storage.parse_history_member", lambda *a, **k: pytest.fail("history reparsed"))
+    journal = storage.load_notification_journal()
+    recipient = journal["outbox"]["records"][0]["recipients"]["10"]
+    begin_attempt(recipient, 1000)
+    storage.save_event_journal(journal)
+    complete_attempt(recipient, "confirmed_success", 1001)
+    storage.save_event_journal(journal)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+    assert writes == [storage.notification_progress_file()] * 2
+    assert storage.load_notification_journal()["outbox"]["records"][0]["recipients"]["10"]["status"] == "delivered"
+
+
+@pytest.mark.parametrize("phase", ["prepare", "activate"])
+@pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_split_migration_interruption_keeps_published_authority(
+    backup_env, journal_factory, monkeypatch, phase, after, interrupt,
+):
+    journal = _progress_journal(journal_factory)
+    # Существующий поддерживаемый journal v3 и необязательная старая preparation.
+    storage.EVENT_JOURNAL_FILE.write_text(json.dumps(journal), encoding="utf-8")
+    storage.notification_progress_file().write_bytes(b"abandoned preparation")
+    before = storage.EVENT_JOURNAL_FILE.read_bytes()
+    write = storage._atomic_write
+    target = storage.notification_progress_file() if phase == "prepare" else storage.EVENT_JOURNAL_FILE
+
+    def fail(path, payload):
+        if path == target:
+            if after:
+                write(path, payload)
+            if interrupt:
+                raise KeyboardInterrupt
+            raise OSError("publication")
+        write(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", fail)
+        with pytest.raises(KeyboardInterrupt if interrupt else storage.EventJournalStateError):
+            storage.save_event_journal(journal)
+    assert storage.load_event_journal() == journal
+    if phase == "prepare" or not after:
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
+    storage.save_event_journal(journal)
+    assert storage.load_event_journal() == journal
+    assert json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())["version"] == 4
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_admission_interruption_keeps_old_progress_valid(
+    backup_env, journal_factory, monkeypatch, after,
+):
+    journal = _progress_journal(journal_factory)
+    storage.save_event_journal(journal)
+    candidate = deepcopy(journal)
+    candidate["events"].append(journal_factory(count=2)["events"][1])
+    before = storage.notification_progress_file().read_bytes()
+    write = storage._atomic_write
+
+    def fail(path, payload):
+        assert path == storage.EVENT_JOURNAL_FILE
+        if after:
+            write(path, payload)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", fail)
+        with pytest.raises(KeyboardInterrupt):
+            storage.save_event_journal(candidate, admitting=True)
+    assert storage.notification_progress_file().read_bytes() == before
+    assert storage.load_event_journal() == (candidate if after else journal)
+    storage.save_event_journal(candidate, admitting=True)
+    assert storage.load_event_journal() == candidate
+
+
+@pytest.mark.parametrize("damage", ["missing_progress", "bad_progress", "bad_history", "generation"])
+def test_warm_history_cache_never_hides_replacement_or_restore(
+    backup_env, journal_factory, monkeypatch, damage,
+):
+    journal = _progress_journal(journal_factory)
+    storage.save_event_journal(journal)
+    assert storage.load_notification_journal() == journal
+    if damage == "missing_progress":
+        storage.notification_progress_file().unlink()
+    elif damage == "bad_progress":
+        storage.notification_progress_file().write_bytes(b"{broken")
+    elif damage == "bad_history":
+        storage.EVENT_JOURNAL_FILE.write_bytes(b"{broken")
+    else:
+        storage.mark_restorable_state_restored()
+        monkeypatch.setattr("storage.parse_history_member", lambda *a, **k: (_ for _ in ()).throw(storage.EventJournalStateError("fresh read")))
+    with pytest.raises(storage.EventJournalStateError):
+        storage.load_notification_journal()
+
+
+def test_general_history_reader_cannot_mutate_cached_authority(backup_env, journal_factory):
+    journal = _progress_journal(journal_factory)
+    storage.save_event_journal(journal)
+    snapshot = storage.load_event_journal()
+    snapshot["events"][0]["title"]["name"] = "changed"
+    snapshot["baseline_ids"].clear()
+    assert storage.load_notification_journal() == journal
+
+
+def test_split_first_baseline_initialization_remains_quiet(backup_env, journal_factory):
+    from notification_outbox import migrate_outbox
+
+    journal = journal_factory(count=0)
+    journal.update(baseline_initialized=False, baseline_ids=[])
+    journal = migrate_outbox(journal, 0)
+    storage.save_event_journal(journal)
+    journal.update(baseline_initialized=True, baseline_ids=[1, 2, 3])
+    storage.save_event_journal(journal, admitting=True)
+    assert storage.load_event_journal() == journal
+    assert journal["outbox"]["records"] == []
+
+
+def test_atomic_history_replacement_with_same_size_and_mtime_invalidates_cache(backup_env, journal_factory):
+    journal = _progress_journal(journal_factory)
+    storage.save_event_journal(journal)
+    assert storage.load_notification_journal() == journal
+    stat = storage.EVENT_JOURNAL_FILE.stat()
+    history = json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())
+    before = history["events"][0]["title"]["name"]
+    history["events"][0]["title"]["name"] = "x" * len(before)
+    storage._atomic_write(storage.EVENT_JOURNAL_FILE, storage.compact_json(history))
+    os.utime(storage.EVENT_JOURNAL_FILE, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert storage.EVENT_JOURNAL_FILE.stat().st_size == stat.st_size
+    assert storage.load_notification_journal()["events"][0]["title"]["name"] != before
+
+
+@pytest.mark.parametrize("change", [
+    lambda journal: journal.update(version=3.0),
+    lambda journal: journal.pop("processed_seq"),
+    lambda journal: journal.pop("outbox"),
+    lambda journal: journal.update(processed_seq=True),
+])
+def test_progress_save_keeps_strict_root_validation_after_cache_warmup(
+    backup_env, journal_factory, change,
+):
+    journal = _progress_journal(journal_factory)
+    storage.save_event_journal(journal)
+    journal = storage.load_event_journal()
+    original = storage.notification_progress_file().read_bytes()
+    change(journal)
+    with pytest.raises(storage.EventJournalStateError):
+        storage.save_event_journal(journal)
+    assert storage.notification_progress_file().read_bytes() == original
