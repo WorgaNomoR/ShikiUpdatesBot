@@ -909,7 +909,7 @@ async def test_terminal_compaction_during_inflight_send_rejects_stale_ack(outbox
         async with storage.restorable_state_transaction():
             journal = storage.load_event_journal()
             lease = deepcopy(journal["outbox"]["records"][0])
-            assert delivery._maintenance(journal, {}, set(), outbox_env[0])
+            journal = delivery._maintenance(journal, {}, set(), outbox_env[0])
             storage.save_event_journal(journal)
             current = storage.compact_event_journal(
                 journal, expected_generation=storage.restorable_restore_generation(),
@@ -929,3 +929,62 @@ async def test_terminal_compaction_during_inflight_send_rejects_stale_ack(outbox
     storage.save_subscribers({10: "resubscribed", 20: "new"})
     await delivery.dispatch_notifications(bot)
     bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delivery_copies_only_recipient_deltas_and_preserves_borrowed_revisions(
+    outbox_env, journal_factory, monkeypatch,
+):
+    await _enqueue(journal_factory, count=3)
+    before = storage.load_notification_journal()
+    exact = deepcopy(before)
+    snapshots = []
+    copy = deepcopy
+
+    def narrow(value):
+        if isinstance(value, dict) and ("records" in value or "outbox" in value):
+            pytest.fail("whole outbox copied per recipient")
+        return copy(value)
+
+    monkeypatch.setattr("notification_delivery.deepcopy", narrow)
+    monkeypatch.setattr("notification_outbox.deepcopy", narrow)
+
+    async def send(**kwargs):
+        marked = storage.load_notification_journal()
+        snapshots.append((marked, copy(marked)))
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await delivery.dispatch_notifications(bot)
+    assert bot.send_message.await_count == 9
+    assert before == exact
+    assert all(snapshot == frozen for snapshot, frozen in snapshots)
+    assert all(
+        r["status"] == "delivered"
+        for record in storage.load_notification_journal()["outbox"]["records"]
+        for r in record["recipients"].values()
+    )
+
+
+def test_maintenance_copies_changed_branches_without_mutating_borrowed_progress(
+    outbox_env, journal_factory,
+):
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+    )
+
+    journal = migrate_outbox(journal_factory(count=2), 0)
+    for event in journal["events"]:
+        journal = enqueue(journal, event, "frozen", {10: "b" * 32, 20: "c" * 32}, outbox_env[0])
+    storage.save_event_journal(journal)
+    borrowed = storage.load_notification_journal()
+    exact = deepcopy(borrowed)
+    assert delivery._maintenance(borrowed, {10: "b" * 32, 20: "c" * 32}, set(), outbox_env[0]) is borrowed
+    maintained = delivery._maintenance(borrowed, {20: "c" * 32}, set(), outbox_env[0])
+    assert borrowed == exact
+    assert storage.load_notification_journal() is borrowed
+    assert all(record["recipients"]["10"]["status"] == "cancelled" for record in maintained["outbox"]["records"])
+    assert all(record["recipients"]["20"]["status"] == "pending" for record in maintained["outbox"]["records"])
+    storage.save_event_journal(maintained)
+    assert storage.load_event_journal() == maintained

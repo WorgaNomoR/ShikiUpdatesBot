@@ -31,6 +31,7 @@ from notification_outbox import (
     completed_seq,
     finish,
     possible_delivery,
+    replace_recipients,
 )
 from storage import (
     compact_event_journal,
@@ -41,6 +42,7 @@ from storage import (
     restorable_restore_generation,
     restorable_state_transaction,
     save_event_journal,
+    save_notification_recipient,
     save_subscriber_state,
 )
 from storage import load_notification_journal as load_event_journal
@@ -81,7 +83,7 @@ def _retry_delay(error):
 
 def _maintenance(journal, memberships, blocked, now):
     """Cancellation/expiry — явная публикация, также для неготового head."""
-    changed = False
+    updates = {}
     for record in journal["outbox"]["records"]:
         for cid, recipient in record.get("recipients", {}).items():
             if recipient["status"] != "pending":
@@ -91,21 +93,23 @@ def _maintenance(journal, memberships, blocked, now):
                 recipient["attempts"][-1]["at"] if recipient["attempts"] else 0,
             )
             if int(cid) in blocked or memberships.get(int(cid)) != recipient["membership"]:
-                finish(recipient, "cancelled", "ineligible", terminal_at)
+                status, reason = "cancelled", "ineligible"
             elif now >= record["expires_at"]:
-                finish(recipient, "expired", "lifetime", terminal_at)
+                status, reason = "expired", "lifetime"
             elif len(recipient["attempts"]) >= MAX_ATTEMPTS:
-                finish(recipient, "expired", "attempt_budget", terminal_at)
+                status, reason = "expired", "attempt_budget"
             else:
                 continue
-            changed = True
+            recipient = deepcopy(recipient)
+            finish(recipient, status, reason, terminal_at)
+            updates[record["seq"], cid] = recipient
             log.warning(
                 "Уведомление seq=%d: %s; possible_delivery=%s.",
                 record["seq"],
                 recipient["status"],
                 possible_delivery(recipient),
             )
-    return changed
+    return replace_recipients(journal, updates)
 
 
 def _next_due(journal, now):
@@ -169,22 +173,23 @@ async def _dispatch(bot):
             journal = load_event_journal()
             if journal is None or journal["journal_id"] != identity:
                 raise _DeliveryChanged
-            journal = {**journal, "outbox": deepcopy(journal["outbox"])}
             now = time.time()
             memberships = notification_memberships()
             blocked = load_blocked_users()
-            if _maintenance(journal, memberships, blocked, now):
-                save_event_journal(journal)
+            maintained = _maintenance(journal, memberships, blocked, now)
+            if maintained is not journal:
+                save_event_journal(maintained)
+                journal = load_event_journal()
             due = _next_due(journal, now)
             remaining = DISPATCH_SECONDS - (time.monotonic() - started)
             if due is None or remaining < REQUEST_SECONDS:
                 return _has_pending(journal)
             record, cid = due
             seq = record["seq"]
-            recipient = record["recipients"][cid]
+            recipient = deepcopy(record["recipients"][cid])
             begin_attempt(recipient, now)
-            save_event_journal(journal)
-            lease = deepcopy(recipient)
+            journal = save_notification_recipient(journal, seq, cid, recipient)
+            lease = recipient
             payload = deepcopy(record["payload"])
 
         async def guard():
@@ -216,8 +221,7 @@ async def _dispatch(bot):
                 or _recipient(journal, seq, cid) != lease
             ):
                 raise _DeliveryChanged
-            journal = {**journal, "outbox": deepcopy(journal["outbox"])}
-            recipient = _recipient(journal, seq, cid)
+            recipient = deepcopy(_recipient(journal, seq, cid))
             outcome = result.attempts[-1].outcome.value
             delay = _retry_delay(result.error)
             if outcome in {"uncertain", "not_dispatched"} and delay is None:
@@ -231,7 +235,7 @@ async def _dispatch(bot):
                     state.subscribers.pop(int(cid), None)
                     save_subscriber_state(state)
                 recipient["reason"] = "forbidden"
-            save_event_journal(journal)
+            journal = save_notification_recipient(journal, seq, cid, recipient)
             if recipient["status"] != "pending":
                 log.info(
                     "Уведомление seq=%d: %s; possible_delivery=%s; duplicate_possible=%s.",

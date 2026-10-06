@@ -245,6 +245,30 @@ def completed_seq(box: dict) -> int:
     return box.get("completed_seq", box["baseline_seq"])
 
 
+def replace_recipients(journal: dict, updates: dict[tuple[int, str], dict]) -> dict:
+    """Копировать только изменяемые ветви; остальное заимствовано read-only.
+
+    Новые recipients принадлежат результату, а не caller. Ни опубликованные
+    snapshots, ни их списки attempts не меняются через общие ссылки.
+    """
+    if not updates:
+        return journal
+    box = journal["outbox"]
+    records = list(box["records"])
+    copied = set()
+    for (seq, cid), recipient in updates.items():
+        if not completed_seq(box) < seq <= box["enqueued_seq"]:
+            raise OutboxStateError("recipient_changed")
+        index = seq - completed_seq(box) - 1
+        if cid not in records[index].get("recipients", {}):
+            raise OutboxStateError("recipient_changed")
+        if index not in copied:
+            records[index] = {**records[index], "recipients": dict(records[index]["recipients"])}
+            copied.add(index)
+        records[index]["recipients"][cid] = deepcopy(recipient)
+    return {**journal, "outbox": {**box, "records": records}}
+
+
 def retain_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
     """Удалить завершённый префикс; оставшийся бюджет отдать сжатию.
 
