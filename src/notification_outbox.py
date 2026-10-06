@@ -7,6 +7,12 @@ import math
 import re
 from copy import deepcopy
 
+from source_history import (
+    event_at_seq,
+    event_count,
+    prefix_seq,
+)
+
 MAX_ATTEMPTS = 6
 LIFETIME = 72 * 60 * 60
 BACKOFF = (60, 300, 1800, 7200, 21600)
@@ -386,13 +392,13 @@ def validate_outbox(journal: dict) -> None:
         or type(box["enqueued_seq"]) is not int
         or box["enqueued_seq"] != journal["processed_seq"]
         or type(completed_seq(box)) is not int
-        or not box["baseline_seq"] <= completed_seq(box) <= box["enqueued_seq"]
+        or not max(box["baseline_seq"], prefix_seq(journal)) <= completed_seq(box) <= box["enqueued_seq"]
         or (
             box["legacy_uncertain_seq"] is not None
             and (
                 type(box["legacy_uncertain_seq"]) is not int
                 or box["legacy_uncertain_seq"] != box["baseline_seq"] + 1
-                or box["legacy_uncertain_seq"] > len(journal["events"])
+                or box["legacy_uncertain_seq"] > event_count(journal)
             )
         )
         or not isinstance(box["records"], list)
@@ -400,7 +406,7 @@ def validate_outbox(journal: dict) -> None:
     ):
         raise OutboxStateError("outbox_structure")
     for seq, record in enumerate(box["records"], completed_seq(box) + 1):
-        event = journal["events"][seq - 1]
+        event = event_at_seq(journal, seq)
         if (
             not isinstance(record, dict)
             or type(record.get("seq")) is not int or record["seq"] != seq

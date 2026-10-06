@@ -12,11 +12,16 @@ from datetime import (
 from event_time_stats import (
     EventTimeStateError,
     validate_event_time,
+    validate_source_base,
 )
 from notification_outbox import (
     OutboxStateError,
     progress_reserve,
     validate_outbox,
+)
+from source_history import (
+    event_count,
+    prefix_seq,
 )
 
 JOURNAL_MAX_BYTES = 8 * 1024 * 1024
@@ -87,6 +92,7 @@ def validate_event_journal(journal: object, *, profile: str | None = None) -> di
             "baseline_initialized", "baseline_ids", "events", "processed_seq",
         } | ({"catchup"} if journal.get("version") in {2, 3} else set())
         | ({"outbox"} if journal.get("version") == 3 else set())
+        | ({"source_base"} if "source_base" in journal and journal.get("version") in {2, 3} else set())
         or type(journal["version"]) is not int or journal["version"] not in {1, 2, 3}
         or type(journal["normalization_version"]) is not int
         or journal["normalization_version"] != 1
@@ -101,8 +107,12 @@ def validate_event_journal(journal: object, *, profile: str | None = None) -> di
     ids = journal["baseline_ids"]
     if any(not _integer(value) for value in ids) or len(set(ids)) != len(ids):
         raise EventJournalStateError("baseline_ids")
-    known = set(ids)
-    for seq, event in enumerate(journal["events"], 1):
+    try:
+        validate_source_base(journal)
+    except (EventTimeStateError, TypeError, KeyError, ValueError):
+        raise EventJournalStateError("source_invalid") from None
+    known = set(ids) | {item[0] for item in journal.get("source_base", {}).get("ids", [])}
+    for seq, event in enumerate(journal["events"], prefix_seq(journal) + 1):
         if (
             not isinstance(event, dict)
             or set(event) != {
@@ -141,8 +151,8 @@ def validate_event_journal(journal: object, *, profile: str | None = None) -> di
         known.add(event["history_id"])
     if (
         not _integer(journal["processed_seq"], 0)
-        or journal["processed_seq"] > len(journal["events"])
-        or (not journal["baseline_initialized"] and (ids or journal["events"]))
+        or not prefix_seq(journal) <= journal["processed_seq"] <= event_count(journal)
+        or (not journal["baseline_initialized"] and (ids or event_count(journal)))
     ):
         raise EventJournalStateError("journal_cursor")
     acquisition = journal.get("catchup")
@@ -171,12 +181,12 @@ def validate_acquisition(state: object, journal: dict, known: set[int]) -> None:
         or type(state["spanning"]) is not bool
         or not isinstance(state["staged"], list)
         or not journal["baseline_initialized"]
-        or journal["processed_seq"] != len(journal["events"])
+        or journal["processed_seq"] != event_count(journal)
     ):
         raise EventJournalStateError("acquisition_structure")
     # Повторно используем ту же матрицу нормализованных событий без рекурсии v2.
     validate_event_journal({
-        **{key: value for key, value in journal.items() if key not in {"catchup", "outbox"}},
+        **{key: value for key, value in journal.items() if key not in {"catchup", "outbox", "source_base"}},
         "version": 1, "baseline_ids": [], "events": state["staged"], "processed_seq": 0,
     })
     staged_ids = {event["history_id"] for event in state["staged"]}
@@ -206,7 +216,7 @@ def validate_recovery_set(journal: dict, cur: dict, *, full_recovery: bool = Tru
     if (
         projection["journal_id"] != journal["journal_id"]
         or projection["baseline_seq"] > completed
-        or not completed <= projection["applied_seq"] <= min(completed + 1, len(journal["events"]))
+        or not completed <= projection["applied_seq"] <= min(completed + 1, event_count(journal))
     ):
         raise EventJournalStateError("recovery_mismatch")
     try:

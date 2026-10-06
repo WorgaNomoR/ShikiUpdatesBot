@@ -17,6 +17,11 @@ import storage
 from event_journal_schema import EventJournalStateError
 from notification_delivery import dispatch_notifications
 from notification_outbox import progress_reserve
+from source_history import (
+    event_at_seq,
+    event_count,
+    prefix_seq,
+)
 
 
 def _entry(history_id=2):
@@ -795,3 +800,139 @@ def test_capacity_retry_merges_retired_prefix_by_absolute_seq(
             assert storage.load_event_journal() == result
             if boundary == "enqueue":
                 assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["admission", "enqueue"])
+@pytest.mark.parametrize("failure", [None, "write", "interruption"])
+async def test_source_capacity_reclaims_history_and_really_resumes_projection_once(
+    history_env, source_history_factory, monkeypatch, boundary, failure,
+):
+    journal, cur = source_history_factory(count=8)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    before = len(handlers.journal_json(journal).encode())
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", before + 4096 + 1000)
+    entry = _entry(20)
+    if boundary == "admission":
+        entry["target"]["name"] = "n" * 4000
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[entry]))
+    monkeypatch.setattr("handlers.build_message", lambda *a, **k: "new payload " * 450)
+    projection = handlers.project_event
+    projections = []
+
+    def project(*args, **kwargs):
+        projections.append(args[2])
+        return projection(*args, **kwargs)
+
+    monkeypatch.setattr("handlers.project_event", project)
+    write = storage._atomic_write
+
+    def publish(path, payload):
+        value = json.loads(payload)
+        if "source_base" in storage.load_event_journal() and (
+            boundary == "enqueue" and path == storage.notification_progress_file() and value.get("processed_seq") == 9
+            or boundary == "admission" and path == storage.EVENT_JOURNAL_FILE and value.get("events", [{}])[-1].get("seq") == 9
+        ):
+            if failure == "interruption":
+                raise asyncio.CancelledError
+            if failure == "write":
+                raise OSError("candidate after reclamation")
+        return write(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", publish)
+        if failure:
+            with pytest.raises(asyncio.CancelledError if failure == "interruption" else EventJournalStateError):
+                await handlers.check_and_notify(AsyncMock(), set(), None)
+        else:
+            await handlers.check_and_notify(AsyncMock(), set(), None)
+    published = storage.load_event_journal()
+    assert prefix_seq(published) == 8
+    if failure:
+        assert published["processed_seq"] == 8
+        applied = storage.load_stats_current(strict=True)["event_projection"]["applied_seq"]
+        assert applied == (9 if boundary == "enqueue" else 8)
+        if boundary == "enqueue":
+            monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
+        storage._journal_history_cache = storage._journal_progress_cache = None
+        await handlers.check_and_notify(AsyncMock(), set(), None)
+    recovered = storage.load_event_journal()
+    assert recovered["processed_seq"] == recovered["outbox"]["enqueued_seq"] == 9
+    assert event_count(recovered) == 9
+    assert [ev["seq"] for ev in recovered["events"]] == [9]
+    assert event_at_seq(recovered, 9)["history_id"] == 20
+    assert projections == [9]
+    assert recovered["outbox"]["records"][0]["payload"]["text"] == "new payload " * 450
+    assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == 9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", [False, True])
+async def test_source_compaction_between_projection_and_enqueue_keeps_suffix_lease(
+    history_env, source_history_factory, monkeypatch, tamper,
+):
+    journal, cur = source_history_factory()
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(20)]))
+
+    def render(*args, **kwargs):
+        published = storage.load_event_journal()
+        assert published["processed_seq"] == 8
+        current = storage.load_stats_current(strict=True)
+        assert current["event_projection"]["applied_seq"] == 9
+        storage.compact_completed_history(
+            published, current, expected_generation=storage.restorable_restore_generation(), force=True,
+        )
+        if tamper:
+            from source_history import content_hash
+            history = json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())
+            base = history["source_base"]
+            # Валидная форма/checksum не доказывает эквивалентность старой authority.
+            base["periods"]["2026-Q1"][-1]["score"] = 9
+            base["checksum"] = content_hash({key: value for key, value in base.items() if key != "checksum"})
+            storage.EVENT_JOURNAL_FILE.write_text(json.dumps(history), encoding="utf-8")
+        return "frozen after concurrent compaction"
+
+    monkeypatch.setattr("handlers.build_message", render)
+    if tamper:
+        with pytest.raises(EventJournalStateError, match="event_time_recovery"):
+            await handlers.check_and_notify(AsyncMock(), set(), None)
+        assert storage.load_event_journal()["processed_seq"] == 8
+        return
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+    recovered = storage.load_event_journal()
+    assert prefix_seq(recovered) == 8
+    assert recovered["processed_seq"] == 9
+    assert recovered["outbox"]["records"][0]["seq"] == 9
+
+
+@pytest.mark.asyncio
+async def test_source_quiet_migration_preserves_one_already_projected_legacy_event(
+    history_env, journal_factory, monkeypatch,
+):
+    from event_time_stats import ensure_event_time
+    from notification_outbox import migrate_outbox
+    legacy = journal_factory(count=3, processed=2)
+    journal = migrate_outbox(legacy, 3)
+    cur = {
+        "period": "2026-Q2",
+        "events": [{"id": "old", "media": "anime", "event": "completed", "score": None}],
+        "pending_quarter_delivery": None,
+        "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 3},
+    }
+    ensure_event_time(cur)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    before = storage.STATS_CURRENT_FILE.read_bytes()
+    monkeypatch.setattr("storage.SOURCE_COMPACTION_BYTES", 0)
+    monkeypatch.setattr("handlers.project_event", lambda *args, **kwargs: pytest.fail("legacy delta repeated"))
+    await handlers._drain_history_journal(AsyncMock())
+    recovered = storage.load_event_journal()
+    assert prefix_seq(recovered) == 2
+    assert recovered["processed_seq"] == 3
+    assert recovered["source_base"]["binding"]["baseline_seq"] == 3
+    assert recovered["outbox"]["legacy_uncertain_seq"] == 3
+    assert recovered["outbox"]["records"][0]["seq"] == 3
+    assert storage.STATS_CURRENT_FILE.read_bytes() == before

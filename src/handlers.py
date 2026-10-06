@@ -88,6 +88,7 @@ from event_journal_schema import (
 from event_time_stats import (
     EVENT_TIME_KEY,
     acknowledge_revisions,
+    compact_source_history,
     ensure_event_time,
     index_event_periods,
     next_period,
@@ -202,6 +203,15 @@ from shiki_api import (
     fetch_current_rates,
     fetch_favourites,
     fetch_history,
+)
+from source_history import (
+    event_at_seq,
+    event_count,
+    known_history_ids,
+    prefix_seq,
+    rebase_source_candidate,
+    same_history_authority,
+    semantic_hash,
 )
 from stats import (
     PICK_CATEGORY_ANIME,
@@ -728,7 +738,7 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
             cur = load_stats_current(strict=True)
             if PROJECTION_KEY in cur:
                 journal, cur = _history_state()
-                if journal.get("catchup") is not None or journal["processed_seq"] < len(journal["events"]):
+                if journal.get("catchup") is not None or journal["processed_seq"] < event_count(journal):
                     return cur
             expected_generation = restorable_restore_generation()
             if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") >= now_period:
@@ -780,7 +790,7 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
                 return cur
             if PROJECTION_KEY in cur:
                 journal, cur = _history_state()
-                if journal.get("catchup") is not None or journal["processed_seq"] < len(journal["events"]):
+                if journal.get("catchup") is not None or journal["processed_seq"] < event_count(journal):
                     return cur
             if cur != expected_cur:
                 # Новое квартальное событие могло успеть опубликоваться, пока
@@ -2227,7 +2237,7 @@ _JOURNAL_STATE_NOTICE = (
 )
 _JOURNAL_CAPACITY_NOTICE = (
     "⚠️ Сохранённая история и очередь уведомлений приближаются к пределу 8 МиБ. Сделай резервную копию "
-    "через /backup. При заполнении новые события будут отложены; сохранённые не удаляются."
+    "через /backup. При заполнении новые события будут отложены; данные для статистики и доставки сохраняются."
 )
 _NOTIFICATION_STATE_NOTICE = (
     "⚠️ Отправка сохранённых уведомлений временно приостановлена. "
@@ -2256,7 +2266,7 @@ async def _journal_diagnostic(bot: Bot, *, capacity: bool = False, delivery: boo
 
 
 def _journal_seen(journal: dict) -> set[int]:
-    return set(journal["baseline_ids"]) | {event["history_id"] for event in journal["events"]}
+    return known_history_ids(journal)
 
 
 def _history_state(*, full_recovery: bool = True) -> tuple[dict | None, dict]:
@@ -2322,11 +2332,11 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
             journal = migrate_outbox(journal, cur[PROJECTION_KEY]["applied_seq"])
             save_event_journal(journal)
         if journal is not None:
-            journal = compact_event_journal(journal, expected_generation=generation)
+            journal = compact_event_journal(journal, expected_generation=generation, cur=cur)
         period_events = index_event_periods(cur, journal) if journal is not None and PROJECTION_KEY in cur else {}
-    while journal is not None and journal["processed_seq"] < len(journal["events"]):
+    while journal is not None and journal["processed_seq"] < event_count(journal):
         seq = journal["processed_seq"] + 1
-        event = journal["events"][seq - 1]
+        event = event_at_seq(journal, seq)
         entry = history_entry_from_event(event)
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
@@ -2361,7 +2371,7 @@ async def _enqueue_history_event(journal: dict, event: dict, text: str | None, g
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
         current_journal, cur = _history_state(full_recovery=False)
-        if not _same_history_authority(current_journal, journal) or cur[PROJECTION_KEY]["applied_seq"] != event["seq"]:
+        if not _same_history_authority(current_journal, journal, cur) or cur[PROJECTION_KEY]["applied_seq"] != event["seq"]:
             raise _HistoryAttemptChanged
         try:
             memberships = notification_memberships() if notification_event(event) else {}
@@ -2370,18 +2380,20 @@ async def _enqueue_history_event(journal: dict, event: dict, text: str | None, g
             raise EventJournalStateError("notification_state") from None
         memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}
         candidate = enqueue(current_journal, event, text, memberships, time.time())
-        candidate = _save_history_progress(current_journal, candidate, generation)
+        candidate = _save_history_progress(current_journal, candidate, generation, cur=cur)
         return candidate, cur
 
 
-def _same_history_authority(current: dict | None, expected: dict) -> bool:
+def _same_history_authority(current: dict | None, expected: dict, cur: dict) -> bool:
     """Подтверждение получателя и очистка outbox не меняют принятую историю."""
-    return current is not None and {
-        key: value for key, value in current.items() if key != "outbox"
-    } == {key: value for key, value in expected.items() if key != "outbox"}
+    if not same_history_authority(current, expected):
+        return False
+    if prefix_seq(current) == prefix_seq(expected):
+        return True
+    return current["source_base"] == compact_source_history(expected, cur, prefix_seq(current))["source_base"]
 
 
-def _save_history_progress(current: dict, candidate: dict, generation: int) -> dict:
+def _save_history_progress(current: dict, candidate: dict, generation: int, *, cur: dict | None = None) -> dict:
     """При нехватке места освободить принятый outbox, затем повторить публикацию."""
     try:
         save_event_journal(candidate, admitting=True)
@@ -2389,10 +2401,13 @@ def _save_history_progress(current: dict, candidate: dict, generation: int) -> d
     except EventJournalStateError as error:
         if str(error) != "journal_capacity":
             raise
-        reclaimed = compact_event_journal(current, expected_generation=generation)
+        reclaimed = compact_event_journal(
+            current, expected_generation=generation, cur=cur,
+            force_history=True,
+        )
         if reclaimed == current:
             raise
-    candidate = deepcopy(candidate)
+    candidate = deepcopy(rebase_source_candidate(candidate, reclaimed))
     suffix = [
         record for record in candidate["outbox"]["records"]
         if record["seq"] > reclaimed["outbox"]["enqueued_seq"]
@@ -2441,7 +2456,7 @@ async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
         published_journal, cur = _history_state()
-        if published_journal != journal and not _same_history_authority(published_journal, journal):
+        if published_journal != journal and not _same_history_authority(published_journal, journal, cur):
             raise _HistoryAttemptChanged
         journal = published_journal
     seen = _journal_seen(journal) if journal is not None else set()
@@ -2461,13 +2476,13 @@ async def _publish_history_candidate(expected: dict, candidate: dict, generation
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
         current, cur = _history_state()
-        if not _same_history_authority(current, expected):
+        if not _same_history_authority(current, expected, cur):
             raise _HistoryAttemptChanged
         if candidate != expected:
-            candidate = deepcopy(candidate)
+            candidate = deepcopy(rebase_source_candidate(candidate, current))
             if current.get("outbox") is not None:
                 candidate["outbox"] = deepcopy(current["outbox"])
-            candidate = _save_history_progress(current, candidate, generation)
+            candidate = _save_history_progress(current, candidate, generation, cur=cur)
         else:
             candidate = current
         return candidate, cur
@@ -2477,11 +2492,9 @@ def _stage_history_page(state: dict, entries: list[dict], journal: dict) -> None
     """Сохранить первую семантику ID без приёма staged записей в журнал."""
     baseline = set(journal["baseline_ids"])
     by_id = {event["history_id"]: event for event in journal["events"] + state["staged"]}
+    compact_ids = dict(journal.get("source_base", {}).get("ids", []))
     observed_at = _utcnow().replace(tzinfo=timezone.utc).isoformat()
     conflicts = 0
-
-    def semantic(value):
-        return {key: item for key, item in value.items() if key not in {"seq", "observed_at"}}
 
     for entry in entries:
         history_id = entry["id"]
@@ -2489,13 +2502,17 @@ def _stage_history_page(state: dict, entries: list[dict], journal: dict) -> None
             continue
         try:
             event = normalize_history_event(entry, observed_at)
-        except (ValueError, TypeError, AttributeError, KeyError):
-            if history_id in by_id:
+            fingerprint = semantic_hash(event)
+        except (ValueError, TypeError, AttributeError, KeyError, RecursionError, UnicodeError):
+            if history_id in by_id or history_id in compact_ids:
                 conflicts += 1
                 continue
             raise EventJournalStateError("normalization_failed") from None
-        if history_id in by_id:
-            if semantic(by_id[history_id]) != semantic(event):
+        if history_id in compact_ids:
+            if compact_ids[history_id] != fingerprint:
+                conflicts += 1
+        elif history_id in by_id:
+            if semantic_hash(by_id[history_id]) != fingerprint:
                 conflicts += 1
         else:
             event["seq"] = len(state["staged"]) + 1
@@ -2537,7 +2554,7 @@ async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tu
             if complete:
                 for event in sorted(state["staged"], key=lambda value: value["history_id"]):
                     event = deepcopy(event)
-                    event["seq"] = len(candidate["events"]) + 1
+                    event["seq"] = event_count(candidate) + 1
                     candidate["events"].append(event)
                 if state["staged"] or previous is not None or journal.get("catchup") is not None:
                     candidate.update(version=max(2, journal["version"]), catchup=None)

@@ -9,6 +9,15 @@ from datetime import (
     timezone,
 )
 
+from source_history import (
+    content_hash,
+    event_at_seq,
+    event_count,
+    prefix_seq,
+    semantic_hash,
+    source_suffix,
+)
+
 EVENT_TIME_KEY = "event_time"
 STAT_TYPES = frozenset({"completed", "dropped", "planned", "rewatching"})
 SCORE_TYPES = frozenset({"score_set", "score_changed", "score_removed"})
@@ -91,8 +100,8 @@ def ensure_event_time(cur: dict) -> bool:
 
 def index_event_periods(cur: dict, journal: dict) -> dict[str, list[dict]]:
     """Временный индекс применённого префикса; после сбоя/restore строится заново."""
-    groups = {}
-    for event in journal["events"][cur[EVENT_TIME_KEY]["baseline_seq"] : cur["event_projection"]["applied_seq"]]:
+    groups, _ = compact_source_groups(cur[EVENT_TIME_KEY], journal)
+    for event in source_suffix(journal, cur[EVENT_TIME_KEY]["baseline_seq"], cur["event_projection"]["applied_seq"]):
         if _eligible(event):
             period, _ = event_period(event)
             if period is not None:
@@ -122,9 +131,10 @@ def _derive(
     if source is None:
         source = [
             ev
-            for ev in journal["events"][state["baseline_seq"] : seq]
+            for ev in source_suffix(journal, state["baseline_seq"], seq)
             if _eligible(ev) and event_period(ev)[0] == period
         ]
+        source = compact_source_groups(state, journal)[0].get(period, []) + source
     else:
         source = list(source)
     source.sort(key=lambda ev: (ev["event_at"], ev["history_id"]))
@@ -170,7 +180,7 @@ def project_event(
 ) -> None:
     """Caller публикует дельту и applied_seq одной заменой stats_current."""
     state = cur[EVENT_TIME_KEY]
-    event = journal["events"][seq - 1]
+    event = event_at_seq(journal, seq)
     if not _eligible(event):
         return
     period, reason = event_period(event)
@@ -369,11 +379,10 @@ def validate_event_time(cur: dict, journal: dict | None = None) -> None:
         raise EventTimeStateError("event_time_ack_missing")
     if journal is not None:
         applied = projection["applied_seq"]
-        if applied > len(journal["events"]):
+        if applied > event_count(journal):
             raise EventTimeStateError("event_time_recovery")
-        groups = {}
-        unknown = dict.fromkeys(sorted(TIME_REASONS), 0)
-        for ev in journal["events"][state["baseline_seq"] : applied]:
+        groups, unknown = compact_source_groups(state, journal)
+        for ev in source_suffix(journal, state["baseline_seq"], applied):
             if _eligible(ev):
                 period, reason = event_period(ev)
                 if period is None:
@@ -390,3 +399,165 @@ def validate_event_time(cur: dict, journal: dict | None = None) -> None:
             expected = _derive(state, journal, applied, period, source=groups.get(period, []))
             if expected != bucket["events"]:
                 raise EventTimeStateError("event_time_recovery_payload")
+
+
+_SOURCE_FIELDS = {
+    "seq", "history_id", "event_at", "event_type", "media", "target_id",
+    "kind", "score", "title",
+}
+_SOURCE_SCORE_FIELDS = {"seq", "history_id", "event_at", "event_type", "media", "target_id", "score"}
+
+
+def _source_binding(state: dict) -> dict:
+    """Привязка к неизменной legacy-семантике, а не к готовой проекции."""
+    return {
+        "baseline_seq": state["baseline_seq"],
+        "legacy_period": state["legacy_period"],
+        "legacy_hash": content_hash(state["legacy_events"]),
+    }
+
+
+def compact_source_groups(state: dict, journal: dict) -> tuple[dict, dict]:
+    """Старая quarter-only граница исключает прежние compact source факты."""
+    base = journal.get("source_base")
+    unknown = dict.fromkeys(sorted(TIME_REASONS), 0)
+    if base is None or state["baseline_seq"] >= base["through_seq"]:
+        return {}, unknown
+    if base["binding"] != _source_binding(state):
+        raise EventTimeStateError("source_binding")
+    return deepcopy(base["periods"]), dict(base["unknown"])
+
+
+def _minimal_sources(source: list[dict]) -> list[dict]:
+    """Первые записи определяют порядок/metadata; последняя оценка — итог.
+
+    Для каждой статистической тройки reducer добавляет только первую запись.
+    Все присваивания оценки одного title заменяют предыдущее; достаточно
+    последнего, включая оценённый повтор completed. При произвольной поздней
+    вставке min(first, new) и max(last, new) дают те же факты и порядок.
+    """
+    first, last = {}, {}
+    for event in sorted(source, key=lambda ev: (ev["event_at"], ev["history_id"])):
+        key = (event["media"], event["target_id"])
+        kind = event["event_type"]
+        if kind in STAT_TYPES:
+            first.setdefault((*key, kind), event)
+        if kind == "score_removed" or kind in SCORE_TYPES | {"completed"} and _score(event["score"]) is not None:
+            last[key] = event
+    selected = {event["seq"]: event for event in [*first.values(), *last.values()]}
+    first_seq = {event["seq"] for event in first.values()}
+    result = []
+    for event in sorted(selected.values(), key=lambda ev: (ev["event_at"], ev["history_id"])):
+        if event["seq"] in first_seq:
+            result.append({
+                **{key: deepcopy(event[key]) for key in sorted(_SOURCE_FIELDS)},
+                "score": _score(event["score"]),
+            })
+        else:
+            # Присваиванию не нужны title/kind или семантика повторного completed.
+            result.append({
+                **{key: event[key] for key in sorted(_SOURCE_SCORE_FIELDS)},
+                "event_type": "score_removed" if event["event_type"] == "score_removed" else "score_set",
+                "score": None if event["event_type"] == "score_removed" else _score(event["score"]),
+            })
+    return result
+
+
+def compact_source_history(journal: dict, cur: dict, through: int) -> dict:
+    """Чистый candidate; caller проверяет consumers и публикует один member."""
+    state = cur[EVENT_TIME_KEY]
+    periods, unknown = compact_source_groups(state, journal)
+    old = journal.get("source_base")
+    ids = list(old["ids"]) if old else []
+    removed = source_suffix(journal, prefix_seq(journal), through)
+    ids.extend([event["history_id"], semantic_hash(event)] for event in removed)
+    for event in removed:
+        if event["seq"] <= state["baseline_seq"] or not _eligible(event):
+            continue
+        period, reason = event_period(event)
+        if period is None:
+            unknown[reason] += 1
+        else:
+            periods.setdefault(period, []).append(event)
+    base = {
+        "version": 1, "through_seq": through, "ids": ids,
+        "binding": _source_binding(state),
+        "periods": {period: _minimal_sources(source) for period, source in sorted(periods.items())},
+        "unknown": unknown,
+    }
+    base["checksum"] = content_hash(base)
+    return {**journal, "source_base": base, "events": journal["events"][through - prefix_seq(journal):]}
+
+
+def validate_source_base(journal: dict) -> None:
+    """Полная форма compact source, точные ID, checksum и canonical min/max."""
+    if "source_base" not in journal:
+        return
+    base = journal["source_base"]
+    def digest(value):
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+    if (
+        not isinstance(base, dict)
+        or set(base) != {"version", "through_seq", "ids", "binding", "periods", "unknown", "checksum"}
+        or type(base["version"]) is not int or base["version"] != 1
+        or type(base["through_seq"]) is not int or not 1 <= base["through_seq"] <= journal["processed_seq"]
+        or not isinstance(base["ids"], list) or len(base["ids"]) != base["through_seq"]
+        or not isinstance(base["binding"], dict)
+        or set(base["binding"]) != {"baseline_seq", "legacy_period", "legacy_hash"}
+        or type(base["binding"]["baseline_seq"]) is not int
+        or not 0 <= base["binding"]["baseline_seq"] <= min(journal["processed_seq"] + 1, event_count(journal))
+        or not _period(base["binding"]["legacy_period"]) or not digest(base["binding"]["legacy_hash"])
+        or not isinstance(base["periods"], dict)
+        or not isinstance(base["unknown"], dict) or set(base["unknown"]) != TIME_REASONS
+        or any(type(count) is not int or count < 0 for count in base["unknown"].values())
+        or sum(base["unknown"].values()) > max(0, base["through_seq"] - base["binding"]["baseline_seq"])
+        or not digest(base["checksum"])
+        or base["checksum"] != content_hash({key: value for key, value in base.items() if key != "checksum"})
+    ):
+        raise EventTimeStateError("source_structure")
+    known = set(journal["baseline_ids"])
+    for item in base["ids"]:
+        if (
+            not isinstance(item, list) or len(item) != 2
+            or type(item[0]) is not int or item[0] in known or not digest(item[1])
+        ):
+            raise EventTimeStateError("source_ids")
+        known.add(item[0])
+    retained_seq = set()
+    for period, source in base["periods"].items():
+        if not _period(period) or not isinstance(source, list):
+            raise EventTimeStateError("source_period")
+        for ev in source:
+            if (
+                not isinstance(ev, dict) or set(ev) != (
+                    _SOURCE_SCORE_FIELDS if ev.get("event_type") in SCORE_TYPES else _SOURCE_FIELDS
+                )
+                or type(ev["seq"]) is not int
+                or not base["binding"]["baseline_seq"] < ev["seq"] <= base["through_seq"]
+                or ev["seq"] in retained_seq
+                or type(ev["history_id"]) is not int or ev["history_id"] != base["ids"][ev["seq"] - 1][0]
+                or not isinstance(ev["media"], str) or ev["media"] not in {"anime", "manga"}
+                or not isinstance(ev["target_id"], str) or not ev["target_id"]
+                or not isinstance(ev["event_type"], str) or ev["event_type"] not in STAT_TYPES | SCORE_TYPES
+                or (ev["score"] is not None and _score(ev["score"]) is None)
+            ):
+                raise EventTimeStateError("source_record")
+            if ev["event_type"] in STAT_TYPES and (
+                not isinstance(ev["kind"], str)
+                or not isinstance(ev["title"], dict) or set(ev["title"]) != {"name", "russian", "url"}
+                or any(not isinstance(text, str) for text in ev["title"].values())
+            ):
+                raise EventTimeStateError("source_record")
+            try:
+                moment = datetime.fromisoformat(ev["event_at"])
+                if (
+                    moment.tzinfo is None or moment.astimezone(timezone.utc).isoformat() != ev["event_at"]
+                    or f"{moment.year:04d}-Q{(moment.month - 1) // 3 + 1}" != period
+                ):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                raise EventTimeStateError("source_time") from None
+            retained_seq.add(ev["seq"])
+        if _minimal_sources(source) != source:
+            raise EventTimeStateError("source_noncanonical")

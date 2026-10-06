@@ -3,12 +3,14 @@
 """Регрессии исходного квартала, source-порядка и ревизий закрытой истории."""
 
 from copy import deepcopy
+from random import Random
 
 import pytest
 
 from event_time_stats import (
     EventTimeStateError,
     acknowledge_revisions,
+    compact_source_history,
     correction_periods,
     ensure_event_time,
     event_period,
@@ -19,6 +21,7 @@ from event_time_stats import (
     report_revisions,
     rotate_event_time,
     validate_event_time,
+    validate_source_base,
 )
 from messages import normalize_history_event
 
@@ -291,3 +294,111 @@ def test_indexed_projection_resumes_prefix_and_matches_source_order(reverse):
     assert cur["events"][0]["score"] is None
     assert cur["event_time"]["unknown"]["missing"] == 1
     assert cur["event_time"]["unknown"]["future"] == 1
+
+
+def _append_source(cur, journal, event, *, indexed=False):
+    journal["events"].append({**deepcopy(event), "seq": journal["processed_seq"] + 1})
+    seq = journal["processed_seq"] + 1
+    index = index_event_periods(cur, journal) if indexed else None
+    project_event(cur, journal, seq, period_events=index)
+    cur["event_projection"]["applied_seq"] = seq
+    journal["processed_seq"] = seq
+    validate_event_time(cur, journal)
+
+
+@pytest.mark.parametrize("legacy_score", [None, 0, 8])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_compact_sources_preserve_late_insertions_order_scores_and_legacy(legacy_score, indexed):
+    legacy = [
+        {"id": "10", "media": "anime", "event": "completed", "score": legacy_score},
+        {"id": "old", "media": "anime", "event": "planned"},
+    ]
+    full_cur = _current(events=legacy)
+    full = {"baseline_ids": [], "events": [], "processed_seq": 0}
+    initial = [
+        _event(9, "2026-04-09T00:00:00Z", "score_removed"),
+        _event(4, "2026-04-04T00:00:00Z", "completed", 7, target="20"),
+        _event(2, "2026-04-02T00:00:00Z", "completed", 8, target="20"),
+        _event(8, "2026-04-08T00:00:00Z", "completed", 3, target="20"),
+        _event(5, "2026-04-05T00:00:00Z", "planned", 4, target="20"),
+        _event(6, "2026-04-06T00:00:00Z", "planned", 9, target="20"),
+        _event(7, None),
+        _event(10, "2027-01-01T00:00:01Z"),
+        _event(11, "2026-07-01T00:00:00Z", "score_changed", None),
+    ]
+    for ev in initial:
+        _append_source(full_cur, full, ev)
+    compact = compact_source_history(full, full_cur, full["processed_seq"])
+    compact_cur = deepcopy(full_cur)
+    validate_source_base(compact)
+    validate_event_time(compact_cur, compact)
+    assert compact["events"] == []
+    assert len(compact["source_base"]["periods"]["2026-Q2"]) < len(initial)
+    later = [
+        _event(12, "2026-04-01T00:00:00Z", "completed", 6, target="20"),
+        _event(13, "2026-04-03T00:00:00Z", "score_removed", target="20"),
+        _event(14, "2026-04-10T00:00:00Z", "score_set", 9, target="20"),
+        _event(15, "2026-04-09T00:00:00Z", "score_set", 5),
+        _event(1, "2026-04-09T00:00:00Z", "score_set", 7),
+        _event(16, "2026-04-01T00:00:00Z", "dropped", target="40"),
+        _event(17, "bad"),
+    ]
+    for ev in later:
+        _append_source(full_cur, full, ev)
+        _append_source(compact_cur, compact, ev, indexed=indexed)
+        assert compact_cur == full_cur
+        compact = compact_source_history(compact, compact_cur, compact["processed_seq"])
+        validate_source_base(compact)
+        validate_event_time(compact_cur, compact)
+    assert compact_cur["events"][0]["score"] == 5
+    assert compact_cur["events"][2]["id"] == "20"
+    assert compact_cur["events"][2]["score"] == 9
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_compact_source_min_max_matches_full_reducer_for_arbitrary_late_history(seed):
+    rng = Random(seed)
+    full_cur = _current()
+    full = {"baseline_ids": [], "events": [], "processed_seq": 0}
+    compact_cur, compact = deepcopy(full_cur), deepcopy(full)
+    for i in range(1, 81):
+        ev = _event(
+            rng.randrange(10**8, 10**9), rng.choice([
+                "2026-04-01T00:00:00Z", "2026-04-02T00:00:00Z",
+                "2026-07-01T00:00:00Z", None, "bad", "2027-01-01T00:00:01Z",
+            ]),
+            rng.choice(["completed", "dropped", "planned", "rewatching", "score_set", "score_changed", "score_removed"]),
+            rng.choice([None, 0, 3, 8, 15]), target=str(rng.randrange(1, 6)),
+            media=rng.choice(["anime", "manga"]),
+        )
+        _append_source(full_cur, full, ev)
+        _append_source(compact_cur, compact, ev, indexed=i % 2 == 0)
+        assert compact_cur == full_cur
+        if i % 9 == 0:
+            compact = compact_source_history(compact, compact_cur, i)
+            validate_source_base(compact)
+            validate_event_time(compact_cur, compact)
+
+
+def test_compact_recovery_rejects_projection_and_binding_changes_and_legacy_reset():
+    cur = _current()
+    journal = {"baseline_ids": [], "events": [], "processed_seq": 0}
+    for i in range(1, 5):
+        _append_source(cur, journal, _event(i, "2026-04-01T00:00:00Z", score=8))
+    compact = compact_source_history(journal, cur, 3)
+    changed = deepcopy(cur)
+    changed["event_time"]["legacy_events"].append({"id": "tampered"})
+    with pytest.raises(EventTimeStateError, match="source_binding"):
+        validate_event_time(changed, compact)
+    changed = deepcopy(cur)
+    changed["events"][0]["score"] = 9
+    changed["event_time"]["periods"]["2026-Q2"]["events"] = deepcopy(changed["events"])
+    with pytest.raises(EventTimeStateError, match="recovery_payload"):
+        validate_event_time(changed, compact)
+    # Явная legacy quarter-only граница исключает все старые source факты.
+    reset = _current(applied=4, events=[{"id": "legacy", "event": "planned"}])
+    validate_event_time(reset, compact)
+    _append_source(reset, compact, _event(5, "2026-04-01T00:00:00Z"))
+    compact = compact_source_history(compact, reset, 5)
+    validate_source_base(compact)
+    validate_event_time(reset, compact)

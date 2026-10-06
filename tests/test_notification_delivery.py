@@ -800,7 +800,7 @@ async def test_compaction_changed_revalidates_restored_authority_before_delivery
     compact = storage.compact_event_journal
     published = []
 
-    def replace_authority(snapshot, *, expected_generation):
+    def replace_authority(snapshot, *, expected_generation, cur=None):
         restored = deepcopy(snapshot)
         restored["journal_id"] = "f" * 32
         restored["outbox"]["records"][1]["payload"]["text"] = "restored payload"
@@ -988,3 +988,43 @@ def test_maintenance_copies_changed_branches_without_mutating_borrowed_progress(
     assert all(record["recipients"]["20"]["status"] == "pending" for record in maintained["outbox"]["records"])
     storage.save_event_journal(maintained)
     assert storage.load_event_journal() == maintained
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_independent_delivery_compacts_source_or_defers_failed_write_without_losing_due_work(
+    outbox_env, source_history_factory, monkeypatch, failure,
+):
+    from source_history import prefix_seq
+    storage.save_subscribers({10: "only"})
+    token = storage.notification_memberships()[10]
+    journal, cur = source_history_factory(count=8, pending_from=6)
+    for record in journal["outbox"]["records"]:
+        record.update(created_at=outbox_env[0], expires_at=outbox_env[0] + 72 * 3600)
+        record["recipients"]["10"].update(membership=token, next_attempt_at=outbox_env[0])
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    original = storage.EVENT_JOURNAL_FILE.read_bytes()
+    monkeypatch.setattr("storage.SOURCE_COMPACTION_BYTES", 0)
+    write = storage._atomic_write
+
+    def publish(path, payload):
+        if failure and path == storage.EVENT_JOURNAL_FILE and json.loads(payload).get("version") == 5:
+            raise OSError("defer source maintenance")
+        return write(path, payload)
+
+    monkeypatch.setattr("storage._atomic_write", publish)
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    assert bot.send_message.await_count == 3
+    recovered = storage.load_event_journal()
+    assert prefix_seq(recovered) == (0 if failure else 5)
+    if failure:
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == original
+    for before, after in zip(journal["outbox"]["records"], recovered["outbox"]["records"], strict=True):
+        assert after["seq"] == before["seq"]
+        assert after["payload"] == before["payload"]
+        assert after["created_at"] == before["created_at"]
+        assert after["expires_at"] == before["expires_at"]
+        assert after["recipients"]["10"]["membership"] == token
+        assert after["recipients"]["10"]["status"] == "delivered"
