@@ -3076,6 +3076,107 @@ async def test_split_backup_capture_freezes_progress_before_concurrent_writer(
 
 
 @pytest.mark.asyncio
+async def test_large_compact_current_roundtrips_complete_v5_backup(
+    backup_env, stats_capacity_factory,
+):
+    from event_journal_schema import validate_recovery_set
+
+    journal, cur = stats_capacity_factory(count=15000)
+    old_raw = json.dumps(cur, ensure_ascii=False, indent=2).replace("\n", "\r\n").encode("utf-8")
+    assert len(old_raw) > backup._IMPORT_MEMBER_MAX_BYTES
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    current_raw = storage.STATS_CURRENT_FILE.read_bytes()
+    assert len(current_raw) < backup._IMPORT_MEMBER_MAX_BYTES
+    assert json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())["version"] == 5
+    archive, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+        assert zipped.read("stats_current.json") == current_raw
+        assert {"event_journal.json", "notification_progress.json", "stats_current.json"} <= set(zipped.namelist())
+    await backup.restore_backup_zip(archive)
+    assert storage.load_stats_current(strict=True) == cur
+    assert storage.load_event_journal() == journal
+    validate_recovery_set(storage.load_event_journal(), storage.load_stats_current(strict=True))
+    storage.save_stats_current(storage.load_stats_current(strict=True), strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == current_raw
+
+
+@pytest.mark.asyncio
+async def test_physically_oversized_current_rejects_before_compact_restore(
+    backup_env,
+):
+    original = b'{"period":"2026-Q2","events":[]}\r\n'
+    storage.STATS_CURRENT_FILE.write_bytes(original)
+    raw = original + b" " * (backup._IMPORT_MEMBER_MAX_BYTES + 1 - len(original))
+    generation = storage.restorable_restore_generation()
+    archive = _zip_bytes({"subscribers.json": '{"subscribers":{"10":"new"}}', "stats_current.json": raw})
+    with pytest.raises(ValueError, match="больше 8 МиБ"):
+        await backup.restore_backup_zip(archive)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    assert not storage.SUBS_FILE.exists()
+    assert storage.restorable_restore_generation() == generation
+    storage.STATS_CURRENT_FILE.write_bytes(raw)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_size"):
+        storage.load_stats_current(strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eol", ["\n", "\r\n"])
+async def test_current_import_reserves_legacy_migration_and_future_writes(
+    backup_env, monkeypatch, eol,
+):
+    from copy import deepcopy
+
+    cur = {"period": "2026-Q2", "events": [], "last_report_sent": None, "tracking_since": "2026-04-01T00:00:00+00:00", "pending_quarter_delivery": {
+        "old_period": "2026-Q1", "new_period": "2026-Q2", "report_messages": ["frozen", "続き"], "report_sent": False,
+    }}
+    future = deepcopy(cur)
+    future["pending_quarter_delivery"] = storage.migrate_quarter_delivery(cur["pending_quarter_delivery"])
+    future["pending_quarter_delivery"].update(next_unit=1, delivery_uncertain=False)
+    boundary = len(json.dumps(future, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    archive = _zip_bytes({"stats_current.json": json.dumps(cur, ensure_ascii=False, indent=2).replace("\n", eol)})
+    original = b'{"period":"2026-Q2","events":[]}\r\n'
+    storage.STATS_CURRENT_FILE.write_bytes(original)
+    generation = storage.restorable_restore_generation()
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary - 1)
+    with pytest.raises(ValueError, match="current_capacity"):
+        await backup.restore_backup_zip(archive)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    assert storage.restorable_restore_generation() == generation
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary)
+    await backup.restore_backup_zip(archive)
+    loaded = storage.load_stats_current(strict=True)
+    assert loaded == cur
+    assert b"\n" not in storage.STATS_CURRENT_FILE.read_bytes()
+    storage.save_stats_current(future, strict=True)
+    assert storage.load_stats_current(strict=True) == future
+
+
+@pytest.mark.asyncio
+async def test_current_restore_rechecks_reserve_after_legacy_journal_binding(
+    backup_env, journal_factory, monkeypatch,
+):
+    journal = journal_factory(count=0)
+    storage.save_event_journal(journal)
+    cur = {"period": "2026-Q2", "events": [], "last_report_sent": None, "tracking_since": "2026-04-01T00:00:00+00:00", "pending_quarter_delivery": storage.new_quarter_delivery("2026-Q1", "2026-Q2", ["frozen"])}
+    bound = {**cur, "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}
+    marker = json.loads(json.dumps(bound))
+    marker["pending_quarter_delivery"]["delivery_uncertain"] = False
+    boundary = len(json.dumps(marker, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    assert len(json.dumps(bound, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) < boundary
+    original = {p.name: p.read_bytes() for p in backup_env.iterdir() if p.is_file()}
+    archive = _zip_bytes({"stats_current.json": json.dumps(cur, ensure_ascii=False, separators=(",", ":"))})
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary - 1)
+    with pytest.raises(ValueError, match="current_capacity"):
+        await backup.restore_backup_zip(archive)
+    assert {p.name: p.read_bytes() for p in backup_env.iterdir() if p.is_file()} == original
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary)
+    await backup.restore_backup_zip(archive)
+    storage.save_stats_current(storage.load_stats_current(strict=True), strict=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("restore_kind", ["complete", "legacy_quarter", "old_complete"])
 async def test_source_backup_coherent_roundtrip_and_older_restore_compatibility(
     backup_env, source_history_factory, restore_kind,

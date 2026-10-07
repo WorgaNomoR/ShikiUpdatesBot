@@ -1795,19 +1795,25 @@ def test_v3_revision_map_is_hash_bound_and_survives_downgrade():
 
 def test_current_capacity_reserves_actual_final_acknowledgement(backup_env, monkeypatch):
     cur = _quarter_state()
+    cur["tracking_since"] = "2026-07-01T00:00:00+00:00"
+    cur["pending_quarter_delivery"]["report_messages"] *= 5
+    cur["pending_quarter_delivery"]["plan_hash"] = storage._quarter_plan_hash(cur["pending_quarter_delivery"])
     storage.save_stats_current(cur, strict=True)
     original = storage.STATS_CURRENT_FILE.read_bytes()
-    current_size = storage.json_publication_size(json.dumps(cur, ensure_ascii=False, indent=2))
+    current_size = storage.json_publication_size(storage.stats_current_json(cur, strict=False))
     completed = json.loads(json.dumps(cur))
     completed["last_report_sent"] = completed["period"]
     completed["pending_quarter_delivery"]["next_unit"] = len(completed["pending_quarter_delivery"]["report_messages"])
-    final_size = storage.json_publication_size(json.dumps(completed, ensure_ascii=False, indent=2))
+    final_size = storage.json_publication_size(storage.stats_current_json(completed, strict=False))
+    started = deepcopy(cur)
+    started["pending_quarter_delivery"].update(next_unit=9, delivery_uncertain=False)
+    boundary = max(final_size, storage.json_publication_size(storage.stats_current_json(started, strict=False)))
     assert final_size > current_size
     monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", current_size)
     with pytest.raises(storage.QuarterDeliveryStateError):
         storage.save_stats_current(cur, strict=True)
     assert storage.STATS_CURRENT_FILE.read_bytes() == original
-    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", final_size)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary)
     storage.save_stats_current(cur, strict=True)
     storage.save_stats_current(completed, strict=True)
     assert storage.load_stats_current(strict=True)["last_report_sent"] == cur["period"]
@@ -2218,11 +2224,12 @@ def test_completed_plan_cannot_retain_unacknowledged_dispatch_marker():
 def test_current_capacity_reserves_dispatch_marker_before_sending(backup_env, monkeypatch):
     cur = _quarter_state()
     cur["last_report_sent"] = None
+    cur["tracking_since"] = "2026-07-01T00:00:00+00:00"
     storage.save_stats_current(cur, strict=True)
     original = storage.STATS_CURRENT_FILE.read_bytes()
     started = json.loads(json.dumps(cur))
-    started["pending_quarter_delivery"]["delivery_uncertain"] = True
-    started_size = storage.json_publication_size(json.dumps(started, ensure_ascii=False, indent=2))
+    started["pending_quarter_delivery"].update(next_unit=1, delivery_uncertain=False)
+    started_size = storage.json_publication_size(storage.stats_current_json(started, strict=False))
     monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", started_size - 1)
     with pytest.raises(storage.QuarterDeliveryStateError, match="current_capacity"):
         storage.stats_current_json(cur)
@@ -2234,6 +2241,140 @@ def test_current_capacity_reserves_dispatch_marker_before_sending(backup_env, mo
     storage.save_stats_current(started, strict=True)
     assert json.loads(storage.STATS_CURRENT_FILE.read_bytes()) == started
     assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == started["pending_quarter_delivery"]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_current_publication_is_compact_and_preserves_all_values(backup_env, strict):
+    cur = _quarter_state_v2()
+    cur["events"] = [{"id": "旧", "title": "строка\n日本語 🍀"}]
+    cur["pending_quarter_delivery"].update(next_unit=1, delivery_uncertain=True)
+    before = deepcopy(cur)
+    storage.save_stats_current(cur, strict=strict)
+    raw = storage.STATS_CURRENT_FILE.read_bytes()
+    assert raw == json.dumps(cur, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert json.loads(raw) == before == cur
+
+
+def test_current_initial_capacity_is_inclusive_and_preserves_old_bytes(backup_env, monkeypatch):
+    cur = {"period": "2026-Q1", "events": [], "tracking_since": "2026-01-01T00:00:00+00:00", "pending_quarter_delivery": None}
+    storage.save_stats_current(cur, strict=True)
+    raw = storage.STATS_CURRENT_FILE.read_bytes()
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", len(raw))
+    assert storage.load_stats_current(strict=True) == cur
+    storage.save_stats_current(cur, strict=True)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", len(raw) - 1)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_capacity"):
+        storage.stats_current_json(cur)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_write"):
+        storage.save_stats_current(cur, strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == raw
+
+
+def test_current_capacity_reserves_reader_defaults(backup_env, monkeypatch):
+    fixed_start = storage.quarter_start()
+    monkeypatch.setattr("storage.quarter_start", lambda: fixed_start)
+    cur = {"period": "2026-Q1", "events": []}
+    completed = {**cur, "tracking_since": storage.quarter_start().isoformat(), "pending_quarter_delivery": None}
+    boundary = len(storage.stats_current_json(completed, strict=False).encode("utf-8"))
+    original = json.dumps(cur, separators=(",", ":")).encode("utf-8")
+    storage.STATS_CURRENT_FILE.write_bytes(original)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary - 1)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_capacity"):
+        storage.load_stats_current(strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == original
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary)
+    storage.save_stats_current(storage.load_stats_current(strict=True), strict=True)
+    assert storage.STATS_CURRENT_FILE.read_bytes() == storage.stats_current_json(completed).encode("utf-8")
+
+
+def test_current_marker_capacity_includes_future_progress_digits(backup_env, monkeypatch):
+    cur = _quarter_state()
+    cur["last_report_sent"] = None
+    cur["tracking_since"] = "2026-07-01T00:00:00+00:00"
+    plan = cur["pending_quarter_delivery"]
+    plan["report_messages"] = ["frozen"] * 1000
+    plan["next_unit"] = 9
+    plan["plan_hash"] = storage._quarter_plan_hash(plan)
+    marker = deepcopy(cur)
+    marker["pending_quarter_delivery"].update(next_unit=999, delivery_uncertain=False)
+    boundary = len(storage.stats_current_json(marker, strict=False).encode("utf-8"))
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary - 1)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_capacity"):
+        storage.stats_current_json(cur)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary)
+    for index, uncertain in [(9, True), (10, False), (999, True), (999, False), (1000, None)]:
+        candidate = deepcopy(cur)
+        candidate["pending_quarter_delivery"]["next_unit"] = index
+        if uncertain is not None:
+            candidate["pending_quarter_delivery"]["delivery_uncertain"] = uncertain
+        else:
+            candidate["last_report_sent"] = candidate["period"]
+        storage.save_stats_current(candidate, strict=True)
+        assert len(storage.STATS_CURRENT_FILE.read_bytes()) <= boundary
+        assert storage.load_stats_current(strict=True) == candidate
+
+
+def test_current_final_capacity_includes_correction_revision_digits(
+    backup_env, source_history_factory, monkeypatch,
+):
+    from event_time_stats import acknowledge_revisions
+
+    _, cur = source_history_factory()
+    bucket = cur["event_time"]["periods"]["2026-Q1"]
+    bucket["revision"] = 10 ** 80
+    cur["event_projection"]["applied_seq"] = bucket["revision"]
+    revisions = {"2026-Q1": bucket["revision"]}
+    plan = storage.new_quarter_delivery_plan(
+        "2026-Q1", "2026-Q2", [{"transport": "html", "content": "frozen", "disable_preview": False}] * 10,
+        event_time_revisions=revisions,
+    )
+    cur["pending_quarter_delivery"] = plan
+    cur["event_time"]["report_ack"] = {"plan_id": plan["plan_id"], "revisions": revisions}
+    completed = deepcopy(cur)
+    completed["pending_quarter_delivery"]["next_unit"] = 10
+    completed["last_report_sent"] = "2026-Q2"
+    acknowledge_revisions(completed)
+    boundary = len(storage.stats_current_json(completed, strict=False).encode("utf-8"))
+    assert boundary > len(storage.stats_current_json(cur, strict=False).encode("utf-8")) + 30
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary - 1)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="current_capacity"):
+        storage.stats_current_json(cur)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary)
+    storage.save_stats_current(cur, strict=True)
+    started = deepcopy(cur)
+    started["pending_quarter_delivery"].update(next_unit=9, delivery_uncertain=True)
+    storage.save_stats_current(started, strict=True)
+    storage.save_stats_current(completed, strict=True)
+    assert storage.load_stats_current(strict=True) == completed
+    assert cur["event_time"]["periods"]["2026-Q1"]["announced_revision"] == 0
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n"])
+@pytest.mark.parametrize("version", ["legacy", 1, 2, 3])
+def test_formatted_current_migrates_encoding_without_changing_frozen_state(
+    backup_env, source_history_factory, eol, version,
+):
+    _, cur = source_history_factory()
+    if version == "legacy":
+        plan = {"old_period": "2026-Q1", "new_period": "2026-Q2", "report_messages": ["frozen 日本語"], "report_sent": True}
+    elif version == 1:
+        plan = storage.new_quarter_delivery("2026-Q1", "2026-Q2", ["frozen", "続き"])
+        plan.update(next_unit=1, delivery_uncertain=True)
+    else:
+        revisions = {"2026-Q1": 1} if version == 3 else None
+        plan = storage.new_quarter_delivery_plan("2026-Q1", "2026-Q2", [_rich_frozen_unit("frozen"), _rich_frozen_unit("続き")], event_time_revisions=revisions)
+        plan.update(next_unit=1, delivery_uncertain=True)
+        if version == 3:
+            cur["event_time"]["report_ack"] = {"plan_id": plan["plan_id"], "revisions": revisions}
+    cur["pending_quarter_delivery"] = plan
+    raw = json.dumps(cur, ensure_ascii=False, indent=2).replace("\n", eol).encode("utf-8")
+    storage.STATS_CURRENT_FILE.write_bytes(raw)
+    loaded = storage.load_stats_current(strict=True)
+    assert loaded == cur
+    assert storage.STATS_CURRENT_FILE.read_bytes() == raw
+    storage.save_stats_current(loaded, strict=True)
+    assert b"\n" not in storage.STATS_CURRENT_FILE.read_bytes()
+    assert storage.load_stats_current(strict=True) == cur
 
 
 def _progress_journal(factory):

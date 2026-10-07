@@ -1435,7 +1435,8 @@ async def test_malformed_recovery_preserves_data_and_debounces_safe_notice(quart
     caplog.set_level(logging.INFO, logger="shikiupdatesbot")
     cur = _frozen_quarter(["PRIVATE REPORT CONTENT"])
     cur["pending_quarter_delivery"]["version"] = 99
-    storage.save_stats_current(cur, strict=True)
+    # Повреждённый диск создаём напрямую, минуя проверку штатной публикации.
+    storage.STATS_CURRENT_FILE.write_bytes(json.dumps(cur, ensure_ascii=False).encode("utf-8"))
     original = storage.STATS_CURRENT_FILE.read_bytes()
     monkeypatch.setattr("handlers.current_quarter", lambda: "2026-Q4")
     bot = AsyncMock()
