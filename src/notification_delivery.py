@@ -151,10 +151,11 @@ async def _dispatch(bot):
         journal = load_event_journal()
         if journal is None or journal["version"] != 3:
             return False
-        validate_recovery_set(journal, load_stats_current(strict=True))
+        cur = load_stats_current(strict=True)
+        validate_recovery_set(journal, cur)
         generation = restorable_restore_generation()
         try:
-            compact_event_journal(journal, expected_generation=generation)
+            compact_event_journal(journal, expected_generation=generation, cur=cur)
         except EventJournalStateError as exc:
             if str(exc) == "compaction_changed":
                 journal = load_event_journal()

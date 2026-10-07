@@ -346,3 +346,58 @@ async def test_failed_first_page_defers_rotation_until_history_is_verified(acqui
     snapshot.assert_called_once()
     assert storage.load_event_journal()["catchup"] is None
     handlers._enqueue_history_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_compacted_old_id_reconnects_resumed_overlap_without_readmission(
+    acquisition_env, source_history_factory, monkeypatch, caplog,
+):
+    from messages import history_entry_from_event
+    from source_history import (
+        event_count,
+        prefix_seq,
+    )
+    full, cur = source_history_factory(count=8, padding=0)
+    old = history_entry_from_event(full["events"][0])
+    old["created_at"] = full["events"][0]["created_at"]
+    storage.save_event_journal(full)
+    storage.save_stats_current(cur, strict=True)
+    compact = storage.compact_completed_history(
+        full, storage.load_stats_current(strict=True),
+        expected_generation=storage.restorable_restore_generation(), force=True,
+    )
+    assert prefix_seq(compact) == 8
+    rows = [_entry(value) for value in range(60, 40, -1)] + [old]
+    calls = []
+
+    async def fetch(_session, page=1):
+        calls.append(page)
+        start = (page - 1) * 3
+        return deepcopy(rows[start:start + 4])
+
+    monkeypatch.setattr("handlers.fetch_history", fetch)
+    seen, _ = await handlers.check_and_notify(AsyncMock(), set(), None)
+    first = storage.load_event_journal()
+    assert first["catchup"] is not None
+    assert first["processed_seq"] == 8
+    assert seen == set(range(1, 10))
+    handlers._enqueue_history_event.assert_not_awaited()
+    storage._journal_history_cache = storage._journal_progress_cache = None
+    for _ in range(6):
+        seen, _ = await handlers.check_and_notify(AsyncMock(), set(), None)
+        if storage.load_event_journal()["catchup"] is None:
+            break
+    recovered = storage.load_event_journal()
+    assert recovered["catchup"] is None
+    assert prefix_seq(recovered) == 8
+    assert event_count(recovered) == recovered["processed_seq"] == 28
+    assert seen == set(range(1, 10)) | set(range(41, 61))
+    assert [ev["seq"] for ev in recovered["events"]] == list(range(9, 29))
+    assert not any("конфликт семантики" in text for text in caplog.messages)
+    changed = deepcopy(old)
+    changed["description"] = "Брошено"
+    before = storage.EVENT_JOURNAL_FILE.read_bytes()
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[old, changed, changed]))
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
+    assert sum("конфликт семантики" in text for text in caplog.messages) == 1

@@ -166,6 +166,43 @@ def outbox_capacity_factory(journal_factory):
 
 
 @pytest.fixture
+def source_history_factory(journal_factory):
+    """Реальный reducer и full outbox: общий recovery-набор для storage/import."""
+    from event_time_stats import (
+        ensure_event_time,
+        index_event_periods,
+        project_event,
+    )
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+        retain_outbox,
+    )
+
+    def factory(count=8, pending_from=None, padding=2000, duplicate_titles=True):
+        journal = migrate_outbox(journal_factory(count=count), 0)
+        cur = {
+            "period": "2026-Q2", "events": [], "pending_quarter_delivery": None,
+            "tracking_since": "2026-04-01T00:00:00",
+            "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
+        }
+        ensure_event_time(cur)
+        index = index_event_periods(cur, journal)
+        for event in journal["events"]:
+            event["description"] += "x" * padding
+            if duplicate_titles:
+                event["target_id"] = "11"
+            project_event(cur, journal, event["seq"], period_events=index)
+            cur["event_projection"]["applied_seq"] = event["seq"]
+            memberships = {10: "b" * 32} if pending_from is not None and event["seq"] >= pending_from else {}
+            journal = enqueue(journal, event, "frozen payload", memberships, 1000)
+        journal = retain_outbox(journal, limit=count)
+        return journal, cur
+
+    return factory
+
+
+@pytest.fixture
 def acquisition_factory(journal_factory):
     """Recovery-набор с отдельными staged seq и неизменной принятой baseline."""
     def factory():

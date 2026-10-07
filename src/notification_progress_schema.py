@@ -17,6 +17,7 @@ from notification_outbox import (
     progress_reserve,
     validate_outbox,
 )
+from source_history import event_count
 
 PROGRESS_FILE_NAME = "notification_progress.json"
 _PROGRESS_FIELDS = {"version", "progress_id", "journal_id", "profile", "processed_seq", "outbox"}
@@ -43,7 +44,7 @@ def history_document(journal: dict, progress_id: str) -> dict:
     """Activation member не содержит изменяемых checkpoint и outbox."""
     return {
         **{key: value for key, value in journal.items() if key not in {"processed_seq", "outbox"}},
-        "version": 4,
+        "version": 5 if "source_base" in journal else 4,
         "progress_id": progress_id,
     }
 
@@ -73,7 +74,7 @@ def progress_budget_size(progress: dict, payload: str) -> int:
 def parse_history_member(raw: bytes, *, profile: str | None = None) -> dict:
     """Историю проверяем полностью на чтении новой физической ревизии."""
     value = _parse_member(raw)
-    if value.get("version") != 4:
+    if value.get("version") not in (4, 5):
         return parse_event_journal(raw, profile=profile)
     identity = value.get("progress_id")
     if (
@@ -81,12 +82,13 @@ def parse_history_member(raw: bytes, *, profile: str | None = None) -> dict:
         or not isinstance(identity, str)
         or re.fullmatch(r"[0-9a-f]{32}", identity) is None
         or "processed_seq" in value or "outbox" in value
+        or ("source_base" in value) != (value["version"] == 5)
     ):
         raise EventJournalStateError("history_structure")
     try:
         validate_event_journal({
             **{key: field for key, field in value.items() if key != "progress_id"},
-            "version": 2, "processed_seq": len(value["events"]),
+            "version": 2, "processed_seq": event_count(value),
         }, profile=profile)
     except (ValueError, TypeError, KeyError, RecursionError):
         raise EventJournalStateError("history_invalid") from None
@@ -112,8 +114,8 @@ def join_history_progress(history: dict, progress: dict) -> dict:
         or type(progress["version"]) is not int or progress["version"] != 1
         or any(progress[key] != history[key] for key in ("progress_id", "journal_id", "profile"))
         or type(progress["processed_seq"]) is not int
-        or not 0 <= progress["processed_seq"] <= len(history["events"])
-        or (history["catchup"] is not None and progress["processed_seq"] != len(history["events"]))
+        or not 0 <= progress["processed_seq"] <= event_count(history)
+        or (history["catchup"] is not None and progress["processed_seq"] != event_count(history))
     ):
         raise EventJournalStateError("progress_mismatch")
     journal = {
@@ -130,7 +132,7 @@ def join_history_progress(history: dict, progress: dict) -> dict:
 def parse_recovery_journal(history_raw: bytes, progress_raw: bytes | None, *, profile: str | None = None) -> dict:
     """Runtime и импорт разделяют границы, lineage и прежний общий бюджет."""
     history = parse_history_member(history_raw, profile=profile)
-    if history["version"] != 4:
+    if history["version"] not in {4, 5}:
         if progress_raw is not None:
             raise EventJournalStateError("progress_orphan")
         return history

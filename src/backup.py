@@ -437,13 +437,29 @@ def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple
     _raise_if_backup_cancelled(cancelled)
     raw = next((member.data for member in members if member.name == "event_journal.json"), None)
     if raw is None:
+        if any(member.name == PROGRESS_FILE_NAME for member in members):
+            raise ValueError("Прогресс уведомлений требует журнал истории")
         return members
     version = _backup_history_version(raw)
     if version in {1, 2, 3}:
         return tuple(member for member in members if member.name != PROGRESS_FILE_NAME)
-    if version == 4:
+    if version in {4, 5}:
         if not any(member.name == PROGRESS_FILE_NAME for member in members):
             raise ValueError("Журнал требует сохранённый прогресс уведомлений")
+    if version == 5:
+        # Compact base и suffix проходят тот же полный proof, что runtime/import.
+        captured = {member.name: member.data for member in members}
+        if "stats_current.json" not in captured:
+            raise ValueError("Журнал требует соответствующий текущий квартал")
+        journal = parse_recovery_journal(raw, captured[PROGRESS_FILE_NAME], profile=SHIKI_USER)
+        try:
+            cur = json.loads(captured["stats_current.json"])
+        except (ValueError, UnicodeError, RecursionError):
+            raise ValueError("Текущий квартал повреждён") from None
+        if not isinstance(cur, dict):
+            raise ValueError("Текущий квартал повреждён")
+        validate_pending_quarter_delivery(cur)
+        validate_recovery_set(journal, cur)
     return members
 
 
