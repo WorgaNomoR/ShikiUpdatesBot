@@ -42,9 +42,10 @@ def _parse_member(raw: bytes) -> dict:
 
 def history_document(journal: dict, progress_id: str) -> dict:
     """Activation member не содержит изменяемых checkpoint и outbox."""
+    base = journal.get("source_base")
     return {
         **{key: value for key, value in journal.items() if key not in {"processed_seq", "outbox"}},
-        "version": 5 if "source_base" in journal else 4,
+        "version": (6 if isinstance(base, dict) and base.get("version") == 2 else 5) if "source_base" in journal else 4,
         "progress_id": progress_id,
     }
 
@@ -74,7 +75,7 @@ def progress_budget_size(progress: dict, payload: str) -> int:
 def parse_history_member(raw: bytes, *, profile: str | None = None) -> dict:
     """Историю проверяем полностью на чтении новой физической ревизии."""
     value = _parse_member(raw)
-    if value.get("version") not in (4, 5):
+    if value.get("version") not in (4, 5, 6):
         return parse_event_journal(raw, profile=profile)
     identity = value.get("progress_id")
     if (
@@ -82,7 +83,12 @@ def parse_history_member(raw: bytes, *, profile: str | None = None) -> dict:
         or not isinstance(identity, str)
         or re.fullmatch(r"[0-9a-f]{32}", identity) is None
         or "processed_seq" in value or "outbox" in value
-        or ("source_base" in value) != (value["version"] == 5)
+        or ("source_base" in value) != (value["version"] in {5, 6})
+        or value["version"] in {5, 6} and (
+            not isinstance(value.get("source_base"), dict)
+            or type(value["source_base"].get("version")) is not int
+            or value["source_base"]["version"] != value["version"] - 4
+        )
     ):
         raise EventJournalStateError("history_structure")
     try:
@@ -132,7 +138,7 @@ def join_history_progress(history: dict, progress: dict) -> dict:
 def parse_recovery_journal(history_raw: bytes, progress_raw: bytes | None, *, profile: str | None = None) -> dict:
     """Runtime и импорт разделяют границы, lineage и прежний общий бюджет."""
     history = parse_history_member(history_raw, profile=profile)
-    if history["version"] not in {4, 5}:
+    if history["version"] not in {4, 5, 6}:
         if progress_raw is not None:
             raise EventJournalStateError("progress_orphan")
         return history

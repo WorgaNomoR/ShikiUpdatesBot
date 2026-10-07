@@ -5,6 +5,28 @@
 import hashlib
 import json
 
+SOURCE_FINGERPRINT_WINDOW = 4096
+
+
+def retain_source_fingerprints(journal: dict) -> dict:
+    """Точные ID/seq неизменны; старая семантика становится недоступной.
+
+    v1 читается по прежним правилам. Только candidate publication вводит v2.
+    Возраст считается от compact through_seq, а не от конца normalized suffix.
+    """
+    base = journal.get("source_base")
+    if base is None:
+        return journal
+    cutoff = max(0, base["through_seq"] - SOURCE_FINGERPRINT_WINDOW)
+    if base["version"] == 2 and all(row[1] is None for row in base["ids"][:cutoff]):
+        return journal
+    replacement = {
+        **base, "version": 2,
+        "ids": [[row[0], None if index < cutoff else row[1]] for index, row in enumerate(base["ids"])],
+    }
+    replacement["checksum"] = content_hash({k: v for k, v in replacement.items() if k != "checksum"})
+    return {**journal, "source_base": replacement}
+
 
 def prefix_seq(journal: dict) -> int:
     """Граница удалённого payload, независимо от времён и source ID."""
@@ -83,18 +105,24 @@ def same_history_authority(current: dict | None, expected: dict) -> bool:
     if not removed:
         return (
             current["events"] == expected["events"]
-            and current.get("source_base") == expected.get("source_base")
+            and (
+                current.get("source_base") == expected.get("source_base")
+                or current.get("source_base") == retain_source_fingerprints(expected).get("source_base")
+            )
         )
     if current["events"] != expected["events"][removed:]:
         return False
     ids = list(expected.get("source_base", {}).get("ids", []))
     ids.extend([ev["history_id"], semantic_hash(ev)] for ev in expected["events"][:removed])
+    if current["source_base"]["version"] == 2:
+        cutoff = max(0, prefix_seq(current) - SOURCE_FINGERPRINT_WINDOW)
+        ids = [[row[0], None if index < cutoff else row[1]] for index, row in enumerate(ids)]
     return current["source_base"]["ids"] == ids
 
 
 def rebase_source_candidate(candidate: dict, current: dict) -> dict:
     """Сохранить новый admission suffix, не воскресив очищенный старый prefix."""
-    if prefix_seq(current) <= prefix_seq(candidate):
+    if prefix_seq(current) < prefix_seq(candidate) or "source_base" not in current:
         return candidate
     return {
         **candidate, "source_base": current["source_base"],

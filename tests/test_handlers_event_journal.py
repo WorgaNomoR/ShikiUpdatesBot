@@ -41,6 +41,138 @@ def history_env(backup_env, monkeypatch):
     return backup_env
 
 
+@pytest.mark.parametrize("position", [0, 3, 4, 100, 4099])
+@pytest.mark.parametrize("malformed", [False, True])
+def test_index_repeats_skip_processing_and_warn_only_with_retained_evidence(
+    source_index_factory, monkeypatch, caplog, position, malformed,
+):
+    journal, _ = source_index_factory(version=2)
+    history_id = journal["source_base"]["ids"][position][0]
+    entry = _entry(history_id)
+    state = handlers.new_acquisition()
+    before = deepcopy(journal)
+    normalize = handlers.normalize_history_event
+    calls = []
+
+    def normalize_repeat(*args):
+        calls.append(args[0]["id"])
+        if malformed:
+            raise ValueError("unencodable repeat")
+        return normalize(*args)
+
+    monkeypatch.setattr("handlers.normalize_history_event", normalize_repeat)
+    handlers._stage_history_page(state, [entry], journal)
+    assert state["staged"] == []
+    assert journal == before
+    assert bool(calls) == (position >= 4)
+    assert ("конфликт семантики" in caplog.text) == (position >= 4)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["admission", "enqueue"])
+@pytest.mark.parametrize("failure", [None, "write", "interruption"])
+async def test_index_capacity_retry_reclaims_before_candidate_and_projects_once(
+    history_env, source_index_factory, monkeypatch, boundary, failure,
+):
+    from event_journal_schema import validate_recovery_set
+
+    journal, cur = source_index_factory(prefix=5000)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    obligations = deepcopy(journal["outbox"]["records"])
+    before = len(handlers.journal_json(journal).encode()) + progress_reserve(journal)
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", before + 4096 + 1000)
+    entry = _entry(12345)
+    if boundary == "admission":
+        entry["target"]["name"] = "n" * 4000
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[entry]))
+    monkeypatch.setattr("handlers.build_message", lambda *a, **k: "index payload " * 400)
+    maintenance = storage.compact_completed_history
+    reclaimed = []
+
+    def compact(journal, cur, *, expected_generation, force=False):
+        if not force:
+            return journal
+        result = maintenance(journal, cur, expected_generation=expected_generation, force=True)
+        reclaimed.append(result)
+        return result
+
+    monkeypatch.setattr("storage.compact_completed_history", compact)
+    projection = handlers.project_event
+    projected = []
+
+    def project(*args, **kwargs):
+        projected.append(args[2])
+        return projection(*args, **kwargs)
+
+    monkeypatch.setattr("handlers.project_event", project)
+    write = storage._atomic_write
+
+    def publish(path, payload):
+        value = json.loads(payload)
+        if reclaimed and (
+            boundary == "enqueue" and path == storage.notification_progress_file() and value.get("processed_seq") == 5003
+            or boundary == "admission" and path == storage.EVENT_JOURNAL_FILE and value.get("events", [{}])[-1].get("seq") == 5003
+        ):
+            if failure == "write":
+                raise OSError("after index reclamation")
+            if failure == "interruption":
+                raise asyncio.CancelledError
+        return write(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", publish)
+        if failure:
+            with pytest.raises(EventJournalStateError if failure == "write" else asyncio.CancelledError):
+                await handlers.check_and_notify(AsyncMock(), set(), None)
+        else:
+            await handlers.check_and_notify(AsyncMock(), set(), None)
+    assert reclaimed and reclaimed[0]["source_base"]["version"] == 2
+    assert reclaimed[0]["outbox"]["records"] == obligations
+    if failure:
+        storage._journal_history_cache = storage._journal_progress_cache = None
+        assert storage.load_event_journal()["processed_seq"] == 5002
+        if boundary == "enqueue":
+            monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
+        await handlers.check_and_notify(AsyncMock(), set(), None)
+    published = storage.load_event_journal()
+    current = storage.load_stats_current(strict=True)
+    validate_recovery_set(published, current)
+    assert projected == [5003]
+    assert published["processed_seq"] == current["event_projection"]["applied_seq"] == 5003
+    assert published["outbox"]["records"][:2] == obligations
+    assert published["outbox"]["records"][-1]["payload"]["text"] == "index payload " * 400
+    assert [ev["seq"] for ev in published["events"]] == [5001, 5002, 5003]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore", [False, True])
+async def test_index_maintenance_during_render_keeps_enqueue_lease_until_restore(
+    history_env, source_index_factory, monkeypatch, restore,
+):
+    old, cur = source_index_factory()
+    storage.save_event_journal(old)
+    storage.save_stats_current(cur, strict=True)
+    compact = storage.compact_completed_history
+    monkeypatch.setattr("storage.compact_completed_history", lambda journal, *a, **k: journal)
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[_entry(12345)]))
+
+    def render(*args, **kwargs):
+        current = storage.load_event_journal()
+        compact(current, storage.load_stats_current(strict=True), expected_generation=storage.restorable_restore_generation())
+        if restore:
+            storage.mark_restorable_state_restored()
+        return "after index maintenance"
+
+    monkeypatch.setattr("handlers.build_message", render)
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+    published = storage.load_event_journal()
+    assert published["source_base"]["version"] == 2
+    assert published["processed_seq"] == (4102 if restore else 4103)
+    if not restore:
+        assert published["outbox"]["records"][-1]["payload"]["text"] == "after index maintenance"
+
+
 async def _ready():
     await handlers._initialize_history_journal({1}, storage.restorable_restore_generation())
     return await handlers._drain_history_journal(AsyncMock())

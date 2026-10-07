@@ -2703,7 +2703,7 @@ def test_source_compaction_atomic_boundary_restart_and_exact_progress(
     write = storage._atomic_write
 
     def publish(path, payload):
-        if path == storage.EVENT_JOURNAL_FILE and json.loads(payload).get("version") == 5:
+        if path == storage.EVENT_JOURNAL_FILE and json.loads(payload).get("version") == 6:
             if failure == "write":
                 raise OSError("publication")
             if failure == "before":
@@ -2743,7 +2743,7 @@ def test_source_compaction_atomic_boundary_restart_and_exact_progress(
         assert event_at_seq(recovered, 6) == journal["events"][5]
         with pytest.raises(ValueError, match="source_seq"):
             event_at_seq(recovered, 5)
-        assert json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())["version"] == 5
+        assert json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())["version"] == 6
 
 
 @pytest.mark.parametrize("change", [
@@ -2876,3 +2876,89 @@ def test_source_compaction_pending_barrier_bounded_repeated_and_fresh_ack(
     assert storage.compact_completed_history(
         fresh, cur, expected_generation=storage.restorable_restore_generation(), force=True,
     ) == fresh
+
+
+@pytest.mark.parametrize("failure", [None, "write", "before", "after"])
+def test_index_retention_migrates_without_payload_deletion_and_recovers_exact_bytes(
+    backup_env, source_index_factory, monkeypatch, failure,
+):
+    from event_journal_schema import validate_recovery_set
+
+    old, cur = source_index_factory()
+    storage.save_event_journal(old)
+    storage.save_stats_current(cur, strict=True)
+    paths = (storage.EVENT_JOURNAL_FILE, storage.notification_progress_file(), storage.STATS_CURRENT_FILE)
+    original = {path: path.read_bytes() for path in paths}
+    assert json.loads(original[storage.EVENT_JOURNAL_FILE])["version"] == 5
+    assert storage.load_event_journal() == old
+    assert {path: path.read_bytes() for path in paths} == original
+    write = storage._atomic_write
+
+    def publish(path, payload):
+        if path == storage.EVENT_JOURNAL_FILE:
+            if failure == "write":
+                raise OSError("index publication")
+            if failure == "before":
+                raise asyncio.CancelledError
+            write(path, payload)
+            if failure == "after":
+                raise asyncio.CancelledError
+        else:
+            raise AssertionError("fingerprint maintenance wrote progress/current")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", publish)
+        if failure:
+            with pytest.raises(storage.EventJournalStateError if failure == "write" else asyncio.CancelledError):
+                storage.compact_completed_history(
+                    old, storage.load_stats_current(strict=True), expected_generation=storage.restorable_restore_generation(),
+                )
+        else:
+            storage.compact_completed_history(
+                old, storage.load_stats_current(strict=True), expected_generation=storage.restorable_restore_generation(),
+            )
+    storage._journal_history_cache = storage._journal_progress_cache = None
+    recovered = storage.load_event_journal()
+    validate_recovery_set(recovered, cur)
+    for path in paths[1:]:
+        assert path.read_bytes() == original[path]
+    assert recovered["events"] == old["events"]
+    assert recovered["outbox"] == old["outbox"]
+    assert [row[0] for row in recovered["source_base"]["ids"]] == [row[0] for row in old["source_base"]["ids"]]
+    if failure in {"write", "before"}:
+        assert recovered == old
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == original[storage.EVENT_JOURNAL_FILE]
+    else:
+        assert json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())["version"] == 6
+        assert recovered["source_base"]["ids"][:4] == [[row[0], None] for row in old["source_base"]["ids"][:4]]
+        assert recovered["source_base"]["ids"][4:] == old["source_base"]["ids"][4:]
+        assert storage.compact_completed_history(
+            recovered, cur, expected_generation=storage.restorable_restore_generation(),
+        ) == recovered
+
+
+def test_index_retention_stale_snapshot_rejects_and_fresh_recipient_ack_survives(
+    backup_env, source_index_factory,
+):
+    from notification_outbox import (
+        begin_attempt,
+        complete_attempt,
+    )
+
+    old, cur = source_index_factory()
+    storage.save_event_journal(old)
+    storage.save_stats_current(cur, strict=True)
+    cur = storage.load_stats_current(strict=True)
+    recipient = deepcopy(old["outbox"]["records"][0]["recipients"]["10"])
+    begin_attempt(recipient, 1001)
+    fresh = storage.save_notification_recipient(storage.load_notification_journal(), 4101, "10", recipient)
+    with pytest.raises(storage.EventJournalStateError, match="compaction_changed"):
+        storage.compact_completed_history(old, cur, expected_generation=storage.restorable_restore_generation())
+    maintained = storage.compact_completed_history(fresh, cur, expected_generation=storage.restorable_restore_generation())
+    complete_attempt(recipient, "confirmed_success", 1002)
+    acknowledged = storage.save_notification_recipient(storage.load_notification_journal(), 4101, "10", recipient)
+    assert acknowledged["source_base"] == maintained["source_base"]
+    assert acknowledged["outbox"]["records"][0]["recipients"]["10"]["status"] == "delivered"
+    assert acknowledged["outbox"]["records"][1] == old["outbox"]["records"][1]
+    with pytest.raises(storage.EventJournalStateError, match="compaction_changed"):
+        storage.compact_completed_history(old, cur, expected_generation=storage.restorable_restore_generation() - 1)

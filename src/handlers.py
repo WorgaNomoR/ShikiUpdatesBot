@@ -2498,7 +2498,7 @@ def _stage_history_page(state: dict, entries: list[dict], journal: dict) -> None
 
     for entry in entries:
         history_id = entry["id"]
-        if history_id in baseline:
+        if history_id in baseline or history_id in compact_ids and compact_ids[history_id] is None:
             continue
         try:
             event = normalize_history_event(entry, observed_at)

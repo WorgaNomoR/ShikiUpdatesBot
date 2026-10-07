@@ -78,7 +78,10 @@ from report_plan import (
     downgrade_rich_units,
     validate_frozen_report_units,
 )
-from source_history import prefix_seq
+from source_history import (
+    prefix_seq,
+    retain_source_fingerprints,
+)
 from utils import (
     _parse_iso_utc,
     _utcnow,
@@ -244,7 +247,7 @@ def _published_history() -> tuple[dict | None, int]:
         history = parse_history_member(_read_journal_member(EVENT_JOURNAL_FILE), profile=SHIKI_USER)
     except OSError:
         raise EventJournalStateError("journal_read") from None
-    if history["version"] in {4, 5}:
+    if history["version"] in {4, 5, 6}:
         size = history_budget_size(history)
         _journal_history_cache = (revision, history, size)
         return history, size
@@ -291,7 +294,7 @@ def _published_progress(history: dict, history_size: int) -> tuple[dict, int]:
 def load_notification_journal() -> dict | None:
     """Внутренний snapshot: history и progress заимствованы строго read-only."""
     history, size = _published_history()
-    if history is None or history["version"] not in {4, 5}:
+    if history is None or history["version"] not in {4, 5, 6}:
         return history
     return _published_progress(history, size)[0]
 
@@ -321,7 +324,7 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
     if not {"processed_seq", "outbox"} <= journal.keys():
         raise EventJournalStateError("journal_structure")
     published, history_size = _published_history()
-    activated = published is not None and published["version"] in {4, 5}
+    activated = published is not None and published["version"] in {4, 5, 6}
     progress_id = published["progress_id"] if activated else uuid.uuid4().hex
     history = history_document(journal, progress_id)
     history_changed = not activated or history != published
@@ -421,16 +424,17 @@ def compact_completed_history(
     """Под state lock: общий recovery proof и одна атомарная history publication."""
     if journal.get("outbox") is None or "event_time" not in cur:
         return journal
-    if not force and len(compact_json(journal["events"]).encode("utf-8")) < SOURCE_COMPACTION_BYTES:
-        return journal
-    through = min(
-        completed_seq(journal["outbox"]), journal["processed_seq"],
-        cur["event_projection"]["applied_seq"], prefix_seq(journal) + SOURCE_COMPACTION_EVENTS,
-    )
-    if through <= prefix_seq(journal):
+    candidate = retain_source_fingerprints(journal)
+    if force or len(compact_json(journal["events"]).encode("utf-8")) >= SOURCE_COMPACTION_BYTES:
+        through = min(
+            completed_seq(journal["outbox"]), journal["processed_seq"],
+            cur["event_projection"]["applied_seq"], prefix_seq(journal) + SOURCE_COMPACTION_EVENTS,
+        )
+        if through > prefix_seq(journal):
+            candidate = compact_source_history(journal, cur, through)
+    if candidate == journal:
         return journal
     validate_recovery_set(journal, cur)
-    candidate = compact_source_history(journal, cur, through)
     validate_event_journal(candidate, profile=SHIKI_USER)
     validate_recovery_set(candidate, cur)
     # Все накладные расходы базы/индекса оплачены; бесполезное сжатие инертно.
@@ -443,7 +447,7 @@ def compact_completed_history(
     ):
         raise EventJournalStateError("compaction_changed")
     history, _ = _published_history()
-    if history is None or history["version"] not in {4, 5}:
+    if history is None or history["version"] not in {4, 5, 6}:
         # Сначала завершить штатную split activation; payload пока не удаляется.
         save_event_journal(journal)
         history, _ = _published_history()
