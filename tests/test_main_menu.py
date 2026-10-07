@@ -7,6 +7,27 @@ import pytest
 import main_menu
 
 
+def test_owner_backup_offers_recovery_full_diagnostics_and_import():
+    view = main_menu.owner_backup_view()
+    assert view.text.startswith("💾 <b>Резервная копия</b>\n\n")
+    assert _callbacks(view) == [
+        "menu:owner:backup:recovery", "menu:owner:backup:export",
+        "menu:owner:backup:import", "menu:owner",
+    ]
+    labels = ["💾 Скачать копию", "🧰 Скачать для диагностики", "📥 Восстановить из архива"]
+    assert _texts(view)[:3] == labels
+    sections = view.caption.split("\n\n")
+    assert len(sections) == 3
+    for label, section in zip(labels, sections, strict=True):
+        emoji, title = label.split(" ", 1)
+        assert section.startswith(f"{emoji} <b>{title}</b>\n")
+    assert "переноса или восстановления" in sections[0]
+    assert "всех кварталов" in sections[0]
+    assert "Все сохранённые данные" in sections[1]
+    assert "вспомогательные файлы" in sections[1]
+    assert "ранее сохранённой" in sections[2]
+
+
 def _callbacks(view):
     return [
         button.callback_data
