@@ -203,6 +203,40 @@ def source_history_factory(journal_factory):
 
 
 @pytest.fixture
+def stats_capacity_factory(journal_factory):
+    """Компактный recovery-набор разных тайтлов, построенный штатным reducer."""
+    from event_journal_schema import validate_recovery_set
+    from event_time_stats import (
+        compact_source_history,
+        ensure_event_time,
+        project_event,
+    )
+    from notification_outbox import migrate_outbox
+
+    def factory(count=20):
+        journal = journal_factory(count=count, processed=count)
+        cur = {
+            "period": "2026-Q1", "events": [], "last_report_sent": None,
+            "pending_quarter_delivery": None,
+            "period_start": "2026-01-01T00:00:00+00:00",
+            "tracking_since": "2026-01-01T00:00:00+00:00",
+            "event_projection": {
+                "journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0,
+            },
+        }
+        ensure_event_time(cur)
+        # Один полный reducer-проход даёт ту же проекцию без квадратичной подготовки.
+        project_event(cur, journal, count)
+        cur["event_projection"]["applied_seq"] = count
+        journal = migrate_outbox(journal, count)
+        journal = compact_source_history(journal, cur, count)
+        validate_recovery_set(journal, cur)
+        return journal, cur
+
+    return factory
+
+
+@pytest.fixture
 def acquisition_factory(journal_factory):
     """Recovery-набор с отдельными staged seq и неизменной принятой baseline."""
     def factory():

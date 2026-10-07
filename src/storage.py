@@ -1721,6 +1721,13 @@ def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict
     }
 
 
+def _backfill_stats_current(data: dict) -> None:
+    """Добавить только прежние defaults чтения, не мигрируя frozen-план."""
+    if "tracking_since" not in data:
+        data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
+    data.setdefault("pending_quarter_delivery", None)
+
+
 def load_stats_current(*, strict: bool = False, initialize_missing: bool = False) -> dict:
     """
     Загружаем события текущего квартала. При ошибке/отсутствии — пустой квартал.
@@ -1750,9 +1757,9 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
                     validate_projection(data["event_projection"])
                 validate_event_time(data)
             # Бэкофилл для файлов, созданных до появления поля tracking_since
-            if "tracking_since" not in data:
-                data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
-            data.setdefault("pending_quarter_delivery", None)
+            _backfill_stats_current(data)
+            if strict:
+                stats_current_json(data)
             return data
         if strict:
             raise QuarterDeliveryStateError("current_structure")
@@ -1783,26 +1790,34 @@ def json_publication_size(payload: str) -> int:
 
 
 def stats_current_json(data: dict, *, strict: bool = True) -> str:
-    """Проверить ёмкость публикации вместе с ростом frozen acknowledgement."""
-    payload = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=not strict)
+    """Компактная публикация с резервом всех штатных frozen-переходов."""
+    def encode(value: dict) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=not strict)
+
+    payload = encode(data)
     if strict:
+        sizes = [json_publication_size(payload)]
         completed = deepcopy(data)
+        # Импорт и следующая запись учитывают те же defaults, что строгий reader.
+        _backfill_stats_current(completed)
+        sizes.append(json_publication_size(encode(completed)))
         pending = completed.get("pending_quarter_delivery")
-        if isinstance(pending, dict) and pending.get("version") in {1, 2, 3}:
+        if isinstance(pending, dict):
+            pending = migrate_quarter_delivery(pending)
+            completed["pending_quarter_delivery"] = pending
+            sizes.append(json_publication_size(encode(completed)))
             key = "report_messages" if pending["version"] == 1 else "report_units"
+            if pending["next_unit"] < len(pending[key]):
+                # Наибольший ещё не подтверждённый индекс; false на байт длиннее true.
+                pending["next_unit"] = len(pending[key]) - 1
+                pending["delivery_uncertain"] = False
+                sizes.append(json_publication_size(encode(completed)))
             pending["next_unit"] = len(pending[key])
             pending.pop("delivery_uncertain", None)
             completed["last_report_sent"] = pending["new_period"]
             acknowledge_revisions(completed)
-        final_size = json_publication_size(json.dumps(completed, ensure_ascii=False, indent=2, allow_nan=False))
-        started_size = json_publication_size(payload)
-        pending = data.get("pending_quarter_delivery")
-        if isinstance(pending, dict) and pending.get("version") in {1, 2, 3}:
-            key = "report_messages" if pending["version"] == 1 else "report_units"
-            if pending["next_unit"] < len(pending[key]) and "delivery_uncertain" not in pending:
-                # Новый pretty-JSON member на втором уровне; false длиннее true.
-                started_size += json_publication_size(',\n    "delivery_uncertain": true')
-        if max(json_publication_size(payload), final_size, started_size) > JOURNAL_MAX_BYTES:
+            sizes.append(json_publication_size(encode(completed)))
+        if max(sizes) > JOURNAL_MAX_BYTES:
             raise QuarterDeliveryStateError("current_capacity")
     return payload
 

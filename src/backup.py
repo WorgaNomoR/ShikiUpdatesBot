@@ -659,8 +659,7 @@ def _valid_import_payload(name: str, obj) -> bool:
             if PROJECTION_KEY in obj:
                 validate_projection(obj[PROJECTION_KEY])
             validate_event_time(obj)
-            if "event_time" in obj:
-                stats_current_json(obj)
+            stats_current_json(obj)
             if obj.get("pending_quarter_delivery") is not None and not isinstance(obj.get("events"), list):
                 raise QuarterDeliveryStateError("current_structure")
         return (isinstance(obj, dict) and "period" in obj
@@ -721,10 +720,9 @@ def _prepare_history_restore_candidate(pending: dict[str, str]) -> dict[str, str
                 "applied_seq": journal["processed_seq"],
             }
             validate_recovery_set(journal, cur)
-            payload = json.dumps(cur, ensure_ascii=False, separators=(",", ":"))
-            if len(payload.encode("utf-8")) > _IMPORT_MEMBER_MAX_BYTES:
-                raise ValueError("Восстановленный квартал превышает предел размера")
-            pending = {**pending, "stats_current.json": payload}
+    if "stats_current.json" in pending:
+        # После legacy-binding повторно резервируем последующие штатные записи.
+        pending = {**pending, "stats_current.json": stats_current_json(cur)}
     return pending
 
 

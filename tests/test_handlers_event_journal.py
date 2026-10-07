@@ -803,6 +803,67 @@ def test_capacity_retry_merges_retired_prefix_by_absolute_seq(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "write", "interruption"])
+async def test_compact_current_capacity_continues_projection_and_enqueue_once(
+    history_env, stats_capacity_factory, monkeypatch, failure,
+):
+    from event_journal_schema import validate_recovery_set
+
+    journal, cur = stats_capacity_factory()
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_subscribers({10: "subscriber"})
+    before = len(cur["events"])
+    boundary = storage.json_publication_size(json.dumps(cur, ensure_ascii=False, indent=2))
+    monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", boundary)
+    entry = {**_entry(100), "created_at": "2026-03-01T00:00:00+00:00"}
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[entry]))
+    monkeypatch.setattr("handlers.build_message", lambda *a, **k: "frozen new payload")
+    projection = handlers.project_event
+    projections = []
+
+    def project(*args, **kwargs):
+        projections.append(args[2])
+        projection(*args, **kwargs)
+        assert storage.json_publication_size(json.dumps(args[0], ensure_ascii=False, indent=2)) > boundary
+
+    monkeypatch.setattr("handlers.project_event", project)
+    write = storage._atomic_write
+
+    def publish(path, payload):
+        if path == storage.notification_progress_file() and json.loads(payload)["processed_seq"] == before + 1:
+            if failure == "write":
+                raise OSError("enqueue after projection")
+            if failure == "interruption":
+                raise asyncio.CancelledError
+        write(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", publish)
+        if failure:
+            with pytest.raises(asyncio.CancelledError if failure == "interruption" else EventJournalStateError):
+                await handlers.check_and_notify(AsyncMock(), {10}, None)
+        else:
+            await handlers.check_and_notify(AsyncMock(), {10}, None)
+    if failure:
+        assert storage.load_event_journal()["processed_seq"] == before
+        assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == before + 1
+        storage._journal_history_cache = storage._journal_progress_cache = None
+        monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
+        await handlers.check_and_notify(AsyncMock(), {10}, None)
+    current = storage.load_stats_current(strict=True)
+    published = storage.load_event_journal()
+    validate_recovery_set(published, current)
+    assert published["processed_seq"] == current["event_projection"]["applied_seq"] == before + 1
+    assert projections == [before + 1]
+    assert len(current["events"]) == before + 1
+    record = published["outbox"]["records"][0]
+    assert record["payload"]["text"] == "frozen new payload"
+    assert record["recipients"]["10"]["status"] == "pending"
+    assert record["recipients"]["10"]["attempts"] == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["admission", "enqueue"])
 @pytest.mark.parametrize("failure", [None, "write", "interruption"])
 async def test_source_capacity_reclaims_history_and_really_resumes_projection_once(
