@@ -1009,7 +1009,7 @@ async def test_independent_delivery_compacts_source_or_defers_failed_write_witho
     write = storage._atomic_write
 
     def publish(path, payload):
-        if failure and path == storage.EVENT_JOURNAL_FILE and json.loads(payload).get("version") == 5:
+        if failure and path == storage.EVENT_JOURNAL_FILE and json.loads(payload).get("version") == 6:
             raise OSError("defer source maintenance")
         return write(path, payload)
 
@@ -1028,3 +1028,57 @@ async def test_independent_delivery_compacts_source_or_defers_failed_write_witho
         assert after["expires_at"] == before["expires_at"]
         assert after["recipients"]["10"]["membership"] == token
         assert after["recipients"]["10"]["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["failed_cleanup", "during_send", "restore"])
+async def test_index_maintenance_preserves_inflight_recipient_ack_and_delivery_failure_policy(
+    outbox_env, source_index_factory, monkeypatch, mode,
+):
+    storage.save_subscribers({10: "only"})
+    token = storage.notification_memberships()[10]
+    journal, cur = source_index_factory()
+    for record in journal["outbox"]["records"]:
+        record.update(created_at=outbox_env[0], expires_at=outbox_env[0] + 72 * 3600)
+        record["recipients"]["10"].update(membership=token, next_attempt_at=outbox_env[0])
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    history_before = storage.EVENT_JOURNAL_FILE.read_bytes()
+    compact = storage.compact_completed_history
+    write = storage._atomic_write
+    if mode == "failed_cleanup":
+        def publish(path, payload):
+            if path == storage.EVENT_JOURNAL_FILE:
+                raise OSError("defer fingerprint cleanup")
+            return write(path, payload)
+        monkeypatch.setattr("storage._atomic_write", publish)
+    else:
+        monkeypatch.setattr("storage.compact_completed_history", lambda journal, *a, **k: journal)
+
+    async def send(**kwargs):
+        if mode != "failed_cleanup":
+            compact(
+                storage.load_event_journal(), storage.load_stats_current(strict=True),
+                expected_generation=storage.restorable_restore_generation(),
+            )
+            if mode == "restore":
+                storage.mark_restorable_state_restored()
+        return True
+
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    await delivery.dispatch_notifications(bot)
+    published = storage.load_event_journal()
+    if mode == "failed_cleanup":
+        assert storage.EVENT_JOURNAL_FILE.read_bytes() == history_before
+        assert published["source_base"]["version"] == 1
+    else:
+        assert published["source_base"]["version"] == 2
+    recipient = published["outbox"]["records"][0]["recipients"]["10"]
+    assert recipient["membership"] == token
+    assert recipient["status"] == ("pending" if mode == "restore" else "delivered")
+    assert recipient["attempts"][0]["outcome"] == ("uncertain" if mode == "restore" else "confirmed_success")
+    assert bot.send_message.await_count == (1 if mode == "restore" else 2)
+    for record in published["outbox"]["records"]:
+        assert record["payload"]["text"] == "frozen index suffix"
+        assert record["expires_at"] == outbox_env[0] + 72 * 3600

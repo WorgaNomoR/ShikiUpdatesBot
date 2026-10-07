@@ -203,6 +203,58 @@ def source_history_factory(journal_factory):
 
 
 @pytest.fixture
+def source_index_factory(journal_factory):
+    """Большой v1 индекс и небольшой suffix: реальный reducer без O(n²)."""
+    from event_time_stats import (
+        compact_source_history,
+        ensure_event_time,
+        project_event,
+    )
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+    )
+    from source_history import (
+        content_hash,
+        semantic_hash,
+    )
+
+    def factory(prefix=4100, suffix=2, version=1, facts=True):
+        journal = journal_factory(count=prefix + suffix, processed=prefix)
+        for ev in journal["events"][:prefix]:
+            seq = ev["seq"]
+            ev["history_id"] = -seq if seq % 2 else 10**40 + seq
+            ev["event_type"] = "ignored"
+        if facts:
+            for ev in journal["events"][:3]:
+                ev.update(event_type="completed", target_id="11")
+            journal["events"][1].update(event_type="score_removed", score=None)
+            journal["events"][2].update(event_at=None, created_at=None, time_quality="missing")
+        original = journal["events"][:prefix]
+        cur = {
+            "period": "2026-Q2", "events": [], "pending_quarter_delivery": None,
+            "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
+        }
+        ensure_event_time(cur)
+        for ev in journal["events"]:
+            if ev["event_type"] != "ignored":
+                project_event(cur, journal, ev["seq"])
+            cur["event_projection"]["applied_seq"] = ev["seq"]
+        journal = migrate_outbox(journal, prefix)
+        for ev in journal["events"][prefix:]:
+            journal = enqueue(journal, ev, "frozen index suffix", {10: "b" * 32}, 1000)
+        journal = compact_source_history(journal, cur, prefix)
+        if version == 1:
+            base = journal["source_base"]
+            base["version"] = 1
+            base["ids"] = [[ev["history_id"], semantic_hash(ev)] for ev in original]
+            base["checksum"] = content_hash({k: v for k, v in base.items() if k != "checksum"})
+        return journal, cur
+
+    return factory
+
+
+@pytest.fixture
 def stats_capacity_factory(journal_factory):
     """Компактный recovery-набор разных тайтлов, построенный штатным reducer."""
     from event_journal_schema import validate_recovery_set

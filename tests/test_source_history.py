@@ -10,6 +10,9 @@ from source_history import (
     event_at_seq,
     event_count,
     known_history_ids,
+    rebase_source_candidate,
+    retain_source_fingerprints,
+    same_history_authority,
     semantic_hash,
     source_suffix,
 )
@@ -39,3 +42,64 @@ def test_semantic_fingerprint_preserves_original_numeric_equality_and_immutable_
     repeated["history_id"] = 8
     assert semantic_hash(event) != semantic_hash(repeated)
     assert event == before
+
+
+@pytest.mark.parametrize("prefix", [4095, 4096, 4097, 4224])
+def test_fingerprint_window_keeps_exact_seq_ids_and_read_only_source_facts(source_index_factory, prefix):
+    old, cur = source_index_factory(prefix=prefix)
+    before = deepcopy(old)
+    candidate = retain_source_fingerprints(old)
+    assert old == before
+    base = candidate["source_base"]
+    cutoff = max(0, prefix - 4096)
+    assert base["version"] == 2
+    assert base["through_seq"] == prefix
+    assert base["ids"] == [[row[0], None if i < cutoff else row[1]] for i, row in enumerate(before["source_base"]["ids"])]
+    for key in ["binding", "periods", "unknown"]:
+        assert base[key] == before["source_base"][key]
+    assert candidate["events"] == old["events"]
+    assert candidate["outbox"] == old["outbox"]
+    assert known_history_ids(candidate) == known_history_ids(old)
+    assert retain_source_fingerprints(candidate) is candidate
+
+
+def test_fingerprint_only_maintenance_preserves_lease_and_rebases_same_boundary(source_index_factory):
+    old, _ = source_index_factory()
+    candidate = retain_source_fingerprints(old)
+    assert same_history_authority(candidate, old)
+    assert not same_history_authority(old, candidate)
+    admission = deepcopy(old)
+    admission["events"].append({"seq": event_count(old) + 1, "history_id": 87654321})
+    rebased = rebase_source_candidate(admission, candidate)
+    assert rebased["source_base"] == candidate["source_base"]
+    assert rebased["events"] == admission["events"]
+    tampered = deepcopy(candidate)
+    tampered["source_base"]["binding"]["legacy_hash"] = "f" * 64
+    assert not same_history_authority(tampered, old)
+
+
+def test_window_moves_with_absolute_compacted_seq_and_keeps_old_source_facts(source_index_factory):
+    from event_time_stats import (
+        compact_source_history,
+        validate_event_time,
+        validate_source_base,
+    )
+
+    full, cur = source_index_factory()
+    old = retain_source_fingerprints(full)
+    candidate = old
+    for through in [4101, 4102]:
+        candidate = compact_source_history(candidate, cur, through)
+        validate_source_base(candidate)
+        validate_event_time(cur, candidate)
+        cutoff = through - 4096
+        assert all(row[1] is None for row in candidate["source_base"]["ids"][:cutoff])
+        assert all(isinstance(row[1], str) for row in candidate["source_base"]["ids"][cutoff:])
+        assert same_history_authority(candidate, old)
+        assert known_history_ids(candidate) == known_history_ids(full)
+    assert candidate["events"] == []
+    assert candidate["source_base"]["unknown"] == old["source_base"]["unknown"]
+    assert candidate["source_base"]["binding"] == old["source_base"]["binding"]
+    tampered = deepcopy(candidate)
+    tampered["source_base"]["ids"][-1][1] = "f" * 64
+    assert not same_history_authority(tampered, old)

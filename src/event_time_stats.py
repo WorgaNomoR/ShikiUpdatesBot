@@ -10,10 +10,12 @@ from datetime import (
 )
 
 from source_history import (
+    SOURCE_FINGERPRINT_WINDOW,
     content_hash,
     event_at_seq,
     event_count,
     prefix_seq,
+    retain_source_fingerprints,
     semantic_hash,
     source_suffix,
 )
@@ -480,13 +482,14 @@ def compact_source_history(journal: dict, cur: dict, through: int) -> dict:
         else:
             periods.setdefault(period, []).append(event)
     base = {
-        "version": 1, "through_seq": through, "ids": ids,
+        "version": 2, "through_seq": through, "ids": ids,
         "binding": _source_binding(state),
         "periods": {period: _minimal_sources(source) for period, source in sorted(periods.items())},
         "unknown": unknown,
     }
     base["checksum"] = content_hash(base)
-    return {**journal, "source_base": base, "events": journal["events"][through - prefix_seq(journal):]}
+    candidate = {**journal, "source_base": base, "events": journal["events"][through - prefix_seq(journal):]}
+    return retain_source_fingerprints(candidate)
 
 
 def validate_source_base(journal: dict) -> None:
@@ -500,7 +503,7 @@ def validate_source_base(journal: dict) -> None:
     if (
         not isinstance(base, dict)
         or set(base) != {"version", "through_seq", "ids", "binding", "periods", "unknown", "checksum"}
-        or type(base["version"]) is not int or base["version"] != 1
+        or type(base["version"]) is not int or base["version"] not in {1, 2}
         or type(base["through_seq"]) is not int or not 1 <= base["through_seq"] <= journal["processed_seq"]
         or not isinstance(base["ids"], list) or len(base["ids"]) != base["through_seq"]
         or not isinstance(base["binding"], dict)
@@ -517,10 +520,12 @@ def validate_source_base(journal: dict) -> None:
     ):
         raise EventTimeStateError("source_structure")
     known = set(journal["baseline_ids"])
-    for item in base["ids"]:
+    cutoff = max(0, base["through_seq"] - SOURCE_FINGERPRINT_WINDOW) if base["version"] == 2 else 0
+    for index, item in enumerate(base["ids"]):
         if (
             not isinstance(item, list) or len(item) != 2
-            or type(item[0]) is not int or item[0] in known or not digest(item[1])
+            or type(item[0]) is not int or item[0] in known
+            or (item[1] is not None if index < cutoff else not digest(item[1]))
         ):
             raise EventTimeStateError("source_ids")
         known.add(item[0])

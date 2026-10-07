@@ -443,10 +443,10 @@ def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple
     version = _backup_history_version(raw)
     if version in {1, 2, 3}:
         return tuple(member for member in members if member.name != PROGRESS_FILE_NAME)
-    if version in {4, 5}:
+    if version in {4, 5, 6}:
         if not any(member.name == PROGRESS_FILE_NAME for member in members):
             raise ValueError("Журнал требует сохранённый прогресс уведомлений")
-    if version == 5:
+    if version in {5, 6}:
         # Compact base и suffix проходят тот же полный proof, что runtime/import.
         captured = {member.name: member.data for member in members}
         if "stats_current.json" not in captured:

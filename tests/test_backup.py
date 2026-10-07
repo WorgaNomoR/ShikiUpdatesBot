@@ -133,6 +133,86 @@ async def test_malformed_quarter_import_rejects_entire_candidate(backup_env, dam
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("base_version", [1, 2])
+@pytest.mark.parametrize("plan_version", [1, 2, 3])
+async def test_index_archive_roundtrip_preserves_old_format_plans_facts_and_schedule(
+    backup_env, source_index_factory, base_version, plan_version,
+):
+    from copy import deepcopy
+
+    from event_journal_schema import validate_recovery_set
+    from notification_progress_schema import parse_recovery_journal
+
+    journal, cur = source_index_factory(version=base_version)
+    if plan_version == 1:
+        plan = storage.new_quarter_delivery("2026-Q1", "2026-Q2", ["frozen one", "frozen two"])
+    else:
+        units = [{"transport": "html", "content": text, "disable_preview": False} for text in ["frozen one", "frozen two"]]
+        revisions = {"2026-Q1": cur["event_time"]["periods"]["2026-Q1"]["revision"]} if plan_version == 3 else None
+        plan = storage.new_quarter_delivery_plan("2026-Q1", "2026-Q2", units, event_time_revisions=revisions)
+        if plan_version == 3:
+            cur["event_time"]["report_ack"] = {"plan_id": plan["plan_id"], "revisions": revisions}
+    plan.update(next_unit=1, delivery_uncertain=True)
+    cur["pending_quarter_delivery"] = plan
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_subscribers({10: "only"})
+    storage.notification_memberships()
+    state = storage.load_subscriber_state(strict_subscribers=True)
+    state_before = deepcopy(state)
+    paths = [storage.EVENT_JOURNAL_FILE, storage.notification_progress_file(), storage.STATS_CURRENT_FILE]
+    original = {path.name: path.read_bytes() for path in paths}
+    archive, generation = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+        history = zipped.read("event_journal.json")
+        assert json.loads(history)["version"] == (5 if base_version == 1 else 6)
+        assert parse_recovery_journal(history, zipped.read("notification_progress.json")) == journal
+    assert {path.name: path.read_bytes() for path in paths} == original
+    await backup.restore_backup_zip(archive)
+    assert storage.restorable_restore_generation() > generation
+    restored = storage.load_event_journal()
+    restored_cur = storage.load_stats_current(strict=True)
+    validate_recovery_set(restored, restored_cur)
+    assert restored == journal
+    assert restored_cur["pending_quarter_delivery"] == plan
+    assert restored_cur["event_time"] == cur["event_time"]
+    assert storage.load_subscriber_state(strict_subscribers=True) == state_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["window_gap", "checksum", "version", "oversized", "missing_progress"])
+async def test_index_archive_invalid_candidate_rejects_before_file_mutation(
+    backup_env, source_index_factory, damage,
+):
+    from source_history import content_hash
+
+    journal, cur = source_index_factory(version=2)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    original = {path.name: path.read_bytes() for path in backup_env.iterdir() if path.is_file()}
+    candidate = dict(original)
+    history = json.loads(candidate["event_journal.json"])
+    base = history["source_base"]
+    if damage == "window_gap":
+        base["ids"][100][1] = None
+        base["checksum"] = content_hash({k: v for k, v in base.items() if k != "checksum"})
+    elif damage == "checksum":
+        base["checksum"] = "f" * 64
+    elif damage == "version":
+        history["version"] = 7
+    candidate["event_journal.json"] = json.dumps(history).encode()
+    if damage == "oversized":
+        candidate["event_journal.json"] = b" " * (8 * 1024 * 1024 + 1)
+    elif damage == "missing_progress":
+        del candidate["notification_progress.json"]
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(_zip_bytes(candidate))
+    assert storage.restorable_restore_generation() == generation
+    assert {path.name: path.read_bytes() for path in backup_env.iterdir() if path.is_file()} == original
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("period", ["old", "2026-Q2 "])
 async def test_import_rejects_invalid_period_without_pending_before_publication(backup_env, period):
     current = storage._empty_stats_current("2026-Q2")
@@ -3076,7 +3156,7 @@ async def test_split_backup_capture_freezes_progress_before_concurrent_writer(
 
 
 @pytest.mark.asyncio
-async def test_large_compact_current_roundtrips_complete_v5_backup(
+async def test_large_compact_current_roundtrips_complete_v6_backup(
     backup_env, stats_capacity_factory,
 ):
     from event_journal_schema import validate_recovery_set
@@ -3088,7 +3168,7 @@ async def test_large_compact_current_roundtrips_complete_v5_backup(
     storage.save_stats_current(cur, strict=True)
     current_raw = storage.STATS_CURRENT_FILE.read_bytes()
     assert len(current_raw) < backup._IMPORT_MEMBER_MAX_BYTES
-    assert json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())["version"] == 5
+    assert json.loads(storage.EVENT_JOURNAL_FILE.read_bytes())["version"] == 6
     archive, _ = await backup._build_backup_zip()
     with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
         assert zipped.read("stats_current.json") == current_raw
