@@ -452,7 +452,12 @@ def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple
         if "stats_current.json" not in captured:
             raise ValueError("Журнал требует соответствующий текущий квартал")
         journal = parse_recovery_journal(raw, captured[PROGRESS_FILE_NAME], profile=SHIKI_USER)
-        cur = json.loads(captured["stats_current.json"])
+        try:
+            cur = json.loads(captured["stats_current.json"])
+        except (ValueError, UnicodeError, RecursionError):
+            raise ValueError("Текущий квартал повреждён") from None
+        if not isinstance(cur, dict):
+            raise ValueError("Текущий квартал повреждён")
         validate_pending_quarter_delivery(cur)
         validate_recovery_set(journal, cur)
     return members

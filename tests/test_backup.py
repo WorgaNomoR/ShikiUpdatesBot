@@ -3168,6 +3168,36 @@ async def test_source_backup_import_and_capture_share_full_recovery_validation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("current_raw", [
+    pytest.param(b"null", id="null"),
+    pytest.param(b"[]", id="list"),
+    pytest.param(b'"text"', id="string"),
+    pytest.param(b"42", id="number"),
+    pytest.param(b"false", id="bool"),
+    pytest.param(b"{broken", id="json"),
+    pytest.param(b"\xffbroken", id="encoding"),
+    pytest.param(b"[" * 10000 + b"0" + b"]" * 10000, id="depth"),
+])
+async def test_source_backup_reports_malformed_current_without_changing_recovery_bytes(
+    backup_env, source_history_factory, current_raw,
+):
+    full, cur = source_history_factory()
+    storage.save_event_journal(full)
+    storage.save_stats_current(cur, strict=True)
+    storage.compact_completed_history(
+        full, storage.load_stats_current(strict=True),
+        expected_generation=storage.restorable_restore_generation(), force=True,
+    )
+    storage.STATS_CURRENT_FILE.write_bytes(current_raw)
+    before = {path.name: path.read_bytes() for path in backup_env.iterdir() if path.is_file()}
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError, match="Текущий квартал повреждён"):
+        await backup._build_backup_zip()
+    assert {path.name: path.read_bytes() for path in backup_env.iterdir() if path.is_file()} == before
+    assert storage.restorable_restore_generation() == generation
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version", [1, 2, 3])
 async def test_source_recovery_preserves_frozen_plans_and_later_correction_ack(
     backup_env, source_history_factory, version,

@@ -357,7 +357,7 @@ def test_compact_sources_preserve_late_insertions_order_scores_and_legacy(legacy
 
 @pytest.mark.parametrize("seed", range(12))
 def test_compact_source_min_max_matches_full_reducer_for_arbitrary_late_history(seed):
-    rng = Random(seed)
+    rng = Random(seed)  # nosec B311  (детерминированные тестовые данные — не криптография)
     full_cur = _current()
     full = {"baseline_ids": [], "events": [], "processed_seq": 0}
     compact_cur, compact = deepcopy(full_cur), deepcopy(full)
