@@ -1127,6 +1127,53 @@ def quarter_delivery_env(backup_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_quarter_recovery_backup_ignores_large_cache_and_preserves_own_ack(
+    quarter_delivery_env, backup_env, source_history_factory, monkeypatch, accepted,
+):
+    from event_time_stats import report_revisions
+
+    journal, cur = source_history_factory(pending_from=7)
+    revisions = {period: revision for period, revision in report_revisions(cur).items() if period < cur["period"]}
+    plan = storage.new_quarter_delivery_plan(
+        "2026-Q1", "2026-Q2", [], event_time_revisions=revisions,
+    )
+    cur["pending_quarter_delivery"] = plan
+    cur["event_time"]["report_ack"] = {"plan_id": plan["plan_id"], "revisions": revisions}
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    before = storage.load_subscription_backup_state()
+    with (backup_env / "stats_all.json").open("wb") as target:
+        target.truncate(backup._BACKUP_TOTAL_MAX_BYTES + 1)
+    monkeypatch.setattr("handlers.send_backup", backup.send_backup)
+    bot = AsyncMock()
+    if not accepted:
+        bot.send_document.side_effect = RuntimeError("upload failed")
+
+    result = await handlers._deliver_pending_quarter(bot, cur)
+
+    bot.send_document.assert_awaited_once()
+    with zipfile.ZipFile(io.BytesIO(bot.send_document.await_args.kwargs["document"].data)) as archive:
+        assert "stats_all.json" not in archive.namelist()
+        captured = json.loads(archive.read("stats_current.json"))
+        assert captured["pending_quarter_delivery"] == plan
+    assert storage.load_event_journal()["outbox"] == journal["outbox"]
+    schedule = storage.load_subscription_backup_state()
+    assert schedule["pending"] == before["pending"]
+    if accepted:
+        assert result["pending_quarter_delivery"] is None
+        assert schedule["last_backup_at"] is not None
+        assert result["event_time"]["report_ack"] is None
+    else:
+        assert result["pending_quarter_delivery"] == plan
+        assert schedule["last_backup_at"] == before["last_backup_at"]
+    assert result["last_report_sent"] == "2026-Q2"
+    for period, revision in revisions.items():
+        assert result["event_time"]["periods"][period]["announced_revision"] == revision
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_index", [1, 2])
 async def test_quarter_failure_reload_resumes_exact_next_unit(quarter_delivery_env, failed_index):
     cur = _frozen_quarter()

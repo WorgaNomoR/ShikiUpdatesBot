@@ -47,6 +47,7 @@ from handlers import (
     backup_export_cb,
     backup_import_cb,
     backup_receive,
+    backup_recovery_cb,
     broadcast_cancel_cb,
     broadcast_confirm_cb,
     broadcast_receive,
@@ -179,6 +180,7 @@ async def main() -> None:
     # FSM-обработчик и кнопки для /backup
     dp.message.register(backup_receive, BackupStates.waiting_import_file)
     dp.callback_query.register(backup_export_cb, F.data == "backup:export")
+    dp.callback_query.register(backup_recovery_cb, F.data == "backup:recovery")
     dp.callback_query.register(backup_import_cb, F.data == "backup:import")
     dp.callback_query.register(backup_close_cb,  F.data == "backup:close")
 

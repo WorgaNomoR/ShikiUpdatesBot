@@ -61,6 +61,7 @@ from access_control import (
 from backup import (
     BACKUP_TAG,
     IMPORT_DOCUMENT_MAX_BYTES,
+    BackupLimitError,
     _backup_after_subscription,
     _weekly_backup_if_due,
     automatic_backup_delivery,
@@ -2998,12 +2999,13 @@ class FactsStates(StatesGroup):
 
 
 def _backup_menu_kb() -> InlineKeyboardMarkup:
-    """Инлайн-меню /backup: экспорт и импорт."""
+    """Инлайн-меню /backup: резервная копия, полный экспорт и импорт."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📤 Экспорт", callback_data="backup:export"),
-            InlineKeyboardButton(text="📥 Импорт",  callback_data="backup:import"),
+            InlineKeyboardButton(text="💾 Скачать копию", callback_data="backup:recovery"),
         ],
+        [InlineKeyboardButton(text="🧰 Скачать для диагностики", callback_data="backup:export")],
+        [InlineKeyboardButton(text="📥 Восстановить из архива", callback_data="backup:import")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="backup:close")],
     ])
 
@@ -3016,39 +3018,45 @@ async def cmd_backup(message: Message) -> None:
     # Отправляем ОТВЕТОМ на команду (reply): у меню появляется reply_to_message
     # = само сообщение /backup, и кнопка ❌ Закрыть удалит заодно и команду.
     await message.reply(
-        "💾 <b>Резервное копирование</b>\n\n"
-        "📤 <b>Экспорт</b> — пришлю zip-архив всего состояния "
-        "(подписчики, дополнительные факты, статистика, кварталы).\n"
-        "📥 <b>Импорт</b> — восстановлю из архива список блокировок, подписчиков, "
-        "дополнительные факты, сведения о доступных обновлениях и данные "
-        "текущего и завершённых кварталов.",
+        main_menu.owner_backup_view().text,
         reply_markup=_backup_menu_kb(),
         parse_mode=ParseMode.HTML,
     )
 
 
-async def _send_backup_export(bot: Bot, chat_id: int) -> None:
-    """Выполнить существующий экспорт для command/menu orchestration."""
+async def _send_backup_export(bot: Bot, chat_id: int, *, full_export: bool = True) -> None:
+    """Выполнить ручную выгрузку, не подтверждая автоматические обязательства."""
+    label = "Архив для диагностики" if full_export else "Резервная копия для восстановления"
     caption = (
-        "📤 Экспорт состояния.\n"
+        f"💾 {label}.\n"
         f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}"
     )
-    if not await send_backup(bot, caption):
+    try:
+        sent = await send_backup(bot, caption, full_export=full_export)
+    except BackupLimitError as e:
+        await bot.send_message(chat_id, f"❌ Архив для диагностики не создан: {e}.")
+        return
+    if not sent:
         await bot.send_message(
             chat_id,
             "❌ Не удалось собрать/отправить архив — см. логи.",
         )
 
 
-async def backup_export_cb(callback: CallbackQuery) -> None:
-    """Кнопка «Экспорт» — собираем и шлём архив, меню убираем."""
+async def backup_export_cb(callback: CallbackQuery, *, full_export: bool = True) -> None:
+    """Собрать выбранный архив после проверки владельца и убрать меню."""
     if callback.from_user is None or callback.from_user.id != OWNER_ID:
         await callback.answer("🚫 Только для владельца.", show_alert=True)
         return
     await callback.answer("Собираю архив...")
     bot, chat_id = callback.message.bot, callback.message.chat.id
     await _safe_delete(bot, chat_id, callback.message.message_id)
-    await _send_backup_export(bot, chat_id)
+    await _send_backup_export(bot, chat_id, full_export=full_export)
+
+
+async def backup_recovery_cb(callback: CallbackQuery) -> None:
+    """Кнопка резервной копии использует общий сценарий с проверкой владельца."""
+    await backup_export_cb(callback, full_export=False)
 
 
 async def _begin_backup_import(
@@ -4902,9 +4910,9 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
                 screen="owner",
             )
             return
-        if action == "menu:owner:backup:export":
+        if action in {"menu:owner:backup:recovery", "menu:owner:backup:export"}:
             bot, chat_id = await _finish_main_menu(callback, state)
-            await _send_backup_export(bot, chat_id)
+            await _send_backup_export(bot, chat_id, full_export=action.endswith(":export"))
             return
         if action == "menu:owner:backup:import":
             opened = await _begin_backup_import(

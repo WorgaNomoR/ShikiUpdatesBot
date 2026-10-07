@@ -249,7 +249,7 @@ def owner_view() -> MenuView:
         (MenuEntry("📢 Рассылка", "menu:owner:broadcast"),),
         (MenuEntry("👥 Пользователи", "menu:owner:users"),),
         (MenuEntry("🗃 Банк фактов", "menu:owner:facts"),),
-        (MenuEntry("💾 Резервная копия", "menu:owner:backup"),),
+        (MenuEntry("💾 Архивы и восстановление", "menu:owner:backup"),),
         (MenuEntry("⬅️ Назад", "menu:home"),),
     )
     return MenuView(
@@ -263,16 +263,21 @@ def owner_backup_view() -> MenuView:
     """Собрать экран существующих операций резервного копирования."""
     rows = (
         (
-            MenuEntry("📤 Экспорт", "menu:owner:backup:export"),
-            MenuEntry("📥 Импорт", "menu:owner:backup:import"),
+            MenuEntry("💾 Скачать копию", "menu:owner:backup:recovery"),
         ),
+        (MenuEntry("🧰 Скачать для диагностики", "menu:owner:backup:export"),),
+        (MenuEntry("📥 Восстановить из архива", "menu:owner:backup:import"),),
         (MenuEntry("⬅️ Назад", "menu:owner"),),
     )
     caption = (
-        "Экспорт создаёт архив состояния, а импорт восстанавливает "
-        "поддерживаемые данные из такого архива."
+        "💾 <b>Скачать копию</b>\n"
+        "Для переноса или восстановления бота. Включает статистику всех кварталов.\n\n"
+        "🧰 <b>Скачать для диагностики</b>\n"
+        "Все сохранённые данные, включая вспомогательные файлы для разбора проблем.\n\n"
+        "📥 <b>Восстановить из архива</b>\n"
+        "Загрузить данные из ранее сохранённой копии или архива для диагностики."
     )
-    text = f"💾 <b>Резервное копирование</b>\n\n{caption}"
+    text = f"💾 <b>Архивы и восстановление</b>\n\n{caption}"
     return MenuView(
         text=text,
         keyboard=_keyboard(rows),

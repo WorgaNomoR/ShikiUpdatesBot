@@ -11,10 +11,12 @@ import asyncio
 import io
 import json
 import lzma
+import random
 import threading
 import time
 import zipfile
 import zlib
+from pathlib import Path
 from unittest.mock import (
     AsyncMock,
     Mock,
@@ -321,7 +323,227 @@ def _corrupt_stored_member(raw: bytes, name: str) -> bytes:
 # ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
+async def test_recovery_backup_ignores_cache_above_total_limit(backup_env):
+    cur = storage._empty_stats_current("2026-Q3")
+    storage.save_stats_current(cur, strict=True)
+    cache = backup_env / "stats_all.json"
+    with cache.open("wb") as target:
+        target.truncate(backup._BACKUP_TOTAL_MAX_BYTES + 1)
+
+    raw, _ = await backup._build_backup_zip()
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert archive.namelist() == ["stats_current.json"]
+        assert archive.read("stats_current.json") == storage.stats_current_json(cur).encode()
+
+
+@pytest.mark.asyncio
+async def test_full_export_preserves_exact_bytes_and_both_modes_restore(backup_env):
+    cur = storage._empty_stats_current("2026-Q3")
+    storage.save_stats_current(cur, strict=True)
+    current_raw = storage.STATS_CURRENT_FILE.read_bytes()
+    diagnostics = {
+        "stats_all.json": b' {"unusual": [1, 2]}\r\n ',
+        "seen_ids.json": b'{"seen_ids": [7,7]}\n',
+        "seen_favourites.json": b'{ "seen_favourites": [] }\r\n',
+        "diagnostic/raw.bin": bytes(range(256)),
+    }
+    for name, data in diagnostics.items():
+        path = backup_env / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(data)
+    quarter = backup_env / "quarters" / "2026-Q2.json"
+    quarter_raw = b'{"period":"2026-Q2","events":[]}\r\n'
+    quarter.write_bytes(quarter_raw)
+
+    for full_export in (True, False):
+        quarter_raw = quarter.read_bytes()
+        raw, _ = await backup._build_backup_zip(full_export=full_export)
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            assert archive.read("stats_current.json") == current_raw
+            assert archive.read("quarters/2026-Q2.json") == quarter_raw
+            assert set(archive.namelist()) == {"stats_current.json", "quarters/2026-Q2.json"} | (
+                set(diagnostics) if full_export else set()
+            )
+            for name, data in diagnostics.items():
+                if full_export:
+                    assert archive.read(name) == data
+        result = await backup.restore_backup_zip(raw)
+        assert set(result["restored"]) == {"stats_current.json", "quarters/2026-Q2.json"}
+        assert storage.load_stats_current(strict=True) == cur
+        assert {name: (backup_env / name).read_bytes() for name in diagnostics} == diagnostics
+
+
+@pytest.mark.asyncio
+async def test_full_export_limit_failure_does_not_block_recovery_or_acknowledge(backup_env, monkeypatch):
+    await storage.mutate_subscription(7, "Neo", subscribed=True)
+    storage.save_stats_current(storage._empty_stats_current("2026-Q3"), strict=True)
+    before = storage.SUBS_FILE.read_bytes()
+    with (backup_env / "stats_all.json").open("wb") as target:
+        target.truncate(backup._BACKUP_TOTAL_MAX_BYTES + 1)
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
+    bot = AsyncMock()
+
+    with pytest.raises(backup.BackupLimitError, match="32 МиБ"):
+        await backup.send_backup(bot, "diagnostics", full_export=True)
+    bot.send_document.assert_not_awaited()
+    assert backup._last_backup_sent_at is None
+    assert storage.SUBS_FILE.read_bytes() == before
+
+    assert await backup.send_backup(bot, "recovery")
+    assert storage.SUBS_FILE.read_bytes() == before
+    assert "shikibot-backup-" in bot.send_document.await_args.kwargs["document"].filename
+
+
+@pytest.mark.asyncio
+async def test_unreadable_diagnostic_export_failure_leaves_recovery_available(backup_env, monkeypatch):
+    storage.save_stats_current(storage._empty_stats_current("2026-Q3"), strict=True)
+    diagnostic = backup_env / "stats_all.json"
+    diagnostic.write_bytes(b"unreadable cache")
+    real_open = Path.open
+
+    def unreadable(path, *args, **kwargs):
+        if path == diagnostic:
+            raise PermissionError("diagnostic cache")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", unreadable)
+    bot = AsyncMock()
+    assert await backup.send_backup(bot, "full", full_export=True) is False
+    bot.send_document.assert_not_awaited()
+    assert await backup.send_backup(bot, "recovery")
+    bot.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+@pytest.mark.parametrize("boundary", ["member", "total", "entries", "zip"])
+async def test_both_archive_modes_enforce_real_resource_limits(backup_env, full_export, boundary):
+    if boundary == "member":
+        with (backup_env / "stats_current.json").open("wb") as target:
+            target.truncate(8 * 1024 * 1024 + 1)
+    elif boundary == "total":
+        for index in range(5):
+            with (backup_env / "quarters" / f"{2000 + index}-Q1.json").open("wb") as target:
+                target.truncate(7 * 1024 * 1024)
+    elif boundary == "entries":
+        for index in range(257):
+            (backup_env / "quarters" / f"{2000 + index}-Q1.json").write_bytes(b"{}")
+    else:
+        # Детерминированная несжимаемая синтетика проверяет реальный ZIP, не прогноз.
+        data = random.Random(0).randbytes(7 * 1024 * 1024)
+        for index in range(3):
+            (backup_env / "quarters" / f"{2000 + index}-Q1.json").write_bytes(data)
+    with pytest.raises(backup.BackupLimitError):
+        await backup._build_backup_zip(full_export=full_export)
+
+
+@pytest.mark.asyncio
+async def test_full_export_allows_diagnostic_member_above_restorable_limit(backup_env):
+    data = b"x" * (backup._BACKUP_RESTORABLE_MEMBER_MAX_BYTES + 1)
+    (backup_env / "stats_all.json").write_bytes(data)
+    raw, _ = await backup._build_backup_zip(full_export=True)
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert archive.read("stats_all.json") == data
+
+
+@pytest.mark.asyncio
+async def test_archive_capacity_measurements_repeat_identical_inputs(backup_env, source_index_factory):
+    """Три замера настоящих архивов; печать позволяет повторить таблицу README."""
+    journal, cur = source_index_factory(version=2)
+    storage.save_event_journal(journal)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_seen_ids({7, 11})
+    storage.save_seen_favourites({"anime:11"})
+    for period in ("2025-Q4", "2026-Q1"):
+        storage._atomic_write(
+            backup_env / "quarters" / f"{period}.json",
+            json.dumps({"period": period, "events": []}, ensure_ascii=False, indent=2),
+        )
+    assert len(storage.load_event_journal()["outbox"]["records"]) == 2
+    recovery_bytes = sum(
+        path.stat().st_size for path in backup_env.rglob("*")
+        if path.is_file() and backup._is_allowed_import_member(path.relative_to(backup_env).as_posix())
+    )
+    for padding in (1024, 9 * 1024 * 1024, 33 * 1024 * 1024):
+        # Cache записан штатным сериализатором; его содержимое намеренно синтетическое.
+        storage.save_stats_all({"synthetic_diagnostic": "x" * padding})
+        total_bytes = sum(path.stat().st_size for path in backup_env.rglob("*") if path.is_file())
+        samples = []
+        for _ in range(3):
+            recovery, _ = await backup._build_backup_zip()
+            with zipfile.ZipFile(io.BytesIO(recovery)) as archive:
+                assert sum(member.file_size for member in archive.infolist()) == recovery_bytes
+            try:
+                exported, _ = await backup._build_backup_zip(full_export=True)
+            except backup.BackupLimitError:
+                assert total_bytes > backup._BACKUP_TOTAL_MAX_BYTES
+                export_size = None
+            else:
+                with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+                    assert sum(member.file_size for member in archive.infolist()) == total_bytes
+                export_size = len(exported)
+            samples.append((len(recovery), export_size))
+        assert samples == [samples[0]] * 3
+        print(f"capacity padding={padding} recovery_raw={recovery_bytes} recovery_zip={samples[0][0]} full_raw={total_bytes} full_zip={samples[0][1]} repeats=3")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["subscription", "weekly", "shutdown"])
+async def test_automatic_backups_ignore_oversized_diagnostics(backup_env, monkeypatch, kind):
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
+    _save_subscriber_schedule(last_backup_at=old, weekly_started_at=old)
+    if kind == "subscription":
+        await storage.mutate_subscription(7, "Neo", subscribed=True)
+    cur = storage._empty_stats_current("2026-Q3")
+    storage.save_stats_current(cur, strict=True)
+    before = storage.load_subscription_backup_state()
+    with (backup_env / "stats_all.json").open("wb") as target:
+        target.truncate(backup._BACKUP_TOTAL_MAX_BYTES + 1)
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
+    bot = AsyncMock()
+
+    if kind == "subscription":
+        assert await backup._backup_after_subscription(bot)
+    elif kind == "weekly":
+        assert await backup._weekly_backup_if_due(bot, cur) is cur
+    else:
+        await backup._shutdown_backup(bot)
+    bot.send_document.assert_awaited_once()
+    with zipfile.ZipFile(io.BytesIO(bot.send_document.await_args.kwargs["document"].data)) as archive:
+        assert set(archive.namelist()) == {"subscribers.json", "stats_current.json"}
+    after = storage.load_subscription_backup_state()
+    if kind == "shutdown":
+        assert after == before
+    else:
+        assert after["last_backup_at"] > old
+        assert after["pending"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_count", [0, 257])
+async def test_recovery_backup_filters_diagnostics_before_count_and_open(backup_env, monkeypatch, extra_count):
+    storage.save_stats_current(storage._empty_stats_current("2026-Q3"), strict=True)
+    names = ["stats_all.json", "seen_ids.json", "seen_favourites.json"]
+    names.extend(f"diagnostic-{index}.bin" for index in range(extra_count))
+    for name in names:
+        (backup_env / name).write_bytes(b"diagnostic")
+    real_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path.name in names:
+            raise AssertionError("Резервная копия не должна открывать диагностику")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    raw, _ = await backup._build_backup_zip()
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        assert archive.namelist() == ["stats_current.json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env, full_export):
     (backup_env / "subscribers.json").write_text('{"subscribers": {}}', encoding="utf-8")
     (backup_env / "blocked_users.json").write_text(
         '{"blocked_user_ids": [7]}',
@@ -342,13 +564,13 @@ async def test_build_backup_zip_excludes_tmp_and_keeps_structure(backup_env):
     storage._atomic_write(restore_stage / "subscribers.json", "staged")
     (backup_env / "quarters" / "2026-Q1.json").write_text('{"period": "2026-Q1"}', encoding="utf-8")
 
-    raw, _ = await backup._build_backup_zip()
+    raw, _ = await backup._build_backup_zip(full_export=full_export)
     names = set(zipfile.ZipFile(io.BytesIO(raw)).namelist())
 
     assert "subscribers.json" in names
     assert "blocked_users.json" in names
     assert "stats_current.json" in names
-    assert "stats_all.json" in names
+    assert ("stats_all.json" in names) is full_export
     assert "known_users.json" in names
     assert "user_alerts.json" in names
     assert "quarters/2026-Q1.json" in names          # вложенность сохранена
@@ -491,10 +713,12 @@ async def test_slow_compression_releases_lock_and_keeps_coherent_snapshot(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["capture", "compression"])
+@pytest.mark.parametrize("full_export", [False, True])
 async def test_backup_cancellation_drains_worker(
     backup_env,
     monkeypatch,
     stage,
+    full_export,
 ):
     (backup_env / "stats_current.json").write_text(
         '{"period":"2026-Q2","events":[]}',
@@ -511,7 +735,7 @@ async def test_backup_cancellation_drains_worker(
 
     target = "_read_backup_members" if stage == "capture" else "_compress_backup_zip"
     monkeypatch.setattr(backup, target, wait_for_cancel)
-    task = asyncio.create_task(backup._build_backup_zip())
+    task = asyncio.create_task(backup._build_backup_zip(full_export=full_export))
     await started.wait()
 
     task.cancel()
@@ -536,9 +760,11 @@ async def test_backup_cancelled_before_start_schedules_no_worker(backup_env, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
 async def test_restore_during_compression_invalidates_snapshot_before_upload(
     backup_env,
     monkeypatch,
+    full_export,
 ):
     storage.save_update_state(storage._empty_update_state())
     started = asyncio.Event()
@@ -554,7 +780,7 @@ async def test_restore_during_compression_invalidates_snapshot_before_upload(
 
     monkeypatch.setattr(backup, "_compress_backup_zip", slow_compress)
     bot = AsyncMock()
-    send_task = asyncio.create_task(backup.send_backup(bot, "x"))
+    send_task = asyncio.create_task(backup.send_backup(bot, "x", full_export=full_export))
     await started.wait()
     generation = storage.restorable_restore_generation()
 
@@ -572,31 +798,34 @@ async def test_restore_during_compression_invalidates_snapshot_before_upload(
 
 
 @pytest.mark.asyncio
-async def test_backup_resource_limits_are_inclusive(backup_env, monkeypatch):
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_backup_resource_limits_are_inclusive(backup_env, monkeypatch, full_export):
     monkeypatch.setattr(backup, "_BACKUP_ARCHIVE_MAX_MEMBERS", 2)
     monkeypatch.setattr(backup, "_BACKUP_RESTORABLE_MEMBER_MAX_BYTES", 4)
     monkeypatch.setattr(backup, "_BACKUP_TOTAL_MAX_BYTES", 8)
     (backup_env / "blocked_users.json").write_bytes(b"1234")
-    (backup_env / "stats_all.json").write_bytes(b"5678")
+    second = "stats_all.json" if full_export else "known_users.json"
+    extra = "extra.json" if full_export else "user_alerts.json"
+    (backup_env / second).write_bytes(b"5678")
 
-    raw, _ = await backup._build_backup_zip()
+    raw, _ = await backup._build_backup_zip(full_export=full_export)
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         assert archive.read("blocked_users.json") == b"1234"
-        assert archive.read("stats_all.json") == b"5678"
+        assert archive.read(second) == b"5678"
 
-    (backup_env / "extra.json").write_bytes(b"x")
+    (backup_env / extra).write_bytes(b"x")
     with pytest.raises(ValueError, match="больше 2 файлов"):
-        await backup._build_backup_zip()
+        await backup._build_backup_zip(full_export=full_export)
 
-    (backup_env / "extra.json").unlink()
+    (backup_env / extra).unlink()
     (backup_env / "blocked_users.json").write_bytes(b"12345")
     with pytest.raises(ValueError, match="восстанавливаемый файл больше"):
-        await backup._build_backup_zip()
+        await backup._build_backup_zip(full_export=full_export)
 
     (backup_env / "blocked_users.json").write_bytes(b"1234")
-    (backup_env / "stats_all.json").write_bytes(b"56789")
-    with pytest.raises(ValueError, match="суммарный размер backup больше"):
-        await backup._build_backup_zip()
+    monkeypatch.setattr(backup, "_BACKUP_TOTAL_MAX_BYTES", 7)
+    with pytest.raises(ValueError, match="суммарный размер архива больше"):
+        await backup._build_backup_zip(full_export=full_export)
 
 
 def test_completed_zip_limit_is_inclusive(monkeypatch):
@@ -609,7 +838,7 @@ def test_completed_zip_limit_is_inclusive(monkeypatch):
     assert len(backup._compress_backup_zip(cancelled, members)) == len(raw)
 
     monkeypatch.setattr(backup, "_BACKUP_ZIP_MAX_BYTES", len(raw) - 1)
-    with pytest.raises(ValueError, match="готовый backup ZIP больше"):
+    with pytest.raises(ValueError, match="готовый ZIP больше"):
         backup._compress_backup_zip(cancelled, members)
 
 
@@ -1833,7 +2062,8 @@ async def test_send_backup_sets_last_backup_clock(backup_env):
 
 
 @pytest.mark.asyncio
-async def test_manual_backup_does_not_change_automatic_schedule(backup_env):
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_manual_backup_does_not_change_automatic_schedule(backup_env, monkeypatch, full_export):
     pending = {
         "subscriptions": 2,
         "unsubscriptions": 1,
@@ -1847,10 +2077,12 @@ async def test_manual_backup_does_not_change_automatic_schedule(backup_env):
         pending=pending,
     )
     before = storage.load_subscription_backup_state()
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
 
-    assert await backup.send_backup(AsyncMock(), f"Вручную\n\n{backup.BACKUP_TAG}")
+    assert await backup.send_backup(AsyncMock(), f"Вручную\n\n{backup.BACKUP_TAG}", full_export=full_export)
 
     assert storage.load_subscription_backup_state() == before
+    assert (backup._last_backup_sent_at is None) is full_export
 
 
 @pytest.mark.asyncio
@@ -1944,7 +2176,7 @@ async def test_real_shutdown_timeout_drains_backup_worker(backup_env, monkeypatc
     monkeypatch.setattr(backup, "SHUTDOWN_BACKUP_TIMEOUT", 0.02)
     started = threading.Event()
 
-    def slow_scan(cancelled):
+    def slow_scan(cancelled, full_export):
         started.set()
         while not cancelled.wait(0.005):
             pass
@@ -3066,13 +3298,14 @@ async def test_split_restore_rolls_back_exact_bytes_and_removes_created_members(
 
 
 @pytest.mark.asyncio
-async def test_unactivated_migration_preparation_is_not_exported(backup_env, journal_factory):
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_unactivated_migration_preparation_is_not_exported(backup_env, journal_factory, full_export):
     journal = _compacted_recovery(journal_factory)
     storage.EVENT_JOURNAL_FILE.write_text(json.dumps(journal), encoding="utf-8")
     storage.save_stats_current(_journal_current(journal), strict=True)
     # Неактивированные данные не занимают ни member, ни общий бюджет capture.
     storage.notification_progress_file().write_bytes(b"x" * (8 * 1024 * 1024 + 1))
-    raw, _ = await backup._build_backup_zip()
+    raw, _ = await backup._build_backup_zip(full_export=full_export)
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         assert "notification_progress.json" not in archive.namelist()
         assert json.loads(archive.read("event_journal.json")) == journal
@@ -3380,8 +3613,9 @@ async def test_source_backup_reports_malformed_current_without_changing_recovery
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("full_export", [False, True])
 async def test_source_recovery_preserves_frozen_plans_and_later_correction_ack(
-    backup_env, source_history_factory, version,
+    backup_env, source_history_factory, version, full_export,
 ):
     from copy import deepcopy
 
@@ -3410,7 +3644,7 @@ async def test_source_recovery_preserves_frozen_plans_and_later_correction_ack(
         expected_generation=storage.restorable_restore_generation(), force=True,
     )
     plan_before = content_hash(plan)
-    archive, _ = await backup._build_backup_zip()
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
     await backup.restore_backup_zip(archive)
     restored = storage.load_stats_current(strict=True)
     assert content_hash(restored["pending_quarter_delivery"]) == plan_before
@@ -3433,7 +3667,7 @@ async def test_source_recovery_preserves_frozen_plans_and_later_correction_ack(
         assert bucket["announced_revision"] == 1
         assert bucket["revision"] == 2
         assert correction_periods(restored) == ["2026-Q1"]
-        archive, _ = await backup._build_backup_zip()
+        archive, _ = await backup._build_backup_zip(full_export=full_export)
         await backup.restore_backup_zip(archive)
         assert storage.load_stats_current(strict=True) == restored
 

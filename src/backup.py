@@ -144,6 +144,10 @@ class BackupSnapshotInvalidated(RuntimeError):
     """Restorable-state был восстановлен во время подготовки или доставки."""
 
 
+class BackupLimitError(ValueError):
+    """Архив превышает фиксированный лимит; текст безопасен для владельца."""
+
+
 class _BackupWorkerCancelled(RuntimeError):
     """Кооперативная остановка синхронной стадии backup worker."""
 
@@ -165,9 +169,10 @@ class _BackupMember:
     data: bytes
 
 
-def _backup_filename() -> str:
+def _backup_filename(*, full_export: bool = False) -> str:
     """Имя архива с меткой времени UTC — чтобы файлы не перезатирались в чате."""
-    return f"shikibot-backup-{_utcnow().strftime('%Y%m%d-%H%M%S')}.zip"
+    kind = "export" if full_export else "backup"
+    return f"shikibot-{kind}-{_utcnow().strftime('%Y%m%d-%H%M%S')}.zip"
 
 
 def _automatic_backup_lock() -> asyncio.Lock:
@@ -284,8 +289,9 @@ def _backup_history_version(raw: bytes) -> int | None:
 
 def _scan_backup_manifest(
     cancelled: threading.Event,
+    full_export: bool = False,
 ) -> tuple[_BackupManifestMember, ...]:
-    """Зафиксировать сортированный состав DATA_DIR вне event loop."""
+    """Зафиксировать выбранный состав; диагностику отсеять до лимитов и чтения."""
     members: list[_BackupManifestMember] = []
     exclude_preparation = False
     if (DATA_DIR / PROGRESS_FILE_NAME).is_file():
@@ -297,7 +303,7 @@ def _scan_backup_manifest(
             pass
     for path in DATA_DIR.rglob("*"):
         _raise_if_backup_cancelled(cancelled)
-        if not path.is_file() or path.name.endswith(".tmp"):
+        if path.name.endswith(".tmp"):
             continue
         relative = path.relative_to(DATA_DIR)
         if any(
@@ -306,18 +312,23 @@ def _scan_backup_manifest(
         ):
             continue
         name = relative.as_posix()
+        restorable = _is_allowed_import_member(name)
+        if not full_export and not restorable:
+            continue
+        if not path.is_file():
+            continue
         if name == PROGRESS_FILE_NAME and exclude_preparation:
             continue
         members.append(
             _BackupManifestMember(
                 path=path,
                 name=name,
-                restorable=_is_allowed_import_member(name),
+                restorable=restorable,
             )
         )
         if len(members) > _BACKUP_ARCHIVE_MAX_MEMBERS:
-            raise ValueError(
-                f"в backup больше {_BACKUP_ARCHIVE_MAX_MEMBERS} файлов"
+            raise BackupLimitError(
+                f"в архиве больше {_BACKUP_ARCHIVE_MAX_MEMBERS} файлов"
             )
     return tuple(sorted(members, key=lambda member: member.name))
 
@@ -346,13 +357,13 @@ def _read_backup_members(
                     member.restorable
                     and size > _BACKUP_RESTORABLE_MEMBER_MAX_BYTES
                 ):
-                    raise ValueError(
+                    raise BackupLimitError(
                         "восстанавливаемый файл больше "
                         f"{_BACKUP_RESTORABLE_MEMBER_MAX_BYTES // (1024 * 1024)} МиБ"
                     )
                 if total > _BACKUP_TOTAL_MAX_BYTES:
-                    raise ValueError(
-                        "суммарный размер backup больше "
+                    raise BackupLimitError(
+                        "суммарный размер архива больше "
                         f"{_BACKUP_TOTAL_MAX_BYTES // (1024 * 1024)} МиБ"
                     )
                 buf.write(chunk)
@@ -375,14 +386,14 @@ def _compress_backup_zip(
                     _raise_if_backup_cancelled(cancelled)
                     target.write(view[offset:offset + _BACKUP_IO_CHUNK_BYTES])
                     if buf.tell() > _BACKUP_ZIP_MAX_BYTES:
-                        raise ValueError(
-                            "готовый backup ZIP больше "
+                        raise BackupLimitError(
+                            "готовый ZIP больше "
                             f"{_BACKUP_ZIP_MAX_BYTES // (1024 * 1024)} МиБ"
                         )
     data = buf.getvalue()
     if len(data) > _BACKUP_ZIP_MAX_BYTES:
-        raise ValueError(
-            "готовый backup ZIP больше "
+        raise BackupLimitError(
+            "готовый ZIP больше "
             f"{_BACKUP_ZIP_MAX_BYTES // (1024 * 1024)} МиБ"
         )
     return data
@@ -463,8 +474,8 @@ def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple
     return members
 
 
-async def _build_backup_zip() -> tuple[bytes, int]:
-    """Получить coherent snapshot и сжать его без блокировки event loop."""
+async def _build_backup_zip(*, full_export: bool = False) -> tuple[bytes, int]:
+    """Снять согласованный набор восстановления либо полный экспорт."""
     cancelled = threading.Event()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shikibot-backup")
     try:
@@ -474,6 +485,7 @@ async def _build_backup_zip() -> tuple[bytes, int]:
                 executor,
                 cancelled,
                 _scan_backup_manifest,
+                full_export,
             )
             restorable_manifest = tuple(
                 member for member in manifest if member.restorable
@@ -520,20 +532,29 @@ async def _build_backup_zip() -> tuple[bytes, int]:
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-async def send_backup(bot: Bot, caption: str) -> bool:
-    """Собрать архив DATA_DIR и отправить владельцу. caption уже содержит
-    #backup. Любой сбой глушим и логируем: бэкап — фоновая страховка, он не
-    должен ронять вызывающий флоу (подписку, ротацию, цикл)."""
+async def send_backup(bot: Bot, caption: str, *, full_export: bool = False) -> bool:
+    """Отправить recovery-копию; полный экспорт выбирается только вручную.
+
+    Автоматическим вызовам возвращаем False при сбое. Для полного экспорта
+    BackupLimitError передаёт безопасную причину отказа в ручной интерфейс.
+    """
     global _last_backup_sent_at
     try:
-        data, generation = await _build_backup_zip()
+        data, generation = (
+            await _build_backup_zip(full_export=True) if full_export else await _build_backup_zip()
+        )
+    except BackupLimitError as e:
+        log.warning("send_backup: превышен лимит архива: %s", e)
+        if full_export:
+            raise
+        return False
     except BackupSnapshotInvalidated:
         log.warning("send_backup: snapshot устарел после восстановления состояния.")
         return False
     except Exception as e:
         log.error("send_backup: не удалось собрать архив: %s", e)
         return False
-    filename = _backup_filename()
+    filename = _backup_filename(full_export=full_export)
 
     async def _before_attempt():
         _ensure_backup_generation(generation)
@@ -562,7 +583,8 @@ async def send_backup(bot: Bot, caption: str) -> bool:
         if sent.duplicate_possible:
             log.warning("send_backup: доставка подтверждена; возможен дубль предыдущей попытки.")
         log.info("send_backup: архив отправлен владельцу (%d байт).", len(data))
-        _last_backup_sent_at = time.monotonic()
+        if not full_export:
+            _last_backup_sent_at = time.monotonic()
         return True
     except BackupSnapshotInvalidated:
         log.warning("send_backup: restore отменил подтверждение старого snapshot.")

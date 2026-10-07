@@ -20,6 +20,8 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest
 
 import handlers
+import main_menu
+from backup import BackupLimitError
 from event_time_stats import EventTimeStateError
 from storage import QuarterDeliveryStateError
 
@@ -48,7 +50,11 @@ async def test_cmd_backup_owner_shows_menu(backup_env):
     await handlers.cmd_backup(msg)
     kwargs = msg.reply.call_args.kwargs
     assert "reply_markup" in kwargs   # инлайн-меню есть
-    assert "доступных обновлениях" in msg.reply.call_args.args[0]
+    assert msg.reply.call_args.args[0] == main_menu.owner_backup_view().text
+    buttons = kwargs["reply_markup"].inline_keyboard
+    labels = [row[0].text for row in buttons[:3]]
+    expected = main_menu.owner_backup_view().keyboard.inline_keyboard
+    assert labels == [row[0].text for row in expected[:3]]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -59,6 +65,8 @@ def test_backup_menu_has_close_button():
     kb = handlers._backup_menu_kb()
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
     assert "backup:close" in datas
+    assert "backup:recovery" in datas
+    assert "backup:export" in datas
 
 
 @pytest.mark.asyncio
@@ -120,7 +128,8 @@ async def test_backup_close_clears_fsm_state(backup_env, monkeypatch):
 # ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_backup_export_rejects_non_owner(backup_env, monkeypatch):
+@pytest.mark.parametrize("handler", [handlers.backup_recovery_cb, handlers.backup_export_cb])
+async def test_backup_export_rejects_non_owner(backup_env, monkeypatch, handler):
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr(handlers, "send_backup", sent)
 
@@ -128,7 +137,7 @@ async def test_backup_export_rejects_non_owner(backup_env, monkeypatch):
     cb.from_user.id = 1                       # не владелец (OWNER_ID=999 в backup_env)
     cb.answer = AsyncMock()
 
-    await handlers.backup_export_cb(cb)
+    await handler(cb)
 
     cb.answer.assert_awaited_once()
     assert cb.answer.call_args.kwargs.get("show_alert") is True
@@ -136,7 +145,8 @@ async def test_backup_export_rejects_non_owner(backup_env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backup_export_owner_sends_archive(backup_env, monkeypatch):
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_backup_export_owner_sends_archive(backup_env, monkeypatch, full_export):
     sent = AsyncMock(return_value=True)       # send_backup успешен
     monkeypatch.setattr(handlers, "send_backup", sent)
     deleted = AsyncMock()
@@ -149,9 +159,12 @@ async def test_backup_export_owner_sends_archive(backup_env, monkeypatch):
     cb.message.chat.id = 999
     cb.message.message_id = 42
 
-    await handlers.backup_export_cb(cb)
+    handler = handlers.backup_export_cb if full_export else handlers.backup_recovery_cb
+    await handler(cb)
 
     sent.assert_awaited_once()                 # архив собран и отправлен
+    assert sent.await_args.kwargs == {"full_export": full_export}
+    assert ("Архив для диагностики" in sent.await_args.args[1]) is full_export
     deleted.assert_awaited_once_with(cb.message.bot, 999, 42)   # меню убрано: (bot, chat_id, message_id)
     cb.message.bot.send_message.assert_not_awaited()   # ошибки нет
 
@@ -172,6 +185,21 @@ async def test_backup_export_reports_failure(backup_env, monkeypatch):
 
     cb.message.bot.send_message.assert_awaited_once()  # пользователю ушла ошибка
     assert "❌" in cb.message.bot.send_message.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_full_export_reports_safe_limit_reason(backup_env, monkeypatch):
+    monkeypatch.setattr("handlers.send_backup", AsyncMock(side_effect=BackupLimitError("Суммарный размер архива больше 32 МиБ")))
+    monkeypatch.setattr("handlers._safe_delete", AsyncMock())
+    cb = MagicMock()
+    cb.from_user.id = handlers.OWNER_ID
+    cb.answer = AsyncMock()
+    cb.message.bot = AsyncMock()
+    cb.message.chat.id = 999
+
+    await handlers.backup_export_cb(cb)
+
+    cb.message.bot.send_message.assert_awaited_once_with(999, "❌ Архив для диагностики не создан: Суммарный размер архива больше 32 МиБ.")
 
 
 # ─────────────────────────────────────────────────────────────
