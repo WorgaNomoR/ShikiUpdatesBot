@@ -249,7 +249,7 @@ def owner_view() -> MenuView:
         (MenuEntry("📢 Рассылка", "menu:owner:broadcast"),),
         (MenuEntry("👥 Пользователи", "menu:owner:users"),),
         (MenuEntry("🗃 Банк фактов", "menu:owner:facts"),),
-        (MenuEntry("💾 Архивы и восстановление", "menu:owner:backup"),),
+        (MenuEntry("💾 Резервная копия", "menu:owner:backup"),),
         (MenuEntry("⬅️ Назад", "menu:home"),),
     )
     return MenuView(
@@ -277,7 +277,7 @@ def owner_backup_view() -> MenuView:
         "📥 <b>Восстановить из архива</b>\n"
         "Загрузить данные из ранее сохранённой копии или архива для диагностики."
     )
-    text = f"💾 <b>Архивы и восстановление</b>\n\n{caption}"
+    text = f"💾 <b>Резервная копия</b>\n\n{caption}"
     return MenuView(
         text=text,
         keyboard=_keyboard(rows),

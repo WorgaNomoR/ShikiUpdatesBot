@@ -9,6 +9,7 @@ import main_menu
 
 def test_owner_backup_offers_recovery_full_diagnostics_and_import():
     view = main_menu.owner_backup_view()
+    assert view.text.startswith("💾 <b>Резервная копия</b>\n\n")
     assert _callbacks(view) == [
         "menu:owner:backup:recovery", "menu:owner:backup:export",
         "menu:owner:backup:import", "menu:owner",
@@ -128,7 +129,7 @@ def test_owner_tools_prioritize_useful_actions_and_omit_version():
         "📢 Рассылка",
         "👥 Пользователи",
         "🗃 Банк фактов",
-        "💾 Архивы и восстановление",
+        "💾 Резервная копия",
         "⬅️ Назад",
     ]
     assert _callbacks(view) == [

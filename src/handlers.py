@@ -3011,9 +3011,12 @@ def _backup_menu_kb() -> InlineKeyboardMarkup:
 
 
 async def cmd_backup(message: Message) -> None:
-    """Меню резервного копирования (только для владельца)."""
+    """Меню резервного копирования для владельца в личном чате."""
     if message.from_user is None or message.from_user.id != OWNER_ID:
         await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer("🔒 Резервное копирование доступно только в личном чате с ботом.")
         return
     # Отправляем ОТВЕТОМ на команду (reply): у меню появляется reply_to_message
     # = само сообщение /backup, и кнопка ❌ Закрыть удалит заодно и команду.
@@ -3044,9 +3047,14 @@ async def _send_backup_export(bot: Bot, chat_id: int, *, full_export: bool = Tru
 
 
 async def backup_export_cb(callback: CallbackQuery, *, full_export: bool = True) -> None:
-    """Собрать выбранный архив после проверки владельца и убрать меню."""
-    if callback.from_user is None or callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Только для владельца.", show_alert=True)
+    """Собрать архив после проверки владельца и личного чата, убрать меню."""
+    if (
+        callback.from_user is None
+        or callback.message is None
+        or isinstance(callback.message, InaccessibleMessage)
+        or not _menu_owner_allowed(callback.from_user.id, callback.message.chat.type)
+    ):
+        await callback.answer("🚫 Только для владельца в личном чате.", show_alert=True)
         return
     await callback.answer("Собираю архив...")
     bot, chat_id = callback.message.bot, callback.message.chat.id
@@ -3055,7 +3063,7 @@ async def backup_export_cb(callback: CallbackQuery, *, full_export: bool = True)
 
 
 async def backup_recovery_cb(callback: CallbackQuery) -> None:
-    """Кнопка резервной копии использует общий сценарий с проверкой владельца."""
+    """Кнопка копии использует общий сценарий с проверкой владельца и личного чата."""
     await backup_export_cb(callback, full_export=False)
 
 
@@ -3091,8 +3099,13 @@ async def _begin_backup_import(
 
 async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """Кнопка «Импорт» — входим в FSM ожидания .zip-файла."""
-    if callback.from_user is None or callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Только для владельца.", show_alert=True)
+    if (
+        callback.from_user is None
+        or callback.message is None
+        or isinstance(callback.message, InaccessibleMessage)
+        or not _menu_owner_allowed(callback.from_user.id, callback.message.chat.type)
+    ):
+        await callback.answer("🚫 Только для владельца в личном чате.", show_alert=True)
         return
     await _begin_backup_import(callback, state)
 
@@ -3101,8 +3114,13 @@ async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """Кнопка «❌ Закрыть» — убираем меню и саму команду /backup. Тот же
     отработанный паттерн, что и ❌ Закрыть в /stats: меню отправлено reply'ем
     на команду, поэтому reply_to_message = сообщение /backup, и его тоже чистим."""
-    if callback.from_user is None or callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Только для владельца.", show_alert=True)
+    if (
+        callback.from_user is None
+        or callback.message is None
+        or isinstance(callback.message, InaccessibleMessage)
+        or not _menu_owner_allowed(callback.from_user.id, callback.message.chat.type)
+    ):
+        await callback.answer("🚫 Только для владельца в личном чате.", show_alert=True)
         return
     await state.clear()   # защитно: Закрыть снимает любое повисшее FSM-состояние
     await callback.answer()
@@ -3110,8 +3128,8 @@ async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def backup_receive(message: Message, state: FSMContext) -> None:
-    """Принять .zip от владельца, восстановить по белому списку, отчитаться."""
-    if message.from_user is None or message.from_user.id != OWNER_ID:
+    """Принять .zip от владельца в личном чате, восстановить и отчитаться."""
+    if message.from_user is None or not _menu_owner_allowed(message.from_user.id, message.chat.type):
         return
     doc = message.document
     if not doc or not (doc.file_name or "").lower().endswith(".zip"):

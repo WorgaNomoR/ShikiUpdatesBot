@@ -17,7 +17,12 @@ from unittest.mock import (
 )
 
 import pytest
+from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    Chat,
+    InaccessibleMessage,
+)
 
 import handlers
 import main_menu
@@ -46,6 +51,7 @@ async def test_cmd_backup_rejects_non_owner(backup_env):
 async def test_cmd_backup_owner_shows_menu(backup_env):
     msg = MagicMock()
     msg.from_user.id = handlers.OWNER_ID
+    msg.chat.type = ChatType.PRIVATE
     msg.reply = AsyncMock()
     await handlers.cmd_backup(msg)
     kwargs = msg.reply.call_args.kwargs
@@ -55,6 +61,73 @@ async def test_cmd_backup_owner_shows_menu(backup_env):
     labels = [row[0].text for row in buttons[:3]]
     expected = main_menu.owner_backup_view().keyboard.inline_keyboard
     assert labels == [row[0].text for row in expected[:3]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type", [ChatType.GROUP, ChatType.SUPERGROUP])
+async def test_cmd_backup_rejects_non_private_chat(backup_env, chat_type):
+    message = MagicMock()
+    message.from_user.id = handlers.OWNER_ID
+    message.chat.type = chat_type
+    message.answer = AsyncMock()
+    message.reply = AsyncMock()
+
+    await handlers.cmd_backup(message)
+
+    message.reply.assert_not_awaited()
+    message.answer.assert_awaited_once()
+    assert "личном чате" in message.answer.await_args.args[0]
+    assert "reply_markup" not in message.answer.await_args.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", [
+    handlers.backup_recovery_cb,
+    handlers.backup_export_cb,
+    handlers.backup_import_cb,
+    handlers.backup_close_cb,
+], ids=["recovery", "export", "import", "close"])
+@pytest.mark.parametrize("invalid", ["group", "supergroup", "missing", "inaccessible"])
+async def test_backup_callbacks_reject_invalid_chat_before_work(backup_env, monkeypatch, handler, invalid):
+    sent = AsyncMock(return_value=False)
+    deleted = AsyncMock()
+    cleanup = AsyncMock()
+    monkeypatch.setattr("handlers.send_backup", sent)
+    monkeypatch.setattr("handlers._safe_delete", deleted)
+    monkeypatch.setattr("handlers._cleanup_inline_menu", cleanup)
+    state = AsyncMock()
+    callback = MagicMock()
+    callback.from_user.id = handlers.OWNER_ID
+    callback.answer = AsyncMock()
+    menu = callback.message
+    menu.chat.id = -100
+    menu.chat.type = ChatType.GROUP if invalid == "group" else ChatType.SUPERGROUP
+    menu.bot = AsyncMock()
+    menu.photo = []
+    menu.edit_text = AsyncMock(return_value=menu)
+    if invalid == "missing":
+        callback.message = None
+    elif invalid == "inaccessible":
+        callback.message = InaccessibleMessage(
+            chat=Chat(id=handlers.OWNER_ID, type=ChatType.PRIVATE),
+            message_id=42,
+            date=0,
+        )
+
+    if handler in (handlers.backup_import_cb, handlers.backup_close_cb):
+        await handler(callback, state)
+    else:
+        await handler(callback)
+
+    sent.assert_not_awaited()
+    menu.bot.send_message.assert_not_awaited()
+    deleted.assert_not_awaited()
+    cleanup.assert_not_awaited()
+    menu.edit_text.assert_not_awaited()
+    assert state.mock_calls == []
+    callback.answer.assert_awaited_once()
+    assert callback.answer.await_args.kwargs.get("show_alert") is True
+    assert "личном чате" in callback.answer.await_args.args[0]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -74,6 +147,7 @@ async def test_backup_close_delegates_cleanup(backup_env, monkeypatch):
     cleanup = AsyncMock()
     monkeypatch.setattr(handlers, "_cleanup_inline_menu", cleanup)
     menu = MagicMock()
+    menu.chat.type = ChatType.PRIVATE
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
     cb.message = menu
@@ -82,19 +156,6 @@ async def test_backup_close_delegates_cleanup(backup_env, monkeypatch):
     await handlers.backup_close_cb(cb, AsyncMock())
 
     cleanup.assert_awaited_once_with(menu)
-
-
-@pytest.mark.asyncio
-async def test_backup_close_handles_missing_message(backup_env, monkeypatch):
-    cleanup = AsyncMock()
-    monkeypatch.setattr(handlers, "_cleanup_inline_menu", cleanup)
-    cb = MagicMock()
-    cb.from_user.id = handlers.OWNER_ID
-    cb.message = None
-    cb.answer = AsyncMock()
-    await handlers.backup_close_cb(cb, AsyncMock())
-    cb.answer.assert_awaited_once()   # ack колбэка отправлен даже без message
-    cleanup.assert_awaited_once_with(None)
 
 
 @pytest.mark.asyncio
@@ -113,6 +174,7 @@ async def test_backup_close_clears_fsm_state(backup_env, monkeypatch):
     monkeypatch.setattr(handlers, "_cleanup_inline_menu", AsyncMock())
     state = AsyncMock()
     menu = MagicMock()
+    menu.chat.type = ChatType.PRIVATE
     menu.delete = AsyncMock()
     menu.reply_to_message = None
     cb = MagicMock()
@@ -154,6 +216,7 @@ async def test_backup_export_owner_sends_archive(backup_env, monkeypatch, full_e
 
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
+    cb.message.chat.type = ChatType.PRIVATE
     cb.answer = AsyncMock()
     cb.message.bot = AsyncMock()
     cb.message.chat.id = 999
@@ -176,6 +239,7 @@ async def test_backup_export_reports_failure(backup_env, monkeypatch):
 
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
+    cb.message.chat.type = ChatType.PRIVATE
     cb.answer = AsyncMock()
     cb.message.bot = AsyncMock()
     cb.message.chat.id = 999
@@ -193,6 +257,7 @@ async def test_full_export_reports_safe_limit_reason(backup_env, monkeypatch):
     monkeypatch.setattr("handlers._safe_delete", AsyncMock())
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
+    cb.message.chat.type = ChatType.PRIVATE
     cb.answer = AsyncMock()
     cb.message.bot = AsyncMock()
     cb.message.chat.id = 999
@@ -226,6 +291,7 @@ async def test_backup_import_enters_fsm_and_stores_prompt(backup_env):
     state = AsyncMock()
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
+    cb.message.chat.type = ChatType.PRIVATE
     cb.answer = AsyncMock()
     cb.message.edit_text = AsyncMock(return_value=MagicMock(message_id=555))
 
@@ -243,6 +309,7 @@ async def test_backup_import_edit_rejection_does_not_enter_fsm(backup_env):
     state = AsyncMock()
     cb = MagicMock()
     cb.from_user.id = handlers.OWNER_ID
+    cb.message.chat.type = ChatType.PRIVATE
     cb.answer = AsyncMock()
     cb.message.photo = []
     cb.message.edit_text = AsyncMock(side_effect=TelegramBadRequest(
@@ -281,10 +348,32 @@ def _import_message(
     else:
         msg.document = None
     msg.chat.id = 999
+    msg.chat.type = ChatType.PRIVATE
     msg.message_id = 77
     msg.answer = AsyncMock()
     msg.bot = AsyncMock()
     return msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type", [ChatType.GROUP, ChatType.SUPERGROUP])
+async def test_backup_receive_rejects_non_private_before_download(backup_env, monkeypatch, chat_type):
+    restore = AsyncMock(return_value={"restored": [], "skipped": []})
+    deleted = AsyncMock()
+    monkeypatch.setattr("handlers.restore_backup_zip", restore)
+    monkeypatch.setattr("handlers._safe_delete", deleted)
+    state = AsyncMock()
+    state.get_data.return_value = {"prompt_msg_id": 55}
+    message = _import_message()
+    message.chat.type = chat_type
+
+    await handlers.backup_receive(message, state)
+
+    message.bot.download.assert_not_awaited()
+    restore.assert_not_awaited()
+    deleted.assert_not_awaited()
+    message.answer.assert_not_awaited()
+    assert state.mock_calls == []
 
 
 @pytest.mark.asyncio

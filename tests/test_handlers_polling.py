@@ -75,6 +75,8 @@ async def test_polling_services_due_subscription_before_weekly(monkeypatch):
         lambda **kwargs: {"period": "2026-Q2", "events": []},
     )
     monkeypatch.setattr("handlers.load_stats_all", storage._empty_stats_all)
+    history = AsyncMock(return_value=[{"id": 1}])
+    monkeypatch.setattr("handlers.fetch_history", history)
     monkeypatch.setattr(
         "handlers.fetch_favourites",
         AsyncMock(return_value={"animes": [], "mangas": []}),
@@ -119,6 +121,7 @@ async def test_polling_services_due_subscription_before_weekly(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await handlers.polling_loop(object())
 
+    history.assert_awaited_once()
     assert order == [
         "subscription",
         "weekly",
