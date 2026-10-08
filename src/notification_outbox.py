@@ -6,7 +6,9 @@ import json
 import math
 import re
 from copy import deepcopy
+from uuid import uuid4
 
+from catchup_digest import html_length
 from source_history import (
     event_at_seq,
     event_count,
@@ -20,6 +22,7 @@ MAX_DISPATCHES = 20
 DISPATCH_SECONDS = 20
 REQUEST_SECONDS = 10
 MAX_COMPACTIONS = 128
+_LEGACY_DIGEST_THRESHOLD = 10
 OUTCOMES = {"confirmed_success", "confirmed_rejection", "not_dispatched", "uncertain"}
 TERMINAL = {"delivered", "cancelled", "expired", "rejected"}
 _TERMINAL_REASONS = {
@@ -131,6 +134,12 @@ def enqueue(
     seq = event["seq"]
     if seq != box["enqueued_seq"] + 1 or seq != journal["processed_seq"] + 1:
         raise OutboxStateError("enqueue_order")
+    plan = event_plan(journal, seq)
+    if plan is not None:
+        box["records"].append(plan_record(event, plan["plan_id"]))
+        box["enqueued_seq"] = seq
+        result["processed_seq"] = seq
+        return result
     notify = notification_event(event)
     inherited = box["legacy_uncertain_seq"] == seq
     recipients = (
@@ -165,6 +174,72 @@ def enqueue(
     box["enqueued_seq"] = seq
     result["processed_seq"] = seq
     return result
+
+
+def plan_record(event: dict, plan_id: str) -> dict:
+    """Самостоятельное решение события с явной связью с frozen delivery plan."""
+    return {"seq": event["seq"], "history_id": event["history_id"], "plan_id": plan_id}
+
+
+def event_plan(journal: dict, seq: int) -> dict | None:
+    return next((plan for plan in journal["outbox"].get("plans", []) if plan["start_seq"] <= seq <= plan["end_seq"]), None)
+
+
+def prepare_digest(journal: dict, parts: list[dict], memberships: dict[int, str], now: float) -> dict:
+    """План готовится до projection; после save состав/аудитория уже immutable."""
+    start, end = journal["processed_seq"] + 1, event_count(journal)
+    identity = uuid4().hex
+    units = []
+    for index, part in enumerate(parts):
+        units.append({
+            "unit_id": f"{identity}:{index}", "seq": part["events"][0][0],
+            "kind": part["kind"], "events": part["events"],
+            "created_at": now, "expires_at": now + LIFETIME,
+            "payload": {"text": part["text"], "parse_mode": "HTML", "disable_web_page_preview": False},
+            "recipients": {
+                str(cid): {"membership": token, "status": "pending", "attempts": [],
+                    "prior_possible": False, "next_attempt_at": now, "terminal_at": None,
+                    "reason": None, "duplicate_possible": False}
+                for cid, token in sorted(memberships.items())
+            },
+        })
+    box = deepcopy(journal["outbox"])
+    box.update(version=4, completed_seq=completed_seq(box))
+    box.setdefault("plans", []).append({
+        "version": 2, "plan_id": identity, "start_seq": start, "end_seq": end,
+        "events": [[seq, event_at_seq(journal, seq)["history_id"]] for seq in range(start, end + 1)],
+        "units": units,
+    })
+    result = {**journal, "outbox": box}
+    validate_outbox(result)
+    return result
+
+
+def delivery_records(journal: dict, *, ready_only: bool = False, ordered: bool = False):
+    """Обычные obligations и части планов имеют общий recipient contract."""
+    records = []
+    for record in journal["outbox"]["records"]:
+        if "recipients" in record:
+            records.append(record)
+    for plan in journal["outbox"].get("plans", []):
+        if not ready_only or plan["end_seq"] <= journal["processed_seq"]:
+            records.extend(plan["units"])
+    if ordered:
+        records.sort(key=lambda record: (record["seq"], int(record["unit_id"].split(":")[1]) if "unit_id" in record else -1))
+    yield from records
+
+
+def delivery_key(record: dict) -> int | str:
+    return record.get("unit_id", record["seq"])
+
+
+def delivery_record(journal: dict, key: int | str) -> dict | None:
+    if isinstance(key, str):
+        return next((record for record in delivery_records(journal) if record.get("unit_id") == key), None)
+    box = journal["outbox"]
+    if not completed_seq(box) < key <= box["enqueued_seq"]:
+        return None
+    return box["records"][key - completed_seq(box) - 1]
 
 
 def possible_delivery(recipient: dict) -> bool:
@@ -226,7 +301,7 @@ def progress_reserve(journal: dict) -> int:
     if box is None:
         return 0
     reserve = 0
-    for record in box["records"]:
+    for record in delivery_records(journal):
         for recipient in record.get("recipients", {}).values():
             if recipient["status"] != "pending":
                 continue
@@ -239,6 +314,13 @@ def progress_reserve(journal: dict) -> int:
             reserve += remaining * (_ATTEMPT_JSON_BYTES + 1) - int(not attempts)
             if attempts:
                 reserve += _OUTCOME_JSON_BYTES - (len(attempts[-1]["outcome"]) + 2)
+    # Подготовленный план оплачивает будущие event links и рост обоих cursors.
+    for plan in box.get("plans", []):
+        for seq, history_id in plan["events"]:
+            if seq > journal["processed_seq"]:
+                reserve += _serialized_size({"seq": seq, "history_id": history_id, "plan_id": plan["plan_id"]}) + 1
+        if plan["end_seq"] > journal["processed_seq"]:
+            reserve += 2 * (len(str(plan["end_seq"])) - len(str(journal["processed_seq"])))
     return reserve
 
 
@@ -251,7 +333,7 @@ def completed_seq(box: dict) -> int:
     return box.get("completed_seq", box["baseline_seq"])
 
 
-def replace_recipients(journal: dict, updates: dict[tuple[int, str], dict]) -> dict:
+def replace_recipients(journal: dict, updates: dict[tuple[int | str, str], dict]) -> dict:
     """Копировать только изменяемые ветви; остальное заимствовано read-only.
 
     Новые recipients принадлежат результату, а не caller. Ни опубликованные
@@ -261,8 +343,33 @@ def replace_recipients(journal: dict, updates: dict[tuple[int, str], dict]) -> d
         return journal
     box = journal["outbox"]
     records = list(box["records"])
+    plans = list(box.get("plans", []))
     copied = set()
+    copied_plans = set()
+    copied_units = set()
     for (seq, cid), recipient in updates.items():
+        if isinstance(seq, str):
+            found = False
+            for index, plan in enumerate(plans):
+                for unit_index, record in enumerate(plan["units"]):
+                    if record["unit_id"] != seq:
+                        continue
+                    if cid not in record["recipients"]:
+                        raise OutboxStateError("recipient_changed")
+                    if index not in copied_plans:
+                        plans[index] = {**plan, "units": list(plan["units"])}
+                        copied_plans.add(index)
+                    if seq not in copied_units:
+                        plans[index]["units"][unit_index] = {**record, "recipients": dict(record["recipients"])}
+                        copied_units.add(seq)
+                    plans[index]["units"][unit_index]["recipients"][cid] = deepcopy(recipient)
+                    found = True
+                    break
+                if found:
+                    break
+            if not found:
+                raise OutboxStateError("recipient_changed")
+            continue
         if not completed_seq(box) < seq <= box["enqueued_seq"]:
             raise OutboxStateError("recipient_changed")
         index = seq - completed_seq(box) - 1
@@ -272,7 +379,7 @@ def replace_recipients(journal: dict, updates: dict[tuple[int, str], dict]) -> d
             records[index] = {**records[index], "recipients": dict(records[index]["recipients"])}
             copied.add(index)
         records[index]["recipients"][cid] = deepcopy(recipient)
-    return {**journal, "outbox": {**box, "records": records}}
+    return {**journal, "outbox": {**box, "records": records, **({"plans": plans} if "plans" in box else {})}}
 
 
 def retain_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
@@ -287,19 +394,25 @@ def retain_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
     box = journal["outbox"]
     count = 0
     for record in box["records"]:
-        if count >= limit or any(
-            r["status"] == "pending" for r in record.get("recipients", {}).values()
-        ):
+        plan = event_plan(journal, record["seq"]) if "plan_id" in record else None
+        pending = any(r["status"] == "pending" for r in record.get("recipients", {}).values())
+        if plan is not None:
+            pending = plan["end_seq"] > journal["processed_seq"] or any(
+                r["status"] == "pending" for unit in plan["units"] for r in unit["recipients"].values()
+            )
+        if count >= limit or pending:
             break
         count += 1
     result = journal
     if count:
         result = {**journal, "outbox": deepcopy(journal["outbox"])}
         result["outbox"].update(
-            version=3,
+            version=max(3, box["version"]),
             completed_seq=completed_seq(box) + count,
             records=result["outbox"]["records"][count:],
         )
+        if "plans" in box:
+            result["outbox"]["plans"] = [plan for plan in box["plans"] if plan["end_seq"] > result["outbox"]["completed_seq"]]
     if count < limit:
         result = compact_outbox(result, limit=limit - count)
     if result is journal:
@@ -324,7 +437,7 @@ def compact_outbox(journal: dict, *, limit: int = MAX_COMPACTIONS) -> dict:
     for index, record in enumerate(journal["outbox"]["records"]):
         if len(replacements) >= limit:
             break
-        if "summary_version" in record or any(
+        if "plan_id" in record or "summary_version" in record or any(
             r["status"] == "pending" for r in record["recipients"].values()
         ):
             continue
@@ -384,9 +497,10 @@ def validate_outbox(journal: dict) -> None:
         not isinstance(box, dict)
         or set(box)
         != {"version", "baseline_seq", "enqueued_seq", "legacy_uncertain_seq", "records"}
-        | ({"completed_seq"} if box.get("version") == 3 else set())
+        | ({"completed_seq"} if box.get("version") in {3, 4} else set())
+        | ({"plans"} if box.get("version") == 4 else set())
         or type(box["version"]) is not int
-        or box["version"] not in {1, 2, 3}
+        or box["version"] not in {1, 2, 3, 4}
         or type(box["baseline_seq"]) is not int
         or not 0 <= box["baseline_seq"] <= journal["processed_seq"]
         or type(box["enqueued_seq"]) is not int
@@ -405,6 +519,8 @@ def validate_outbox(journal: dict) -> None:
         or len(box["records"]) != box["enqueued_seq"] - completed_seq(box)
     ):
         raise OutboxStateError("outbox_structure")
+    if box["version"] == 4:
+        _validate_plans(journal)
     for seq, record in enumerate(box["records"], completed_seq(box) + 1):
         event = event_at_seq(journal, seq)
         if (
@@ -413,8 +529,15 @@ def validate_outbox(journal: dict) -> None:
             or type(record.get("history_id")) is not int or record["history_id"] != event["history_id"]
         ):
             raise OutboxStateError("outbox_record_identity")
+        plan = event_plan(journal, seq)
+        if "plan_id" in record:
+            if plan is None or record != plan_record(event, plan["plan_id"]):
+                raise OutboxStateError("outbox_plan_link")
+            continue
+        if plan is not None:
+            raise OutboxStateError("outbox_plan_link")
         if "summary_version" in record:
-            if box["version"] not in {2, 3}:
+            if box["version"] not in {2, 3, 4}:
                 raise OutboxStateError("outbox_summary_version")
             _validate_summary(record, event)
             continue
@@ -446,88 +569,178 @@ def validate_outbox(journal: dict) -> None:
             payload["text"].encode("utf-8")
         elif payload is not None or record["recipients"]:
             raise OutboxStateError("outbox_silent")
-        for cid, recipient in record["recipients"].items():
+        _validate_recipients(record, inherited=box["legacy_uncertain_seq"] == seq)
+
+
+def _validate_plans(journal: dict) -> None:
+    """Точный состав, ordered coverage, payload и общая audience без rerender."""
+    box = journal["outbox"]
+    plans = box["plans"]
+    if not isinstance(plans, list):
+        raise OutboxStateError("outbox_plans")
+    previous_end = 0
+    identities = set()
+    for plan in plans:
+        if (
+            not isinstance(plan, dict)
+            or set(plan) != {"version", "plan_id", "start_seq", "end_seq", "events", "units"}
+            or type(plan["version"]) is not int or plan["version"] not in {1, 2}
+            or not _identity(plan["plan_id"]) or plan["plan_id"] in identities
+            or type(plan["start_seq"]) is not int or type(plan["end_seq"]) is not int
+            or not max(previous_end, prefix_seq(journal)) < plan["start_seq"] <= plan["end_seq"] <= event_count(journal)
+            or plan["start_seq"] > journal["processed_seq"] + 1
+            or plan["end_seq"] <= completed_seq(box)
+            or journal.get("catchup") is not None and plan["end_seq"] > journal["processed_seq"]
+            or not isinstance(plan["events"], list) or not isinstance(plan["units"], list)
+            or not plan["units"]
+            or box["legacy_uncertain_seq"] is not None and plan["start_seq"] <= box["legacy_uncertain_seq"] <= plan["end_seq"]
+        ):
+            raise OutboxStateError("outbox_plan")
+        events = [event_at_seq(journal, seq) for seq in range(plan["start_seq"], plan["end_seq"] + 1)]
+        exact = [[event["seq"], event["history_id"]] for event in events]
+        if plan["events"] != exact or any(type(n) is not int for ref in plan["events"] for n in ref):
+            raise OutboxStateError("outbox_plan_events")
+        eligible = [event for event in events if notification_event(event)]
+        if plan["version"] == 1 and sum(event["event_type"] != "unknown" for event in eligible) < _LEGACY_DIGEST_THRESHOLD:
+            raise OutboxStateError("outbox_plan_threshold")
+        expected = [[event["seq"], event["history_id"]] for event in eligible]
+        by_seq = {event["seq"]: event for event in eligible}
+        coverage = []
+        audience = None
+        clocks = None
+        for index, unit in enumerate(plan["units"]):
             if (
-                not _chat(cid)
-                or not isinstance(recipient, dict)
-                or set(recipient)
-                != {
-                    "membership",
-                    "status",
-                    "attempts",
-                    "prior_possible",
-                    "next_attempt_at",
-                    "terminal_at",
-                    "reason",
-                    "duplicate_possible",
-                }
-                or not _identity(recipient["membership"])
-                or not isinstance(recipient["status"], str)
-                or recipient["status"] not in TERMINAL | {"pending"}
-                or type(recipient["prior_possible"]) is not bool
-                or recipient["prior_possible"] != (box["legacy_uncertain_seq"] == seq)
-                or type(recipient["duplicate_possible"]) is not bool
-                or not _time(recipient["next_attempt_at"])
-                or recipient["next_attempt_at"] < record["created_at"]
-                or not isinstance(recipient["attempts"], list)
-                or len(recipient["attempts"]) > MAX_ATTEMPTS
+                not isinstance(unit, dict)
+                or set(unit) != {"unit_id", "seq", "kind", "events", "created_at", "expires_at", "payload", "recipients"}
+                or unit["unit_id"] != f"{plan['plan_id']}:{index}"
+                or type(unit["seq"]) is not int
+                or unit["kind"] not in {"digest", "ordinary"}
+                or plan["version"] == 2 and unit["kind"] != "digest"
+                or not isinstance(unit["events"], list) or not unit["events"]
+                or not _time(unit["created_at"]) or not _time(unit["expires_at"])
+                or unit["expires_at"] != unit["created_at"] + LIFETIME
+                or not isinstance(unit["recipients"], dict)
             ):
-                raise OutboxStateError("outbox_recipient")
-            previous = record["created_at"]
-            for attempt in recipient["attempts"]:
+                raise OutboxStateError("outbox_plan_unit")
+            previous_seq = 0
+            for ref in unit["events"]:
                 if (
-                    not isinstance(attempt, dict)
-                    or set(attempt) != {"at", "outcome"}
-                    or not _time(attempt["at"])
-                    or not previous <= attempt["at"] < record["expires_at"]
-                    or not isinstance(attempt["outcome"], str)
-                    or attempt["outcome"] not in OUTCOMES
+                    not isinstance(ref, list) or len(ref) != 2 or any(type(n) is not int for n in ref)
+                    or ref[0] not in by_seq or ref[1] != by_seq[ref[0]]["history_id"]
+                    or ref[0] <= previous_seq
+                    or plan["version"] == 1 and (by_seq[ref[0]]["event_type"] == "unknown") != (unit["kind"] == "ordinary")
                 ):
-                    raise OutboxStateError("outbox_attempt")
-                previous = attempt["at"]
-            status = recipient["status"]
-            if recipient["next_attempt_at"] < previous:
-                raise OutboxStateError("outbox_due_time")
-            if status == "rejected" and (
-                not recipient["attempts"]
-                or recipient["attempts"][-1]["outcome"] != "confirmed_rejection"
+                    raise OutboxStateError("outbox_plan_coverage")
+                if not coverage or coverage[-1] != ref:
+                    coverage.append(ref)
+                previous_seq = ref[0]
+            if unit["seq"] != unit["events"][0][0] or unit["kind"] == "ordinary" and len(unit["events"]) != 1:
+                raise OutboxStateError("outbox_plan_order")
+            payload = unit["payload"]
+            if (
+                not isinstance(payload, dict) or set(payload) != {"text", "parse_mode", "disable_web_page_preview"}
+                or not isinstance(payload["text"], str) or not payload["text"].strip()
+                or payload["parse_mode"] != "HTML" or payload["disable_web_page_preview"] is not False
+                or not 0 < html_length(payload["text"]) <= 4096
             ):
-                raise OutboxStateError("outbox_rejection")
-            if status == "pending":
-                if recipient["terminal_at"] is not None or recipient["reason"] is not None:
-                    raise OutboxStateError("outbox_pending")
-            elif (
-                not _time(recipient["terminal_at"])
-                or recipient["terminal_at"] < previous
-                or not isinstance(recipient["reason"], str)
-                or recipient["reason"] not in _TERMINAL_REASONS[status]
+                raise OutboxStateError("outbox_plan_payload")
+            _validate_recipients(unit, inherited=False)
+            tokens = {cid: recipient["membership"] for cid, recipient in unit["recipients"].items()}
+            unit_clocks = (unit["created_at"], unit["expires_at"])
+            if audience is not None and (tokens != audience or unit_clocks != clocks):
+                raise OutboxStateError("outbox_plan_audience")
+            audience, clocks = tokens, unit_clocks
+            if plan["end_seq"] > journal["processed_seq"] and any(r["attempts"] for r in unit["recipients"].values()):
+                raise OutboxStateError("outbox_plan_not_ready")
+        if coverage != expected:
+            raise OutboxStateError("outbox_plan_coverage")
+        previous_end = plan["end_seq"]
+        identities.add(plan["plan_id"])
+
+
+def _validate_recipients(record: dict, *, inherited: bool) -> None:
+    for cid, recipient in record["recipients"].items():
+        if (
+            not _chat(cid)
+            or not isinstance(recipient, dict)
+            or set(recipient)
+            != {
+                "membership",
+                "status",
+                "attempts",
+                "prior_possible",
+                "next_attempt_at",
+                "terminal_at",
+                "reason",
+                "duplicate_possible",
+            }
+            or not _identity(recipient["membership"])
+            or not isinstance(recipient["status"], str)
+            or recipient["status"] not in TERMINAL | {"pending"}
+            or type(recipient["prior_possible"]) is not bool
+            or recipient["prior_possible"] != inherited
+            or type(recipient["duplicate_possible"]) is not bool
+            or not _time(recipient["next_attempt_at"])
+            or recipient["next_attempt_at"] < record["created_at"]
+            or not isinstance(recipient["attempts"], list)
+            or len(recipient["attempts"]) > MAX_ATTEMPTS
+        ):
+            raise OutboxStateError("outbox_recipient")
+        previous = record["created_at"]
+        for attempt in recipient["attempts"]:
+            if (
+                not isinstance(attempt, dict)
+                or set(attempt) != {"at", "outcome"}
+                or not _time(attempt["at"])
+                or not previous <= attempt["at"] < record["expires_at"]
+                or not isinstance(attempt["outcome"], str)
+                or attempt["outcome"] not in OUTCOMES
             ):
-                raise OutboxStateError("outbox_terminal")
-            if status == "expired" and (
-                recipient["reason"] == "attempt_budget"
-                and len(recipient["attempts"]) != MAX_ATTEMPTS
-                or recipient["reason"] == "lifetime"
-                and recipient["terminal_at"] < record["expires_at"]
-            ):
-                raise OutboxStateError("outbox_expiry")
-            success = bool(
-                recipient["attempts"]
-                and recipient["attempts"][-1]["outcome"] == "confirmed_success"
-            )
-            if success != (status == "delivered") or any(
-                attempt["outcome"] == "confirmed_success" for attempt in recipient["attempts"][:-1]
-            ):
-                raise OutboxStateError("outbox_success")
-            duplicate = (
-                status == "delivered"
-                and (
-                    int(recipient["prior_possible"])
-                    + sum(
-                        a["outcome"] in {"uncertain", "confirmed_success"}
-                        for a in recipient["attempts"]
-                    )
+                raise OutboxStateError("outbox_attempt")
+            previous = attempt["at"]
+        status = recipient["status"]
+        if recipient["next_attempt_at"] < previous:
+            raise OutboxStateError("outbox_due_time")
+        if status == "rejected" and (
+            not recipient["attempts"]
+            or recipient["attempts"][-1]["outcome"] != "confirmed_rejection"
+        ):
+            raise OutboxStateError("outbox_rejection")
+        if status == "pending":
+            if recipient["terminal_at"] is not None or recipient["reason"] is not None:
+                raise OutboxStateError("outbox_pending")
+        elif (
+            not _time(recipient["terminal_at"])
+            or recipient["terminal_at"] < previous
+            or not isinstance(recipient["reason"], str)
+            or recipient["reason"] not in _TERMINAL_REASONS[status]
+        ):
+            raise OutboxStateError("outbox_terminal")
+        if status == "expired" and (
+            recipient["reason"] == "attempt_budget"
+            and len(recipient["attempts"]) != MAX_ATTEMPTS
+            or recipient["reason"] == "lifetime"
+            and recipient["terminal_at"] < record["expires_at"]
+        ):
+            raise OutboxStateError("outbox_expiry")
+        success = bool(
+            recipient["attempts"]
+            and recipient["attempts"][-1]["outcome"] == "confirmed_success"
+        )
+        if success != (status == "delivered") or any(
+            attempt["outcome"] == "confirmed_success" for attempt in recipient["attempts"][:-1]
+        ):
+            raise OutboxStateError("outbox_success")
+        duplicate = (
+            status == "delivered"
+            and (
+                int(recipient["prior_possible"])
+                + sum(
+                    a["outcome"] in {"uncertain", "confirmed_success"}
+                    for a in recipient["attempts"]
                 )
-                > 1
             )
-            if recipient["duplicate_possible"] != duplicate:
-                raise OutboxStateError("outbox_duplicate")
+            > 1
+        )
+        if recipient["duplicate_possible"] != duplicate:
+            raise OutboxStateError("outbox_duplicate")

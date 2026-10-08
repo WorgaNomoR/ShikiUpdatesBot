@@ -2862,6 +2862,7 @@ async def test_legacy_journal_restore_over_retained_state_migrates_quietly(
     assert recovered["outbox"]["baseline_seq"] == 1
     assert recovered["outbox"]["enqueued_seq"] == recovered["processed_seq"] == 2
     assert [r["seq"] for r in recovered["outbox"]["records"]] == [2]
+    assert not recovered["outbox"].get("plans")
     assert recovered["outbox"]["records"][0]["recipients"]["10"]["status"] == "pending"
     assert not recovered["outbox"]["records"][0]["recipients"]["10"]["prior_possible"]
 
@@ -3673,6 +3674,29 @@ async def test_source_recovery_preserves_frozen_plans_and_later_correction_ack(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+@pytest.mark.parametrize("ready", [False, True])
+async def test_archives_restore_legacy_digest_plan_without_upgrading(backup_env, legacy_digest_factory, monkeypatch, full_export, ready):
+    from copy import deepcopy
+
+    from notification_outbox import begin_attempt
+
+    journal = legacy_digest_factory(ready=False)
+    storage.save_stats_current({"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}, strict=True)
+    storage.save_event_journal(journal)
+    monkeypatch.setattr("handlers.render_digest", lambda *a, **k: pytest.fail("legacy plan rerender"))
+    if ready:
+        await handlers._drain_history_journal(AsyncMock())
+        journal = storage.load_event_journal()
+        begin_attempt(journal["outbox"]["plans"][0]["units"][0]["recipients"]["10"], 1800000000.0)
+        storage.save_event_journal(journal)
+    before = deepcopy(storage.load_event_journal())
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
+    await backup.restore_backup_zip(archive)
+    assert storage.load_event_journal() == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fail_name", ["event_journal.json", "notification_progress.json", "stats_current.json"])
 async def test_source_restore_failure_rolls_back_exact_bytes_and_cache(
     backup_env, source_history_factory, monkeypatch, fail_name,
@@ -3710,3 +3734,146 @@ async def test_source_restore_failure_rolls_back_exact_bytes_and_cache(
     assert failed
     assert {name: (backup_env / name).read_bytes() for name in original} == original
     assert storage.restorable_restore_generation() == generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("full_export", [False, True])
+@pytest.mark.parametrize("ready", [False, True])
+async def test_digest_archives_preserve_prepared_ready_and_quarterly_plans(backup_env, digest_factory, version, full_export, ready):
+    from copy import deepcopy
+
+    from event_time_stats import ensure_event_time
+
+    journal = digest_factory(ready=False, long_title=True)
+    cur = {"period": "2026-Q1", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}
+    ensure_event_time(cur)
+    cur["period"] = "2026-Q2"
+    storage.save_stats_current(cur, strict=True)
+    storage.save_event_journal(journal)
+    if ready:
+        await handlers._drain_history_journal(AsyncMock())
+    cur = storage.load_stats_current(strict=True)
+    revisions = {period: bucket["revision"] for period, bucket in cur["event_time"]["periods"].items()} if version == 3 else None
+    if version == 1:
+        plan = storage.new_quarter_delivery("2026-Q1", "2026-Q2", ["one", "two"])
+    else:
+        units = [{"transport": "html", "content": text, "disable_preview": False} for text in ["one", "two"]]
+        plan = storage.new_quarter_delivery_plan("2026-Q1", "2026-Q2", units, event_time_revisions=revisions)
+        if version == 3:
+            cur["event_time"]["report_ack"] = {"plan_id": plan["plan_id"], "revisions": revisions}
+    plan.update(next_unit=1, delivery_uncertain=True)
+    cur["pending_quarter_delivery"] = plan
+    storage.save_stats_current(cur, strict=True)
+    storage.STATS_ALL_FILE.write_bytes(b'{"diagnostic":"exact bytes"}\r\n')
+    before = deepcopy(storage.load_event_journal())
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+        assert ("stats_all.json" in zipped.namelist()) is full_export
+        if full_export:
+            assert zipped.read("stats_all.json") == storage.STATS_ALL_FILE.read_bytes()
+    await backup.restore_backup_zip(archive)
+    assert storage.load_event_journal() == before
+    assert storage.load_stats_current(strict=True)["pending_quarter_delivery"] == plan
+    assert storage.load_stats_current(strict=True)["event_time"].get("report_ack") == cur["event_time"].get("report_ack")
+    if version == 3 and ready:
+        from event_time_stats import (
+            acknowledge_revisions,
+            correction_periods,
+        )
+        restored = storage.load_event_journal()
+        event = {**deepcopy(restored["events"][-1]), "seq": 11, "history_id": 100, "event_type": "score_removed", "score": None}
+        restored["events"].append(event)
+        storage.save_event_journal(restored, admitting=True)
+        await handlers._drain_history_journal(AsyncMock())
+        fresh = storage.load_stats_current(strict=True)
+        assert fresh["pending_quarter_delivery"] == plan
+        fresh["pending_quarter_delivery"].update(next_unit=2, delivery_uncertain=False)
+        fresh["last_report_sent"] = "2026-Q2"
+        acknowledge_revisions(fresh)
+        storage.save_stats_current(fresh, strict=True)
+        assert fresh["event_time"]["periods"]["2026-Q1"]["announced_revision"] == revisions["2026-Q1"]
+        assert fresh["event_time"]["periods"]["2026-Q1"]["revision"] > revisions["2026-Q1"]
+        assert correction_periods(fresh) == ["2026-Q1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_name", ["event_journal.json", "notification_progress.json", "stats_current.json"])
+async def test_digest_restore_rolls_back_exact_damaged_bytes(backup_env, digest_factory, monkeypatch, fail_name):
+    journal = digest_factory(ready=False)
+    storage.save_stats_current({"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}, strict=True)
+    storage.save_event_journal(journal)
+    archive, _ = await backup._build_backup_zip()
+    files = [storage.EVENT_JOURNAL_FILE, storage.notification_progress_file(), storage.STATS_CURRENT_FILE]
+    before = {path: b'\xff damaged ' + path.name.encode() + b'\r\n' for path in files}
+    for path, data in before.items():
+        path.write_bytes(data)
+    publish = backup._publish_staged_file
+
+    def fail(source, target):
+        if target.name == fail_name:
+            raise OSError("publication failure")
+        return publish(source, target)
+
+    monkeypatch.setattr("backup._publish_staged_file", fail)
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(archive)
+    assert {path: path.read_bytes() for path in files} == before
+    assert storage.restorable_restore_generation() == generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_digest_capture_rejects_malformed_plan_without_normalizing_bytes(backup_env, digest_factory, full_export):
+    journal = digest_factory(ready=False)
+    storage.save_stats_current({"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}, strict=True)
+    storage.save_event_journal(journal)
+    progress = storage.notification_progress_file()
+    payload = json.loads(progress.read_bytes())
+    payload["outbox"]["plans"][0]["units"][0]["events"].pop()
+    damaged = json.dumps(payload).encode() + b'\r\n'
+    progress.write_bytes(damaged)
+    with pytest.raises(ValueError):
+        await backup._build_backup_zip(full_export=full_export)
+    assert progress.read_bytes() == damaged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("kind", ["subscription", "weekly", "shutdown"])
+async def test_automatic_backups_capture_unfinished_digest_and_keep_its_authority(backup_env, digest_factory, monkeypatch, ready, kind):
+    from notification_progress_schema import parse_recovery_journal
+
+    journal = digest_factory(ready=False)
+    cur = storage._empty_stats_current("2026-Q2")
+    cur["event_projection"] = {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}
+    storage.save_stats_current(cur, strict=True)
+    storage.save_event_journal(journal)
+    old = time.time() - backup.WEEKLY_BACKUP_INTERVAL - 100
+    _save_subscriber_schedule(last_backup_at=old, weekly_started_at=old)
+    if ready:
+        await handlers._drain_history_journal(AsyncMock())
+    if kind == "subscription":
+        await storage.mutate_subscription(7, "Neo", subscribed=True)
+    before = storage.notification_progress_file().read_bytes()
+    frozen = storage.load_event_journal()
+    schedule = storage.load_subscription_backup_state()
+    monkeypatch.setattr("backup._last_backup_sent_at", None)
+    bot = AsyncMock()
+    cur = storage.load_stats_current(strict=True)
+    if kind == "subscription":
+        assert await backup._backup_after_subscription(bot)
+    elif kind == "weekly":
+        assert await backup._weekly_backup_if_due(bot, cur) is cur
+    else:
+        await backup._shutdown_backup(bot)
+    bot.send_document.assert_awaited_once()
+    with zipfile.ZipFile(io.BytesIO(bot.send_document.await_args.kwargs["document"].data)) as archive:
+        assert parse_recovery_journal(archive.read("event_journal.json"), archive.read("notification_progress.json")) == frozen
+    assert storage.notification_progress_file().read_bytes() == before
+    after = storage.load_subscription_backup_state()
+    if kind == "shutdown":
+        assert after == schedule
+    else:
+        assert after["last_backup_at"] > old and after["pending"] is None

@@ -61,14 +61,20 @@ def _archive():
 
 
 @pytest.mark.asyncio
-async def test_three_missed_quarters_publish_separate_snapshots_and_plans(event_time_env):
+@pytest.mark.parametrize("events_per_period", [1, 4])
+async def test_three_missed_quarters_publish_separate_snapshots_and_plans(event_time_env, events_per_period):
+    storage.save_subscribers({10: "subscriber"})
     for history_id, source in [
         (90, "2026-07-01T00:00:00Z"),
         (2, "2026-01-01T00:00:00Z"),
         (10, "2026-04-01T00:00:00Z"),
     ]:
-        _append(history_id, source)
+        for offset in range(events_per_period):
+            _append(history_id + offset * 100, source)
     await handlers._drain_history_journal(AsyncMock())
+    frozen_progress = storage.notification_progress_file().read_bytes()
+    if events_per_period == 4:
+        assert len(storage.load_event_journal()["outbox"]["plans"]) == 1
     stats_all = storage._empty_stats_all()
     for old, new, title_id in [
         ("2026-Q1", "2026-Q2", "2"),
@@ -80,14 +86,15 @@ async def test_three_missed_quarters_publish_separate_snapshots_and_plans(event_
         frozen = json.loads(
             (event_time_env / "quarters" / f"{old}.json").read_text(encoding="utf-8")
         )
-        assert [event["id"] for event in frozen["events"]] == [title_id]
+        assert [event["id"] for event in frozen["events"]] == [str(int(title_id) + offset * 100) for offset in range(events_per_period)]
         assert frozen["time_basis"] == "UTC"
         assert frozen["history_complete"] is False
-        assert returned["event_projection"]["applied_seq"] == 3
+        assert returned["event_projection"]["applied_seq"] == 3 * events_per_period
+        assert storage.notification_progress_file().read_bytes() == frozen_progress
     assert handlers.send_backup.await_count == 3
-    assert handlers._enqueue_history_event.await_count == 3
+    assert handlers._enqueue_history_event.await_count == 3 * events_per_period
     assert all(
-        value["completed"] == 1 for value in stats_all["anime"]["aggregates"]["by_quarter"].values()
+        value["completed"] == events_per_period for value in stats_all["anime"]["aggregates"]["by_quarter"].values()
     )
 
 

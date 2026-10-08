@@ -79,6 +79,7 @@ from report_plan import (
     validate_frozen_report_units,
 )
 from source_history import (
+    event_count,
     prefix_seq,
     retain_source_fingerprints,
 )
@@ -380,7 +381,7 @@ def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
     return size
 
 
-def save_notification_recipient(journal: dict, seq: int, cid: str, recipient: dict) -> dict:
+def save_notification_recipient(journal: dict, seq: int | str, cid: str, recipient: dict) -> dict:
     """Под state transaction: приватная дельта поверх точной свежей authority.
 
     Общий save полностью проверяет каждую ревизию. Только этот узкий путь
@@ -429,6 +430,7 @@ def compact_completed_history(
         through = min(
             completed_seq(journal["outbox"]), journal["processed_seq"],
             cur["event_projection"]["applied_seq"], prefix_seq(journal) + SOURCE_COMPACTION_EVENTS,
+            min((plan["start_seq"] - 1 for plan in journal["outbox"].get("plans", [])), default=event_count(journal)),
         )
         if through > prefix_seq(journal):
             candidate = compact_source_history(journal, cur, through)

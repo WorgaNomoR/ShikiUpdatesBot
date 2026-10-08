@@ -69,6 +69,7 @@ from backup import (
     restore_backup_zip,
     send_backup,
 )
+from catchup_digest import render_digest
 from config import (
     CHECK_INTERVAL,
     DISPLAY_NAME,
@@ -165,6 +166,7 @@ from lists import (
 from messages import (
     BROADCAST_HEADER,
     build_favourite_message,
+    build_history_digest_heading,
     build_message,
     build_startup_snapshot,
     build_status_report,
@@ -174,8 +176,10 @@ from messages import (
 from notification_delivery import dispatch_notifications
 from notification_outbox import (
     enqueue,
+    event_plan,
     migrate_outbox,
     notification_event,
+    prepare_digest,
     progress_reserve,
 )
 from report_delivery import (
@@ -2335,9 +2339,16 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
         if journal is not None:
             journal = compact_event_journal(journal, expected_generation=generation, cur=cur)
         period_events = index_event_periods(cur, journal) if journal is not None and PROJECTION_KEY in cur else {}
+    preparation_attempted = False
     while journal is not None and journal["processed_seq"] < event_count(journal):
         seq = journal["processed_seq"] + 1
         event = event_at_seq(journal, seq)
+        if (
+            not preparation_attempted and event_plan(journal, seq) is None
+            and journal["outbox"]["legacy_uncertain_seq"] != seq
+        ):
+            preparation_attempted = True
+            journal, cur = await _prepare_history_digest(journal, generation)
         entry = history_entry_from_event(event)
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
@@ -2361,9 +2372,45 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
         if notification_event(event):
             if event["event_type"] == "unknown":
                 log.warning("Неизвестное описание истории entry id=%d.", event["history_id"])
-            text = build_message(entry, normalized=event)
+            if event_plan(journal, seq) is None:
+                text = build_message(entry, normalized=event)
         journal, cur = await _enqueue_history_event(journal, event, text, generation)
     return journal, cur
+
+
+async def _prepare_history_digest(journal: dict, generation: int) -> tuple[dict, dict]:
+    """План до новых projections; ошибки rendering допускают обычный путь."""
+    events = [event_at_seq(journal, seq) for seq in range(journal["processed_seq"] + 1, event_count(journal) + 1)]
+    eligible = [event for event in events if notification_event(event)]
+    if (
+        len(eligible) < 2
+        or journal["outbox"]["legacy_uncertain_seq"] in {event["seq"] for event in events}
+    ):
+        return journal, load_stats_current(strict=True)
+    try:
+        parts = render_digest(
+            eligible,
+            ordinary=lambda event: build_message(history_entry_from_event(event), normalized=event),
+            heading=build_history_digest_heading(),
+        )
+    except Exception as error:
+        log.warning("История: compact-представление недоступно; обычная подготовка (%s).", type(error).__name__)
+        return journal, load_stats_current(strict=True)
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        current, cur = _history_state(full_recovery=False)
+        if not _same_history_authority(current, journal, cur):
+            raise _HistoryAttemptChanged
+        try:
+            memberships = notification_memberships()
+            blocked = load_blocked_users() if memberships else set()
+        except (ValueError, OSError):
+            raise EventJournalStateError("notification_state") from None
+        memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}
+        candidate = prepare_digest(current, parts, memberships, time.time())
+        # Ошибка durable publication не является безопасным rendering fallback.
+        return _save_history_progress(current, candidate, generation, cur=cur), cur
 
 
 async def _enqueue_history_event(journal: dict, event: dict, text: str | None, generation: int) -> tuple[dict, dict]:
@@ -2375,7 +2422,7 @@ async def _enqueue_history_event(journal: dict, event: dict, text: str | None, g
         if not _same_history_authority(current_journal, journal, cur) or cur[PROJECTION_KEY]["applied_seq"] != event["seq"]:
             raise _HistoryAttemptChanged
         try:
-            memberships = notification_memberships() if notification_event(event) else {}
+            memberships = notification_memberships() if notification_event(event) and event_plan(current_journal, event["seq"]) is None else {}
             blocked = load_blocked_users() if memberships else set()
         except (ValueError, OSError):
             raise EventJournalStateError("notification_state") from None
@@ -2413,7 +2460,14 @@ def _save_history_progress(current: dict, candidate: dict, generation: int, *, c
         record for record in candidate["outbox"]["records"]
         if record["seq"] > reclaimed["outbox"]["enqueued_seq"]
     ]
+    new_plans = [
+        plan for plan in candidate["outbox"].get("plans", [])
+        if plan["plan_id"] not in {existing["plan_id"] for existing in current["outbox"].get("plans", [])}
+    ]
     candidate["outbox"] = deepcopy(reclaimed["outbox"])
+    if new_plans:
+        candidate["outbox"].update(version=4, completed_seq=candidate["outbox"].get("completed_seq", candidate["outbox"]["baseline_seq"]))
+        candidate["outbox"].setdefault("plans", []).extend(new_plans)
     candidate["outbox"]["records"].extend(suffix)
     candidate["outbox"]["enqueued_seq"] = candidate["processed_seq"]
     save_event_journal(candidate, admitting=True)

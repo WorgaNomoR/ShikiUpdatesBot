@@ -88,11 +88,14 @@ def _patch_history_pages(monkeypatch, pages):
 
 
 def _capture_sends(monkeypatch):
+    """Решения enqueue: обычный payload либо ID события из durable digest plan."""
     sent = []
     real_enqueue = handlers._enqueue_history_event
     async def _send(journal, event, text, generation):
         if text is not None:
             sent.append(text)
+        elif handlers.notification_event(event) and handlers.event_plan(journal, event["seq"]) is not None:
+            sent.append(event["history_id"])
         return await real_enqueue(journal, event, text, generation)
     monkeypatch.setattr("handlers._enqueue_history_event", _send)
     return sent
@@ -100,7 +103,7 @@ def _capture_sends(monkeypatch):
 
 def _sent_history_ids(messages):
     return [
-        int(message.split("/animes/", 1)[1].split('"', 1)[0])
+        message if type(message) is int else int(message.split("/animes/", 1)[1].split('"', 1)[0])
         for message in messages
     ]
 
@@ -500,7 +503,7 @@ async def test_score_change_updates_completion_through_handler(monkeypatch):
 
     _, returned_cur = await _check_legacy(DummyBot(), {999}, cur)
 
-    assert sent == ["EVENT-123", "EVENT-124"]
+    assert sent == [123, 124]
     assert len(returned_cur["events"]) == 1
     assert returned_cur["events"][0]["event"] == "completed"
     assert returned_cur["events"][0]["score"] == 9

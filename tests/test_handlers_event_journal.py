@@ -37,6 +37,8 @@ def history_env(backup_env, monkeypatch):
     storage.save_stats_current({"period": "2026-Q2", "events": []}, strict=True)
     monkeypatch.setattr("handlers.asyncio.sleep", AsyncMock())
     monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[]))
+    # Здесь проверяем прежний ordinary enqueue; новая подготовка имеет свой test home.
+    monkeypatch.setattr("handlers.render_digest", lambda *a, **k: (_ for _ in ()).throw(ValueError("ordinary fixture")))
     monkeypatch.setattr("handlers._enqueue_history_event", AsyncMock(wraps=handlers._enqueue_history_event))
     return backup_env
 

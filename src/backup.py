@@ -457,9 +457,17 @@ def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple
     if version in {4, 5, 6}:
         if not any(member.name == PROGRESS_FILE_NAME for member in members):
             raise ValueError("Журнал требует сохранённый прогресс уведомлений")
-    if version in {5, 6}:
-        # Compact base и suffix проходят тот же полный proof, что runtime/import.
-        captured = {member.name: member.data for member in members}
+    captured = {member.name: member.data for member in members}
+    digest_progress = False
+    if version == 4:
+        try:
+            progress = json.loads(captured[PROGRESS_FILE_NAME])
+            box = progress.get("outbox") if isinstance(progress, dict) else None
+            digest_progress = isinstance(box, dict) and (box.get("version") == 4 or "plans" in box)
+        except (ValueError, UnicodeError, RecursionError):
+            pass
+    if version in {5, 6} or digest_progress:
+        # Compact base и frozen digest проходят тот же proof, что runtime/import.
         if "stats_current.json" not in captured:
             raise ValueError("Журнал требует соответствующий текущий квартал")
         journal = parse_recovery_journal(raw, captured[PROGRESS_FILE_NAME], profile=SHIKI_USER)

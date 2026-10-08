@@ -9,7 +9,10 @@ import zipfile
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import (
+    AsyncMock,
+    patch,
+)
 
 import pytest
 from aiogram.exceptions import (
@@ -62,7 +65,7 @@ def outbox_env(backup_env, monkeypatch):
     return clock
 
 
-async def _enqueue(factory, count=2):
+async def _enqueue(factory, count=2, *, digest=False):
     journal = factory(count=count)
     storage.save_event_journal(journal)
     cur = storage.load_stats_current(strict=True)
@@ -72,7 +75,12 @@ async def _enqueue(factory, count=2):
         "applied_seq": 0,
     }
     storage.save_stats_current(cur, strict=True)
-    await handlers._drain_history_journal(AsyncMock())
+    if digest:
+        await handlers._drain_history_journal(AsyncMock())
+    else:
+        # Прежние ordinary obligations остаются самостоятельным transport contract.
+        with patch("handlers.render_digest", side_effect=ValueError("ordinary fixture")):
+            await handlers._drain_history_journal(AsyncMock())
 
 
 def _recipient(seq=1, cid="10"):
@@ -897,6 +905,7 @@ async def test_enqueue_merges_ack_and_compaction_since_render_snapshot(
     assert current["processed_seq"] == 2
     assert current["outbox"]["completed_seq"] == 1
     assert current["outbox"]["records"][0]["seq"] == 2
+    assert not current["outbox"].get("plans")
     assert current["outbox"]["records"][0]["recipients"]["10"]["status"] == "pending"
 
 
@@ -1082,3 +1091,177 @@ async def test_index_maintenance_preserves_inflight_recipient_ack_and_delivery_f
     for record in published["outbox"]["records"]:
         assert record["payload"]["text"] == "frozen index suffix"
         assert record["expires_at"] == outbox_env[0] + 72 * 3600
+
+
+@pytest.mark.asyncio
+async def test_digest_lost_response_retries_frozen_part_with_shared_ack(outbox_env, journal_factory, monkeypatch):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=10, digest=True)
+    plan = storage.load_event_journal()["outbox"]["plans"][0]
+    key = plan["units"][0]["unit_id"]
+    bot = AsyncMock()
+    bot.send_message.side_effect = TelegramNetworkError(SendMessage(chat_id=10, text="x"), "accepted but lost")
+    await delivery.dispatch_notifications(bot)
+    pending = delivery._recipient(storage.load_event_journal(), key, "10")
+    assert pending["status"] == "pending" and pending["attempts"][0]["outcome"] == "uncertain"
+    payload = deepcopy(plan["units"][0]["payload"])
+    await delivery.dispatch_notifications(bot)
+    assert bot.send_message.await_count == 1
+    outbox_env[0] += 60
+    bot.send_message.side_effect = None
+    monkeypatch.setattr("handlers.render_digest", lambda *a, **k: pytest.fail("frozen plan rerender"))
+    storage._journal_progress_cache = None
+    await delivery.dispatch_notifications(bot)
+    assert bot.send_message.await_count == 2
+    assert all({k: v for k, v in call.kwargs.items() if k != "chat_id"} == payload for call in bot.send_message.await_args_list)
+    journal = storage.load_event_journal()
+    recipient = delivery._recipient(journal, key, "10")
+    assert recipient["status"] == "delivered" and recipient["duplicate_possible"]
+    assert len(recipient["attempts"]) == 2
+    assert all(record["plan_id"] == plan["plan_id"] for record in journal["outbox"]["records"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["marker", "ack"])
+@pytest.mark.parametrize("after", [False, True])
+async def test_digest_marker_ack_publication_is_atomic_for_covered_events(outbox_env, journal_factory, monkeypatch, boundary, after):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=10, digest=True)
+    write = storage._atomic_write
+    before = storage.notification_progress_file().read_bytes()
+    bot = AsyncMock()
+
+    def publish(path, payload):
+        if path == storage.notification_progress_file():
+            value = json.loads(payload)
+            recipient = value["outbox"]["plans"][0]["units"][0]["recipients"]["10"]
+            target = recipient["attempts"] and (recipient["status"] == "pending" if boundary == "marker" else recipient["status"] == "delivered")
+            if target:
+                if after:
+                    write(path, payload)
+                raise asyncio.CancelledError
+        return write(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("storage._atomic_write", publish)
+        with pytest.raises(asyncio.CancelledError):
+            await delivery.dispatch_notifications(bot)
+    assert bot.send_message.await_count == int(boundary == "ack")
+    storage._journal_progress_cache = None
+    journal = storage.load_event_journal()
+    plan = journal["outbox"]["plans"][0]
+    recipient = plan["units"][0]["recipients"]["10"]
+    assert len(journal["outbox"]["records"]) == 10
+    assert {record["plan_id"] for record in journal["outbox"]["records"]} == {plan["plan_id"]}
+    if boundary == "marker" and not after:
+        assert storage.notification_progress_file().read_bytes() == before
+        assert recipient["attempts"] == []
+    elif boundary == "ack" and after:
+        assert recipient["status"] == "delivered"
+    else:
+        assert recipient["status"] == "pending" and recipient["attempts"][-1]["outcome"] == "uncertain"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rate_limit", "permanent", "forbidden"])
+async def test_digest_refusal_keeps_representation_and_budgets(outbox_env, journal_factory, failure):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=10, digest=True)
+    plan = storage.load_event_journal()["outbox"]["plans"][0]
+    method = SendMessage(chat_id=10, text="x")
+    errors = {"rate_limit": TelegramRetryAfter(method, "wait", retry_after=123), "permanent": TelegramBadRequest(method, "rejected"), "forbidden": TelegramForbiddenError(method, "blocked")}
+    bot = AsyncMock()
+    bot.send_message.side_effect = errors[failure]
+    await delivery.dispatch_notifications(bot)
+    journal = storage.load_event_journal()
+    recipient = journal["outbox"]["plans"][0]["units"][0]["recipients"]["10"]
+    assert bot.send_message.await_count == 1
+    assert journal["outbox"]["plans"][0]["units"][0]["payload"] == plan["units"][0]["payload"]
+    assert recipient["attempts"][0]["outcome"] == "confirmed_rejection"
+    if failure == "rate_limit":
+        assert recipient["status"] == "pending" and recipient["next_attempt_at"] == outbox_env[0] + 123
+    else:
+        assert recipient["status"] == "rejected"
+    if failure == "forbidden":
+        assert 10 not in storage.load_subscribers()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["unsubscribe", "resubscribe", "ttl", "attempts"])
+async def test_digest_terminal_maintenance_never_sends_or_claims_success(outbox_env, journal_factory, terminal):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=10, digest=True)
+    journal = storage.load_event_journal()
+    unit = journal["outbox"]["plans"][0]["units"][0]
+    if terminal in {"unsubscribe", "resubscribe"}:
+        storage.save_subscribers({})
+        if terminal == "resubscribe":
+            storage.save_subscribers({10: "new membership"})
+    elif terminal == "ttl":
+        outbox_env[0] += LIFETIME
+    else:
+        for index in range(MAX_ATTEMPTS):
+            begin_attempt(unit["recipients"]["10"], outbox_env[0] + index)
+        outbox_env[0] += MAX_ATTEMPTS
+        storage.save_event_journal(journal)
+    bot = AsyncMock()
+    await delivery.dispatch_notifications(bot)
+    bot.send_message.assert_not_awaited()
+    recipient = storage.load_event_journal()["outbox"]["plans"][0]["units"][0]["recipients"]["10"]
+    assert recipient["status"] == ("cancelled" if terminal in {"unsubscribe", "resubscribe"} else "expired")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identical", [False, True])
+async def test_digest_restore_during_acceptance_invalidates_shared_ack(outbox_env, journal_factory, identical):
+    storage.save_subscribers({10: "only"})
+    await _enqueue(journal_factory, count=10, digest=True)
+    bot = AsyncMock()
+
+    async def send(**kwargs):
+        archive = _recovery() if identical else _zip({"known_users.json": {"version": 1, "users": {}}})
+        await backup.restore_backup_zip(archive)
+        return object()
+
+    bot.send_message.side_effect = send
+    await delivery.dispatch_notifications(bot)
+    unit = storage.load_event_journal()["outbox"]["plans"][0]["units"][0]
+    assert unit["recipients"]["10"]["status"] == "pending"
+    assert unit["recipients"]["10"]["attempts"][-1]["outcome"] == "uncertain"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["uncertain", "forbidden"])
+async def test_multifragment_digest_partial_success_preserves_order_and_stops_chat(outbox_env, journal_factory, outcome):
+    storage.save_subscribers({10: "first", 20: "second"})
+
+    def factory(count):
+        journal = journal_factory(count=count)
+        journal["events"][0]["title"].update(name="😀" * 10000, url="/animes/11")
+        return journal
+
+    await _enqueue(factory, count=10, digest=True)
+    units = storage.load_event_journal()["outbox"]["plans"][0]["units"]
+    seen = {10: [], 20: []}
+    bot = AsyncMock()
+
+    async def send(**kwargs):
+        cid = kwargs["chat_id"]
+        seen[cid].append(kwargs["text"])
+        if cid == 10 and len(seen[cid]) == 2:
+            method = SendMessage(chat_id=10, text="x")
+            if outcome == "uncertain":
+                raise TelegramNetworkError(method, "lost response")
+            raise TelegramForbiddenError(method, "blocked")
+        return object()
+
+    bot.send_message.side_effect = send
+    await delivery.dispatch_notifications(bot)
+    assert seen[10] == [unit["payload"]["text"] for unit in units[:2]]
+    assert seen[20] == [unit["payload"]["text"] for unit in units]
+    journal = storage.load_event_journal()
+    actual = journal["outbox"]["plans"][0]["units"]
+    assert actual[0]["recipients"]["10"]["status"] == "delivered"
+    assert actual[1]["recipients"]["10"]["status"] == ("pending" if outcome == "uncertain" else "rejected")
+    assert all(unit["recipients"]["10"]["status"] == ("pending" if outcome == "uncertain" else "cancelled") for unit in actual[2:])
+    assert all(unit["recipients"]["20"]["status"] == "delivered" for unit in actual)
