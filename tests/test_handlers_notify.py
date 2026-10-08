@@ -317,7 +317,7 @@ async def test_new_relevant_entry_sends_and_saves(monkeypatch):
     result, cur = await _check_legacy(DummyBot(), {999}, _empty_cur())
 
     assert 123 in result
-    assert sent == [123]
+    assert sent == ["MESSAGE"]
     assert saved == [{999, 123}]
 
 
@@ -362,7 +362,7 @@ async def test_unknown_event_sends_and_marks_seen_without_quarter_event(
 
     assert result == {999, 123}
     assert saved == [{999, 123}]
-    assert sent == [123]
+    assert sent == ["NEUTRAL"]
     assert returned_cur["events"] == expected_cur["events"]
     assert any(
         "Неизвестное описание истории" in message
@@ -474,7 +474,7 @@ async def test_score_set_notifies_and_updates_completed_without_duplicate(monkey
 
     _, returned_cur = await _check_legacy(DummyBot(), {999}, cur)
 
-    assert sent == [123]
+    assert sent == ["SCORE"]
     assert len(returned_cur["events"]) == 1
     assert returned_cur["events"][0]["score"] == 8
 

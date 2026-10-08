@@ -417,15 +417,17 @@ Evidence: [window/authority tests](tests/test_source_history.py), [shared format
 
 ### Durable catch-up digest
 
-Stage #199, child of #59, after #197/#198. Every completed admitted batch with notification events
-receives a compact ordinary-HTML plan, without a minimum count. One, two or eight events use the
-same summary path. Eligibility uses the existing `notification_event` contract; ignored/excluded
+Stage #199, child of #59, after #197/#198. A completed admitted batch with exactly one notification
+event keeps its ordinary message without a summary heading; two or more receive a compact
+ordinary-HTML plan. Count after the existing `notification_event` filter; ignored/excluded
 events and silent score removal never notify. Unknown events join the summary in admission order.
-An empty eligible set is silent. Each completed admission receives its own plan; multi-cycle
+An empty eligible set is silent. Each summary receives its own plan; multi-cycle
 acquisition waits for completion, and later admission never joins an earlier frozen plan.
 Bootstrap stays silent. Existing processed/enqueued records are never regrouped; a legacy
 possibly broadcast event also keeps the ordinary path. Subscriber preferences, weekly digest,
 favourites, manual broadcast and unavailable-history recovery remain outside this stage.
+Preparation loads the block list only for a nonempty membership audience, as ordinary enqueue does;
+an unreadable block list cannot stop projections/enqueue when there are no recipients.
 
 `catchup_digest` groups existing playful ordinary notifications supplied by the caller's
 `build_message` callback. It introduces no action dictionary or media formatter: the shared
@@ -452,8 +454,9 @@ New plans have version 2, UUID `plan_id`, absolute `start_seq`/`end_seq`, exact 
 payload, creation/expiry clocks and its complete recipient-to-membership map. All units share
 the same frozen initial audience and clocks; each owns independent attempts and outcomes.
 Units may share only a boundary event for text continuation. Version 2 uses only digest units,
-including unknown events, and has no threshold. Published version 1 plans remain supported with
-their original minimum of ten known notification events and separate single-event ordinary
+including unknown events. Its validator accepts already published singleton summaries even though
+current preparation requires at least two notification events. Published version 1 plans remain supported
+with their original minimum of ten known notification events and separate single-event ordinary
 unknown units. Reading either version never upgrades or re-renders it. The shared runtime/import
 validator checks exact fields/types/versions, identity, ordered complete eligible-event coverage,
 links, HTML/UTF-16 limits, version-specific representation rules, audience/clocks, recipient matrix
@@ -480,6 +483,8 @@ success leaves later parts intact. The six-attempt/72-hour policy, due clocks, u
 immediate forbidden membership removal, eligibility recheck, exact recipient lease and restore
 generation guards are shared with ordinary delivery. Acceptance before lost reply/ack may
 repeat the entire unacknowledged part; it never becomes confirmed delivery automatically.
+Within one recipient-update batch, copy each affected plan's units list and each affected unit's
+recipient map once; untouched branches remain borrowed and updated recipient deltas remain owned.
 
 `progress_reserve` applies the existing recipient envelope once per transport-part recipient,
 including preparing units. It also reserves every future event-link's exact compact bytes plus

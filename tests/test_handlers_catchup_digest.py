@@ -5,7 +5,10 @@
 import asyncio
 import json
 from copy import deepcopy
-from unittest.mock import AsyncMock
+from unittest.mock import (
+    AsyncMock,
+    Mock,
+)
 
 import pytest
 
@@ -37,9 +40,57 @@ async def test_every_completed_batch_reduces_sends_without_losing_event_projecti
     assert bot.send_message.await_count == units
     journal = storage.load_event_journal()
     assert journal["processed_seq"] == count
+    assert bool(journal["outbox"].get("plans")) == (count >= 2)
+    text = bot.send_message.await_args.kwargs["text"]
+    assert ("Что нового у" in text) == (count >= 2)
     current = storage.load_stats_current(strict=True)
     assert current["event_projection"]["applied_seq"] == count
     assert sum(len(period["events"]) for period in current["event_time"]["periods"].values()) == count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audience", [False, True])
+@pytest.mark.parametrize("error", [ValueError, OSError])
+async def test_block_list_failure_only_blocks_preparation_with_recipients(digest_env, journal_factory, monkeypatch, audience, error):
+    _install(journal_factory(count=2))
+    if not audience:
+        storage.save_subscribers({})
+    blocked = Mock(side_effect=error("broken block list"))
+    monkeypatch.setattr("handlers.load_blocked_users", blocked)
+    if audience:
+        with pytest.raises(EventJournalStateError, match="^notification_state$"):
+            await handlers._drain_history_journal(AsyncMock())
+        blocked.assert_called_once()
+    else:
+        await handlers._drain_history_journal(AsyncMock())
+        blocked.assert_not_called()
+    journal = storage.load_event_journal()
+    expected = 0 if audience else 2
+    assert journal["processed_seq"] == expected
+    assert storage.load_stats_current(strict=True)["event_projection"]["applied_seq"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("silent", ["ignored", "score_removed", "irrelevant"])
+@pytest.mark.parametrize("unknown", [False, True])
+async def test_single_notification_among_silent_events_keeps_ordinary_payload(digest_env, journal_factory, monkeypatch, silent, unknown):
+    journal = journal_factory(count=2)
+    if unknown:
+        journal["events"][0]["event_type"] = "unknown"
+    if silent == "irrelevant":
+        journal["events"][1]["relevant"] = False
+    else:
+        journal["events"][1]["event_type"] = silent
+    _install(journal)
+    monkeypatch.setattr("messages.random.choice", lambda bank: bank[0])
+    expected = handlers.build_message(handlers.history_entry_from_event(journal["events"][0]), normalized=journal["events"][0])
+    await handlers._drain_history_journal(AsyncMock())
+    saved = storage.load_event_journal()
+    assert not saved["outbox"].get("plans")
+    bot = AsyncMock()
+    await notification_delivery.dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs["text"] == expected
 
 
 @pytest.mark.asyncio
@@ -185,14 +236,15 @@ async def test_consecutive_admitted_batches_keep_separate_frozen_summaries(diges
 
 
 @pytest.mark.asyncio
-async def test_restart_resumes_legacy_plan_without_reformatting(digest_env, legacy_digest_factory, monkeypatch):
-    journal = legacy_digest_factory(ready=False)
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_restart_resumes_published_plan_without_reformatting(digest_env, legacy_digest_factory, digest_factory, monkeypatch, legacy):
+    journal = legacy_digest_factory(ready=False) if legacy else digest_factory(ready=False, count=1)
     _install(journal)
     state = storage.load_subscriber_state(strict_subscribers=True)
     state.notification_memberships = {10: "b" * 32}
     storage.save_subscriber_state(state)
     previous = deepcopy(journal["outbox"]["plans"])
-    monkeypatch.setattr("handlers.render_digest", lambda *a, **k: pytest.fail("legacy rerender"))
+    monkeypatch.setattr("handlers.render_digest", lambda *a, **k: pytest.fail("published plan rerender"))
     monkeypatch.setattr("notification_delivery.time.time", lambda: 1800000000.0)
     storage._journal_history_cache = None
     storage._journal_progress_cache = None

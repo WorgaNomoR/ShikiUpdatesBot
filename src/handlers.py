@@ -2383,7 +2383,7 @@ async def _prepare_history_digest(journal: dict, generation: int) -> tuple[dict,
     events = [event_at_seq(journal, seq) for seq in range(journal["processed_seq"] + 1, event_count(journal) + 1)]
     eligible = [event for event in events if notification_event(event)]
     if (
-        not eligible
+        len(eligible) < 2
         or journal["outbox"]["legacy_uncertain_seq"] in {event["seq"] for event in events}
     ):
         return journal, load_stats_current(strict=True)
@@ -2404,7 +2404,7 @@ async def _prepare_history_digest(journal: dict, generation: int) -> tuple[dict,
             raise _HistoryAttemptChanged
         try:
             memberships = notification_memberships()
-            blocked = load_blocked_users()
+            blocked = load_blocked_users() if memberships else set()
         except (ValueError, OSError):
             raise EventJournalStateError("notification_state") from None
         memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}

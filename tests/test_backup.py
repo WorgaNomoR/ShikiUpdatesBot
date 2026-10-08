@@ -2862,11 +2862,9 @@ async def test_legacy_journal_restore_over_retained_state_migrates_quietly(
     assert recovered["outbox"]["baseline_seq"] == 1
     assert recovered["outbox"]["enqueued_seq"] == recovered["processed_seq"] == 2
     assert [r["seq"] for r in recovered["outbox"]["records"]] == [2]
-    plan = recovered["outbox"]["plans"][0]
-    assert plan["version"] == 2 and plan["start_seq"] == plan["end_seq"] == 2
-    assert recovered["outbox"]["records"][0]["plan_id"] == plan["plan_id"]
-    assert plan["units"][0]["recipients"]["10"]["status"] == "pending"
-    assert not plan["units"][0]["recipients"]["10"]["prior_possible"]
+    assert not recovered["outbox"].get("plans")
+    assert recovered["outbox"]["records"][0]["recipients"]["10"]["status"] == "pending"
+    assert not recovered["outbox"]["records"][0]["recipients"]["10"]["prior_possible"]
 
 
 def _compacted_recovery(journal_factory):

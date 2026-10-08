@@ -96,7 +96,7 @@ async def test_polling_drains_three_batches_without_another_history_check(
     from notification_outbox import delivery_records
 
     storage.save_subscribers({cid: str(cid) for cid in range(1, 101)})
-    journal = journal_factory()
+    journal = journal_factory(count=2 if digest else 1)
     storage.save_event_journal(journal)
     storage.save_stats_current({
         "period": "2026-Q2", "events": [],
@@ -106,7 +106,9 @@ async def test_polling_drains_three_batches_without_another_history_check(
         if not digest:
             patch.setattr("handlers.render_digest", lambda *a, **k: (_ for _ in ()).throw(ValueError("ordinary fixture")))
         await handlers._drain_history_journal(AsyncMock())
-    frozen = next(delivery_records(storage.load_event_journal()))
+    prepared = storage.load_event_journal()
+    assert bool(prepared["outbox"].get("plans")) == digest
+    frozen = next(delivery_records(prepared))
     clock = [0.0]
     checks = []
     monkeypatch.setattr("handlers.CHECK_INTERVAL", 180)

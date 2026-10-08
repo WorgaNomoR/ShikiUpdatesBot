@@ -905,10 +905,8 @@ async def test_enqueue_merges_ack_and_compaction_since_render_snapshot(
     assert current["processed_seq"] == 2
     assert current["outbox"]["completed_seq"] == 1
     assert current["outbox"]["records"][0]["seq"] == 2
-    plan = current["outbox"]["plans"][0]
-    assert current["outbox"]["records"][0]["plan_id"] == plan["plan_id"]
-    assert plan["start_seq"] == plan["end_seq"] == 2
-    assert plan["units"][0]["recipients"]["10"]["status"] == "pending"
+    assert not current["outbox"].get("plans")
+    assert current["outbox"]["records"][0]["recipients"]["10"]["status"] == "pending"
 
 
 @pytest.mark.asyncio

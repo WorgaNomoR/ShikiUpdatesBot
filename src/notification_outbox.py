@@ -345,6 +345,8 @@ def replace_recipients(journal: dict, updates: dict[tuple[int | str, str], dict]
     records = list(box["records"])
     plans = list(box.get("plans", []))
     copied = set()
+    copied_plans = set()
+    copied_units = set()
     for (seq, cid), recipient in updates.items():
         if isinstance(seq, str):
             found = False
@@ -354,9 +356,13 @@ def replace_recipients(journal: dict, updates: dict[tuple[int | str, str], dict]
                         continue
                     if cid not in record["recipients"]:
                         raise OutboxStateError("recipient_changed")
-                    units = list(plan["units"])
-                    units[unit_index] = {**record, "recipients": {**record["recipients"], cid: deepcopy(recipient)}}
-                    plans[index] = {**plan, "units": units}
+                    if index not in copied_plans:
+                        plans[index] = {**plan, "units": list(plan["units"])}
+                        copied_plans.add(index)
+                    if seq not in copied_units:
+                        plans[index]["units"][unit_index] = {**record, "recipients": dict(record["recipients"])}
+                        copied_units.add(seq)
+                    plans[index]["units"][unit_index]["recipients"][cid] = deepcopy(recipient)
                     found = True
                     break
                 if found:

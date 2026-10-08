@@ -4,6 +4,7 @@
 
 import json
 import math
+import sys
 from copy import deepcopy
 
 import pytest
@@ -642,8 +643,18 @@ def test_digest_part_reserve_covers_all_recipient_transitions(digest_factory, ou
         budget = actual
 
 
-@pytest.mark.parametrize("damage", ["version", "coverage", "gap", "link", "audience", "payload", "attempt_before_ready", "silent", "ordinary_v2"])
-def test_digest_shared_validator_rejects_inconsistent_plan(digest_factory, damage):
+@pytest.mark.parametrize("damage,reason", [
+    ("version", "outbox_plan"),
+    ("coverage", "outbox_plan_coverage"),
+    ("gap", "outbox_plan_events"),
+    ("link", "outbox_plan_link"),
+    ("audience", "outbox_plan_audience"),
+    ("payload", "outbox_plan_payload"),
+    ("attempt_before_ready", "outbox_plan_not_ready"),
+    ("silent", "outbox_plan_coverage"),
+    ("ordinary_v2", "outbox_plan_unit"),
+])
+def test_digest_shared_validator_rejects_inconsistent_plan(digest_factory, damage, reason):
     journal = digest_factory(ready=damage != "attempt_before_ready")
     plan = journal["outbox"]["plans"][0]
     unit = plan["units"][0]
@@ -667,8 +678,60 @@ def test_digest_shared_validator_rejects_inconsistent_plan(digest_factory, damag
         journal["events"][0]["event_type"] = "score_removed"
     else:
         unit["kind"] = "ordinary"
-    with pytest.raises(ValueError):
+    with pytest.raises(OutboxStateError, match=f"^{reason}$"):
         validate_outbox(journal)
+
+
+def test_digest_recipient_batch_copies_each_changed_container_once(digest_factory, monkeypatch):
+    journal = digest_factory(audience=20, long_title=True)
+    units = journal["outbox"]["plans"][0]["units"]
+    assert len(units) >= 3
+    before = deepcopy(journal)
+    updates = {}
+    observed_lists, observed_maps = [], {unit["unit_id"]: [] for unit in units[:2]}
+    for cid in units[0]["recipients"]:
+        for unit in units[:2]:
+            recipient = deepcopy(unit["recipients"][cid])
+            finish(recipient, "expired", "lifetime", unit["expires_at"])
+            updates[unit["unit_id"], cid] = recipient
+    source_units = {id(value): key[0] for key, value in updates.items()}
+
+    def observe(value):
+        # Структурный бюджет копий: наблюдаем private-ветви перед каждой дельтой.
+        # Сохраняем ссылки, чтобы повторное использование id не скрывало копии.
+        state = sys._getframe(1).f_locals
+        current = state["plans"][0]["units"]
+        observed_lists.append(current)
+        key = source_units[id(value)]
+        unit = next(unit for unit in current if unit["unit_id"] == key)
+        observed_maps[key].append(unit["recipients"])
+        return deepcopy(value)
+
+    monkeypatch.setattr("notification_outbox.deepcopy", observe)
+    result = replace_recipients(journal, updates)
+    assert len({id(value) for value in observed_lists}) == 1
+    assert all(len({id(value) for value in values}) == 1 for values in observed_maps.values())
+    assert journal == before
+    changed = result["outbox"]["plans"][0]["units"]
+    assert changed[2] is units[2]
+    assert changed[0]["payload"] is units[0]["payload"]
+    assert all(recipient["status"] == "expired" for unit in changed[:2] for recipient in unit["recipients"].values())
+    updates[units[0]["unit_id"], "10"]["attempts"].append({"at": 0, "outcome": "uncertain"})
+    assert changed[0]["recipients"]["10"]["attempts"] == []
+    validate_outbox(result)
+
+
+@pytest.mark.parametrize("missing", ["unit", "recipient"])
+def test_digest_recipient_batch_rejects_missing_lease_without_mutating_source(digest_factory, missing):
+    journal = digest_factory()
+    before = deepcopy(journal)
+    unit = journal["outbox"]["plans"][0]["units"][0]
+    recipient = deepcopy(unit["recipients"]["10"])
+    begin_attempt(recipient, unit["created_at"])
+    bad_key = (unit["unit_id"] + "missing", "10") if missing == "unit" else (unit["unit_id"], "missing")
+    with pytest.raises(OutboxStateError, match="^recipient_changed$"):
+        replace_recipients(journal, {(unit["unit_id"], "10"): recipient, bad_key: recipient})
+    assert journal == before
 
 
 def test_digest_retention_keeps_whole_plan_until_every_part_terminal(digest_factory):
