@@ -89,9 +89,12 @@ async def test_notification_wait_propagates_cancellation(wait_clock, monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("digest", [False, True])
 async def test_polling_drains_three_batches_without_another_history_check(
-    backup_env, journal_factory, monkeypatch,
+    backup_env, journal_factory, monkeypatch, digest,
 ):
+    from notification_outbox import delivery_records
+
     storage.save_subscribers({cid: str(cid) for cid in range(1, 101)})
     journal = journal_factory()
     storage.save_event_journal(journal)
@@ -99,8 +102,11 @@ async def test_polling_drains_three_batches_without_another_history_check(
         "period": "2026-Q2", "events": [],
         "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
     }, strict=True)
-    await handlers._drain_history_journal(AsyncMock())
-    frozen = storage.load_event_journal()["outbox"]["records"][0]
+    with monkeypatch.context() as patch:
+        if not digest:
+            patch.setattr("handlers.render_digest", lambda *a, **k: (_ for _ in ()).throw(ValueError("ordinary fixture")))
+        await handlers._drain_history_journal(AsyncMock())
+    frozen = next(delivery_records(storage.load_event_journal()))
     clock = [0.0]
     checks = []
     monkeypatch.setattr("handlers.CHECK_INTERVAL", 180)
@@ -130,7 +136,7 @@ async def test_polling_drains_three_batches_without_another_history_check(
 
     assert bot.send_message.await_count == 60
     assert checks == pytest.approx([0, 180])
-    record = storage.load_event_journal()["outbox"]["records"][0]
+    record = next(delivery_records(storage.load_event_journal()))
     assert record["payload"] == frozen["payload"]
     assert record["expires_at"] == frozen["expires_at"]
     assert list(record["recipients"]) == list(frozen["recipients"])

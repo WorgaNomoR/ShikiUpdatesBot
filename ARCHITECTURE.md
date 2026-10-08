@@ -23,6 +23,7 @@ Read [AGENTS.md](AGENTS.md) for collaboration, verification, and delivery rules.
     - [History and media domains](#history-and-media-domains)
     - [Durable history ingestion and processing](#durable-history-ingestion-and-processing)
     - [Durable journal notification delivery](#durable-journal-notification-delivery)
+    - [Durable catch-up digest](#durable-catch-up-digest)
     - [Event-time quarterly projections](#event-time-quarterly-projections)
   - [Typed reports and interactive delivery](#typed-reports-and-interactive-delivery)
     - [Telegram send outcomes](#telegram-send-outcomes)
@@ -58,7 +59,8 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [source_history.py](src/source_history.py) | Pure absolute-seq/suffix access, exact accepted IDs, bounded diagnostic fingerprints and safe rebasing after prefix/fingerprint maintenance; stdlib only. |
 | [event_journal_schema.py](src/event_journal_schema.py) | Pure logical journal/acquisition/source-base/recovery validation and bounded parsing; uses `event_time_stats` and `source_history`, with no runtime imports. |
 | [notification_progress_schema.py](src/notification_progress_schema.py) | Pure physical history v4/v5/v6/progress v1 binding, bounded runtime/import parsing and compatibility with logical v3; uses journal/outbox schemas and `source_history`, with no runtime imports. |
-| [notification_outbox.py](src/notification_outbox.py) | Pure versioned recipient obligations, terminal summaries, completed-prefix retention, membership validation, retry/expiry transitions and capacity reserve; uses `source_history`, with no runtime imports. |
+| [notification_outbox.py](src/notification_outbox.py) | Pure versioned recipient obligations, frozen digest plans, terminal summaries, completed-prefix retention, membership validation, retry/expiry transitions and capacity reserve; uses `source_history` and `catchup_digest`, with no runtime imports. |
+| [catchup_digest.py](src/catchup_digest.py) | Pure lossless ordinary-HTML digest rendering, safe HTML/UTF-16 validation and continuation; uses only `report_model` helpers and stdlib. |
 | [notification_delivery.py](src/notification_delivery.py) | Independent bounded journal-notification consumer over storage and Telegram outcomes; owns durable per-recipient attempts/acknowledgements. |
 | [history_catchup.py](src/history_catchup.py) | Pure connected-page traversal, exact frontier reconnection and head bridging; owns no I/O, normalization or publication. |
 | [storage.py](src/storage.py) | JSON persistence, cache read states, strict validators, restorable-state transaction and restore generation; frozen-plan validation uses `report_plan`. |
@@ -117,6 +119,9 @@ graph TD
     notification_progress_schema --> notification_outbox
     event_journal_schema --> notification_outbox
     handlers --> notification_delivery
+    handlers --> catchup_digest
+    notification_outbox --> catchup_digest
+    catchup_digest --> report_model
     notification_delivery --> storage
     notification_delivery --> telegram_delivery
     storage --> event_time_stats
@@ -409,6 +414,108 @@ Before a blocked admission/enqueue, existing capacity retry publishes this indep
 Coherent v6 capture uses the same full parser/recovery comparison as v5. New archives require history, matching progress and current quarter; supported older complete and legacy quarter-only archives retain their previous semantics. Frozen plans v1/v2/v3, correction acknowledgements, exact-byte rollback and automatic backup scheduling are unchanged. Programs through v1.9.x cannot read v6; downgrade requires a compatible pre-update recovery archive because omitted fingerprints cannot be reconstructed. The exact ID index, new statistical facts, normalized suffix, pending queue, projections and snapshots still grow under the unchanged 8/32/20 MiB and 256-entry limits. Measurements belong in README; reduced fingerprint entropy does not imply a throughput or unlimited-capacity guarantee.
 
 Evidence: [window/authority tests](tests/test_source_history.py), [shared format/budget tests](tests/test_notification_progress_schema.py), [maintenance/crash tests](tests/test_storage.py), [capacity/lease/repeat tests](tests/test_handlers_event_journal.py), [recipient acknowledgement tests](tests/test_notification_delivery.py), [old/new archive/plan tests](tests/test_backup.py).
+
+### Durable catch-up digest
+
+Stage #199, child of #59, after #197/#198. Every completed admitted batch with notification events
+receives a compact ordinary-HTML plan, without a minimum count. One, two or eight events use the
+same summary path. Eligibility uses the existing `notification_event` contract; ignored/excluded
+events and silent score removal never notify. Unknown events join the summary in admission order.
+An empty eligible set is silent. Each completed admission receives its own plan; multi-cycle
+acquisition waits for completion, and later admission never joins an earlier frozen plan.
+Bootstrap stays silent. Existing processed/enqueued records are never regrouped; a legacy
+possibly broadcast event also keeps the ordinary path. Subscriber preferences, weekly digest,
+favourites, manual broadcast and unavailable-history recovery remain outside this stage.
+
+`catchup_digest` groups existing playful ordinary notifications supplied by the caller's
+`build_message` callback. It introduces no action dictionary or media formatter: the shared
+title suffix `(аниме)`/`(манга)`/`(ранобэ)`, emoji, wording, title/link and known owner scores
+come from the ordinary builder. Each event's template is selected once during preparation,
+with blank-line paragraph spacing. `messages.build_history_digest_heading` supplies the escaped
+`📬 Что нового у …:` header through the shared display-name grammar. Old published plans retain
+their exact payloads. Its safe
+HTML parser decodes entities once and splits text by code point, retaining and reopening styles
+and links; even an oversized linked title can continue without losing characters or splitting
+an emoji surrogate pair. Every part independently validates at 4096 visible UTF-16 units.
+The date header uses the entire summary's source-time range in UTC only when every included source
+timestamp is offset-aware and no later than its first observation. Missing/naive/invalid/future
+times omit that range; observation time is never a substitute. Local rendering failure before
+publication permits ordinary processing. Published plans never change representation, including
+after proven rejection: permanent refusal is explicit, and ambiguity remains bounded replay of
+the same part. A failed durable plan publication stops preparation without dispatch or fallback.
+
+Logical journal v3 and physical history v4/v5/v6 plus progress v1 remain unchanged. Outbox v4
+adds mandatory `completed_seq` and `plans`, retaining exact legacy ordinary/full/summary records.
+New plans have version 2, UUID `plan_id`, absolute `start_seq`/`end_seq`, exact contiguous
+`[seq, history_id]` source pairs (including silent events), and ordered units. Each unit freezes
+`unit_id = plan_id:index`, first source seq, representation kind, exact covered source pairs,
+payload, creation/expiry clocks and its complete recipient-to-membership map. All units share
+the same frozen initial audience and clocks; each owns independent attempts and outcomes.
+Units may share only a boundary event for text continuation. Version 2 uses only digest units,
+including unknown events, and has no threshold. Published version 1 plans remain supported with
+their original minimum of ten known notification events and separate single-event ordinary
+unknown units. Reading either version never upgrades or re-renders it. The shared runtime/import
+validator checks exact fields/types/versions, identity, ordered complete eligible-event coverage,
+links, HTML/UTF-16 limits, version-specific representation rules, audience/clocks, recipient matrix
+and readiness. No renderer runs on recovery.
+
+Plan publication precedes new projections; an already applied delta is retained without replay.
+Each source event still publishes its own quarter delta
+and `applied_seq`, followed by one independent outbox decision `{seq, history_id, plan_id}` and
+processed/enqueued advancement. The existing `processed <= applied <= processed + 1` relation
+is preserved. A unit cannot dispatch until the plan's entire source interval is processed;
+attempts in a preparing plan are invalid. Enqueue uses the published plan instead of rendering
+again or discovering a new audience. Rendering, Telegram and waits stay outside the state lock.
+Restart after admission prepares once; restart after plan/projection/enqueue restores the exact
+published plan and finishes source decisions without repeated statistics.
+
+Dispatch combines ordinary records and ready plan units in absolute source/part order, with
+the existing per-chat head rule and fairness. Maintenance may cancel/expire an unready unit,
+but cannot send it. One atomic progress replacement appends a conservative attempt marker or
+acknowledges one unit's recipient, so its covered events cannot acquire partially acknowledged
+delivery. Multiple parts of one oversized event remain separate obligations; that event is fully
+delivered only when all its parts are delivered. Missing event-recipient fields on a plan link
+are not evidence of success: source accounting must follow the referenced units. A partial
+success leaves later parts intact. The six-attempt/72-hour policy, due clocks, uncertainty,
+immediate forbidden membership removal, eligibility recheck, exact recipient lease and restore
+generation guards are shared with ordinary delivery. Acceptance before lost reply/ack may
+repeat the entire unacknowledged part; it never becomes confirmed delivery automatically.
+
+`progress_reserve` applies the existing recipient envelope once per transport-part recipient,
+including preparing units. It also reserves every future event-link's exact compact bytes plus
+one comma, and both processed/enqueued checkpoint digit growth through the plan end. Thus
+projection/enqueue consumes paid bytes without increasing actual-plus-reserve; marker/ack/terminal
+transitions retain the existing non-increasing envelope. Runtime, legacy logical parsing,
+activated publication and import all use this helper. Plan-capacity rejection preserves admitted
+source and prior authority; capacity retries merge fresh ordinary progress and existing plans,
+carry new plans by identity and rebase source without resurrecting retained records.
+
+Retention stops before a plan link while any part recipient is pending or source enqueue is
+unfinished, including silent links at that boundary. Once the whole plan is terminal, its prefix
+links can retire within the existing 128-record bound. A terminal plan behind an older pending
+barrier stays complete; its links do not become independent delivery-success summaries.
+The plan leaves progress only with deletion of its final source link. Source compaction is pinned
+before every retained plan's start, including partially retired terminal plans, so validation
+and unfinished delivery never lose necessary normalized source. Completed boundaries retain
+their existing meaning: no remaining obligation, without claiming successful delivery.
+
+Coherent recovery and full diagnostic exports retain the entire prepared/ready plan, attempts,
+memberships, source/current bindings and quarterly snapshots. Capture of a history v4 containing
+the new outbox uses the same full parser/recovery proof as compact v5/v6 capture. Import rejects
+incomplete or incompatible candidates before publication. Old journals/outboxes/archives read
+quietly without creating historical recipients; old complete restores may deliberately replay.
+Quarterly frozen plans v1/v2/v3, later correction revisions, automatic backup acknowledgement,
+restore generations and exact-byte rollback retain their contracts. Programs before v1.12.0
+cannot read outbox v4, even after its plans retire: downgrade requires a compatible pre-update
+archive. A reader supporting only digest-plan v1 also rejects v2; published v2 plans cannot be
+converted by rerendering for downgrade. No history/progress/member/archive limit changes or quarterly snapshot deletion occur.
+Send-count/actual-byte/reserve/ZIP probes in README are synthetic repeated controls, not CPU,
+physical-I/O or throughput guarantees. Complete progress validation/serialization/publication
+and finite source/index/projection capacity remain costs.
+
+Evidence: [renderer tests](tests/test_catchup_digest.py), [preparation/crash tests](tests/test_handlers_catchup_digest.py),
+[outbox tests](tests/test_notification_outbox.py), [delivery tests](tests/test_notification_delivery.py),
+[multi-cycle tests](tests/test_handlers_history_catchup.py), [archive tests](tests/test_backup.py).
 
 ### Event-time quarterly projections
 

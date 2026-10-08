@@ -81,6 +81,10 @@ async def test_long_history_survives_restart_and_only_complete_batch_is_processe
     journal = await _finish(calls)
     assert [event["history_id"] for event in journal["events"]] == list(range(2, 34))
     assert journal["processed_seq"] == 32
+    plan = journal["outbox"]["plans"][0]
+    assert plan["events"] == [[event["seq"], event["history_id"]] for event in journal["events"]]
+    assert plan["start_seq"] == 1 and plan["end_seq"] == 32
+    assert [ref[1] for unit in plan["units"] for ref in unit["events"]] == list(range(2, 34))
     projected = storage.load_stats_current(strict=True)
     assert projected["events"] == []
     assert len(projected["event_time"]["periods"]["2026-Q1"]["events"]) == 32

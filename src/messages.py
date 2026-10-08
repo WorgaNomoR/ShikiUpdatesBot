@@ -560,6 +560,12 @@ DISPLAY_NAME_CONTEXT = build_display_name_context(
 _DISPLAY_NAME_HTML = format_name_template("{n}", DISPLAY_NAME_CONTEXT)
 BROADCAST_HEADER = f"📢 <b>{_DISPLAY_NAME_HTML} говорит:</b>"
 
+
+def build_history_digest_heading() -> str:
+    """Общий заголовок истории с прежней грамматикой и безопасным именем."""
+    return format_name_template("📬 <b>Что нового у {n_gen}:</b>", DISPLAY_NAME_CONTEXT)
+
+
 _MEDIA_LABELS = {
     "anime": "аниме",
     "manga": "манга",

@@ -2962,3 +2962,32 @@ def test_index_retention_stale_snapshot_rejects_and_fresh_recipient_ack_survives
     assert acknowledged["outbox"]["records"][1] == old["outbox"]["records"][1]
     with pytest.raises(storage.EventJournalStateError, match="compaction_changed"):
         storage.compact_completed_history(old, cur, expected_generation=storage.restorable_restore_generation() - 1)
+
+
+def test_digest_source_compaction_keeps_partially_retired_terminal_plan(backup_env, digest_factory, monkeypatch):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+    )
+    from notification_outbox import (
+        finish,
+        retain_outbox,
+    )
+
+    journal = digest_factory(long_title=True)
+    cur = {"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}
+    ensure_event_time(cur)
+    groups = {}
+    for event in journal["events"]:
+        project_event(cur, journal, event["seq"], period_events=groups)
+        cur["event_projection"]["applied_seq"] = event["seq"]
+    for unit in journal["outbox"]["plans"][0]["units"]:
+        finish(unit["recipients"]["10"], "cancelled", "ineligible", unit["created_at"])
+    partial = retain_outbox(journal, limit=3)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_event_journal(partial)
+    before = storage.EVENT_JOURNAL_FILE.read_bytes()
+    monkeypatch.setattr("storage.compact_source_history", lambda *a, **k: pytest.fail("retained plan source deleted"))
+    maintained = storage.compact_completed_history(partial, cur, expected_generation=storage.restorable_restore_generation(), force=True)
+    assert maintained == partial
+    assert storage.EVENT_JOURNAL_FILE.read_bytes() == before

@@ -236,3 +236,34 @@ def test_v6_logical_budget_keeps_exact_inclusive_pending_reserve(
                 storage.load_event_journal()
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == history
     assert storage.notification_progress_file().read_bytes() == progress
+
+
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("offset", [0, -1])
+def test_digest_runtime_import_share_inclusive_future_reserve(digest_factory, monkeypatch, ready, split, offset):
+    from event_journal_schema import (
+        EventJournalStateError,
+        journal_json,
+        parse_event_journal,
+    )
+    from notification_outbox import progress_reserve
+
+    journal = digest_factory(ready=ready)
+    budget = len(journal_json(journal).encode()) + progress_reserve(journal)
+    monkeypatch.setattr("event_journal_schema.JOURNAL_MAX_BYTES", budget + offset)
+    monkeypatch.setattr("notification_progress_schema.JOURNAL_MAX_BYTES", budget + offset)
+    if split:
+        history = compact_json(history_document(journal, "c" * 32)).encode()
+        progress = compact_json(progress_document(journal, "c" * 32)).encode()
+        def parse():
+            return parse_recovery_journal(history, progress)
+    else:
+        raw = journal_json(journal).encode()
+        def parse():
+            return parse_event_journal(raw)
+    if offset:
+        with pytest.raises(EventJournalStateError):
+            parse()
+    else:
+        assert parse() == journal

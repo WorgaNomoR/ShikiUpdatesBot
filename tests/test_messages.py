@@ -15,6 +15,7 @@ import messages
 from messages import (
     _strip_html,
     build_favourite_message,
+    build_history_digest_heading,
     build_message,
     build_startup_snapshot,
     build_status_report,
@@ -88,6 +89,19 @@ def render_message_template(
 
 
 FALLBACK_NAME_CONTEXT = build_display_name_context("WorgaNomoR", "none")
+
+
+@pytest.mark.parametrize("name,mode,expected", [
+    ("Сергей", "auto", "Сергея"),
+    ("Анна", "auto", "Анны"),
+    ("Саша", "female", "Саши"),
+    ("WNR", "male", "WNR"),
+    ("Сергей", "none", "Сергей"),
+    ('A<b>&😀', "female", 'A&lt;b&gt;&amp;😀'),
+])
+def test_history_digest_heading_uses_existing_genitive_and_escaping(monkeypatch, name, mode, expected):
+    monkeypatch.setattr("messages.DISPLAY_NAME_CONTEXT", build_display_name_context(name, mode))
+    assert build_history_digest_heading() == f"📬 <b>Что нового у {expected}:</b>"
 
 
 @pytest.fixture(scope="module")

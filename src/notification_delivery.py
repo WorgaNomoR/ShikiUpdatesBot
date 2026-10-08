@@ -29,6 +29,9 @@ from notification_outbox import (
     begin_attempt,
     complete_attempt,
     completed_seq,
+    delivery_key,
+    delivery_record,
+    delivery_records,
     finish,
     possible_delivery,
     replace_recipients,
@@ -56,6 +59,9 @@ _locks = weakref.WeakKeyDictionary()
 
 
 def _recipient(journal, seq, cid):
+    if isinstance(seq, str):
+        record = delivery_record(journal, seq)
+        return record["recipients"].get(cid) if record is not None else None
     box = journal["outbox"]
     if not completed_seq(box) < seq <= box["enqueued_seq"]:
         return None
@@ -84,7 +90,7 @@ def _retry_delay(error):
 def _maintenance(journal, memberships, blocked, now):
     """Cancellation/expiry — явная публикация, также для неготового head."""
     updates = {}
-    for record in journal["outbox"]["records"]:
+    for record in delivery_records(journal):
         for cid, recipient in record.get("recipients", {}).items():
             if recipient["status"] != "pending":
                 continue
@@ -102,9 +108,9 @@ def _maintenance(journal, memberships, blocked, now):
                 continue
             recipient = deepcopy(recipient)
             finish(recipient, status, reason, terminal_at)
-            updates[record["seq"], cid] = recipient
+            updates[delivery_key(record), cid] = recipient
             log.warning(
-                "Уведомление seq=%d: %s; possible_delivery=%s.",
+                "Уведомление seq=%s: %s; possible_delivery=%s.",
                 record["seq"],
                 recipient["status"],
                 possible_delivery(recipient),
@@ -115,7 +121,7 @@ def _maintenance(journal, memberships, blocked, now):
 def _next_due(journal, now):
     """Только первый pending для чата; старейший due обеспечивает fairness."""
     heads = {}
-    for record in journal["outbox"]["records"]:
+    for record in delivery_records(journal, ready_only=True, ordered=True):
         for cid, recipient in record.get("recipients", {}).items():
             if recipient["status"] == "pending":
                 heads.setdefault(cid, (record, recipient))
@@ -186,7 +192,7 @@ async def _dispatch(bot):
             if due is None or remaining < REQUEST_SECONDS:
                 return _has_pending(journal)
             record, cid = due
-            seq = record["seq"]
+            seq = delivery_key(record)
             recipient = deepcopy(record["recipients"][cid])
             begin_attempt(recipient, now)
             journal = save_notification_recipient(journal, seq, cid, recipient)
@@ -239,7 +245,7 @@ async def _dispatch(bot):
             journal = save_notification_recipient(journal, seq, cid, recipient)
             if recipient["status"] != "pending":
                 log.info(
-                    "Уведомление seq=%d: %s; possible_delivery=%s; duplicate_possible=%s.",
+                    "Уведомление seq=%s: %s; possible_delivery=%s; duplicate_possible=%s.",
                     seq,
                     recipient["status"],
                     possible_delivery(recipient),
@@ -255,6 +261,6 @@ def _has_pending(journal: dict) -> bool:
     """Подсказка планировщику; следующая порция заново читает authority."""
     return any(
         recipient["status"] == "pending"
-        for record in journal["outbox"]["records"]
+        for record in delivery_records(journal)
         for recipient in record.get("recipients", {}).values()
     )

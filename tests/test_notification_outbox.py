@@ -31,6 +31,7 @@ from notification_outbox import (
     replace_recipients,
     retain_outbox,
     validate_memberships,
+    validate_outbox,
 )
 
 
@@ -595,3 +596,115 @@ def test_retained_runtime_import_schema_rejects_inconsistent_checkpoint(journal_
         box["outcomes"] = {"delivered": 1}
     with pytest.raises(EventJournalStateError):
         parse_event_journal(json.dumps(journal).encode())
+
+
+def test_digest_preparation_and_enqueue_reserve_is_nonincreasing(digest_factory):
+    from event_journal_schema import journal_json
+    from notification_outbox import enqueue
+
+    journal = digest_factory(ready=False, audience=20, long_title=True)
+    budget = len(journal_json(journal).encode()) + progress_reserve(journal)
+    frozen = deepcopy(journal["outbox"]["plans"])
+    for event in journal["events"]:
+        journal = enqueue(journal, event, "ignored rerender", {}, 0)
+        actual = len(journal_json(journal).encode()) + progress_reserve(journal)
+        assert actual <= budget
+        budget = actual
+    assert journal["outbox"]["plans"] == frozen
+
+
+@pytest.mark.parametrize("outcome", ["confirmed_success", "confirmed_rejection", "not_dispatched", "uncertain"])
+@pytest.mark.parametrize("attempts", range(1, 7))
+def test_digest_part_reserve_covers_all_recipient_transitions(digest_factory, outcome, attempts):
+    from event_journal_schema import journal_json
+    from notification_outbox import (
+        delivery_key,
+        delivery_records,
+        replace_recipients,
+    )
+
+    journal = digest_factory()
+    record = next(delivery_records(journal))
+    budget = len(journal_json(journal).encode()) + progress_reserve(journal)
+    recipient = deepcopy(record["recipients"]["10"])
+    for index in range(attempts):
+        now = record["created_at"] + index * 22000
+        begin_attempt(recipient, now)
+        journal = replace_recipients(journal, {(delivery_key(record), "10"): recipient})
+        actual = len(journal_json(journal).encode()) + progress_reserve(journal)
+        assert actual <= budget
+        budget = actual
+        evidence = outcome if index == attempts - 1 else "uncertain"
+        complete_attempt(recipient, evidence, now, retry_delay=None if evidence in {"confirmed_success", "confirmed_rejection"} else 0)
+        journal = replace_recipients(journal, {(delivery_key(record), "10"): recipient})
+        actual = len(journal_json(journal).encode()) + progress_reserve(journal)
+        assert actual <= budget
+        budget = actual
+
+
+@pytest.mark.parametrize("damage", ["version", "coverage", "gap", "link", "audience", "payload", "attempt_before_ready", "silent", "ordinary_v2"])
+def test_digest_shared_validator_rejects_inconsistent_plan(digest_factory, damage):
+    journal = digest_factory(ready=damage != "attempt_before_ready")
+    plan = journal["outbox"]["plans"][0]
+    unit = plan["units"][0]
+    if damage == "version":
+        plan["version"] = 3
+    elif damage == "coverage":
+        unit["events"].pop()
+    elif damage == "gap":
+        plan["events"].pop()
+    elif damage == "link":
+        journal["outbox"]["records"][0]["plan_id"] = "c" * 32
+    elif damage == "audience":
+        plan["units"].append(deepcopy(unit))
+        plan["units"][-1].update(unit_id=plan["plan_id"] + ":1", events=[unit["events"][-1]], seq=10)
+        plan["units"][-1]["recipients"] = {}
+    elif damage == "payload":
+        unit["payload"]["text"] = "😀" * 2049
+    elif damage == "attempt_before_ready":
+        begin_attempt(unit["recipients"]["10"], unit["created_at"])
+    elif damage == "silent":
+        journal["events"][0]["event_type"] = "score_removed"
+    else:
+        unit["kind"] = "ordinary"
+    with pytest.raises(ValueError):
+        validate_outbox(journal)
+
+
+def test_digest_retention_keeps_whole_plan_until_every_part_terminal(digest_factory):
+    from notification_outbox import (
+        delivery_records,
+        retain_outbox,
+    )
+
+    journal = digest_factory(long_title=True)
+    before = deepcopy(journal)
+    units = list(delivery_records(journal))
+    for unit in units[:-1]:
+        begin_attempt(unit["recipients"]["10"], unit["created_at"])
+        complete_attempt(unit["recipients"]["10"], "confirmed_success", unit["created_at"])
+    assert retain_outbox(journal) is journal
+    assert journal["events"] == before["events"]
+    begin_attempt(units[-1]["recipients"]["10"], units[-1]["created_at"])
+    complete_attempt(units[-1]["recipients"]["10"], "confirmed_rejection", units[-1]["created_at"])
+    partial = retain_outbox(journal, limit=3)
+    assert partial["outbox"]["completed_seq"] == 3
+    assert partial["outbox"]["plans"] == journal["outbox"]["plans"]
+    validate_outbox(partial)
+    complete = retain_outbox(partial)
+    assert complete["outbox"]["completed_seq"] == 10
+    assert complete["outbox"]["plans"] == []
+    validate_outbox(complete)
+
+
+def test_legacy_plan_keeps_original_threshold_and_unknown_parts(legacy_digest_factory):
+    journal = legacy_digest_factory()
+    validate_outbox(journal)
+    changed = deepcopy(journal)
+    changed["events"][0]["event_type"] = "unknown"
+    with pytest.raises(ValueError, match="outbox_plan_threshold"):
+        validate_outbox(changed)
+    changed = deepcopy(journal)
+    changed["outbox"]["plans"][0]["units"][1]["kind"] = "digest"
+    with pytest.raises(ValueError, match="outbox_plan_coverage"):
+        validate_outbox(changed)

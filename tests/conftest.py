@@ -136,6 +136,67 @@ def journal_factory():
 
 
 @pytest.fixture
+def digest_factory(journal_factory):
+    """Штатный prepared/ready plan; I/O и projection проверяются у их владельцев."""
+    from catchup_digest import render_digest
+    from messages import (
+        build_history_digest_heading,
+        build_message,
+        history_entry_from_event,
+    )
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+        prepare_digest,
+    )
+
+    def factory(*, ready=True, audience=1, long_title=False, count=10):
+        journal = migrate_outbox(journal_factory(count=count), 0)
+        if long_title:
+            journal["events"][0]["title"].update(name="😀<&>" * 2500, url="/animes/11")
+        from unittest.mock import patch
+
+        with patch("messages.random.choice", side_effect=lambda bank: bank[0]):
+            parts = render_digest(journal["events"], ordinary=lambda event: build_message(history_entry_from_event(event), normalized=event), heading=build_history_digest_heading())
+        journal = prepare_digest(journal, parts, {10 + i: "b" * 32 for i in range(audience)}, 1800000000.0)
+        if ready:
+            for event in journal["events"]:
+                journal = enqueue(journal, event, None, {}, 1800000000.0)
+        return journal
+
+    return factory
+
+
+@pytest.fixture
+def legacy_digest_factory(digest_factory):
+    """Опубликованный v1: десять известных событий и отдельный unknown между ними."""
+    from copy import deepcopy
+
+    from notification_outbox import validate_outbox
+
+    def factory(*, ready=True):
+        journal = digest_factory(ready=ready, count=11)
+        journal["events"][4]["event_type"] = "unknown"
+        plan = journal["outbox"]["plans"][0]
+        template = plan["units"][0]
+        plan["version"] = 1
+        plan["units"] = []
+        for index, refs, kind, text in (
+            (0, plan["events"][:4], "digest", "<b>История профиля</b>\nСтарый текст: первые четыре события."),
+            (1, plan["events"][4:5], "ordinary", "🤔 Старое неизвестное действие &amp; пояснение."),
+            (2, plan["events"][5:], "digest", "<b>История профиля</b>\nСтарый текст: последние шесть событий."),
+        ):
+            unit = deepcopy(template)
+            unit.update(unit_id=f"{plan['plan_id']}:{index}", seq=refs[0][0], kind=kind, events=refs)
+            unit["payload"]["text"] = text
+            plan["units"].append(unit)
+        validate_outbox(journal)
+        return journal
+
+    return factory
+
+
+@pytest.fixture
 def outbox_capacity_factory(journal_factory):
     """Повторяемый контроль ёмкости штатным logical serializer, без I/O."""
     from event_journal_schema import journal_json
