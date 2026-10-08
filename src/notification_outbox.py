@@ -6,6 +6,10 @@ import json
 import math
 import re
 from copy import deepcopy
+from datetime import (
+    datetime,
+    timedelta,
+)
 from uuid import uuid4
 
 from catchup_digest import html_length
@@ -105,6 +109,46 @@ def notification_event(event: dict) -> bool:
     return event["relevant"] and event["event_type"] not in {"ignored", "score_removed"}
 
 
+def coalescible_pair(first: dict, last: dict) -> bool:
+    """Только соседние исходники одной порции; source time без округления."""
+    if (
+        first["event_type"] != "planned" or last["event_type"] != "completed"
+        or not notification_event(first) or not notification_event(last)
+        or not first["media"] or not first["target_id"].strip()
+        or (first["media"], first["target_id"]) != (last["media"], last["target_id"])
+        or last["seq"] != first["seq"] + 1
+    ):
+        return False
+    try:
+        times = []
+        for event in (first, last):
+            if event["time_quality"] != "aware" or not event["event_at"]:
+                return False
+            source = datetime.fromisoformat(event["event_at"])
+            if source.utcoffset() is None or source > datetime.fromisoformat(event["observed_at"]):
+                return False
+            times.append(source)
+        return timedelta(0) <= times[1] - times[0] <= timedelta(seconds=1)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def notification_entries(events: list[dict]) -> list[list[dict]]:
+    """Сначала adjacency исходников, затем фильтр; описания не перечитываются."""
+    entries = []
+    index = 0
+    while index < len(events):
+        event = events[index]
+        if index + 1 < len(events) and coalescible_pair(event, events[index + 1]):
+            entries.append([event, events[index + 1]])
+            index += 2
+        else:
+            if notification_event(event):
+                entries.append([event])
+            index += 1
+    return entries
+
+
 def migrate_outbox(journal: dict, applied_seq: int) -> dict:
     """Старый processed_seq — только тихая граница, никогда не delivered."""
     if journal["version"] == 3:
@@ -185,7 +229,10 @@ def event_plan(journal: dict, seq: int) -> dict | None:
     return next((plan for plan in journal["outbox"].get("plans", []) if plan["start_seq"] <= seq <= plan["end_seq"]), None)
 
 
-def prepare_digest(journal: dict, parts: list[dict], memberships: dict[int, str], now: float) -> dict:
+def prepare_digest(
+    journal: dict, parts: list[dict], memberships: dict[int, str], now: float,
+    *, entries: list[list[dict]] | None = None, presentation: str = "digest",
+) -> dict:
     """План готовится до projection; после save состав/аудитория уже immutable."""
     start, end = journal["processed_seq"] + 1, event_count(journal)
     identity = uuid4().hex
@@ -194,6 +241,7 @@ def prepare_digest(journal: dict, parts: list[dict], memberships: dict[int, str]
         units.append({
             "unit_id": f"{identity}:{index}", "seq": part["events"][0][0],
             "kind": part["kind"], "events": part["events"],
+            **({"entries": part["entries"]} if entries is not None else {}),
             "created_at": now, "expires_at": now + LIFETIME,
             "payload": {"text": part["text"], "parse_mode": "HTML", "disable_web_page_preview": False},
             "recipients": {
@@ -206,8 +254,12 @@ def prepare_digest(journal: dict, parts: list[dict], memberships: dict[int, str]
     box = deepcopy(journal["outbox"])
     box.update(version=4, completed_seq=completed_seq(box))
     box.setdefault("plans", []).append({
-        "version": 2, "plan_id": identity, "start_seq": start, "end_seq": end,
+        "version": 3 if entries is not None else 2, "plan_id": identity, "start_seq": start, "end_seq": end,
         "events": [[seq, event_at_seq(journal, seq)["history_id"]] for seq in range(start, end + 1)],
+        **({"entries": [
+            {"events": [[event["seq"], event["history_id"]] for event in entry], "notification_seq": entry[-1]["seq"]}
+            for entry in entries
+        ], "presentation": presentation} if entries is not None else {}),
         "units": units,
     })
     result = {**journal, "outbox": box}
@@ -584,7 +636,8 @@ def _validate_plans(journal: dict) -> None:
         if (
             not isinstance(plan, dict)
             or set(plan) != {"version", "plan_id", "start_seq", "end_seq", "events", "units"}
-            or type(plan["version"]) is not int or plan["version"] not in {1, 2}
+            | ({"entries", "presentation"} if plan.get("version") == 3 else set())
+            or type(plan["version"]) is not int or plan["version"] not in {1, 2, 3}
             or not _identity(plan["plan_id"]) or plan["plan_id"] in identities
             or type(plan["start_seq"]) is not int or type(plan["end_seq"]) is not int
             or not max(previous_end, prefix_seq(journal)) < plan["start_seq"] <= plan["end_seq"] <= event_count(journal)
@@ -605,6 +658,9 @@ def _validate_plans(journal: dict) -> None:
             raise OutboxStateError("outbox_plan_threshold")
         expected = [[event["seq"], event["history_id"]] for event in eligible]
         by_seq = {event["seq"]: event for event in eligible}
+        if plan["version"] == 3:
+            _validate_entries(plan, by_seq, expected)
+            expected = list(range(len(plan["entries"])))
         coverage = []
         audience = None
         clocks = None
@@ -612,10 +668,12 @@ def _validate_plans(journal: dict) -> None:
             if (
                 not isinstance(unit, dict)
                 or set(unit) != {"unit_id", "seq", "kind", "events", "created_at", "expires_at", "payload", "recipients"}
+                | ({"entries"} if plan["version"] == 3 else set())
                 or unit["unit_id"] != f"{plan['plan_id']}:{index}"
                 or type(unit["seq"]) is not int
                 or unit["kind"] not in {"digest", "ordinary"}
                 or plan["version"] == 2 and unit["kind"] != "digest"
+                or plan["version"] == 3 and unit["kind"] != plan["presentation"]
                 or not isinstance(unit["events"], list) or not unit["events"]
                 or not _time(unit["created_at"]) or not _time(unit["expires_at"])
                 or unit["expires_at"] != unit["created_at"] + LIFETIME
@@ -631,10 +689,23 @@ def _validate_plans(journal: dict) -> None:
                     or plan["version"] == 1 and (by_seq[ref[0]]["event_type"] == "unknown") != (unit["kind"] == "ordinary")
                 ):
                     raise OutboxStateError("outbox_plan_coverage")
-                if not coverage or coverage[-1] != ref:
+                if plan["version"] != 3 and (not coverage or coverage[-1] != ref):
                     coverage.append(ref)
                 previous_seq = ref[0]
-            if unit["seq"] != unit["events"][0][0] or unit["kind"] == "ordinary" and len(unit["events"]) != 1:
+            if plan["version"] == 3:
+                refs = unit["entries"]
+                if (
+                    not isinstance(refs, list) or not refs
+                    or any(type(n) is not int or not 0 <= n < len(plan["entries"]) for n in refs)
+                    or any(a >= b for a, b in zip(refs, refs[1:]))
+                    or unit["kind"] == "ordinary" and len(refs) != 1
+                    or unit["events"] != [ref for n in refs for ref in plan["entries"][n]["events"]]
+                ):
+                    raise OutboxStateError("outbox_plan_coverage")
+                for ref in refs:
+                    if not coverage or coverage[-1] != ref:
+                        coverage.append(ref)
+            if unit["seq"] != unit["events"][0][0] or plan["version"] != 3 and unit["kind"] == "ordinary" and len(unit["events"]) != 1:
                 raise OutboxStateError("outbox_plan_order")
             payload = unit["payload"]
             if (
@@ -656,6 +727,40 @@ def _validate_plans(journal: dict) -> None:
             raise OutboxStateError("outbox_plan_coverage")
         previous_end = plan["end_seq"]
         identities.add(plan["plan_id"])
+
+
+def _validate_entries(plan: dict, by_seq: dict, expected: list) -> None:
+    """Проверить опубликованное соответствие, не выбирать новую группировку."""
+    entries = plan["entries"]
+    if (
+        not isinstance(entries, list) or not entries
+        or not isinstance(plan["presentation"], str) or plan["presentation"] not in {"ordinary", "digest"}
+        or plan["presentation"] == "digest" and len(entries) < 2
+    ):
+        raise OutboxStateError("outbox_plan_entries")
+    coverage = []
+    paired = False
+    for entry in entries:
+        if (
+            not isinstance(entry, dict) or set(entry) != {"events", "notification_seq"}
+            or not isinstance(entry["events"], list) or len(entry["events"]) not in {1, 2}
+            or type(entry["notification_seq"]) is not int
+        ):
+            raise OutboxStateError("outbox_plan_entries")
+        sources = []
+        for ref in entry["events"]:
+            if (
+                not isinstance(ref, list) or len(ref) != 2 or any(type(n) is not int for n in ref)
+                or ref[0] not in by_seq or ref[1] != by_seq[ref[0]]["history_id"]
+            ):
+                raise OutboxStateError("outbox_plan_entries")
+            sources.append(by_seq[ref[0]])
+        if entry["notification_seq"] != sources[-1]["seq"] or len(sources) == 2 and not coalescible_pair(sources[0], sources[1]):
+            raise OutboxStateError("outbox_plan_entries")
+        paired |= len(sources) == 2
+        coverage.extend(entry["events"])
+    if not paired or coverage != expected:
+        raise OutboxStateError("outbox_plan_entries")
 
 
 def _validate_recipients(record: dict, *, inherited: bool) -> None:

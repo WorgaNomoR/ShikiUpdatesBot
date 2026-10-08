@@ -522,6 +522,45 @@ Evidence: [renderer tests](tests/test_catchup_digest.py), [preparation/crash tes
 [outbox tests](tests/test_notification_outbox.py), [delivery tests](tests/test_notification_delivery.py),
 [multi-cycle tests](tests/test_handlers_history_catchup.py), [archive tests](tests/test_backup.py).
 
+Stage #200 extends preparation with adjacent `planned → completed` coalescing. `notification_entries`
+in `notification_outbox` examines consecutive original admitted source records before filtering.
+Both must notify, share a nonempty `(media, target_id)`, and have aware source times no later than
+their own observations, with `0 <= completion - addition <= 1 second` at full datetime precision.
+No observation-time substitution, description parsing or normalization flag is added. Intervening
+silent/unknown/other records break adjacency. Acquisition must be complete; only the unprocessed
+new batch participates. Old enqueued obligations, published plans, legacy possible broadcasts and
+different admission batches never join. The survivor uses the existing normalized completion builder,
+including its title/link, media suffix and known owner score. Counting final entries chooses ordinary
+without a heading for one, digest for two or more. Bootstrap remains silent.
+
+Only batches containing a pair publish notification plan v3; ordinary obligations and new unpaired
+summaries keep their existing formats. V3 adds `entries` and `presentation` to the existing plan.
+Each ordered entry contains exact `events = [[seq, history_id], ...]` and `notification_seq`:
+a singleton names itself, a pair names its completion. Each unit adds ordered entry indices in
+`entries`, and its existing `events` must exactly expand those entries. Every continuation repeats
+both pair sources. V2's source-only boundary coverage cannot distinguish two entries from one paired
+entry or express that repeated two-source continuation, so it cannot safely encode this decision.
+Runtime/import validate the stored entry partition, qualifying pair semantics, exact source/part
+coverage, order and representation, without selecting a new grouping or rendering. V1/v2 remain exact.
+
+The plan freezes before either new projection, retaining the entire source interval (including silent
+records). Both source events/IDs/order and independent quarter deltas remain unchanged. Existing
+readiness waits for all projections/enqueue decisions; each atomic marker/ack affects a transport unit
+shared by its covered sources. All parts remain owed independently until terminal, with the existing
+uncertainty, membership, attempt/TTL, fairness, forbidden stopping and generation/lease guards.
+Suppression never proves delivery. A local summary failure freezes ordinary v3 parts with the same
+entries; unpublished rendering is memoized once per survivor. Durable publication failure stops,
+and restart/acceptance with a lost reply never returns to two-message presentation.
+
+The shared reserve pays actual entry metadata at preparation, every future source link/checkpoint
+and each part recipient's future transitions. Whole-plan retention and source pinning apply unchanged
+to both sources, including partially retired terminal plans; deletion of the last link removes the
+plan. Coherent recovery/full diagnostic exports use the same complete parser/recovery proof, preserving
+quarter snapshots, old archives/frozen quarterly plans, exact-byte rollback and automatic backup clocks.
+No physical journal/progress version or 8/32/20 MiB/256-entry limit changes. Code before v1.13.0 rejects
+retained notification plans v3; downgrade requires a compatible recovery set. The time window is a
+conservative presentation heuristic, not a source operation ID or general history deduplication.
+
 ### Event-time quarterly projections
 
 `event_time_stats` owns the stdlib-only projection contract; handlers publish it together with `event_projection.applied_seq` in one `stats_current.json` replacement. Source events retain normalization v1 independently of journal v1/v2/v3. `stats_current.event_time` v1 holds an explicit migration `baseline_seq`, `legacy_period`/immutable `legacy_events`, per-period effective `events` with `revision`/`announced_revision`, cumulative unallocated-time counts, and an optional frozen-plan revision acknowledgement binding. All projections stay within the existing 8 MiB member limit. Strict publication/import checks encoded size including eventual report acknowledgement; strict reads consume at most that limit plus one byte. Original snapshots are bounded before rotation publication too.

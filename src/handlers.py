@@ -69,7 +69,10 @@ from backup import (
     restore_backup_zip,
     send_backup,
 )
-from catchup_digest import render_digest
+from catchup_digest import (
+    render_digest,
+    render_ordinary_entries,
+)
 from config import (
     CHECK_INTERVAL,
     DISPLAY_NAME,
@@ -178,6 +181,7 @@ from notification_outbox import (
     enqueue,
     event_plan,
     migrate_outbox,
+    notification_entries,
     notification_event,
     prepare_digest,
     progress_reserve,
@@ -2381,21 +2385,38 @@ async def _consume_history_journal(bot: Bot, *, expected_generation: int | None 
 async def _prepare_history_digest(journal: dict, generation: int) -> tuple[dict, dict]:
     """План до новых projections; ошибки rendering допускают обычный путь."""
     events = [event_at_seq(journal, seq) for seq in range(journal["processed_seq"] + 1, event_count(journal) + 1)]
+    entries = notification_entries(events)
+    coalesced = any(len(entry) == 2 for entry in entries)
     eligible = [event for event in events if notification_event(event)]
     if (
-        len(eligible) < 2
+        not entries or len(entries) < 2 and not coalesced
+        or journal.get("catchup") is not None
         or journal["outbox"]["legacy_uncertain_seq"] in {event["seq"] for event in events}
     ):
         return journal, load_stats_current(strict=True)
+    rendered = {}
+
+    def ordinary(event):
+        if event["seq"] not in rendered:
+            rendered[event["seq"]] = build_message(history_entry_from_event(event), normalized=event)
+        return rendered[event["seq"]]
+
+    presentation = "digest" if len(entries) >= 2 else "ordinary"
     try:
-        parts = render_digest(
-            eligible,
-            ordinary=lambda event: build_message(history_entry_from_event(event), normalized=event),
-            heading=build_history_digest_heading(),
-        )
+        if presentation == "ordinary":
+            parts = render_ordinary_entries(entries, ordinary=ordinary)
+        else:
+            parts = render_digest(
+                eligible, ordinary=ordinary, heading=build_history_digest_heading(),
+                **({"entries": entries} if coalesced else {}),
+            )
     except Exception as error:
         log.warning("История: compact-представление недоступно; обычная подготовка (%s).", type(error).__name__)
-        return journal, load_stats_current(strict=True)
+        if not coalesced:
+            return journal, load_stats_current(strict=True)
+        # После решения о паре fallback также замораживает оба источника.
+        presentation = "ordinary"
+        parts = render_ordinary_entries(entries, ordinary=ordinary)
     async with restorable_state_transaction():
         if restorable_restore_generation() != generation:
             raise _HistoryAttemptChanged
@@ -2408,7 +2429,10 @@ async def _prepare_history_digest(journal: dict, generation: int) -> tuple[dict,
         except (ValueError, OSError):
             raise EventJournalStateError("notification_state") from None
         memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}
-        candidate = prepare_digest(current, parts, memberships, time.time())
+        candidate = prepare_digest(
+            current, parts, memberships, time.time(),
+            **({"entries": entries, "presentation": presentation} if coalesced else {}),
+        )
         # Ошибка durable publication не является безопасным rendering fallback.
         return _save_history_progress(current, candidate, generation, cur=cur), cur
 

@@ -3740,12 +3740,12 @@ async def test_source_restore_failure_rolls_back_exact_bytes_and_cache(
 @pytest.mark.parametrize("version", [1, 2, 3])
 @pytest.mark.parametrize("full_export", [False, True])
 @pytest.mark.parametrize("ready", [False, True])
-async def test_digest_archives_preserve_prepared_ready_and_quarterly_plans(backup_env, digest_factory, version, full_export, ready):
+async def test_digest_archives_preserve_prepared_ready_and_quarterly_plans(backup_env, frozen_history_factory, version, full_export, ready):
     from copy import deepcopy
 
     from event_time_stats import ensure_event_time
 
-    journal = digest_factory(ready=False, long_title=True)
+    journal = frozen_history_factory(ready=False, long_title=True)
     cur = {"period": "2026-Q1", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}
     ensure_event_time(cur)
     cur["period"] = "2026-Q2"
@@ -3754,7 +3754,7 @@ async def test_digest_archives_preserve_prepared_ready_and_quarterly_plans(backu
     if ready:
         await handlers._drain_history_journal(AsyncMock())
     cur = storage.load_stats_current(strict=True)
-    revisions = {period: bucket["revision"] for period, bucket in cur["event_time"]["periods"].items()} if version == 3 else None
+    revisions = {period: bucket["revision"] for period, bucket in cur["event_time"]["periods"].items() if period <= "2026-Q1"} if version == 3 else None
     if version == 1:
         plan = storage.new_quarter_delivery("2026-Q1", "2026-Q2", ["one", "two"])
     else:
@@ -3799,8 +3799,8 @@ async def test_digest_archives_preserve_prepared_ready_and_quarterly_plans(backu
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_name", ["event_journal.json", "notification_progress.json", "stats_current.json"])
-async def test_digest_restore_rolls_back_exact_damaged_bytes(backup_env, digest_factory, monkeypatch, fail_name):
-    journal = digest_factory(ready=False)
+async def test_digest_restore_rolls_back_exact_damaged_bytes(backup_env, frozen_history_factory, monkeypatch, fail_name):
+    journal = frozen_history_factory(ready=False)
     storage.save_stats_current({"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}, strict=True)
     storage.save_event_journal(journal)
     archive, _ = await backup._build_backup_zip()
@@ -3825,8 +3825,8 @@ async def test_digest_restore_rolls_back_exact_damaged_bytes(backup_env, digest_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("full_export", [False, True])
-async def test_digest_capture_rejects_malformed_plan_without_normalizing_bytes(backup_env, digest_factory, full_export):
-    journal = digest_factory(ready=False)
+async def test_digest_capture_rejects_malformed_plan_without_normalizing_bytes(backup_env, frozen_history_factory, full_export):
+    journal = frozen_history_factory(ready=False)
     storage.save_stats_current({"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}, strict=True)
     storage.save_event_journal(journal)
     progress = storage.notification_progress_file()
@@ -3842,10 +3842,10 @@ async def test_digest_capture_rejects_malformed_plan_without_normalizing_bytes(b
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ready", [False, True])
 @pytest.mark.parametrize("kind", ["subscription", "weekly", "shutdown"])
-async def test_automatic_backups_capture_unfinished_digest_and_keep_its_authority(backup_env, digest_factory, monkeypatch, ready, kind):
+async def test_automatic_backups_capture_unfinished_digest_and_keep_its_authority(backup_env, frozen_history_factory, monkeypatch, ready, kind):
     from notification_progress_schema import parse_recovery_journal
 
-    journal = digest_factory(ready=False)
+    journal = frozen_history_factory(ready=False)
     cur = storage._empty_stats_current("2026-Q2")
     cur["event_projection"] = {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}
     storage.save_stats_current(cur, strict=True)

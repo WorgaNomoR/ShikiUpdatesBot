@@ -94,6 +94,45 @@ async def test_long_history_survives_restart_and_only_complete_batch_is_processe
 
 
 @pytest.mark.asyncio
+async def test_coalescing_across_page_seam_waits_for_completed_acquisition(acquisition_env, monkeypatch):
+    rows = [_entry(value) for value in [6, 5, 4, 3, 2, 1]]
+    for row in rows:
+        if row["id"] in {3, 4}:
+            row["target"]["id"] = 11
+            row["description"] = "Добавлено в список" if row["id"] == 3 else "Просмотрено и оценено на 8"
+            row["created_at"] = "2026-04-01T00:00:00.990+00:00" if row["id"] == 3 else "2026-04-01T00:00:01.010+00:00"
+    calls = []
+    unavailable = [True]
+
+    async def fetch(_session, page=1):
+        calls.append(page)
+        if page == 2 and unavailable[0]:
+            return None
+        start = (page - 1) * 3
+        return deepcopy(rows[start:start + 4])
+
+    monkeypatch.setattr("handlers.fetch_history", fetch)
+    storage.save_subscribers({10: "only"})
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+    staged = storage.load_event_journal()
+    assert staged["catchup"] is not None and staged["events"] == []
+    assert staged["processed_seq"] == 0 and not staged["outbox"].get("plans")
+    handlers._enqueue_history_event.assert_not_awaited()
+    unavailable[0] = False
+    storage._journal_history_cache = None
+    await handlers.check_and_notify(AsyncMock(), set(), None)
+    ready = storage.load_event_journal()
+    assert ready["catchup"] is None and ready["processed_seq"] == 5
+    plan = ready["outbox"]["plans"][0]
+    assert plan["version"] == 3
+    assert {"events": [[2, 3], [3, 4]], "notification_seq": 3} in plan["entries"]
+    assert plan["events"] == [[seq, seq + 1] for seq in range(1, 6)]
+    assert calls == [1, 2, 1, 2, 1]
+    await _cycle(calls)
+    assert handlers._enqueue_history_event.await_count == 5
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["insert", "delete_prefix", "delete_anchor", "delete_head"])
 async def test_page_shifts_reconnect_or_restart_and_bridge_head(acquisition_env, monkeypatch, mutation):
     rows, calls = _source(monkeypatch)
