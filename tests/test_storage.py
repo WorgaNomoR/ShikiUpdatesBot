@@ -2964,7 +2964,7 @@ def test_index_retention_stale_snapshot_rejects_and_fresh_recipient_ack_survives
         storage.compact_completed_history(old, cur, expected_generation=storage.restorable_restore_generation() - 1)
 
 
-def test_digest_source_compaction_keeps_partially_retired_terminal_plan(backup_env, digest_factory, monkeypatch):
+def test_digest_source_compaction_keeps_partially_retired_terminal_plan(backup_env, frozen_history_factory, monkeypatch):
     from event_time_stats import (
         ensure_event_time,
         project_event,
@@ -2974,7 +2974,7 @@ def test_digest_source_compaction_keeps_partially_retired_terminal_plan(backup_e
         retain_outbox,
     )
 
-    journal = digest_factory(long_title=True)
+    journal = frozen_history_factory(long_title=True)
     cur = {"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}
     ensure_event_time(cur)
     groups = {}

@@ -24,6 +24,164 @@ def _install(journal):
     storage.save_event_journal(journal)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [2, 3])
+async def test_coalescing_counts_entries_and_keeps_independent_quarters(digest_env, coalescing_journal_factory, monkeypatch, count):
+    journal = coalescing_journal_factory(count=count)
+    _install(journal)
+    monkeypatch.setattr("messages.random.choice", lambda bank: bank[0])
+    completion = handlers.build_message(handlers.history_entry_from_event(journal["events"][1]), normalized=journal["events"][1])
+    await handlers._drain_history_journal(AsyncMock())
+    saved = storage.load_event_journal()
+    assert saved["events"] == journal["events"]
+    plan = saved["outbox"]["plans"][0]
+    assert plan["version"] == 3
+    assert plan["entries"][0] == {"events": [[1, 2], [2, 3]], "notification_seq": 2}
+    bot = AsyncMock()
+    await notification_delivery.dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    text = bot.send_message.await_args.kwargs["text"]
+    assert ("Что нового у" in text) == (count == 3)
+    assert completion in text
+    if count == 2:
+        assert text == completion
+    current = storage.load_stats_current(strict=True)
+    assert current["event_projection"]["applied_seq"] == count
+    assert any(event["event"] == "planned" for event in current["event_time"]["periods"]["2026-Q1"]["events"])
+    assert any(event["event"] == "completed" for event in current["event_time"]["periods"]["2026-Q2"]["events"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media,kind,suffix", [("anime", "tv", "аниме"), ("manga", "manga", "манга"), ("manga", "novel", "ранобэ")])
+@pytest.mark.parametrize("score", [None, 8])
+async def test_coalescing_reuses_normalized_completion_without_description_parsing(digest_env, coalescing_journal_factory, monkeypatch, media, kind, suffix, score):
+    journal = coalescing_journal_factory()
+    for event in journal["events"]:
+        event.update(media=media, kind=kind, description="Полностью другое исходное описание")
+    journal["events"][1]["score"] = score
+    journal["events"][1]["title"].update(name='<Title & "😀">', url=f"/{media}s/11")
+    _install(journal)
+    monkeypatch.setattr("messages.classify_event", lambda *a: pytest.fail("published semantics reparsed"))
+    await handlers._drain_history_journal(AsyncMock())
+    plan = storage.load_event_journal()["outbox"]["plans"][0]
+    text = plan["units"][0]["payload"]["text"]
+    assert f"({suffix})" in text and "&lt;Title &amp; &quot;😀&quot;&gt;" in text
+    assert f'https://shikimori.io/{media}s/11' in text
+    assert ("8/10" in text) == (score == 8)
+    assert "Полностью другое" not in text
+
+
+@pytest.mark.asyncio
+async def test_coalescing_local_fallback_keeps_pairs_and_freezes_all_ordinary_parts(digest_env, coalescing_journal_factory, monkeypatch):
+    _install(coalescing_journal_factory(count=3, long_title=True))
+    monkeypatch.setattr("handlers.render_digest", Mock(side_effect=ValueError("local rendering")))
+    await handlers._drain_history_journal(AsyncMock())
+    before = storage.load_event_journal()["outbox"]["plans"][0]
+    assert before["presentation"] == "ordinary" and len(before["entries"]) == 2
+    parts = [unit for unit in before["units"] if unit["entries"] == [0]]
+    assert len(parts) > 1 and all(unit["events"] == [[1, 2], [2, 3]] for unit in parts)
+    monkeypatch.setattr("handlers.build_message", lambda *a, **k: pytest.fail("fallback rerender"))
+    await handlers._drain_history_journal(AsyncMock())
+    bot = AsyncMock()
+    await notification_delivery.dispatch_notifications(bot)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [unit["payload"]["text"] for unit in before["units"]]
+    assert all("Что нового у" not in unit["payload"]["text"] for unit in before["units"])
+
+
+@pytest.mark.asyncio
+async def test_multiple_coalesced_pairs_count_as_two_summary_entries(digest_env, coalescing_journal_factory):
+    journal = coalescing_journal_factory(count=4)
+    first, last = journal["events"][2:]
+    first.update(event_type="planned", score=None)
+    last["target_id"] = first["target_id"]
+    _install(journal)
+    await handlers._drain_history_journal(AsyncMock())
+    plan = storage.load_event_journal()["outbox"]["plans"][0]
+    assert plan["presentation"] == "digest"
+    assert plan["entries"] == [
+        {"events": [[1, 2], [2, 3]], "notification_seq": 2},
+        {"events": [[3, 4], [4, 5]], "notification_seq": 4},
+    ]
+    assert plan["units"][0]["entries"] == [0, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2])
+async def test_old_frozen_plan_with_qualifying_pair_is_never_regrouped(digest_env, coalescing_journal_factory, monkeypatch, version):
+    from catchup_digest import render_digest
+    from notification_outbox import (
+        migrate_outbox,
+        prepare_digest,
+    )
+
+    journal = migrate_outbox(coalescing_journal_factory(count=11), 0)
+    parts = render_digest(journal["events"], ordinary=lambda event: f"Старая запись {event['seq']}", heading="Старый заголовок")
+    journal = prepare_digest(journal, parts, {10: "b" * 32}, 1800000000.0)
+    journal["outbox"]["plans"][0]["version"] = version
+    _install(journal)
+    state = storage.load_subscriber_state(strict_subscribers=True)
+    state.notification_memberships = {10: "b" * 32}
+    storage.save_subscriber_state(state)
+    previous = deepcopy(journal["outbox"]["plans"])
+    monkeypatch.setattr("handlers.notification_entries", lambda *a: pytest.fail("old plan regrouped"))
+    monkeypatch.setattr("handlers.build_message", lambda *a, **k: pytest.fail("old plan rerendered"))
+    monkeypatch.setattr("notification_delivery.time.time", lambda: 1800000000.0)
+    await handlers._drain_history_journal(AsyncMock())
+    assert storage.load_event_journal()["outbox"]["plans"] == previous
+    bot = AsyncMock()
+    await notification_delivery.dispatch_notifications(bot)
+    assert bot.send_message.await_args.kwargs["text"] == previous[0]["units"][0]["payload"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_pair_during_bootstrap_remains_silent(digest_env, coalescing_journal_factory, monkeypatch):
+    events = coalescing_journal_factory()["events"]
+    rows = [{**handlers.history_entry_from_event(event), "created_at": event["created_at"]} for event in events]
+    storage.save_stats_current({"period": "2026-Q2", "events": []}, strict=True)
+    storage.save_subscribers({10: "only"})
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=rows))
+    bot = AsyncMock()
+    await handlers.check_and_notify(bot, set(), None)
+    await notification_delivery.dispatch_notifications(bot)
+    bot.send_message.assert_not_awaited()
+    journal = storage.load_event_journal()
+    assert journal["baseline_ids"] == [2, 3] and journal["events"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_coalescing_never_joins_old_enqueued_or_possibly_sent_source(digest_env, coalescing_journal_factory, monkeypatch, legacy):
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+    )
+
+    journal = coalescing_journal_factory()
+    if not legacy:
+        journal["events"] = journal["events"][:1]
+    _install(journal)
+    if legacy:
+        cur = storage.load_stats_current(strict=True)
+        ensure_event_time(cur)
+        project_event(cur, journal, 1)
+        cur["event_projection"]["applied_seq"] = 1
+        storage.save_stats_current(cur, strict=True)
+    else:
+        await handlers._drain_history_journal(AsyncMock())
+        journal = storage.load_event_journal()
+        previous = deepcopy(journal["outbox"]["records"][0])
+        journal["events"].append(coalescing_journal_factory()["events"][1])
+        storage.save_event_journal(journal, admitting=True)
+    await handlers._drain_history_journal(AsyncMock())
+    saved = storage.load_event_journal()
+    assert not saved["outbox"].get("plans")
+    if legacy:
+        assert saved["outbox"]["records"][0]["recipients"]["10"]["prior_possible"]
+    else:
+        assert saved["outbox"]["records"][0] == previous
+    assert len(saved["outbox"]["records"]) == 2
+
+
 @pytest.fixture
 def digest_env(backup_env, monkeypatch):
     monkeypatch.setattr("notification_delivery.asyncio.sleep", AsyncMock())
@@ -115,8 +273,8 @@ async def test_silent_events_are_excluded_and_unknown_joins_summary(digest_env, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["plan", "projection", "enqueue"])
 @pytest.mark.parametrize("after", [False, True])
-async def test_failed_publication_and_cold_resume_freeze_plan(digest_env, journal_factory, monkeypatch, boundary, after):
-    _install(journal_factory(count=10))
+async def test_failed_publication_and_cold_resume_freeze_plan(digest_env, notification_batch_factory, monkeypatch, boundary, after):
+    _install(notification_batch_factory(count=10))
     write = storage._atomic_write
     frozen = []
     calls = []
@@ -260,18 +418,19 @@ async def test_restart_resumes_published_plan_without_reformatting(digest_env, l
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("offset", [0, -1])
-async def test_prepared_reserve_admits_every_future_event_link_at_inclusive_limit(digest_env, digest_factory, journal_factory, monkeypatch, offset):
+@pytest.mark.parametrize("coalesced", [False, True])
+async def test_prepared_reserve_admits_every_future_event_link_at_inclusive_limit(digest_env, digest_factory, journal_factory, coalescing_factory, coalescing_journal_factory, monkeypatch, offset, coalesced):
     from types import SimpleNamespace
 
     from event_journal_schema import journal_json
     from notification_outbox import progress_reserve
 
     monkeypatch.setattr("messages.random.choice", lambda bank: bank[0])
-    prepared = digest_factory(ready=False)
+    prepared = (coalescing_factory if coalesced else digest_factory)(ready=False)
     identity = prepared["outbox"]["plans"][0]["plan_id"]
     monkeypatch.setattr("notification_outbox.uuid4", lambda: SimpleNamespace(hex=identity))
     monkeypatch.setattr("handlers.time.time", lambda: 1800000000.0)
-    _install(journal_factory(count=10))
+    _install((coalescing_journal_factory if coalesced else journal_factory)(count=10))
     limit = len(journal_json(prepared).encode()) + progress_reserve(prepared) + 4096
     monkeypatch.setattr("storage.JOURNAL_MAX_BYTES", limit + offset)
     if offset:

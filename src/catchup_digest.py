@@ -116,7 +116,9 @@ def _source_period(events):
     return f"\n{start}" + (f" — {end}" if start != end else "") + " UTC"
 
 
-def render_digest(events: list[dict], *, ordinary, heading: str) -> list[dict]:
+def render_digest(
+    events: list[dict], *, ordinary, heading: str, entries: list[list[dict]] | None = None,
+) -> list[dict]:
     """Одна сводка принятой порции, включая unknown в исходном порядке."""
     if not events:
         return []
@@ -125,22 +127,34 @@ def render_digest(events: list[dict], *, ordinary, heading: str) -> list[dict]:
     header_size = html_length(header)
     if header_size >= TELEGRAM_TEXT_LIMIT:
         raise ValueError("digest_heading_limit")
-    text, refs, size = header, [], header_size
-    for event in events:
+    text, refs, indices, size = header, [], [], header_size
+    grouped = entries if entries is not None else [[event] for event in events]
+    for index, entry in enumerate(grouped):
         # Один выбор штатного шаблона; recovery использует сохранённый payload.
-        row = ordinary(event)
-        ref = [event["seq"], event["history_id"]]
+        row = ordinary(entry[-1])
+        source_refs = [[event["seq"], event["history_id"]] for event in entry]
         for fragment in split_html(row, limit=TELEGRAM_TEXT_LIMIT - header_size):
             length = html_length(fragment)
             separator = "\n\n" if refs else ""
             if size + len(separator) + length > TELEGRAM_TEXT_LIMIT:
-                parts.append({"kind": "digest", "events": refs, "text": text})
-                text, refs, size = header, [], header_size
+                parts.append({"kind": "digest", "events": refs, "text": text, **({"entries": indices} if entries is not None else {})})
+                text, refs, indices, size = header, [], [], header_size
                 separator = ""
             text += separator + fragment
             size += len(separator) + length
-            if not refs or refs[-1] != ref:
-                refs.append(ref)
+            if not indices or indices[-1] != index:
+                refs.extend(source_refs)
+                indices.append(index)
     if refs:
-        parts.append({"kind": "digest", "events": refs, "text": text})
+        parts.append({"kind": "digest", "events": refs, "text": text, **({"entries": indices} if entries is not None else {})})
     return parts
+
+
+def render_ordinary_entries(entries: list[list[dict]], *, ordinary) -> list[dict]:
+    """Те же решения без заголовка: singleton и local fallback со split."""
+    return [
+        {"kind": "ordinary", "entries": [index],
+         "events": [[event["seq"], event["history_id"]] for event in entry], "text": text}
+        for index, entry in enumerate(entries)
+        for text in split_html(ordinary(entry[-1]))
+    ]

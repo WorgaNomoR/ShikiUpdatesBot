@@ -21,12 +21,14 @@ from notification_outbox import (
     MAX_ATTEMPTS,
     OutboxStateError,
     begin_attempt,
+    coalescible_pair,
     compact_outbox,
     complete_attempt,
     completed_seq,
     enqueue,
     finish,
     migrate_outbox,
+    notification_entries,
     possible_delivery,
     progress_reserve,
     replace_recipients,
@@ -34,6 +36,112 @@ from notification_outbox import (
     validate_memberships,
     validate_outbox,
 )
+
+
+@pytest.mark.parametrize("first,last,paired", [
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:00+00:00", True),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:01+00:00", True),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:01.000001+00:00", False),
+    ("2026-04-01T00:00:00.999+00:00", "2026-04-01T00:00:01.001+00:00", True),
+    ("2026-04-01T03:00:00.990+03:00", "2026-04-01T00:00:01.990+00:00", True),
+    ("2026-04-01T00:00:01.000001+00:00", "2026-04-01T00:00:01+00:00", False),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:15+00:00", False),
+    (None, "2026-04-01T00:00:00+00:00", False),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:00", False),
+    ("bad", "2026-04-01T00:00:00+00:00", False),
+    ("2026-04-02T00:00:00+00:00", "2026-04-02T00:00:00.000001+00:00", False),
+])
+def test_coalescing_uses_full_trusted_source_interval(coalescing_journal_factory, first, last, paired):
+    from event_journal_schema import source_time
+
+    events = coalescing_journal_factory()["events"]
+    for event, timestamp in zip(events, (first, last)):
+        event["event_at"], event["time_quality"] = source_time(timestamp)
+    before = deepcopy(events)
+    assert coalescible_pair(*events) is paired
+    assert len(notification_entries(events)) == (1 if paired else 2)
+    assert events == before
+
+
+@pytest.mark.parametrize("damage", ["media", "empty_id", "other_id", "irrelevant_first", "irrelevant_last", "watching", "rating", "gap"])
+def test_coalescing_requires_same_nonempty_relevant_adjacent_target(coalescing_journal_factory, damage):
+    first, last = coalescing_journal_factory()["events"]
+    if damage == "media":
+        last.update(media="manga", kind="manga")
+    elif damage == "empty_id":
+        first["target_id"] = last["target_id"] = ""
+    elif damage == "other_id":
+        last["target_id"] = "other"
+    elif damage.startswith("irrelevant"):
+        (first if damage.endswith("first") else last)["relevant"] = False
+    elif damage == "gap":
+        last["seq"] += 1
+    else:
+        last["event_type"] = "watching" if damage == "watching" else "score_set"
+    assert not coalescible_pair(first, last)
+
+
+@pytest.mark.parametrize("intervening", ["ignored", "unknown", "score_removed", "score_set", "watching", "other_title", "excluded"])
+def test_coalescing_checks_adjacency_before_filtering(coalescing_journal_factory, intervening):
+    journal = coalescing_journal_factory(count=3)
+    first, last, middle = journal["events"]
+    middle["seq"], last["seq"] = 2, 3
+    if intervening == "excluded":
+        middle["relevant"] = False
+    elif intervening != "other_title":
+        middle["event_type"] = intervening
+    entries = notification_entries([first, middle, last])
+    assert all(len(entry) == 1 for entry in entries)
+    assert [entry[0]["seq"] for entry in entries] == ([1, 3] if intervening in {"ignored", "score_removed", "excluded"} else [1, 2, 3])
+
+
+@pytest.mark.parametrize("damage", ["survivor", "missing_source", "pair_order", "target", "time", "part_source", "continuation_source", "part_entry", "boolean", "presentation", "extra"])
+def test_coalescing_mapping_is_strict_in_runtime_and_import(coalescing_factory, damage):
+    journal = coalescing_factory(count=2, long_title=True)
+    plan = journal["outbox"]["plans"][0]
+    entry, unit = plan["entries"][0], plan["units"][0]
+    if damage == "survivor":
+        entry["notification_seq"] = 1
+    elif damage == "missing_source":
+        entry["events"].pop(0)
+    elif damage == "pair_order":
+        entry["events"].reverse()
+    elif damage == "target":
+        journal["events"][1]["target_id"] = "other"
+    elif damage == "time":
+        journal["events"][1]["event_at"] = "2026-04-01T00:00:01.990001+00:00"
+    elif damage == "part_source":
+        unit["events"].pop()
+    elif damage == "continuation_source":
+        plan["units"][1]["events"].pop(0)
+    elif damage == "part_entry":
+        unit["entries"] = [1]
+    elif damage == "boolean":
+        unit["entries"] = [False]
+    elif damage == "presentation":
+        plan["presentation"] = "digest"
+    else:
+        entry["guessed"] = True
+    with pytest.raises(OutboxStateError):
+        validate_outbox(journal)
+    with pytest.raises(EventJournalStateError):
+        parse_event_journal(json.dumps(journal).encode())
+
+
+def test_coalesced_retention_pins_both_sources_until_last_part_terminal(coalescing_factory):
+    journal = coalescing_factory(count=2, long_title=True)
+    units = journal["outbox"]["plans"][0]["units"]
+    for unit in units[:-1]:
+        begin_attempt(unit["recipients"]["10"], unit["created_at"])
+        complete_attempt(unit["recipients"]["10"], "confirmed_success", unit["created_at"])
+    assert retain_outbox(journal) == journal
+    finish(units[-1]["recipients"]["10"], "cancelled", "ineligible", units[-1]["created_at"])
+    partial = retain_outbox(journal, limit=1)
+    assert partial["outbox"]["completed_seq"] == 1
+    assert partial["outbox"]["plans"] == journal["outbox"]["plans"]
+    validate_outbox(partial)
+    complete = retain_outbox(partial)
+    assert complete["outbox"]["completed_seq"] == 2 and complete["outbox"]["plans"] == []
 
 
 def _box(factory):
@@ -599,12 +707,20 @@ def test_retained_runtime_import_schema_rejects_inconsistent_checkpoint(journal_
         parse_event_journal(json.dumps(journal).encode())
 
 
-def test_digest_preparation_and_enqueue_reserve_is_nonincreasing(digest_factory):
+def test_digest_preparation_and_enqueue_reserve_is_nonincreasing(frozen_history_factory, monkeypatch):
     from event_journal_schema import journal_json
     from notification_outbox import enqueue
 
-    journal = digest_factory(ready=False, audience=20, long_title=True)
+    # Размер контрольного входа не должен зависеть от RNG вне fixture.
+    monkeypatch.setattr("messages.random.choice", lambda bank: bank[0])
+    journal = frozen_history_factory(ready=False, audience=20, long_title=True)
     budget = len(journal_json(journal).encode()) + progress_reserve(journal)
+    monkeypatch.setattr("messages.random.choice", lambda bank: bank[-1])
+    repeated = frozen_history_factory(ready=False, audience=20, long_title=True)
+    assert len(journal_json(repeated).encode()) + progress_reserve(repeated) == budget
+    assert [unit["payload"] for unit in repeated["outbox"]["plans"][0]["units"]] == [
+        unit["payload"] for unit in journal["outbox"]["plans"][0]["units"]
+    ]
     frozen = deepcopy(journal["outbox"]["plans"])
     for event in journal["events"]:
         journal = enqueue(journal, event, "ignored rerender", {}, 0)
@@ -616,7 +732,7 @@ def test_digest_preparation_and_enqueue_reserve_is_nonincreasing(digest_factory)
 
 @pytest.mark.parametrize("outcome", ["confirmed_success", "confirmed_rejection", "not_dispatched", "uncertain"])
 @pytest.mark.parametrize("attempts", range(1, 7))
-def test_digest_part_reserve_covers_all_recipient_transitions(digest_factory, outcome, attempts):
+def test_digest_part_reserve_covers_all_recipient_transitions(frozen_history_factory, outcome, attempts):
     from event_journal_schema import journal_json
     from notification_outbox import (
         delivery_key,
@@ -624,7 +740,7 @@ def test_digest_part_reserve_covers_all_recipient_transitions(digest_factory, ou
         replace_recipients,
     )
 
-    journal = digest_factory()
+    journal = frozen_history_factory()
     record = next(delivery_records(journal))
     budget = len(journal_json(journal).encode()) + progress_reserve(journal)
     recipient = deepcopy(record["recipients"]["10"])

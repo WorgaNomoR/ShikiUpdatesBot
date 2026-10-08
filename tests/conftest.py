@@ -136,6 +136,73 @@ def journal_factory():
 
 
 @pytest.fixture
+def coalescing_journal_factory(journal_factory):
+    """Новая порция с соседней парой на границе секунды и квартала."""
+    def factory(count=2, *, long_title=False):
+        journal = journal_factory(count=count)
+        first, last = journal["events"][:2]
+        first.update(event_type="planned", score=None, created_at="2026-03-31T23:59:59.990+00:00", event_at="2026-03-31T23:59:59.990000+00:00")
+        last.update(target_id=first["target_id"], created_at="2026-04-01T00:00:00.010+00:00", event_at="2026-04-01T00:00:00.010000+00:00")
+        if long_title:
+            last["title"].update(name="😀<&>" * 2500, url="/animes/11")
+        return journal
+
+    return factory
+
+
+@pytest.fixture
+def coalescing_factory(coalescing_journal_factory):
+    """Plan v3 с явно связанными источниками, включая много частей completion."""
+    from unittest.mock import patch
+
+    from catchup_digest import (
+        render_digest,
+        render_ordinary_entries,
+    )
+    from messages import (
+        build_history_digest_heading,
+        build_message,
+        history_entry_from_event,
+    )
+    from notification_outbox import (
+        enqueue,
+        migrate_outbox,
+        notification_entries,
+        prepare_digest,
+    )
+
+    def factory(*, ready=True, audience=1, long_title=False, count=10):
+        journal = migrate_outbox(coalescing_journal_factory(count=count, long_title=long_title), 0)
+        entries = notification_entries(journal["events"])
+        def ordinary(event):
+            return build_message(history_entry_from_event(event), normalized=event)
+        presentation = "ordinary" if len(entries) == 1 else "digest"
+        with patch("messages.random.choice", side_effect=lambda bank: bank[0]):
+            parts = render_ordinary_entries(entries, ordinary=ordinary) if presentation == "ordinary" else render_digest(
+                journal["events"], ordinary=ordinary, heading=build_history_digest_heading(), entries=entries,
+            )
+        journal = prepare_digest(journal, parts, {10 + i: "b" * 32 for i in range(audience)}, 1800000000.0, entries=entries, presentation=presentation)
+        if ready:
+            for event in journal["events"]:
+                journal = enqueue(journal, event, None, {}, 1800000000.0)
+        return journal
+
+    return factory
+
+
+@pytest.fixture(params=["digest", "coalesced"])
+def frozen_history_factory(request, digest_factory, coalescing_factory):
+    """Одна матрица archive/reserve contract для старого и нового frozen plan."""
+    return coalescing_factory if request.param == "coalesced" else digest_factory
+
+
+@pytest.fixture(params=["ordinary", "coalesced"])
+def notification_batch_factory(request, journal_factory, coalescing_journal_factory):
+    """Одна матрица crash/delivery для независимых записей и связанной пары."""
+    return coalescing_journal_factory if request.param == "coalesced" else journal_factory
+
+
+@pytest.fixture
 def digest_factory(journal_factory):
     """Штатный prepared/ready plan; I/O и projection проверяются у их владельцев."""
     from catchup_digest import render_digest

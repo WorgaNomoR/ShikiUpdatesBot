@@ -11,6 +11,7 @@ import pytest
 from catchup_digest import (
     html_length,
     render_digest,
+    render_ordinary_entries,
     split_html,
 )
 from messages import (
@@ -18,6 +19,7 @@ from messages import (
     build_message,
     history_entry_from_event,
 )
+from notification_outbox import notification_entries
 
 
 def _render(events):
@@ -115,3 +117,24 @@ def test_empty_batch_needs_no_rendering():
 def test_oversized_heading_rejects_before_rendering(journal_factory):
     with pytest.raises(ValueError, match="digest_heading_limit"):
         render_digest(journal_factory(count=1)["events"], ordinary=lambda event: pytest.fail("heading too long"), heading="😀" * 2048)
+
+
+@pytest.mark.parametrize("summary", [False, True])
+def test_coalesced_completion_continuation_covers_both_ids_losslessly(coalescing_journal_factory, summary):
+    events = coalescing_journal_factory(count=3 if summary else 2)["events"]
+    entries = notification_entries(events)
+    title = "<&😀>" * 3000
+    calls = []
+
+    def ordinary(event):
+        calls.append(event["seq"])
+        return '<a href="https://example.com/title">' + title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;') + '</a>' if event["seq"] == 2 else "третье событие"
+
+    parts = render_digest(events, ordinary=ordinary, heading="📬 Сводка", entries=entries) if summary else render_ordinary_entries(entries, ordinary=ordinary)
+    assert calls == ([2, 3] if summary else [2])
+    pair_parts = [part for part in parts if 0 in part["entries"]]
+    assert len(pair_parts) > 1
+    assert all(part["events"][:2] == [[1, 2], [2, 3]] for part in pair_parts)
+    recovered = "".join(unescape(value) for part in pair_parts for value in re.findall(r'<a href="https://example.com/title">(.*?)</a>', part["text"], re.S))
+    assert recovered == title
+    assert all(0 < html_length(part["text"]) <= 4096 for part in parts)
