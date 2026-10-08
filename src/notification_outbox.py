@@ -119,15 +119,18 @@ def coalescible_pair(first: dict, last: dict) -> bool:
         or last["seq"] != first["seq"] + 1
     ):
         return False
-    times = []
-    for event in (first, last):
-        if event["time_quality"] != "aware" or not event["event_at"]:
-            return False
-        source = datetime.fromisoformat(event["event_at"])
-        if source.utcoffset() is None or source > datetime.fromisoformat(event["observed_at"]):
-            return False
-        times.append(source)
-    return timedelta(0) <= times[1] - times[0] <= timedelta(seconds=1)
+    try:
+        times = []
+        for event in (first, last):
+            if event["time_quality"] != "aware" or not event["event_at"]:
+                return False
+            source = datetime.fromisoformat(event["event_at"])
+            if source.utcoffset() is None or source > datetime.fromisoformat(event["observed_at"]):
+                return False
+            times.append(source)
+        return timedelta(0) <= times[1] - times[0] <= timedelta(seconds=1)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def notification_entries(events: list[dict]) -> list[list[dict]]:
@@ -752,7 +755,7 @@ def _validate_entries(plan: dict, by_seq: dict, expected: list) -> None:
             ):
                 raise OutboxStateError("outbox_plan_entries")
             sources.append(by_seq[ref[0]])
-        if entry["notification_seq"] != sources[-1]["seq"] or len(sources) == 2 and not coalescible_pair(*sources):
+        if entry["notification_seq"] != sources[-1]["seq"] or len(sources) == 2 and not coalescible_pair(sources[0], sources[1]):
             raise OutboxStateError("outbox_plan_entries")
         paired |= len(sources) == 2
         coverage.extend(entry["events"])

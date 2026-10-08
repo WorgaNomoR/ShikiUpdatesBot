@@ -63,6 +63,32 @@ def test_coalescing_uses_full_trusted_source_interval(coalescing_journal_factory
     assert events == before
 
 
+@pytest.mark.parametrize("index", [0, 1])
+@pytest.mark.parametrize("field,value", [
+    ("observed_at", "2026-04-02T00:00:00"),
+    ("observed_at", "bad"),
+    ("observed_at", None),
+    ("observed_at", 42),
+    ("event_at", "2026-04-01T00:00:00"),
+    ("event_at", "bad"),
+    ("event_at", "2026-04-01T00:00:00+24:00"),
+    ("event_at", 42),
+])
+def test_coalescing_rejects_invalid_timestamps_without_mutation(coalescing_factory, index, field, value):
+    journal = coalescing_factory(count=2)
+    events = journal["events"]
+    events[index][field] = value
+    before = deepcopy(journal)
+
+    assert not coalescible_pair(events[0], events[1])
+    assert notification_entries(events) == [[events[0]], [events[1]]]
+    with pytest.raises(OutboxStateError, match="outbox_plan_entries"):
+        validate_outbox(journal)
+    with pytest.raises(EventJournalStateError):
+        parse_event_journal(json.dumps(journal).encode())
+    assert journal == before
+
+
 @pytest.mark.parametrize("damage", ["media", "empty_id", "other_id", "irrelevant_first", "irrelevant_last", "watching", "rating", "gap"])
 def test_coalescing_requires_same_nonempty_relevant_adjacent_target(coalescing_journal_factory, damage):
     first, last = coalescing_journal_factory()["events"]
