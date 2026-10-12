@@ -13,21 +13,25 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
 import weakref
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
 from config import (
     BLOCKED_USERS_FILE,
+    EVENT_JOURNAL_FILE,
     KNOWN_USERS_FILE,
     OWNER_ID,
     SEEN_FAVS_FILE,
     SEEN_IDS_FILE,
+    SHIKI_USER,
     STATS_ALL_FILE,
     STATS_CURRENT_FILE,
     SUBS_FILE,
@@ -35,10 +39,49 @@ from config import (
     USER_ALERTS_FILE,
     log,
 )
+from event_journal_schema import (
+    JOURNAL_CHECKPOINT_RESERVE,
+    JOURNAL_MAX_BYTES,
+    EventJournalStateError,
+    journal_json,
+    validate_event_journal,
+    validate_projection,
+    validate_recovery_set,
+)
+from event_time_stats import (
+    acknowledge_revisions,
+    compact_source_history,
+    validate_event_time,
+)
+from notification_outbox import (
+    OutboxStateError,
+    completed_seq,
+    parse_subscriber_payload,
+    progress_reserve,
+    replace_recipients,
+    retain_outbox,
+    validate_memberships,
+)
+from notification_progress_schema import (
+    PROGRESS_FILE_NAME,
+    compact_json,
+    history_budget_size,
+    history_document,
+    join_history_progress,
+    parse_history_member,
+    parse_progress_member,
+    progress_budget_size,
+    progress_document,
+)
 from report_plan import (
     FrozenReportPlanError,
     downgrade_rich_units,
     validate_frozen_report_units,
+)
+from source_history import (
+    event_count,
+    prefix_seq,
+    retain_source_fingerprints,
 )
 from utils import (
     _parse_iso_utc,
@@ -71,6 +114,7 @@ class SubscriberState:
     backup_schedule: dict
     schedule_missing: bool = False
     schedule_malformed: bool = False
+    notification_memberships: dict[int, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +191,283 @@ def save_seen_ids(seen_ids: set[int]) -> None:
         SEEN_IDS_FILE,
         json.dumps({"seen_ids": list(seen_ids)}, ensure_ascii=False, indent=2),
     )
+
+
+def load_legacy_seen_ids() -> set[int] | None:
+    """Отличить валидный пустой baseline от отсутствующего/повреждённого."""
+    try:
+        data = json.loads(SEEN_IDS_FILE.read_text(encoding="utf-8"))
+        values = data.get("seen_ids", []) if isinstance(data, dict) else None
+        if not isinstance(values, list) or any(type(value) is not int for value in values):
+            return None
+        return set(values)
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+_journal_history_cache = None
+_journal_progress_cache = None
+
+# Один bounded batch на границе consumer; мелкую историю не переписываем.
+SOURCE_COMPACTION_BYTES = 512 * 1024
+SOURCE_COMPACTION_EVENTS = 128
+
+
+def notification_progress_file() -> Path:
+    """Оба member всегда рядом, в том числе при перенаправлении DATA_DIR в тестах."""
+    return EVENT_JOURNAL_FILE.with_name(PROGRESS_FILE_NAME)
+
+
+def _read_journal_member(path: Path) -> bytes:
+    with path.open("rb") as handle:
+        # read(limit) заранее выделял 8 МиБ даже для небольшого progress.
+        size = os.fstat(handle.fileno()).st_size
+        return handle.read(min(size, JOURNAL_MAX_BYTES) + 1)
+
+
+def _published_history() -> tuple[dict | None, int]:
+    """Кеш только immutable history: stat и restore generation проверяются всегда."""
+    global _journal_history_cache, _journal_progress_cache
+    try:
+        stat = EVENT_JOURNAL_FILE.stat()
+    except FileNotFoundError:
+        _journal_history_cache = None
+        _journal_progress_cache = None
+        if notification_progress_file().exists():
+            raise EventJournalStateError("progress_orphan")
+        return None, 0
+    except OSError:
+        raise EventJournalStateError("journal_read") from None
+    revision = (
+        EVENT_JOURNAL_FILE, stat.st_dev, stat.st_ino, stat.st_size,
+        stat.st_mtime_ns, stat.st_ctime_ns, restorable_restore_generation(), SHIKI_USER,
+    )
+    if _journal_history_cache is not None and _journal_history_cache[0] == revision:
+        return _journal_history_cache[1:]
+    try:
+        history = parse_history_member(_read_journal_member(EVENT_JOURNAL_FILE), profile=SHIKI_USER)
+    except OSError:
+        raise EventJournalStateError("journal_read") from None
+    if history["version"] in {4, 5, 6}:
+        size = history_budget_size(history)
+        _journal_history_cache = (revision, history, size)
+        return history, size
+    # Legacy содержит mutable progress, поэтому не кешируется.
+    _journal_history_cache = None
+    _journal_progress_cache = None
+    return history, 0
+
+
+def _progress_revision() -> tuple:
+    """Проверять оба member, policy и generation даже при тёплом progress."""
+    path = notification_progress_file()
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        raise EventJournalStateError("progress_missing") from None
+    except OSError:
+        raise EventJournalStateError("progress_read") from None
+    return (
+        _journal_history_cache[0], path, stat.st_dev, stat.st_ino, stat.st_size,
+        stat.st_mtime_ns, stat.st_ctime_ns, restorable_restore_generation(), JOURNAL_MAX_BYTES,
+    )
+
+
+def _published_progress(history: dict, history_size: int) -> tuple[dict, int]:
+    global _journal_progress_cache
+    revision = _progress_revision()
+    if _journal_progress_cache is not None and _journal_progress_cache[0] == revision:
+        return _journal_progress_cache[1:]
+    try:
+        progress = parse_progress_member(_read_journal_member(notification_progress_file()))
+    except FileNotFoundError:
+        raise EventJournalStateError("progress_missing") from None
+    except OSError:
+        raise EventJournalStateError("progress_read") from None
+    journal = join_history_progress(history, progress)
+    size = history_size + progress_budget_size(progress, compact_json(progress))
+    if size + progress_reserve(journal) > JOURNAL_MAX_BYTES:
+        raise EventJournalStateError("journal_capacity")
+    _journal_progress_cache = (revision, journal, size)
+    return journal, size
+
+
+def load_notification_journal() -> dict | None:
+    """Внутренний snapshot: history и progress заимствованы строго read-only."""
+    history, size = _published_history()
+    if history is None or history["version"] not in {4, 5, 6}:
+        return history
+    return _published_progress(history, size)[0]
+
+
+def load_event_journal() -> dict | None:
+    """Общий caller получает свою копию; опубликованный кеш ему недоступен."""
+    return deepcopy(load_notification_journal())
+
+
+def save_event_journal(journal: dict, *, admitting: bool = False) -> int:
+    """Progress атомарен отдельно; admission оставляет прежний checkpoint валидным."""
+    global _journal_progress_cache
+    if not isinstance(journal, dict):
+        raise EventJournalStateError("journal_structure")
+    limit = JOURNAL_MAX_BYTES - JOURNAL_CHECKPOINT_RESERVE if admitting else JOURNAL_MAX_BYTES
+    if type(journal.get("version")) is not int or journal.get("version") != 3:
+        payload = journal_json(journal)
+        size = len(payload.encode("utf-8"))
+        if size > limit:
+            raise EventJournalStateError("journal_capacity")
+        _journal_progress_cache = None
+        try:
+            _atomic_write(EVENT_JOURNAL_FILE, payload)
+        except Exception:
+            raise EventJournalStateError("journal_write") from None
+        return size
+    if not {"processed_seq", "outbox"} <= journal.keys():
+        raise EventJournalStateError("journal_structure")
+    published, history_size = _published_history()
+    activated = published is not None and published["version"] in {4, 5, 6}
+    progress_id = published["progress_id"] if activated else uuid.uuid4().hex
+    history = history_document(journal, progress_id)
+    history_changed = not activated or history != published
+    if history_changed:
+        validate_event_journal(journal, profile=SHIKI_USER)
+        history_size = history_budget_size(history)
+    progress = progress_document(journal, progress_id)
+    join_history_progress(history, progress)
+    payload = compact_json(progress)
+    size = history_size + progress_budget_size(progress, payload)
+    if size + progress_reserve(journal) > limit:
+        raise EventJournalStateError("journal_capacity")
+    if len(payload.encode("utf-8")) > JOURNAL_MAX_BYTES:
+        raise EventJournalStateError("journal_capacity")
+    history_payload = compact_json(history) if history_changed else None
+    if history_payload is not None and len(history_payload.encode("utf-8")) > JOURNAL_MAX_BYTES:
+        raise EventJournalStateError("journal_capacity")
+    # Общий caller владеет candidate и может менять его после save: не кешируем aliases.
+    _journal_progress_cache = None
+    try:
+        if not activated:
+            # До activation старый member остаётся единственной authority.
+            _atomic_write(notification_progress_file(), payload)
+            _atomic_write(EVENT_JOURNAL_FILE, history_payload)
+        elif history_changed:
+            current, _ = _published_progress(published, history_budget_size(published))
+            initializing = (
+                not current["baseline_initialized"] and journal["baseline_initialized"]
+                and not current["events"] and current["processed_seq"] == 0
+            )
+            if (
+                journal["journal_id"] != current["journal_id"]
+                or journal["profile"] != current["profile"]
+                or not initializing and (
+                    journal["baseline_ids"] != current["baseline_ids"]
+                    or journal["baseline_initialized"] != current["baseline_initialized"]
+                )
+                or journal.get("source_base") != current.get("source_base")
+                or journal["events"][:len(current["events"])] != current["events"]
+                or len(journal["events"]) < len(current["events"])
+                or journal["processed_seq"] != current["processed_seq"]
+                or journal["outbox"] != current["outbox"]
+            ):
+                raise EventJournalStateError("history_changed")
+            join_history_progress(history, progress_document(current, progress_id))
+            _atomic_write(EVENT_JOURNAL_FILE, history_payload)
+        else:
+            _atomic_write(notification_progress_file(), payload)
+    except EventJournalStateError:
+        raise
+    except Exception:
+        raise EventJournalStateError("journal_write") from None
+    return size
+
+
+def save_notification_recipient(journal: dict, seq: int | str, cid: str, recipient: dict) -> dict:
+    """Под state transaction: приватная дельта поверх точной свежей authority.
+
+    Общий save полностью проверяет каждую ревизию. Только этот узкий путь
+    передаёт владение своими ветвями кешу после успешного atomic replacement.
+    """
+    global _journal_progress_cache
+    current = load_notification_journal()
+    cached = _journal_progress_cache is not None and current is _journal_progress_cache[1]
+    if current is not journal and (cached or current != journal):
+        raise EventJournalStateError("recipient_changed")
+    candidate = replace_recipients(current, {(seq, cid): recipient})
+    size = save_event_journal(candidate)
+    if cached:
+        _journal_progress_cache = (_progress_revision(), candidate, size)
+        return candidate
+    # Legacy activation: заново прочитать новые members, не заимствовать caller aliases.
+    return load_notification_journal()
+
+
+def compact_event_journal(
+    journal: dict, *, expected_generation: int, cur: dict | None = None, force_history: bool = False,
+) -> dict:
+    """Под общей транзакцией: ограниченное обслуживание progress и source history."""
+    candidate = retain_outbox(journal)
+    if candidate != journal:
+        if (
+            restorable_restore_generation() != expected_generation
+            or load_notification_journal() != journal
+        ):
+            raise EventJournalStateError("compaction_changed")
+        save_event_journal(candidate)
+    return (
+        compact_completed_history(candidate, cur, expected_generation=expected_generation, force=force_history)
+        if cur is not None else candidate
+    )
+
+
+def compact_completed_history(
+    journal: dict, cur: dict, *, expected_generation: int, force: bool = False,
+) -> dict:
+    """Под state lock: общий recovery proof и одна атомарная history publication."""
+    if journal.get("outbox") is None or "event_time" not in cur:
+        return journal
+    candidate = retain_source_fingerprints(journal)
+    if force or len(compact_json(journal["events"]).encode("utf-8")) >= SOURCE_COMPACTION_BYTES:
+        through = min(
+            completed_seq(journal["outbox"]), journal["processed_seq"],
+            cur["event_projection"]["applied_seq"], prefix_seq(journal) + SOURCE_COMPACTION_EVENTS,
+            min((plan["start_seq"] - 1 for plan in journal["outbox"].get("plans", [])), default=event_count(journal)),
+        )
+        if through > prefix_seq(journal):
+            candidate = compact_source_history(journal, cur, through)
+    if candidate == journal:
+        return journal
+    validate_recovery_set(journal, cur)
+    validate_event_journal(candidate, profile=SHIKI_USER)
+    validate_recovery_set(candidate, cur)
+    # Все накладные расходы базы/индекса оплачены; бесполезное сжатие инертно.
+    if len(compact_json(candidate).encode("utf-8")) >= len(compact_json(journal).encode("utf-8")):
+        return journal
+    if (
+        restorable_restore_generation() != expected_generation
+        or load_notification_journal() != journal
+        or load_stats_current(strict=True) != cur
+    ):
+        raise EventJournalStateError("compaction_changed")
+    history, _ = _published_history()
+    if history is None or history["version"] not in {4, 5, 6}:
+        # Сначала завершить штатную split activation; payload пока не удаляется.
+        save_event_journal(journal)
+        history, _ = _published_history()
+    replacement = history_document(candidate, history["progress_id"])
+    progress = progress_document(journal, history["progress_id"])
+    join_history_progress(replacement, progress)
+    payload = compact_json(replacement)
+    size = history_budget_size(replacement) + progress_budget_size(progress, compact_json(progress))
+    if (
+        len(payload.encode("utf-8")) > JOURNAL_MAX_BYTES
+        or size + progress_reserve(candidate) > JOURNAL_MAX_BYTES
+    ):
+        raise EventJournalStateError("journal_capacity")
+    try:
+        _atomic_write(EVENT_JOURNAL_FILE, payload)
+    except Exception:
+        raise EventJournalStateError("journal_write") from None
+    return candidate
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -284,14 +605,24 @@ def subscriber_state_from_payload(
     strict_schedule: bool = False,
 ) -> SubscriberState:
     """Разобрать подписчиков и совместимое состояние их бэкапа."""
-    subscribers = subscribers_from_payload(payload)
     if not isinstance(payload, dict):
         raise ValueError("состояние подписчиков должно быть объектом")
+    if "notification_memberships" in payload:
+        try:
+            subscribers = strict_subscribers_from_payload(payload)
+        except ValueError:
+            raise OutboxStateError("notification_subscribers") from None
+        if payload["notification_memberships"] is None:
+            raise OutboxStateError("notification_memberships")
+    else:
+        subscribers = subscribers_from_payload(payload)
+    memberships = validate_memberships(payload.get("notification_memberships"), subscribers)
     if _BACKUP_SCHEDULE_KEY not in payload:
         return SubscriberState(
             subscribers,
             _empty_backup_schedule(),
             schedule_missing=True,
+            notification_memberships=memberships,
         )
     try:
         schedule = backup_schedule_from_payload(payload.get(_BACKUP_SCHEDULE_KEY))
@@ -310,8 +641,9 @@ def subscriber_state_from_payload(
             subscribers,
             schedule,
             schedule_malformed=True,
+            notification_memberships=memberships,
         )
-    return SubscriberState(subscribers, schedule)
+    return SubscriberState(subscribers, schedule, notification_memberships=memberships)
 
 
 def load_subscriber_state(*, strict_subscribers: bool = False) -> SubscriberState:
@@ -324,7 +656,7 @@ def load_subscriber_state(*, strict_subscribers: bool = False) -> SubscriberStat
             schedule_missing=True,
         )
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = _read_subscriber_payload(path)
         return subscriber_state_from_payload(payload)
     except (json.JSONDecodeError, OSError, ValueError):
         if strict_subscribers:
@@ -346,22 +678,34 @@ def load_subscription_backup_state() -> dict:
 def subscriber_state_json(state: SubscriberState) -> str:
     """Сериализовать единый subscriber-state без потери backup metadata."""
     schedule = backup_schedule_from_payload(state.backup_schedule)
-    return json.dumps(
+    subscribers = {str(cid): label for cid, label in state.subscribers.items()}
+    try:
+        strict_subscribers_from_payload({"subscribers": subscribers})
+    except ValueError:
+        raise OutboxStateError("notification_subscribers") from None
+    previous = state.notification_memberships or {}
+    memberships = {cid: previous.get(cid) or uuid.uuid4().hex for cid in state.subscribers}
+    metadata = {"version": 1, "tokens": {str(cid): token for cid, token in memberships.items()}}
+    validate_memberships(metadata, state.subscribers)
+    payload = json.dumps(
         {
-            "subscribers": {
-                str(key): value
-                for key, value in state.subscribers.items()
-            },
+            "subscribers": subscribers,
             _BACKUP_SCHEDULE_KEY: schedule,
+            "notification_memberships": metadata,
         },
         ensure_ascii=False,
         indent=2,
     )
+    if json_publication_size(payload) > JOURNAL_MAX_BYTES:
+        raise OutboxStateError("subscribers_capacity")
+    return payload
 
 
 def save_subscriber_state(state: SubscriberState) -> None:
     """Атомарно опубликовать подписчиков и состояние их бэкапа."""
-    _atomic_write(SUBS_FILE, subscriber_state_json(state))
+    payload = subscriber_state_json(state)
+    _atomic_write(SUBS_FILE, payload)
+    state.notification_memberships = validate_memberships(json.loads(payload)["notification_memberships"], state.subscribers)
     state.schedule_missing = False
     state.schedule_malformed = False
 
@@ -414,6 +758,8 @@ async def mutate_subscription(
             state.subscribers[chat_id] = name
         else:
             state.subscribers.pop(chat_id)
+            if state.notification_memberships is not None:
+                state.notification_memberships.pop(chat_id, None)
 
         pending = state.backup_schedule.get("pending")
         if pending is None:
@@ -447,7 +793,7 @@ def load_subscribers_strict() -> dict[int, str]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = _read_subscriber_payload(path)
         subscribers = strict_subscribers_from_payload(payload)
         subscriber_state_from_payload(payload, strict_schedule=True)
         return subscribers
@@ -466,6 +812,22 @@ def load_subscribers_strict() -> dict[int, str]:
         raise SubscribersStateError(
             "состояние подписчиков недоступно или повреждено"
         ) from e
+
+
+def _read_subscriber_payload(path: Path) -> dict:
+    """Общий ограниченный reader сохраняет исходные байты при ошибках."""
+    with path.open("rb") as handle:
+        return parse_subscriber_payload(handle.read(JOURNAL_MAX_BYTES + 1), JOURNAL_MAX_BYTES)
+
+
+def notification_memberships() -> dict[int, str]:
+    """Под state lock мигрировать идентичность подписок до enqueue/dispatch."""
+    load_subscribers_strict()
+    state = load_subscriber_state(strict_subscribers=True)
+    migrated = ensure_backup_schedule(state, now=time.time())
+    if state.notification_memberships is None or migrated:
+        save_subscriber_state(state)
+    return dict(state.notification_memberships)
 
 
 def _load_subscriber_state_for_access_recovery() -> SubscriberState:
@@ -489,7 +851,7 @@ def _load_subscribers_for_access_recovery() -> dict[int, str]:
 
 def save_subscribers(subs: dict[int, str]) -> None:
     """Сохранить подписчиков, не меняя durable backup metadata."""
-    state = load_subscriber_state()
+    state = load_subscriber_state(strict_subscribers=True)
     state.subscribers = dict(subs)
     save_subscriber_state(state)
 
@@ -592,12 +954,14 @@ def save_blocked_users(blocked: set[int]) -> None:
 def _subscribers_json(
     subscribers: dict[int, str],
     backup_schedule: dict | None = None,
+    memberships: dict[int, str] | None = None,
 ) -> str:
     """Сериализовать подписчиков для общей access-control транзакции."""
     return subscriber_state_json(
         SubscriberState(
             dict(subscribers),
             backup_schedule or _empty_backup_schedule(),
+            notification_memberships=memberships,
         )
     )
 
@@ -668,6 +1032,7 @@ async def add_blocked_user(user_id: int) -> tuple[bool, bool]:
             payloads[Path(SUBS_FILE)] = _subscribers_json(
                 subscribers,
                 subscriber_state.backup_schedule,
+                subscriber_state.notification_memberships,
             )
         _publish_access_state(payloads)
         return added, subscriber_removed
@@ -1143,7 +1508,7 @@ def mark_restorable_state_restored() -> None:
 def _quarter_plan_hash(pending: dict) -> str:
     """Связать неизменяемые поля плана, исключив только acknowledgement."""
     identity = {key: value for key, value in pending.items()
-                if key not in {"next_unit", "plan_hash"}}
+                if key not in {"next_unit", "plan_hash", "delivery_uncertain"}}
     raw = json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("ascii")).hexdigest()
 
@@ -1167,20 +1532,24 @@ def new_quarter_delivery_plan(
     old_period: str,
     new_period: str,
     units: list[dict],
+    *,
+    event_time_revisions: dict[str, int] | None = None,
 ) -> dict:
-    """Заморозить version-2 plan с точными transport и content."""
+    """Заморозить v2 transport/content или v3 с ревизиями корректировок."""
     try:
         validate_frozen_report_units(units)
     except FrozenReportPlanError:
         raise QuarterDeliveryStateError("report_units") from None
     pending = {
-        "version": 2,
+        "version": 2 if event_time_revisions is None else 3,
         "plan_id": uuid.uuid4().hex,
         "old_period": old_period,
         "new_period": new_period,
         "report_units": json.loads(json.dumps(units, ensure_ascii=False)),
         "next_unit": 0,
     }
+    if event_time_revisions is not None:
+        pending["event_time_revisions"] = dict(event_time_revisions)
     pending["plan_hash"] = _quarter_plan_hash(pending)
     validate_pending_quarter_delivery({
         "period": new_period,
@@ -1191,7 +1560,9 @@ def new_quarter_delivery_plan(
 
 def downgrade_quarter_delivery(pending: dict, start_unit: int) -> dict:
     """После точного unsupported-ответа заморозить remaining HTML plan."""
-    if pending.get("version") != 2:
+    if pending.get("delivery_uncertain"):
+        raise QuarterDeliveryStateError("uncertain_downgrade")
+    if pending.get("version") not in {2, 3}:
         raise QuarterDeliveryStateError("unsupported_downgrade")
     try:
         units = downgrade_rich_units(pending["report_units"], start_unit)
@@ -1200,13 +1571,15 @@ def downgrade_quarter_delivery(pending: dict, start_unit: int) -> dict:
     except (KeyError, FrozenReportPlanError):
         raise QuarterDeliveryStateError("unsupported_downgrade") from None
     downgraded = {
-        "version": 2,
+        "version": pending["version"],
         "plan_id": uuid.uuid4().hex,
         "old_period": old_period,
         "new_period": new_period,
         "report_units": units,
         "next_unit": start_unit,
     }
+    if pending["version"] == 3:
+        downgraded["event_time_revisions"] = dict(pending["event_time_revisions"])
     downgraded["plan_hash"] = _quarter_plan_hash(downgraded)
     validate_pending_quarter_delivery({
         "period": downgraded["new_period"],
@@ -1253,14 +1626,18 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
     legacy = "version" not in pending
     if not legacy and (
         type(pending.get("version")) is not int
-        or pending["version"] not in {1, 2}
+        or pending["version"] not in {1, 2, 3}
     ):
         raise QuarterDeliveryStateError("unsupported_version")
     expected_keys = (
         legacy_keys
         if legacy
-        else version1_keys if pending["version"] == 1 else version2_keys
+        else version1_keys if pending["version"] == 1 else version2_keys | ({"event_time_revisions"} if pending["version"] == 3 else set())
     )
+    if not legacy and "delivery_uncertain" in pending:
+        expected_keys = expected_keys | {"delivery_uncertain"}
+        if type(pending["delivery_uncertain"]) is not bool:
+            raise QuarterDeliveryStateError("delivery_uncertainty")
     if set(pending) != expected_keys:
         raise QuarterDeliveryStateError("pending_fields")
     old, new = pending["old_period"], pending["new_period"]
@@ -1268,6 +1645,14 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
     validate_quarter_period(new)
     if old >= new or new != cur.get("period"):
         raise QuarterDeliveryStateError("period_lineage")
+    if pending.get("version") == 3:
+        revisions = pending["event_time_revisions"]
+        if not isinstance(revisions, dict) or old not in revisions:
+            raise QuarterDeliveryStateError("correction_revisions")
+        for period, revision in revisions.items():
+            validate_quarter_period(period)
+            if period > old or type(revision) is not int or revision < 0:
+                raise QuarterDeliveryStateError("correction_revisions")
     messages = pending.get("report_messages")
     units = pending.get("report_units")
     if legacy or pending.get("version") == 1:
@@ -1301,6 +1686,8 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
             raise QuarterDeliveryStateError("progress_index")
         if cur.get("last_report_sent") == new and pending["next_unit"] < total_units:
             raise QuarterDeliveryStateError("premature_completion")
+        if pending.get("delivery_uncertain") and pending["next_unit"] == total_units:
+            raise QuarterDeliveryStateError("completed_uncertainty")
         if not isinstance(pending["plan_id"], str) or re.fullmatch(r"[0-9a-f]{32}", pending["plan_id"]) is None:
             raise QuarterDeliveryStateError("plan_identity")
         if pending["plan_hash"] != _quarter_plan_hash(pending):
@@ -1340,6 +1727,13 @@ def _empty_stats_current(period: str, tracking_since: str | None = None) -> dict
     }
 
 
+def _backfill_stats_current(data: dict) -> None:
+    """Добавить только прежние defaults чтения, не мигрируя frozen-план."""
+    if "tracking_since" not in data:
+        data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
+    data.setdefault("pending_quarter_delivery", None)
+
+
 def load_stats_current(*, strict: bool = False, initialize_missing: bool = False) -> dict:
     """
     Загружаем события текущего квартала. При ошибке/отсутствии — пустой квартал.
@@ -1354,23 +1748,30 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
     чтобы не сбрасывалась при последующих перезапусках.
     """
     try:
-        data = json.loads(STATS_CURRENT_FILE.read_text(encoding="utf-8"))
+        with STATS_CURRENT_FILE.open("rb") as stream:
+            raw = stream.read(JOURNAL_MAX_BYTES + 1 if strict else -1)
+        if strict and len(raw) > JOURNAL_MAX_BYTES:
+            raise QuarterDeliveryStateError("current_size")
+        data = json.loads(raw.decode("utf-8"))
         if isinstance(data, dict) and "period" in data and "events" in data:
             if strict and (not isinstance(data["period"], str) or not isinstance(data["events"], list)):
                 raise QuarterDeliveryStateError("current_structure")
             if strict:
                 validate_quarter_period(data["period"])
                 validate_pending_quarter_delivery(data)
+                if "event_projection" in data:
+                    validate_projection(data["event_projection"])
+                validate_event_time(data)
             # Бэкофилл для файлов, созданных до появления поля tracking_since
-            if "tracking_since" not in data:
-                data["tracking_since"] = data.get("period_start") or quarter_start().isoformat()
-            data.setdefault("pending_quarter_delivery", None)
+            _backfill_stats_current(data)
+            if strict:
+                stats_current_json(data)
             return data
         if strict:
             raise QuarterDeliveryStateError("current_structure")
         log.warning("load_stats_current: неожиданная структура, сбрасываем.")
     except FileNotFoundError:
-        if strict and not initialize_missing:
+        if strict and (not initialize_missing or EVENT_JOURNAL_FILE.exists()):
             raise QuarterDeliveryStateError("current_missing") from None
     except QuarterDeliveryStateError:
         raise
@@ -1389,10 +1790,56 @@ def load_stats_current(*, strict: bool = False, initialize_missing: bool = False
     return fresh
 
 
+def json_publication_size(payload: str) -> int:
+    """Path.write_text переводит JSON-переносы в системный EOL на Windows."""
+    return len(payload.replace("\n", os.linesep).encode("utf-8"))
+
+
+def stats_current_json(data: dict, *, strict: bool = True) -> str:
+    """Компактная публикация с резервом всех штатных frozen-переходов."""
+    def encode(value: dict) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=not strict)
+
+    payload = encode(data)
+    if strict:
+        sizes = [json_publication_size(payload)]
+        completed = deepcopy(data)
+        # Импорт и следующая запись учитывают те же defaults, что строгий reader.
+        _backfill_stats_current(completed)
+        sizes.append(json_publication_size(encode(completed)))
+        pending = completed.get("pending_quarter_delivery")
+        if isinstance(pending, dict):
+            pending = migrate_quarter_delivery(pending)
+            completed["pending_quarter_delivery"] = pending
+            sizes.append(json_publication_size(encode(completed)))
+            key = "report_messages" if pending["version"] == 1 else "report_units"
+            if pending["next_unit"] < len(pending[key]):
+                # Наибольший ещё не подтверждённый индекс; false на байт длиннее true.
+                pending["next_unit"] = len(pending[key]) - 1
+                pending["delivery_uncertain"] = False
+                sizes.append(json_publication_size(encode(completed)))
+            pending["next_unit"] = len(pending[key])
+            pending.pop("delivery_uncertain", None)
+            completed["last_report_sent"] = pending["new_period"]
+            acknowledge_revisions(completed)
+            sizes.append(json_publication_size(encode(completed)))
+        if max(sizes) > JOURNAL_MAX_BYTES:
+            raise QuarterDeliveryStateError("current_capacity")
+    return payload
+
+
 def save_stats_current(data: dict, *, strict: bool = False) -> None:
     """Атомарно записать состояние; strict не скрывает ошибку acknowledgement."""
     try:
-        _atomic_write(STATS_CURRENT_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+        if strict and "event_projection" in data:
+            validate_projection(data["event_projection"])
+        if strict:
+            if "event_time" in data:
+                validate_quarter_period(data.get("period"))
+                validate_pending_quarter_delivery(data)
+            validate_event_time(data)
+        payload = stats_current_json(data, strict=strict)
+        _atomic_write(STATS_CURRENT_FILE, payload)
     except Exception as e:
         if strict:
             log.error("save_stats_current: strict-запись не удалась: %s", type(e).__name__)

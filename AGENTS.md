@@ -30,6 +30,7 @@
 - Do not keep duplicate sources of truth. Code and tests establish current behaviour; `README.md` owns user-facing behaviour, configuration, and deployment; `AGENTS.md` owns working agreements; `ARCHITECTURE.md` owns internal design and contracts; GitHub issues own accepted active work; `ideas.md` is the pre-issue inbox and decision parking lot.
 - Codex may update `AGENTS.md` and `ARCHITECTURE.md` whenever needed without asking for permission, but must report material documentation changes in its handoff.
 - Both files are committed and synchronized through public GitHub. Never put secrets, tokens, private identifiers, machine-specific paths, or temporary session details in them.
+- When implementation changes a documented contract, update its authoritative current description instead of appending a narrative of the next stage. Keep historical context only when it explains a supported migration, compatibility requirement, current constraint or deferred decision. Preserve useful measurements with their input/runtime/method assumptions; link superseded comparisons to their original evidence.
 - Keep `AGENTS.md` focused on how work is performed. New bot knowledge belongs in `ARCHITECTURE.md`; do not repeatedly compress architectural context to make it fit beside process instructions.
 
 ### Tests and verification

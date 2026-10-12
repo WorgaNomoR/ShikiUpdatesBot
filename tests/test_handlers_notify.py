@@ -5,14 +5,21 @@ import io
 import json
 import logging
 import zipfile
+from copy import deepcopy
 
 import pytest
 
 import backup
+import handlers
 import shiki_api
 import storage
-from handlers import check_and_notify
 
+
+async def _check_legacy(bot, seen, cur):
+    """Существующие сценарии начинают с соответствующего дискового legacy-кеша."""
+    if storage.load_event_journal() is None and seen:
+        storage.save_seen_ids(seen)
+    return await handlers.check_and_notify(bot, seen, cur)
 
 def _empty_cur():
     return {"period": "2026-Q2", "events": []}
@@ -81,26 +88,32 @@ def _patch_history_pages(monkeypatch, pages):
 
 
 def _capture_sends(monkeypatch):
+    """Решения enqueue: обычный payload либо ID события из durable digest plan."""
     sent = []
-    async def _send(bot, text):
-        sent.append(text)
-    monkeypatch.setattr("handlers.send_to_all_chats", _send)
+    real_enqueue = handlers._enqueue_history_event
+    async def _send(journal, event, text, generation):
+        if text is not None:
+            sent.append(text)
+        elif handlers.notification_event(event) and handlers.event_plan(journal, event["seq"]) is not None:
+            sent.append(event["history_id"])
+        return await real_enqueue(journal, event, text, generation)
+    monkeypatch.setattr("handlers._enqueue_history_event", _send)
     return sent
 
 
 def _sent_history_ids(messages):
     return [
-        int(message.split("/animes/", 1)[1].split('"', 1)[0])
+        message if type(message) is int else int(message.split("/animes/", 1)[1].split('"', 1)[0])
         for message in messages
     ]
 
 
 def _capture_saves(monkeypatch, current=None):
     saved = []
-    current = current if current is not None else _empty_cur()
+    published = [deepcopy(current if current is not None else _empty_cur())]
     monkeypatch.setattr("handlers.save_seen_ids", lambda ids: saved.append(set(ids)))
-    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: current)
-    monkeypatch.setattr("handlers.save_stats_current", lambda cur, **kwargs: None)
+    monkeypatch.setattr("handlers.load_stats_current", lambda **kwargs: deepcopy(published[0]))
+    monkeypatch.setattr("handlers.save_stats_current", lambda cur, **kwargs: published.__setitem__(0, deepcopy(cur)))
     return saved
 
 
@@ -111,7 +124,7 @@ async def test_failed_fetch_skips_cycle(monkeypatch):
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, cur = await check_and_notify(DummyBot(), {5}, _empty_cur())
+    result, cur = await _check_legacy(DummyBot(), {5}, _empty_cur())
 
     assert result == {5}     # seen_ids не тронут
     assert saved == []       # ничего не сохранили
@@ -130,7 +143,7 @@ async def test_private_history_preserves_state_and_never_broadcasts(monkeypatch)
     original_cur = _empty_cur()
 
     with pytest.raises(shiki_api.ProfilePrivacyError):
-        await check_and_notify(DummyBot(), original_seen, original_cur)
+        await _check_legacy(DummyBot(), original_seen, original_cur)
 
     assert original_seen == {5}
     assert original_cur == _empty_cur()
@@ -149,7 +162,7 @@ async def test_baseline_init_from_empty_seen_no_send(monkeypatch):
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, cur = await check_and_notify(DummyBot(), set(), _empty_cur())
+    result, cur = await _check_legacy(DummyBot(), set(), _empty_cur())
 
     assert result == set(range(1, 52))
     assert saved == [set(range(1, 52))]
@@ -164,7 +177,7 @@ async def test_known_boundary_on_full_first_page_uses_one_request(monkeypatch):
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, _cur = await check_and_notify(DummyBot(), {150}, _empty_cur())
+    result, _cur = await _check_legacy(DummyBot(), {150}, _empty_cur())
 
     assert calls == [1]
     assert _sent_history_ids(sent) == list(range(151, 201))
@@ -179,7 +192,7 @@ async def test_exact_limit_page_without_boundary_is_exhausted(monkeypatch):
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, _cur = await check_and_notify(DummyBot(), {1}, _empty_cur())
+    result, _cur = await _check_legacy(DummyBot(), {1}, _empty_cur())
 
     assert calls == [1]
     assert _sent_history_ids(sent) == list(range(451, 501))
@@ -197,7 +210,7 @@ async def test_catchup_fetches_until_boundary_deduplicates_and_orders(monkeypatc
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, _cur = await check_and_notify(DummyBot(), {150}, _empty_cur())
+    result, _cur = await _check_legacy(DummyBot(), {150}, _empty_cur())
 
     assert calls == [1, 2]
     sent_ids = _sent_history_ids(sent)
@@ -217,7 +230,7 @@ async def test_catchup_short_page_without_boundary_is_exhausted(monkeypatch):
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, _cur = await check_and_notify(DummyBot(), {1}, _empty_cur())
+    result, _cur = await _check_legacy(DummyBot(), {1}, _empty_cur())
 
     assert calls == [1, 2]
     assert _sent_history_ids(sent) == list(range(298, 351))
@@ -237,13 +250,13 @@ async def test_catchup_failure_on_second_page_keeps_seen_unpublished(monkeypatch
     saved = _capture_saves(monkeypatch, original_cur)
     sent = _capture_sends(monkeypatch)
 
-    result, returned_cur = await check_and_notify(
+    result, returned_cur = await _check_legacy(
         DummyBot(), original_seen, original_cur,
     )
 
     assert calls == [1, 2]
-    assert result is original_seen
-    assert returned_cur is original_cur
+    assert result == original_seen
+    assert returned_cur["events"] == original_cur["events"]
     assert saved == []
     assert sent == []
 
@@ -260,10 +273,10 @@ async def test_catchup_cap_without_boundary_is_incomplete(monkeypatch, caplog):
     original_seen = {1}
 
     with caplog.at_level(logging.WARNING):
-        result, _cur = await check_and_notify(DummyBot(), original_seen, _empty_cur())
+        result, _cur = await _check_legacy(DummyBot(), original_seen, _empty_cur())
 
     assert calls == [1, 2, 3, 4, 5]
-    assert result is original_seen
+    assert result == original_seen
     assert saved == []
     assert sent == []
     assert any("за 5 страниц не найдена известная граница" in msg for msg in caplog.messages)
@@ -275,7 +288,7 @@ async def test_empty_history_keeps_seen(monkeypatch):
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, cur = await check_and_notify(DummyBot(), {1, 2, 3}, _empty_cur())
+    result, cur = await _check_legacy(DummyBot(), {1, 2, 3}, _empty_cur())
 
     assert result == {1, 2, 3}
     assert saved == []
@@ -288,7 +301,7 @@ async def test_no_new_entries_no_send(monkeypatch):
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    await check_and_notify(DummyBot(), {100}, _empty_cur())
+    await _check_legacy(DummyBot(), {100}, _empty_cur())
 
     assert sent == []
     assert saved == []
@@ -297,11 +310,11 @@ async def test_no_new_entries_no_send(monkeypatch):
 @pytest.mark.asyncio
 async def test_new_relevant_entry_sends_and_saves(monkeypatch):
     _patch_history(monkeypatch, [_relevant_entry(123)])
-    monkeypatch.setattr("handlers.build_message", lambda entry: "MESSAGE")
+    monkeypatch.setattr("handlers.build_message", lambda entry, **kwargs: "MESSAGE")
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, cur = await check_and_notify(DummyBot(), {999}, _empty_cur())
+    result, cur = await _check_legacy(DummyBot(), {999}, _empty_cur())
 
     assert 123 in result
     assert sent == ["MESSAGE"]
@@ -315,11 +328,11 @@ async def test_new_irrelevant_entry_records_but_no_send(monkeypatch):
     entry = _relevant_entry(999)
     entry["target"]["kind"] = "special"
     _patch_history(monkeypatch, [entry])
-    monkeypatch.setattr("handlers.build_message", lambda entry: "SHOULD_NOT_SEND")
+    monkeypatch.setattr("handlers.build_message", lambda entry, **kwargs: "SHOULD_NOT_SEND")
     _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
 
-    result, cur = await check_and_notify(DummyBot(), {111}, _empty_cur())
+    result, cur = await _check_legacy(DummyBot(), {111}, _empty_cur())
 
     assert 999 in result     # ID запомнен даже для нерелевантного
     assert sent == []        # но сообщение не отправлено (фильтр)
@@ -336,23 +349,23 @@ async def test_unknown_event_sends_and_marks_seen_without_quarter_event(
         "target": {"id": 77, "type": "Anime", "kind": "tv"},
     }
     _patch_history(monkeypatch, [entry])
-    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
-    monkeypatch.setattr("handlers.build_message", lambda item: "NEUTRAL")
+    monkeypatch.setattr("messages.get_media_info", lambda item, **kwargs: ("anime", "tv"))
+    monkeypatch.setattr("messages.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda item, **kwargs: "NEUTRAL")
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
     cur = _empty_cur()
     expected_cur = _empty_cur()
 
     with caplog.at_level(logging.WARNING):
-        result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+        result, returned_cur = await _check_legacy(DummyBot(), {999}, cur)
 
     assert result == {999, 123}
     assert saved == [{999, 123}]
     assert sent == ["NEUTRAL"]
-    assert returned_cur == expected_cur
+    assert returned_cur["events"] == expected_cur["events"]
     assert any(
-        "Неизвестно & новое" in message
+        "Неизвестное описание истории" in message
         for message in caplog.messages
     )
 
@@ -375,11 +388,11 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
         },
     ]
     _patch_history(monkeypatch, entries)
-    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("messages.get_media_info", lambda item, **kwargs: ("anime", "tv"))
+    monkeypatch.setattr("messages.is_relevant", lambda media_type, kind: True)
     monkeypatch.setattr(
         "handlers.build_message",
-        lambda item: pytest.fail("для ignored начали строить сообщение"),
+        lambda item, **kwargs: pytest.fail("для ignored начали строить сообщение"),
     )
     saved = _capture_saves(monkeypatch)
     sent = _capture_sends(monkeypatch)
@@ -387,12 +400,12 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
     expected_cur = _empty_cur()
 
     with caplog.at_level(logging.WARNING):
-        result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+        result, returned_cur = await _check_legacy(DummyBot(), {999}, cur)
 
     assert result == {999, 123, 124}
     assert saved == [{999, 123, 124}]
     assert sent == []
-    assert returned_cur == expected_cur
+    assert returned_cur["events"] == expected_cur["events"]
     assert not caplog.messages
 
 
@@ -404,14 +417,15 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
     entry = {
         "id": 125,
         "description": "Отменена оценка",
+        "created_at": "2026-04-02T00:00:00+00:00",
         "target": {"id": 79, "type": "Anime", "kind": "tv"},
     }
     _patch_history(monkeypatch, [entry])
-    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("messages.get_media_info", lambda item, **kwargs: ("anime", "tv"))
+    monkeypatch.setattr("messages.is_relevant", lambda media_type, kind: True)
     monkeypatch.setattr(
         "handlers.build_message",
-        lambda item: pytest.fail("для score_removed начали строить сообщение"),
+        lambda item, **kwargs: pytest.fail("для score_removed начали строить сообщение"),
     )
     cur = _empty_cur()
     cur["events"].append({
@@ -425,12 +439,13 @@ async def test_score_removed_is_seen_and_clears_current_score_without_send(
     sent = _capture_sends(monkeypatch)
 
     with caplog.at_level(logging.WARNING):
-        result, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+        result, returned_cur = await _check_legacy(DummyBot(), {999}, cur)
 
     assert result == {999, 125}
     assert saved == [{999, 125}]
     assert sent == []
-    assert returned_cur["events"][0]["score"] is None
+    assert returned_cur["events"][0]["score"] == 0
+    assert returned_cur["event_time"]["legacy_events"][0]["score"] == 5
     assert not caplog.messages
 
 
@@ -439,12 +454,13 @@ async def test_score_set_notifies_and_updates_completed_without_duplicate(monkey
     entry = {
         "id": 123,
         "description": "Оценено на <b>8</b>",
+        "created_at": "2026-04-02T00:00:00+00:00",
         "target": {"id": 77, "type": "Anime", "kind": "tv"},
     }
     _patch_history(monkeypatch, [entry])
-    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
-    monkeypatch.setattr("handlers.build_message", lambda item: "SCORE")
+    monkeypatch.setattr("messages.get_media_info", lambda item, **kwargs: ("anime", "tv"))
+    monkeypatch.setattr("messages.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda item, **kwargs: "SCORE")
     cur = _empty_cur()
     cur["events"].append({
         "id": "77",
@@ -456,7 +472,7 @@ async def test_score_set_notifies_and_updates_completed_without_duplicate(monkey
     _capture_saves(monkeypatch, cur)
     sent = _capture_sends(monkeypatch)
 
-    _, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+    _, returned_cur = await _check_legacy(DummyBot(), {999}, cur)
 
     assert sent == ["SCORE"]
     assert len(returned_cur["events"]) == 1
@@ -469,23 +485,25 @@ async def test_score_change_updates_completion_through_handler(monkeypatch):
         {
             "id": 124,
             "description": "Изменена оценка c <b>3</b> на <b>9</b>",
+            "created_at": "2026-04-02T00:00:00+00:00",
             "target": {"id": 77, "type": "Anime", "kind": "tv"},
         },
         {
             "id": 123,
             "description": "Просмотрено и оценено на <b>3</b>",
+            "created_at": "2026-04-01T00:00:00+00:00",
             "target": {"id": 77, "type": "Anime", "kind": "tv"},
         },
     ]
     _patch_history(monkeypatch, entries)
-    monkeypatch.setattr("handlers.build_message", lambda item: f"EVENT-{item['id']}")
+    monkeypatch.setattr("handlers.build_message", lambda item, **kwargs: f"EVENT-{item['id']}")
     cur = _empty_cur()
     _capture_saves(monkeypatch, cur)
     sent = _capture_sends(monkeypatch)
 
-    _, returned_cur = await check_and_notify(DummyBot(), {999}, cur)
+    _, returned_cur = await _check_legacy(DummyBot(), {999}, cur)
 
-    assert sent == ["EVENT-123", "EVENT-124"]
+    assert sent == [123, 124]
     assert len(returned_cur["events"]) == 1
     assert returned_cur["events"][0]["event"] == "completed"
     assert returned_cur["events"][0]["score"] == 9
@@ -501,21 +519,24 @@ async def test_stale_history_writer_rebases_on_imported_current_state(
     entry = {
         "id": 123,
         "description": "Просмотрено",
+        "created_at": "2026-04-01T00:00:00+00:00",
         "target": {"id": 77, "type": "Anime", "kind": "tv"},
     }
     _patch_history(monkeypatch, [entry])
-    monkeypatch.setattr("handlers.get_media_info", lambda item: ("anime", "tv"))
-    monkeypatch.setattr("handlers.is_relevant", lambda media_type, kind: True)
-    monkeypatch.setattr("handlers.build_message", lambda item: "COMPLETED")
+    monkeypatch.setattr("messages.get_media_info", lambda item, **kwargs: ("anime", "tv"))
+    monkeypatch.setattr("messages.is_relevant", lambda media_type, kind: True)
+    monkeypatch.setattr("handlers.build_message", lambda item, **kwargs: "COMPLETED")
     started = asyncio.Event()
     resume = asyncio.Event()
 
-    async def pause_send(bot, text):
+    real_enqueue = handlers._enqueue_history_event
+    async def pause_send(*args, **kwargs):
         started.set()
         await resume.wait()
+        return await real_enqueue(*args, **kwargs)
 
-    monkeypatch.setattr("handlers.send_to_all_chats", pause_send)
-    writer = asyncio.create_task(check_and_notify(DummyBot(), {999}, old_cur))
+    monkeypatch.setattr("handlers._enqueue_history_event", pause_send)
+    writer = asyncio.create_task(_check_legacy(DummyBot(), {999}, old_cur))
     await started.wait()
 
     imported = {
@@ -536,4 +557,7 @@ async def test_stale_history_writer_rebases_on_imported_current_state(
     await writer
 
     event_ids = {event["id"] for event in storage.load_stats_current()["events"]}
-    assert event_ids == {"77", "88"}
+    assert event_ids == {"88"}
+    assert storage.load_event_journal()["processed_seq"] == 0
+    await handlers._drain_history_journal(DummyBot())
+    assert {event["id"] for event in storage.load_stats_current()["events"]} == {"77", "88"}

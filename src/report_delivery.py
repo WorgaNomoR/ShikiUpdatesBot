@@ -38,13 +38,21 @@ from rich_report import (
     render_rich_report,
     report_has_rich_features,
 )
-from telegram_delivery import send_with_retry
+from telegram_delivery import (
+    RetryPolicy,
+    SendResult,
+    send_with_retry,
+)
 
 PARTIAL_REPORT_NOTICE = (
     "⚠️ Отчёт доставлен не полностью. Попробуй отправить его ещё раз позже."
 )
 FAILED_REPORT_NOTICE = (
     "⚠️ Не удалось доставить отчёт. Попробуй отправить его ещё раз позже."
+)
+UNCERTAIN_REPORT_NOTICE = (
+    "⚠️ Не удалось подтвердить доставку отчёта. Часть сообщений могла прийти; "
+    "повторная отправка может создать дубли."
 )
 _DELIVERY_GAP = 0.3
 _UNSUPPORTED_METHOD_DESCRIPTION = "Not Found"
@@ -60,6 +68,16 @@ class ReportDeliveryResult:
     error: Exception | None = None
     partial_notice_delivered: bool = False
     next_unit: int = 0
+    send_results: tuple[SendResult, ...] = ()
+
+    @property
+    def safe_to_fallback(self) -> bool:
+        """Предыдущая возможная доставка текущей unit запрещает смену формата."""
+        if self.send_results:
+            last = self.send_results[-1]
+            if last.delivered or last.uncertain:
+                return False
+        return is_rich_method_unsupported(self.error) or is_local_rich_asset_error(self.error)
 
 
 def is_rich_method_unsupported(exc: Exception) -> bool:
@@ -197,19 +215,25 @@ def freeze_report(
         ]
 
 
-async def _try_failure_notice(bot: Bot, chat_id: int, delivered_units: int) -> bool:
+async def _try_failure_notice(
+    bot: Bot, chat_id: int, delivered_units: int, *, uncertain: bool = False,
+) -> bool:
     """Best-effort сообщить caller о полной или частичной ошибке доставки."""
-    text = PARTIAL_REPORT_NOTICE if delivered_units else FAILED_REPORT_NOTICE
+    text = (
+        UNCERTAIN_REPORT_NOTICE if uncertain
+        else PARTIAL_REPORT_NOTICE if delivered_units else FAILED_REPORT_NOTICE
+    )
     try:
-        await send_with_retry(
+        result = await send_with_retry(
             lambda: bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
-            )
+            ),
+            policy=RetryPolicy.SAFE_ONLY,
         )
-        return True
+        return result.delivered
     except Exception:
         return False
 
@@ -257,16 +281,23 @@ async def deliver_frozen_report(
 
     delivered_units = 0
     next_unit = start_unit
+    send_results = []
     for index in range(start_unit, len(frozen)):
         transport_unit = frozen[index]
 
-        async def send_unit(index=index, transport_unit=transport_unit):
+        rich_message = None
+
+        async def prepare_unit(index=index, transport_unit=transport_unit):
+            nonlocal rich_message
             # Проверяем durable state заново и перед retry того же transport.
             if before_send is not None:
                 await before_send(index)
             if transport_unit["transport"] == "rich":
                 # Asset перечитывается и проверяется перед каждой попыткой.
                 rich_message = materialize_rich_message(transport_unit["content"])
+
+        async def send_unit(transport_unit=transport_unit):
+            if transport_unit["transport"] == "rich":
                 return await bot.send_rich_message(
                     chat_id=chat_id,
                     rich_message=rich_message,
@@ -279,7 +310,17 @@ async def deliver_frozen_report(
             )
 
         try:
-            await send_with_retry(send_unit)
+            sent = await send_with_retry(
+                send_unit,
+                policy=RetryPolicy.AT_LEAST_ONCE,
+                before_attempt=prepare_unit,
+            )
+            send_results.append(sent)
+            if not sent.delivered:
+                return ReportDeliveryResult(
+                    False, delivered_units, len(frozen), sent.error,
+                    next_unit=next_unit, send_results=tuple(send_results),
+                )
             delivered_units += 1
             if acknowledge is not None:
                 await acknowledge(index)
@@ -291,6 +332,7 @@ async def deliver_frozen_report(
                 len(frozen),
                 exc,
                 next_unit=next_unit,
+                send_results=tuple(send_results),
             )
         if index + 1 < len(frozen):
             await sleep(_DELIVERY_GAP)
@@ -299,6 +341,7 @@ async def deliver_frozen_report(
         delivered_units,
         len(frozen),
         next_unit=next_unit,
+        send_results=tuple(send_results),
     )
 
 
@@ -330,6 +373,7 @@ async def deliver_report(
 
     delivered_units = 0
     start_unit = 0
+    send_results = []
     while True:
         result = await deliver_frozen_report(
             bot,
@@ -339,17 +383,16 @@ async def deliver_report(
             start_unit=start_unit,
         )
         delivered_units += result.delivered_units
+        send_results.extend(result.send_results)
         if result.delivered:
             return ReportDeliveryResult(
                 True,
                 delivered_units,
                 len(frozen),
                 next_unit=result.next_unit,
+                send_results=tuple(send_results),
             )
-        if (
-            is_rich_method_unsupported(result.error)
-            or is_local_rich_asset_error(result.error)
-        ):
+        if result.safe_to_fallback:
             try:
                 frozen = downgrade_rich_units(frozen, result.next_unit)
                 start_unit = result.next_unit
@@ -360,11 +403,15 @@ async def deliver_report(
                     len(frozen),
                     exc,
                     next_unit=result.next_unit,
+                    send_results=result.send_results,
                 )
             else:
                 continue
         notice_delivered = (
-            await _try_failure_notice(bot, chat_id, delivered_units)
+            await _try_failure_notice(
+                bot, chat_id, delivered_units,
+                uncertain=any(sent.uncertain for sent in result.send_results[-1:]),
+            )
             if notify_partial
             else False
         )
@@ -375,6 +422,7 @@ async def deliver_report(
             result.error,
             notice_delivered,
             result.next_unit,
+            tuple(send_results),
         )
 
 
