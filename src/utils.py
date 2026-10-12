@@ -180,8 +180,10 @@ def current_quarter(dt: datetime | None = None) -> str:
     """'2026-Q2' для UTC-даты (по умолчанию — сейчас)."""
     if dt is None:
         dt = _utcnow()
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
     q = (dt.month - 1) // 3 + 1
-    return f"{dt.year}-Q{q}"
+    return f"{dt.year:04d}-Q{q}"
 
 
 def previous_quarter(period: str) -> str | None:
@@ -203,6 +205,8 @@ def quarter_start(dt: datetime | None = None) -> datetime:
     """Первый день текущего (или переданного) квартала, UTC."""
     if dt is None:
         dt = _utcnow()
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
     q = (dt.month - 1) // 3 + 1
     return datetime(dt.year, (q - 1) * 3 + 1, 1)
 

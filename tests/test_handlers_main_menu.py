@@ -27,6 +27,45 @@ from storage import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_owner_backup_menu_dispatches_selected_mode_once(backup_env, monkeypatch, full_export):
+    state = _state(screen="owner:backup", user_id=handlers.OWNER_ID)
+    action = "export" if full_export else "recovery"
+    callback = _callback(f"menu:owner:backup:{action}", user_id=handlers.OWNER_ID)
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr("handlers.send_backup", sent)
+
+    await handlers.main_menu_cb(callback, state)
+
+    assert state.state is None
+    sent.assert_awaited_once()
+    assert sent.await_args.kwargs == {"full_export": full_export}
+    assert sent.await_args.args[0] is callback.message.bot
+    await handlers.main_menu_cb(callback, state)
+    sent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["recovery", "export"])
+@pytest.mark.parametrize("invalid", ["non_owner", "group", "stale"])
+async def test_backup_menu_rejects_unbound_or_unprivileged_selection(backup_env, monkeypatch, action, invalid):
+    actor = 7 if invalid == "non_owner" else handlers.OWNER_ID
+    state = _state(screen="owner:backup", user_id=actor)
+    callback = _callback(f"menu:owner:backup:{action}", user_id=actor)
+    if invalid == "group":
+        callback.message.chat.type = ChatType.GROUP
+    elif invalid == "stale":
+        callback.message.message_id += 1
+    sent = AsyncMock()
+    monkeypatch.setattr("handlers.send_backup", sent)
+
+    await handlers.main_menu_cb(callback, state)
+
+    sent.assert_not_awaited()
+    assert state.state is not None
+
+
 class _State:
     def __init__(self, state=None, data=None):
         self.state = state

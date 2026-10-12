@@ -34,15 +34,33 @@ from aiogram.types import BufferedInputFile
 from config import (
     DATA_DIR,
     OWNER_ID,
+    SHIKI_USER,
     WEEKLY_BACKUP_INTERVAL,
     log,
 )
+from event_journal_schema import (
+    PROJECTION_KEY,
+    validate_projection,
+    validate_recovery_set,
+)
+from event_time_stats import validate_event_time
 from fact_bank import (
     FactBankDocument,
     FactBankValidationError,
     activate_restored_fact_bank,
     parse_fact_bank_bytes,
     serialize_fact_bank,
+)
+from notification_outbox import (
+    OutboxStateError,
+    parse_subscriber_payload,
+)
+from notification_progress_schema import (
+    PROGRESS_FILE_NAME,
+    compact_json,
+    parse_history_member,
+    parse_progress_member,
+    parse_recovery_journal,
 )
 from storage import (
     BlockedUsersStateError,
@@ -54,20 +72,26 @@ from storage import (
     _atomic_write,
     blocked_users_from_payload,
     ensure_backup_schedule,
+    json_publication_size,
     known_users_from_payload,
     load_blocked_users,
+    load_event_journal,
     load_subscriber_state,
     mark_restorable_state_restored,
     restorable_restore_generation,
     restorable_state_transaction,
     save_subscriber_state,
+    stats_current_json,
     subscriber_state_from_payload,
     user_alerts_from_payload,
     validate_pending_quarter_delivery,
     validate_quarter_period,
 )
 from storage import subscriber_state_json as storage_subscriber_state_json
-from telegram_delivery import send_with_retry
+from telegram_delivery import (
+    RetryPolicy,
+    send_with_retry,
+)
 from utils import _utcnow
 
 # ═══════════════════════════════════════════════════════════════════
@@ -101,13 +125,16 @@ _automatic_backup_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, a
 
 _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
     "blocked_users.json", "facts.json", "subscribers.json", "stats_current.json",
-    "update_state.json", "known_users.json", "user_alerts.json",
+    "update_state.json", "known_users.json", "user_alerts.json", "event_journal.json",
+    PROGRESS_FILE_NAME,
 })
 
 _STRICT_IMPORT_FILES: frozenset[str] = frozenset({
     "facts.json",
     "known_users.json",
     "user_alerts.json",
+    "event_journal.json",
+    PROGRESS_FILE_NAME,
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -115,6 +142,10 @@ _IMPORT_ALLOWED_DIR = "quarters"
 
 class BackupSnapshotInvalidated(RuntimeError):
     """Restorable-state был восстановлен во время подготовки или доставки."""
+
+
+class BackupLimitError(ValueError):
+    """Архив превышает фиксированный лимит; текст безопасен для владельца."""
 
 
 class _BackupWorkerCancelled(RuntimeError):
@@ -138,9 +169,10 @@ class _BackupMember:
     data: bytes
 
 
-def _backup_filename() -> str:
+def _backup_filename(*, full_export: bool = False) -> str:
     """Имя архива с меткой времени UTC — чтобы файлы не перезатирались в чате."""
-    return f"shikibot-backup-{_utcnow().strftime('%Y%m%d-%H%M%S')}.zip"
+    kind = "export" if full_export else "backup"
+    return f"shikibot-{kind}-{_utcnow().strftime('%Y%m%d-%H%M%S')}.zip"
 
 
 def _automatic_backup_lock() -> asyncio.Lock:
@@ -174,8 +206,8 @@ def _valid_past_timestamp(value: object, now: float) -> float | None:
 
 
 def _prepare_schedule(state: SubscriberState, now: float) -> bool:
-    """Мигрировать расписание и сбросить недостоверные будущие метки."""
-    changed = ensure_backup_schedule(state, now=now)
+    """Подготовить миграции подписок/расписания и исправить будущие метки."""
+    changed = ensure_backup_schedule(state, now=now) or state.notification_memberships is None
     schedule = state.backup_schedule
     last = _valid_past_timestamp(schedule.get("last_backup_at"), now)
     if schedule.get("last_backup_at") is not None and last is None:
@@ -189,7 +221,7 @@ def _prepare_schedule(state: SubscriberState, now: float) -> bool:
 
 
 def prepare_backup_schedule(state: SubscriberState, now: float) -> bool:
-    """Подготовить durable-расписание для внешнего automatic backup flow."""
+    """Подготовить subscriber-state к публикации для automatic backup flow."""
     return _prepare_schedule(state, now)
 
 
@@ -245,14 +277,33 @@ def _raise_if_backup_cancelled(cancelled: threading.Event) -> None:
         raise _BackupWorkerCancelled
 
 
+def _backup_history_version(raw: bytes) -> int | None:
+    """Только exact int выбирает формат; повреждённые данные сохраняем для диагностики."""
+    try:
+        history = json.loads(raw)
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    version = history.get("version") if isinstance(history, dict) else None
+    return version if type(version) is int else None
+
+
 def _scan_backup_manifest(
     cancelled: threading.Event,
+    full_export: bool = False,
 ) -> tuple[_BackupManifestMember, ...]:
-    """Зафиксировать сортированный состав DATA_DIR вне event loop."""
+    """Зафиксировать выбранный состав; диагностику отсеять до лимитов и чтения."""
     members: list[_BackupManifestMember] = []
+    exclude_preparation = False
+    if (DATA_DIR / PROGRESS_FILE_NAME).is_file():
+        try:
+            with (DATA_DIR / "event_journal.json").open("rb") as source:
+                version = _backup_history_version(source.read(_BACKUP_RESTORABLE_MEMBER_MAX_BYTES + 1))
+            exclude_preparation = version in {1, 2, 3}
+        except OSError:
+            pass
     for path in DATA_DIR.rglob("*"):
         _raise_if_backup_cancelled(cancelled)
-        if not path.is_file() or path.name.endswith(".tmp"):
+        if path.name.endswith(".tmp"):
             continue
         relative = path.relative_to(DATA_DIR)
         if any(
@@ -261,16 +312,23 @@ def _scan_backup_manifest(
         ):
             continue
         name = relative.as_posix()
+        restorable = _is_allowed_import_member(name)
+        if not full_export and not restorable:
+            continue
+        if not path.is_file():
+            continue
+        if name == PROGRESS_FILE_NAME and exclude_preparation:
+            continue
         members.append(
             _BackupManifestMember(
                 path=path,
                 name=name,
-                restorable=_is_allowed_import_member(name),
+                restorable=restorable,
             )
         )
         if len(members) > _BACKUP_ARCHIVE_MAX_MEMBERS:
-            raise ValueError(
-                f"в backup больше {_BACKUP_ARCHIVE_MAX_MEMBERS} файлов"
+            raise BackupLimitError(
+                f"в архиве больше {_BACKUP_ARCHIVE_MAX_MEMBERS} файлов"
             )
     return tuple(sorted(members, key=lambda member: member.name))
 
@@ -299,13 +357,13 @@ def _read_backup_members(
                     member.restorable
                     and size > _BACKUP_RESTORABLE_MEMBER_MAX_BYTES
                 ):
-                    raise ValueError(
+                    raise BackupLimitError(
                         "восстанавливаемый файл больше "
                         f"{_BACKUP_RESTORABLE_MEMBER_MAX_BYTES // (1024 * 1024)} МиБ"
                     )
                 if total > _BACKUP_TOTAL_MAX_BYTES:
-                    raise ValueError(
-                        "суммарный размер backup больше "
+                    raise BackupLimitError(
+                        "суммарный размер архива больше "
                         f"{_BACKUP_TOTAL_MAX_BYTES // (1024 * 1024)} МиБ"
                     )
                 buf.write(chunk)
@@ -328,14 +386,14 @@ def _compress_backup_zip(
                     _raise_if_backup_cancelled(cancelled)
                     target.write(view[offset:offset + _BACKUP_IO_CHUNK_BYTES])
                     if buf.tell() > _BACKUP_ZIP_MAX_BYTES:
-                        raise ValueError(
-                            "готовый backup ZIP больше "
+                        raise BackupLimitError(
+                            "готовый ZIP больше "
                             f"{_BACKUP_ZIP_MAX_BYTES // (1024 * 1024)} МиБ"
                         )
     data = buf.getvalue()
     if len(data) > _BACKUP_ZIP_MAX_BYTES:
-        raise ValueError(
-            "готовый backup ZIP больше "
+        raise BackupLimitError(
+            "готовый ZIP больше "
             f"{_BACKUP_ZIP_MAX_BYTES // (1024 * 1024)} МиБ"
         )
     return data
@@ -385,8 +443,47 @@ def _ensure_backup_generation(generation: int) -> None:
         raise BackupSnapshotInvalidated
 
 
-async def _build_backup_zip() -> tuple[bytes, int]:
-    """Получить coherent snapshot и сжать его без блокировки event loop."""
+def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple:
+    """Неактивированная migration preparation не входит в recovery-набор."""
+    _raise_if_backup_cancelled(cancelled)
+    raw = next((member.data for member in members if member.name == "event_journal.json"), None)
+    if raw is None:
+        if any(member.name == PROGRESS_FILE_NAME for member in members):
+            raise ValueError("Прогресс уведомлений требует журнал истории")
+        return members
+    version = _backup_history_version(raw)
+    if version in {1, 2, 3}:
+        return tuple(member for member in members if member.name != PROGRESS_FILE_NAME)
+    if version in {4, 5, 6}:
+        if not any(member.name == PROGRESS_FILE_NAME for member in members):
+            raise ValueError("Журнал требует сохранённый прогресс уведомлений")
+    captured = {member.name: member.data for member in members}
+    digest_progress = False
+    if version == 4:
+        try:
+            progress = json.loads(captured[PROGRESS_FILE_NAME])
+            box = progress.get("outbox") if isinstance(progress, dict) else None
+            digest_progress = isinstance(box, dict) and (box.get("version") == 4 or "plans" in box)
+        except (ValueError, UnicodeError, RecursionError):
+            pass
+    if version in {5, 6} or digest_progress:
+        # Compact base и frozen digest проходят тот же proof, что runtime/import.
+        if "stats_current.json" not in captured:
+            raise ValueError("Журнал требует соответствующий текущий квартал")
+        journal = parse_recovery_journal(raw, captured[PROGRESS_FILE_NAME], profile=SHIKI_USER)
+        try:
+            cur = json.loads(captured["stats_current.json"])
+        except (ValueError, UnicodeError, RecursionError):
+            raise ValueError("Текущий квартал повреждён") from None
+        if not isinstance(cur, dict):
+            raise ValueError("Текущий квартал повреждён")
+        validate_pending_quarter_delivery(cur)
+        validate_recovery_set(journal, cur)
+    return members
+
+
+async def _build_backup_zip(*, full_export: bool = False) -> tuple[bytes, int]:
+    """Снять согласованный набор восстановления либо полный экспорт."""
     cancelled = threading.Event()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shikibot-backup")
     try:
@@ -396,6 +493,7 @@ async def _build_backup_zip() -> tuple[bytes, int]:
                 executor,
                 cancelled,
                 _scan_backup_manifest,
+                full_export,
             )
             restorable_manifest = tuple(
                 member for member in manifest if member.restorable
@@ -406,6 +504,9 @@ async def _build_backup_zip() -> tuple[bytes, int]:
                 _read_backup_members,
                 restorable_manifest,
                 0,
+            )
+            restorable_members = await _run_backup_worker(
+                executor, cancelled, _active_history_members, restorable_members,
             )
 
         _ensure_backup_generation(generation)
@@ -439,23 +540,34 @@ async def _build_backup_zip() -> tuple[bytes, int]:
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-async def send_backup(bot: Bot, caption: str) -> bool:
-    """Собрать архив DATA_DIR и отправить владельцу. caption уже содержит
-    #backup. Любой сбой глушим и логируем: бэкап — фоновая страховка, он не
-    должен ронять вызывающий флоу (подписку, ротацию, цикл)."""
+async def send_backup(bot: Bot, caption: str, *, full_export: bool = False) -> bool:
+    """Отправить recovery-копию; полный экспорт выбирается только вручную.
+
+    Автоматическим вызовам возвращаем False при сбое. Для полного экспорта
+    BackupLimitError передаёт безопасную причину отказа в ручной интерфейс.
+    """
     global _last_backup_sent_at
     try:
-        data, generation = await _build_backup_zip()
+        data, generation = (
+            await _build_backup_zip(full_export=True) if full_export else await _build_backup_zip()
+        )
+    except BackupLimitError as e:
+        log.warning("send_backup: превышен лимит архива: %s", e)
+        if full_export:
+            raise
+        return False
     except BackupSnapshotInvalidated:
         log.warning("send_backup: snapshot устарел после восстановления состояния.")
         return False
     except Exception as e:
         log.error("send_backup: не удалось собрать архив: %s", e)
         return False
-    filename = _backup_filename()
+    filename = _backup_filename(full_export=full_export)
+
+    async def _before_attempt():
+        _ensure_backup_generation(generation)
 
     async def _send_document():
-        _ensure_backup_generation(generation)
         return await bot.send_document(
             OWNER_ID,
             document=BufferedInputFile(data, filename=filename),
@@ -464,10 +576,23 @@ async def send_backup(bot: Bot, caption: str) -> bool:
         )
 
     try:
-        await send_with_retry(_send_document)
+        sent = await send_with_retry(
+            _send_document,
+            policy=RetryPolicy.AT_LEAST_ONCE,
+            before_attempt=_before_attempt,
+        )
+        if not sent.delivered:
+            log.warning(
+                "send_backup: отправка не подтверждена (outcome=%s, attempts=%d, type=%s).",
+                sent.outcome.value, len(sent.attempts), type(sent.error).__name__,
+            )
+            return False
         _ensure_backup_generation(generation)
+        if sent.duplicate_possible:
+            log.warning("send_backup: доставка подтверждена; возможен дубль предыдущей попытки.")
         log.info("send_backup: архив отправлен владельцу (%d байт).", len(data))
-        _last_backup_sent_at = time.monotonic()
+        if not full_export:
+            _last_backup_sent_at = time.monotonic()
         return True
     except BackupSnapshotInvalidated:
         log.warning("send_backup: restore отменил подтверждение старого snapshot.")
@@ -504,7 +629,8 @@ async def _shutdown_backup(bot: Bot) -> None:
 def _is_allowed_import_member(name: str) -> bool:
     """Разрешено ли имя из архива к восстановлению?
     Бел.список: blocked_users.json, facts.json, known_users.json,
-    subscribers.json, stats_current.json, update_state.json, user_alerts.json
+    subscribers.json, stats_current.json, event_journal.json, notification_progress.json,
+    update_state.json, user_alerts.json
     и кварталы.
     Глушим zip-slip: '..'-сегменты, абсолютные пути и бэкслеши отвергаем."""
     if not name or name.endswith("/"):
@@ -537,6 +663,8 @@ def _valid_import_payload(name: str, obj) -> bool:
             subscriber_state_from_payload(obj, strict_schedule=True)
         except SubscriptionBackupStateError:
             raise
+        except OutboxStateError:
+            raise
         except ValueError:
             return False
         return True
@@ -558,6 +686,10 @@ def _valid_import_payload(name: str, obj) -> bool:
                 validate_quarter_period(obj["period"])
             # Повреждённый pending отменяет весь импорт до публикации файлов.
             validate_pending_quarter_delivery(obj)
+            if PROJECTION_KEY in obj:
+                validate_projection(obj[PROJECTION_KEY])
+            validate_event_time(obj)
+            stats_current_json(obj)
             if obj.get("pending_quarter_delivery") is not None and not isinstance(obj.get("events"), list):
                 raise QuarterDeliveryStateError("current_structure")
         return (isinstance(obj, dict) and "period" in obj
@@ -589,6 +721,39 @@ def _subscriber_state_from_import_payload(payload: str) -> SubscriberState:
         json.loads(payload),
         strict_schedule=True,
     )
+
+
+def _prepare_history_restore_candidate(pending: dict[str, str]) -> dict[str, str]:
+    """Полный recovery-набор либо явная граница старого квартального архива."""
+    if "event_journal.json" in pending:
+        if "stats_current.json" not in pending:
+            raise ValueError("Журнал требует соответствующий текущий квартал в архиве")
+        progress = pending.get(PROGRESS_FILE_NAME)
+        journal = parse_recovery_journal(
+            pending["event_journal.json"].encode("utf-8"),
+            progress.encode("utf-8") if progress is not None else None,
+            profile=SHIKI_USER,
+        )
+        cur = json.loads(pending["stats_current.json"])
+        validate_recovery_set(journal, cur)
+    elif PROGRESS_FILE_NAME in pending:
+        raise ValueError("Прогресс уведомлений требует журнал истории и текущий квартал")
+    elif "stats_current.json" in pending:
+        cur = json.loads(pending["stats_current.json"])
+        if PROJECTION_KEY in cur:
+            raise ValueError("Архив с привязанным кварталом требует журнал истории")
+        journal = load_event_journal()
+        if journal is not None:
+            cur[PROJECTION_KEY] = {
+                "journal_id": journal["journal_id"],
+                "baseline_seq": journal["processed_seq"],
+                "applied_seq": journal["processed_seq"],
+            }
+            validate_recovery_set(journal, cur)
+    if "stats_current.json" in pending:
+        # После legacy-binding повторно резервируем последующие штатные записи.
+        pending = {**pending, "stats_current.json": stats_current_json(cur)}
+    return pending
 
 
 def _prepare_access_restore_candidate(pending: dict[str, str]) -> dict[str, str]:
@@ -654,7 +819,7 @@ def _publish_staged_file(source: Path, target: Path) -> None:
     source.replace(target)
 
 
-def _publish_restore_files(pending: dict[str, str]) -> list[str]:
+def _publish_restore_files(pending: dict[str, str], *, remove: tuple[str, ...] = ()) -> list[str]:
     """Применить набор файлов с откатом при ошибке текущего процесса.
 
     Новые данные и снимки заменяемых файлов сначала записываются рядом с
@@ -674,9 +839,11 @@ def _publish_restore_files(pending: dict[str, str]) -> list[str]:
             old_root = stage / "old"
             existed: dict[str, bool] = {}
 
-            for name, payload in pending.items():
+            changes = {**pending, **{name: None for name in remove}}
+            for name, payload in changes.items():
                 target = DATA_DIR / name
-                _atomic_write(new_root / name, payload)
+                if payload is not None:
+                    _atomic_write(new_root / name, payload)
                 existed[name] = target.is_file()
                 if existed[name]:
                     original = old_root / name
@@ -685,8 +852,11 @@ def _publish_restore_files(pending: dict[str, str]) -> list[str]:
 
             published: list[str] = []
             try:
-                for name in pending:
-                    _publish_staged_file(new_root / name, DATA_DIR / name)
+                for name, payload in changes.items():
+                    if payload is None:
+                        (DATA_DIR / name).unlink(missing_ok=True)
+                    else:
+                        _publish_staged_file(new_root / name, DATA_DIR / name)
                     published.append(name)
             except Exception as publish_error:
                 rollback_errors: list[Exception] = []
@@ -712,7 +882,7 @@ def _publish_restore_files(pending: dict[str, str]) -> list[str]:
                 raise ValueError(
                     "не удалось применить архив; исходное состояние восстановлено"
                 ) from publish_error
-            return published
+            return list(pending)
     except ValueError:
         raise
     except Exception as e:
@@ -793,12 +963,29 @@ async def restore_backup_zip(raw: bytes) -> dict:
                     ) from e
                 pending[name] = serialize_fact_bank(restored_fact_document)
                 continue
+            if name in {"event_journal.json", PROGRESS_FILE_NAME}:
+                try:
+                    document = (
+                        parse_history_member(zf.read(info), profile=SHIKI_USER)
+                        if name == "event_journal.json"
+                        else parse_progress_member(zf.read(info))
+                    )
+                except (
+                    ValueError, OSError, RuntimeError, zipfile.BadZipFile,
+                    NotImplementedError, EOFError, zlib.error, lzma.LZMAError,
+                ):
+                    raise ValueError(f"Файл {name} в архиве повреждён; восстановление отменено") from None
+                pending[name] = compact_json(document)
+                continue
             try:
                 payload = zf.read(info).decode("utf-8")
                 obj = json.loads(payload)   # синтаксически валидный JSON?
+                if name == "subscribers.json":
+                    obj = parse_subscriber_payload(payload.encode("utf-8"), _IMPORT_MEMBER_MAX_BYTES)
             except (
                 UnicodeDecodeError,
                 json.JSONDecodeError,
+                RecursionError,
                 zipfile.BadZipFile,
                 RuntimeError,
                 NotImplementedError,
@@ -839,8 +1026,17 @@ async def restore_backup_zip(raw: bytes) -> dict:
         )
 
     async with restorable_state_transaction():
+        pending = _prepare_history_restore_candidate(pending)
         pending = _prepare_access_restore_candidate(pending)
-        restored = _publish_restore_files(pending)
+        sizes = [json_publication_size(payload) for payload in pending.values()]
+        if any(size > _IMPORT_MEMBER_MAX_BYTES for size in sizes) or sum(sizes) > _IMPORT_TOTAL_MAX_BYTES:
+            raise ValueError("Подготовленный recovery-набор превышает предел размера")
+        remove = (
+            (PROGRESS_FILE_NAME,)
+            if "event_journal.json" in pending and PROGRESS_FILE_NAME not in pending
+            else ()
+        )
+        restored = _publish_restore_files(pending, remove=remove)
         mark_restorable_state_restored()
         if restored_fact_document is not None:
             activate_restored_fact_bank(restored_fact_document)

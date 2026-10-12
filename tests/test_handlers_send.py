@@ -7,6 +7,11 @@ import zipfile
 
 import aiohttp
 import pytest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+)
+from aiogram.methods import SendMessage
 
 import backup
 import handlers
@@ -116,7 +121,7 @@ async def test_blocked_user_removed(monkeypatch):
         async def send_message(self, chat_id, text, parse_mode=None):
             self.calls.append(chat_id)
             if chat_id == 111:
-                raise Exception("bot was blocked")
+                raise TelegramForbiddenError(method=SendMessage(chat_id=chat_id, text=text), message="bot was blocked")
             return
 
     bot = BotWithBlockedUser()
@@ -152,7 +157,7 @@ async def test_chat_not_found_removed(monkeypatch):
     class BotChatNotFound:
         async def send_message(self, chat_id, text, parse_mode=None):
             if chat_id == 111:
-                raise Exception("chat not found")
+                raise TelegramBadRequest(method=SendMessage(chat_id=chat_id, text=text), message="chat not found")
 
     await send_to_all_chats(
         BotChatNotFound(),
@@ -240,7 +245,7 @@ async def test_stale_broadcast_removal_preserves_imported_subscribers(
         async def send_message(self, chat_id, text, parse_mode=None):
             started.set()
             await resume.wait()
-            raise Exception("bot was blocked")
+            raise TelegramForbiddenError(method=SendMessage(chat_id=chat_id, text=text), message="bot was blocked")
 
     writer = asyncio.create_task(send_to_all_chats(PausedBlockedBot(), "hello"))
     await started.wait()
@@ -256,23 +261,3 @@ async def test_stale_broadcast_removal_preserves_imported_subscribers(
     await writer
 
     assert storage.load_subscribers() == {222: "Imported"}
-
-
-# ── _is_blocked_error: единый детектор «получатель недоступен» ──────
-
-@pytest.mark.parametrize("msg", [
-    "Forbidden: bot was blocked by the user",
-    "Forbidden: user is deactivated",
-    "Bad Request: chat not found",
-])
-def test_is_blocked_error_true(msg):
-    assert handlers._is_blocked_error(Exception(msg)) is True
-
-
-@pytest.mark.parametrize("msg", [
-    "Too Many Requests: retry after 5",
-    "Internal Server Error",
-    "",
-])
-def test_is_blocked_error_false(msg):
-    assert handlers._is_blocked_error(Exception(msg)) is False

@@ -78,7 +78,7 @@ def test_ruff_autofix_actions_match_approved_shas():
         ),
         (
             "Apply Ruff fixes",
-            "astral-sh/ruff-action@4919ec5cf1f49eff0871dbcea0da843445b837e6",
+            "astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89",
         ),
     ]
 

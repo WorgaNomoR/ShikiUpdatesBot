@@ -16,10 +16,14 @@ import io
 import math
 import re
 import time
+import weakref
+from copy import deepcopy
+from datetime import timezone
 from urllib.parse import (
     quote,
     urlsplit,
 )
+from uuid import uuid4
 
 import aiohttp
 from aiogram import Bot
@@ -57,12 +61,17 @@ from access_control import (
 from backup import (
     BACKUP_TAG,
     IMPORT_DOCUMENT_MAX_BYTES,
+    BackupLimitError,
     _backup_after_subscription,
     _weekly_backup_if_due,
     automatic_backup_delivery,
     prepare_backup_schedule,
     restore_backup_zip,
     send_backup,
+)
+from catchup_digest import (
+    render_digest,
+    render_ordinary_entries,
 )
 from config import (
     CHECK_INTERVAL,
@@ -73,6 +82,24 @@ from config import (
     SHIKI_BASE_URL,
     SHIKI_USER,
     log,
+)
+from event_journal_schema import (
+    JOURNAL_WARN_BYTES,
+    PROJECTION_KEY,
+    EventJournalStateError,
+    journal_json,
+    validate_recovery_set,
+)
+from event_time_stats import (
+    EVENT_TIME_KEY,
+    acknowledge_revisions,
+    compact_source_history,
+    ensure_event_time,
+    index_event_periods,
+    next_period,
+    project_event,
+    report_revisions,
+    rotate_event_time,
 )
 from fact_bank import (
     FACT_BANK_MAX_BYTES,
@@ -98,6 +125,11 @@ from healthcheck import (
     heartbeat,
     polling_started,
     polling_stopped,
+)
+from history_catchup import (
+    advance_acquisition,
+    new_acquisition,
+    resume_acquisition,
 )
 from inline_cards import (
     CARD_KIND_LABELS,
@@ -137,21 +169,28 @@ from lists import (
 from messages import (
     BROADCAST_HEADER,
     build_favourite_message,
+    build_history_digest_heading,
     build_message,
     build_startup_snapshot,
     build_status_report,
-    classify_event,
-    clean_description,
-    extract_score,
-    extract_score_change,
+    history_entry_from_event,
+    normalize_history_event,
+)
+from notification_delivery import dispatch_notifications
+from notification_outbox import (
+    enqueue,
+    event_plan,
+    migrate_outbox,
+    notification_entries,
+    notification_event,
+    prepare_digest,
+    progress_reserve,
 )
 from report_delivery import (
     deliver_frozen_report,
     deliver_rendered_report,
     deliver_report,
     freeze_report,
-    is_local_rich_asset_error,
-    is_rich_method_unsupported,
 )
 from report_model import (
     Report,
@@ -173,8 +212,15 @@ from shiki_api import (
     fetch_current_rates,
     fetch_favourites,
     fetch_history,
-    get_media_info,
-    is_relevant,
+)
+from source_history import (
+    event_at_seq,
+    event_count,
+    known_history_ids,
+    prefix_seq,
+    rebase_source_candidate,
+    same_history_authority,
+    semantic_hash,
 )
 from stats import (
     PICK_CATEGORY_ANIME,
@@ -188,7 +234,7 @@ from stats import (
     build_pick_catalog,
     build_quarterly_report_messages,
     build_stats_all_messages,
-    record_current_event,
+    refresh_event_time_by_quarter,
     select_contrast_pick_candidate,
     select_pick_candidate,
     sync_stats_all,
@@ -203,8 +249,12 @@ from storage import (
     UserAlertsStateError,
     _empty_stats_current,
     add_blocked_user,
+    compact_event_journal,
     downgrade_quarter_delivery,
     list_blocked_users,
+    load_blocked_users,
+    load_event_journal,
+    load_legacy_seen_ids,
     load_seen_favourites,
     load_seen_ids,
     load_stats_all,
@@ -217,9 +267,11 @@ from storage import (
     migrate_quarter_delivery,
     mutate_subscription,
     new_quarter_delivery_plan,
+    notification_memberships,
     remove_blocked_user,
     restorable_restore_generation,
     restorable_state_transaction,
+    save_event_journal,
     save_seen_favourites,
     save_seen_ids,
     save_stats_all,
@@ -231,8 +283,11 @@ from storage import (
     validate_pending_quarter_delivery,
     validate_telegram_user_id,
 )
+from telegram_delivery import (
+    RetryPolicy,
+    send_with_retry,
+)
 from telegram_delivery import is_blocked_error as _is_blocked_error
-from telegram_delivery import send_with_retry
 from updates import (
     build_version_keyboard,
     build_version_text,
@@ -243,6 +298,7 @@ from utils import (
     _parse_iso_utc,
     _rel_url,
     _subscriber_link,
+    _utcnow,
     current_quarter,
     h,
     previous_quarter,
@@ -496,7 +552,7 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         generation = restorable_restore_generation()
         migrated = migrate_quarter_delivery(pending)
         units_key = (
-            "report_units" if migrated.get("version") == 2 else "report_messages"
+            "report_units" if migrated.get("version") in {2, 3} else "report_messages"
         )
         total_units = len(migrated[units_key])
         complete = migrated["next_unit"] == total_units
@@ -504,8 +560,10 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
             cur[_PENDING_QUARTER_DELIVERY] = migrated
             if complete:
                 cur["last_report_sent"] = migrated["new_period"]
+                acknowledge_revisions(cur)
             save_stats_current(cur, strict=True)
         pending = migrated
+    inherited_uncertain = pending.get("delivery_uncertain", False)
 
     def read_expected(index: int) -> dict:
         # Caller держит lock; перечитываем и сохраняем чужие независимые поля.
@@ -517,20 +575,34 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         return current
 
     async def before_send(index: int) -> None:
-        async with restorable_state_transaction():
-            read_expected(index)
-
-    async def acknowledge(index: int) -> None:
+        nonlocal pending
         async with restorable_state_transaction():
             current = read_expected(index)
-            current[_PENDING_QUARTER_DELIVERY] = dict(pending, next_unit=index + 1)
+            if not pending.get("delivery_uncertain"):
+                started = dict(pending, next_unit=index, delivery_uncertain=True)
+                current[_PENDING_QUARTER_DELIVERY] = started
+                save_stats_current(current, strict=True)
+                pending = started
+
+    async def acknowledge(index: int) -> None:
+        nonlocal pending, inherited_uncertain
+        async with restorable_state_transaction():
+            current = read_expected(index)
+            confirmed = dict(pending, next_unit=index + 1)
+            confirmed.pop("delivery_uncertain", None)
+            current[_PENDING_QUARTER_DELIVERY] = confirmed
             if index + 1 == total_units:
                 current["last_report_sent"] = pending["new_period"]
+                acknowledge_revisions(current)
             save_stats_current(current, strict=True)
+            pending = confirmed
+            if inherited_uncertain:
+                log.warning("rotate_quarter: доставка подтверждена; возможен дубль прежней попытки.")
+            inherited_uncertain = False
 
     delivery = (
         deliver_frozen_report
-        if pending.get("version") == 2
+        if pending.get("version") in {2, 3}
         else deliver_rendered_report
     )
     result = await delivery(
@@ -542,12 +614,24 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         acknowledge=acknowledge,
         sleep=asyncio.sleep,
     )
+    if any(sent.duplicate_possible for sent in result.send_results):
+        log.warning("rotate_quarter: повторы могли доставить один frozen-фрагмент несколько раз.")
     if not result.delivered:
-        safe_rich_fallback = (
-            is_rich_method_unsupported(result.error)
-            or is_local_rich_asset_error(result.error)
+        uncertain = inherited_uncertain or any(
+            sent.uncertain or sent.delivered for sent in result.send_results[-1:]
         )
-        if pending.get("version") == 2 and safe_rich_fallback:
+        # Убираем только собственный marker доказанно неуспешной попытки.
+        # Унаследованный после restart/crash marker не опровергается новым отказом.
+        if not uncertain and pending.get("delivery_uncertain"):
+            async with restorable_state_transaction():
+                current = read_expected(result.next_unit)
+                rejected = dict(pending, next_unit=result.next_unit)
+                rejected.pop("delivery_uncertain", None)
+                current[_PENDING_QUARTER_DELIVERY] = rejected
+                save_stats_current(current, strict=True)
+                pending = rejected
+        safe_rich_fallback = not uncertain and result.safe_to_fallback
+        if pending.get("version") in {2, 3} and safe_rich_fallback:
             log.warning(
                 "rotate_quarter: rich transport заменён frozen HTML (%s)",
                 type(result.error).__name__,
@@ -558,6 +642,8 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
                     pending,
                     result.next_unit,
                 )
+                if EVENT_TIME_KEY in current and current[EVENT_TIME_KEY]["report_ack"] is not None:
+                    current[EVENT_TIME_KEY]["report_ack"]["plan_id"] = current[_PENDING_QUARTER_DELIVERY]["plan_id"]
                 save_stats_current(current, strict=True)
             return await _resume_pending_quarter(bot)
         # Исключения Telegram могут содержать весь запрос: логируем только тип.
@@ -596,6 +682,8 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
         subscriber_state.backup_schedule["last_backup_at"] = completed_at
         save_subscriber_state(subscriber_state)
         cur[_PENDING_QUARTER_DELIVERY] = None
+        if EVENT_TIME_KEY in cur:
+            cur[EVENT_TIME_KEY]["report_ack"] = None
         save_stats_current(cur, strict=True)
     return cur
 
@@ -603,7 +691,13 @@ async def _resume_pending_quarter(bot: Bot) -> dict:
 async def rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync: bool = True) -> dict:
     """Не сбрасывать недоступное состояние и сообщить владельцу о проблеме."""
     try:
+        await _drain_history_journal(bot)
         return await _rotate_quarter_if_needed(bot, cur, stats_all, resync)
+    except _HistoryAttemptChanged:
+        return await _load_stats_current_transactional()
+    except EventJournalStateError:
+        await _journal_diagnostic(bot)
+        return cur
     except QuarterDeliveryStateError as error:
         await _quarter_state_diagnostic(bot, error)
         return cur
@@ -626,7 +720,11 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
     now_period = current_quarter()
     async with restorable_state_transaction():
         cur = load_stats_current(strict=True)
-        rotation_needed = cur.get("period") != now_period
+        rotation_needed = cur.get("period") < now_period
+        if PROJECTION_KEY in cur:
+            journal, cur = _history_state()
+            if journal.get("catchup") is not None and cur.get(_PENDING_QUARTER_DELIVERY) is None:
+                return cur
 
     if cur.get(_PENDING_QUARTER_DELIVERY) is not None or not rotation_needed:
         return await _deliver_pending_quarter(bot, cur)
@@ -647,14 +745,21 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
     for attempt in range(1, _QUARTER_ROTATION_ATTEMPTS + 1):
         async with restorable_state_transaction():
             cur = load_stats_current(strict=True)
-            if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") == now_period:
+            if PROJECTION_KEY in cur:
+                journal, cur = _history_state()
+                if journal.get("catchup") is not None or journal["processed_seq"] < event_count(journal):
+                    return cur
+            expected_generation = restorable_restore_generation()
+            if cur.get(_PENDING_QUARTER_DELIVERY) is not None or cur.get("period") >= now_period:
                 return cur
 
             old_period = cur.get("period", "???")
-            if cur.get("last_report_sent") == now_period:
+            if EVENT_TIME_KEY not in cur and cur.get("last_report_sent") == now_period:
                 # Отчёт уже отправлен (перезапуск в день ротации) — просто сбрасываем
                 log.info("rotate_quarter: отчёт за переход в %s уже был отправлен.", now_period)
                 fresh = _empty_stats_current(now_period)
+                if PROJECTION_KEY in cur:
+                    fresh[PROJECTION_KEY] = deepcopy(cur[PROJECTION_KEY])
                 fresh["last_report_sent"] = now_period
                 save_stats_current(fresh, strict=True)
                 return fresh
@@ -690,6 +795,12 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
 
         async with restorable_state_transaction():
             cur = load_stats_current(strict=True)
+            if restorable_restore_generation() != expected_generation:
+                return cur
+            if PROJECTION_KEY in cur:
+                journal, cur = _history_state()
+                if journal.get("catchup") is not None or journal["processed_seq"] < event_count(journal):
+                    return cur
             if cur != expected_cur:
                 # Новое квартальное событие могло успеть опубликоваться, пока
                 # renderer работал без lock. Перестраиваем модель без потери.
@@ -711,12 +822,19 @@ async def _rotate_quarter_if_needed(bot: Bot, cur: dict, stats_all: dict, resync
             except Exception as e:
                 log.error("rotate_quarter: обновление by_quarter: %s", e)
 
-            fresh = _empty_stats_current(now_period)
+            # Один отчёт за цикл оставляет время избранному и независимым backup.
+            new_period = next_period(old_period) if EVENT_TIME_KEY in cur else now_period
+            fresh = _empty_stats_current(new_period)
+            if PROJECTION_KEY in cur:
+                fresh[PROJECTION_KEY] = deepcopy(cur[PROJECTION_KEY])
             fresh[_PENDING_QUARTER_DELIVERY] = new_quarter_delivery_plan(
                 old_period,
-                now_period,
+                new_period,
                 report_units,
+                event_time_revisions=report_revisions(cur) if EVENT_TIME_KEY in cur else None,
             )
+            if EVENT_TIME_KEY in cur:
+                rotate_event_time(cur, fresh, fresh[_PENDING_QUARTER_DELIVERY])
             save_stats_current(fresh, strict=True)
         break
 
@@ -2047,11 +2165,13 @@ async def check_and_notify_favourites(
     return seen, found_new
 
 
-async def _unsubscribe_blocked(to_remove: list[int]) -> None:
+async def _unsubscribe_blocked(to_remove: list[int], *, generation: int | None = None) -> None:
     """Удаляет заблокировавших из subs и сохраняет актуальный список."""
     if not to_remove:
         return
     async with restorable_state_transaction():
+        if generation is not None and restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
         subs = load_subscribers()
         removed = 0
         for cid in to_remove:
@@ -2062,7 +2182,7 @@ async def _unsubscribe_blocked(to_remove: list[int]) -> None:
     log.info("Отписано %d пользователей, заблокировавших бота.", removed)
 
 
-async def send_to_all_chats(bot: Bot, text: str) -> None:
+async def send_to_all_chats(bot: Bot, text: str, *, before_send=None, generation: int | None = None) -> None:
     """
     Отправляем одно сообщение всем подписчикам.
     Список берём из файла каждый раз — чтобы подхватывать новых подписчиков
@@ -2080,186 +2200,457 @@ async def send_to_all_chats(bot: Bot, text: str) -> None:
 
     for chat_id, name in subs.items():
         try:
-            await send_with_retry(
-                lambda: bot.send_message(
+            async def send():
+                return await bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     parse_mode=ParseMode.HTML,
                 )
+            sent = await send_with_retry(
+                send,
+                policy=RetryPolicy.AT_LEAST_ONCE,
+                before_attempt=before_send,
             )
+            if not sent.delivered:
+                raise sent.error
+            if sent.duplicate_possible:
+                log.warning("  → Доставка подтверждена; возможен дубль предыдущей попытки.")
             log.info("  → Отправлено подписчику %s (chat_id=%d)", name, chat_id)
+        except (_HistoryAttemptChanged, EventJournalStateError, QuarterDeliveryStateError):
+            raise
         except Exception as e:
             if _is_blocked_error(e):
                 log.warning("  ✗ %s (chat_id=%d) заблокировал бота — отписываем.", name, chat_id)
                 to_remove.append(chat_id)
             else:
-                log.error("  ✗ Не удалось отправить %s (chat_id=%d): %s", name, chat_id, e)
+                log.error(
+                    "  ✗ Отправка %s (chat_id=%d) не подтверждена: outcome=%s, attempts=%d, type=%s",
+                    name, chat_id, sent.outcome.value, len(sent.attempts), type(e).__name__,
+                )
         # Небольшая пауза между отправками — не триггерим flood control
         await asyncio.sleep(0.3)
 
-    await _unsubscribe_blocked(to_remove)
+    await _unsubscribe_blocked(to_remove, generation=generation)
 
 
-async def _fetch_history_catchup(
-    session: aiohttp.ClientSession,
-    seen_ids: set[int],
-) -> list[dict] | None:
-    """Собирает пропущенную историю до известного ID или конца выдачи."""
-    entries_by_id: dict[int, dict] = {}
+class _HistoryAttemptChanged(RuntimeError):
+    """Restore или другая попытка отменили текущий lease истории."""
 
-    for page in range(1, _HISTORY_CATCHUP_MAX_PAGES + 1):
-        page_entries = await fetch_history(session, page=page)
-        if page_entries is None:
-            log.warning(
-                "История: страница %d не загрузилась, catch-up отменён без обновления seen_ids.",
-                page,
+
+_last_journal_notice_at: float | None = None
+_last_journal_capacity_notice_at: float | None = None
+_history_processing_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_JOURNAL_STATE_NOTICE = (
+    "⚠️ Сохранённая история временно недоступна. Новые события не обрабатываются. "
+    "Данные сохранены; восстановление доступно через /backup."
+)
+_JOURNAL_CAPACITY_NOTICE = (
+    "⚠️ Сохранённая история и очередь уведомлений приближаются к пределу 8 МиБ. Сделай резервную копию "
+    "через /backup. При заполнении новые события будут отложены; данные для статистики и доставки сохраняются."
+)
+_NOTIFICATION_STATE_NOTICE = (
+    "⚠️ Отправка сохранённых уведомлений временно приостановлена. "
+    "Данные сохранены; восстановление доступно через /backup."
+)
+
+
+async def _journal_diagnostic(bot: Bot, *, capacity: bool = False, delivery: bool = False) -> None:
+    """Статическая owner-only диагностика без содержимого журнала."""
+    global _last_journal_notice_at, _last_journal_capacity_notice_at
+    now = time.monotonic()
+    previous = _last_journal_capacity_notice_at if capacity else _last_journal_notice_at
+    if previous is not None and now - previous < ERROR_NOTIFY_INTERVAL:
+        return
+    if capacity:
+        _last_journal_capacity_notice_at = now
+    else:
+        _last_journal_notice_at = now
+    try:
+        await bot.send_message(
+            chat_id=OWNER_ID,
+            text=_JOURNAL_CAPACITY_NOTICE if capacity else _NOTIFICATION_STATE_NOTICE if delivery else _JOURNAL_STATE_NOTICE,
+        )
+    except Exception:
+        log.warning("История: диагностика владельцу не доставлена.")
+
+
+def _journal_seen(journal: dict) -> set[int]:
+    return known_history_ids(journal)
+
+
+def _history_state(*, full_recovery: bool = True) -> tuple[dict | None, dict]:
+    """Вызывается под lock; отсутствие привязанного файла не есть первый запуск."""
+    journal = load_event_journal()
+    cur = load_stats_current(strict=True, initialize_missing=journal is None)
+    if journal is None:
+        if PROJECTION_KEY in cur:
+            raise EventJournalStateError("bound_journal_missing")
+    elif PROJECTION_KEY in cur:
+        validate_recovery_set(journal, cur, full_recovery=full_recovery)
+    elif journal["events"] or journal["processed_seq"] or journal.get("catchup") is not None:
+        raise EventJournalStateError("projection_missing")
+    return journal, cur
+
+
+async def _initialize_history_journal(ids: set[int], generation: int) -> tuple[dict, dict]:
+    """Журнал публикуется первым; оборванная пустая привязка безопасно повторяется."""
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        journal, cur = _history_state()
+        if journal is None:
+            journal = {
+                "version": 2, "catchup": None, "journal_id": uuid4().hex, "profile": SHIKI_USER,
+                "normalization_version": 1, "baseline_initialized": True,
+                "baseline_ids": sorted(ids), "events": [], "processed_seq": 0,
+            }
+            save_event_journal(journal, admitting=True)
+        elif not journal["baseline_initialized"]:
+            journal = deepcopy(journal)
+            journal["baseline_initialized"] = True
+            journal["baseline_ids"] = sorted(ids)
+            save_event_journal(journal, admitting=True)
+        if PROJECTION_KEY not in cur:
+            cur = deepcopy(cur)
+            cur[PROJECTION_KEY] = {
+                "journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0,
+            }
+            ensure_event_time(cur)
+            save_stats_current(cur, strict=True)
+        return journal, cur
+
+
+async def _drain_history_journal(bot: Bot, *, expected_generation: int | None = None) -> tuple[dict | None, dict]:
+    """Последовательно завершить локально принятые события без обращения к API."""
+    loop = asyncio.get_running_loop()
+    lock = _history_processing_locks.setdefault(loop, asyncio.Lock())
+    async with lock:
+        return await _consume_history_journal(bot, expected_generation=expected_generation)
+
+
+async def _consume_history_journal(bot: Bot, *, expected_generation: int | None = None) -> tuple[dict | None, dict]:
+    """Один потребитель удерживает очередь, но не state lock во время отправки."""
+    async with restorable_state_transaction():
+        if expected_generation is not None and restorable_restore_generation() != expected_generation:
+            raise _HistoryAttemptChanged
+        journal, cur = _history_state()
+        generation = restorable_restore_generation()
+        if journal is not None and PROJECTION_KEY in cur and ensure_event_time(cur):
+            save_stats_current(cur, strict=True)
+        if journal is not None and PROJECTION_KEY in cur and journal["version"] != 3:
+            journal = migrate_outbox(journal, cur[PROJECTION_KEY]["applied_seq"])
+            save_event_journal(journal)
+        if journal is not None:
+            journal = compact_event_journal(journal, expected_generation=generation, cur=cur)
+        period_events = index_event_periods(cur, journal) if journal is not None and PROJECTION_KEY in cur else {}
+    preparation_attempted = False
+    while journal is not None and journal["processed_seq"] < event_count(journal):
+        seq = journal["processed_seq"] + 1
+        event = event_at_seq(journal, seq)
+        if (
+            not preparation_attempted and event_plan(journal, seq) is None
+            and journal["outbox"]["legacy_uncertain_seq"] != seq
+        ):
+            preparation_attempted = True
+            journal, cur = await _prepare_history_digest(journal, generation)
+        entry = history_entry_from_event(event)
+        async with restorable_state_transaction():
+            if restorable_restore_generation() != generation:
+                raise _HistoryAttemptChanged
+            cur = load_stats_current(strict=True)
+            validate_recovery_set(journal, cur, full_recovery=False)
+            if cur[PROJECTION_KEY]["applied_seq"] < seq:
+                cur = deepcopy(cur)
+                project_event(cur, journal, seq, period_events=period_events)
+                cur[PROJECTION_KEY]["applied_seq"] = seq
+                save_stats_current(cur, strict=True)
+                # Кеш восстановим и при следующем полном sync; его сбой не
+                # отменяет уже опубликованную restorable-проекцию.
+                try:
+                    stats_all = load_stats_all()
+                    if refresh_event_time_by_quarter(stats_all, cur):
+                        save_stats_all(stats_all)
+                except Exception as error:
+                    log.warning("История: by_quarter не обновлён (%s).", type(error).__name__)
+        text = None
+        if notification_event(event):
+            if event["event_type"] == "unknown":
+                log.warning("Неизвестное описание истории entry id=%d.", event["history_id"])
+            if event_plan(journal, seq) is None:
+                text = build_message(entry, normalized=event)
+        journal, cur = await _enqueue_history_event(journal, event, text, generation)
+    return journal, cur
+
+
+async def _prepare_history_digest(journal: dict, generation: int) -> tuple[dict, dict]:
+    """План до новых projections; ошибки rendering допускают обычный путь."""
+    events = [event_at_seq(journal, seq) for seq in range(journal["processed_seq"] + 1, event_count(journal) + 1)]
+    entries = notification_entries(events)
+    coalesced = any(len(entry) == 2 for entry in entries)
+    eligible = [event for event in events if notification_event(event)]
+    if (
+        not entries or len(entries) < 2 and not coalesced
+        or journal.get("catchup") is not None
+        or journal["outbox"]["legacy_uncertain_seq"] in {event["seq"] for event in events}
+    ):
+        return journal, load_stats_current(strict=True)
+    rendered = {}
+
+    def ordinary(event):
+        if event["seq"] not in rendered:
+            rendered[event["seq"]] = build_message(history_entry_from_event(event), normalized=event)
+        return rendered[event["seq"]]
+
+    presentation = "digest" if len(entries) >= 2 else "ordinary"
+    try:
+        if presentation == "ordinary":
+            parts = render_ordinary_entries(entries, ordinary=ordinary)
+        else:
+            parts = render_digest(
+                eligible, ordinary=ordinary, heading=build_history_digest_heading(),
+                **({"entries": entries} if coalesced else {}),
             )
-            return None
-
+    except Exception as error:
+        log.warning("История: compact-представление недоступно; обычная подготовка (%s).", type(error).__name__)
+        if not coalesced:
+            return journal, load_stats_current(strict=True)
+        # После решения о паре fallback также замораживает оба источника.
+        presentation = "ordinary"
+        parts = render_ordinary_entries(entries, ordinary=ordinary)
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        current, cur = _history_state(full_recovery=False)
+        if not _same_history_authority(current, journal, cur):
+            raise _HistoryAttemptChanged
         try:
-            page_ids = {entry["id"] for entry in page_entries}
-            for entry in page_entries:
-                entries_by_id.setdefault(entry["id"], entry)
-        except (KeyError, TypeError) as e:
-            log.warning(
-                "История: некорректная страница %d (%s), catch-up отменён без обновления seen_ids.",
-                page,
-                e,
-            )
-            return None
+            memberships = notification_memberships()
+            blocked = load_blocked_users() if memberships else set()
+        except (ValueError, OSError):
+            raise EventJournalStateError("notification_state") from None
+        memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}
+        candidate = prepare_digest(
+            current, parts, memberships, time.time(),
+            **({"entries": entries, "presentation": presentation} if coalesced else {}),
+        )
+        # Ошибка durable publication не является безопасным rendering fallback.
+        return _save_history_progress(current, candidate, generation, cur=cur), cur
 
-        if page_ids & seen_ids:
-            return list(entries_by_id.values())
 
-        # API Shikimori читает limit + 1 запись как признак следующей страницы.
-        # При limit=50 короткая выдача содержит меньше 51 записи и означает конец.
-        if len(page_entries) < HISTORY_PAGE_LIMIT + 1:
-            return list(entries_by_id.values())
+async def _enqueue_history_event(journal: dict, event: dict, text: str | None, generation: int) -> tuple[dict, dict]:
+    """Единая публикация frozen audience/payload и завершённой обработки."""
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        current_journal, cur = _history_state(full_recovery=False)
+        if not _same_history_authority(current_journal, journal, cur) or cur[PROJECTION_KEY]["applied_seq"] != event["seq"]:
+            raise _HistoryAttemptChanged
+        try:
+            memberships = notification_memberships() if notification_event(event) and event_plan(current_journal, event["seq"]) is None else {}
+            blocked = load_blocked_users() if memberships else set()
+        except (ValueError, OSError):
+            raise EventJournalStateError("notification_state") from None
+        memberships = {cid: token for cid, token in memberships.items() if cid not in blocked}
+        candidate = enqueue(current_journal, event, text, memberships, time.time())
+        candidate = _save_history_progress(current_journal, candidate, generation, cur=cur)
+        return candidate, cur
 
-    log.warning(
-        "История: за %d страниц не найдена известная граница; "
-        "catch-up отменён без обновления seen_ids.",
-        _HISTORY_CATCHUP_MAX_PAGES,
-    )
-    return None
+
+def _same_history_authority(current: dict | None, expected: dict, cur: dict) -> bool:
+    """Подтверждение получателя и очистка outbox не меняют принятую историю."""
+    if not same_history_authority(current, expected):
+        return False
+    if prefix_seq(current) == prefix_seq(expected):
+        return True
+    return current["source_base"] == compact_source_history(expected, cur, prefix_seq(current))["source_base"]
+
+
+def _save_history_progress(current: dict, candidate: dict, generation: int, *, cur: dict | None = None) -> dict:
+    """При нехватке места освободить принятый outbox, затем повторить публикацию."""
+    try:
+        save_event_journal(candidate, admitting=True)
+        return candidate
+    except EventJournalStateError as error:
+        if str(error) != "journal_capacity":
+            raise
+        reclaimed = compact_event_journal(
+            current, expected_generation=generation, cur=cur,
+            force_history=True,
+        )
+        if reclaimed == current:
+            raise
+    candidate = deepcopy(rebase_source_candidate(candidate, reclaimed))
+    suffix = [
+        record for record in candidate["outbox"]["records"]
+        if record["seq"] > reclaimed["outbox"]["enqueued_seq"]
+    ]
+    new_plans = [
+        plan for plan in candidate["outbox"].get("plans", [])
+        if plan["plan_id"] not in {existing["plan_id"] for existing in current["outbox"].get("plans", [])}
+    ]
+    candidate["outbox"] = deepcopy(reclaimed["outbox"])
+    if new_plans:
+        candidate["outbox"].update(version=4, completed_seq=candidate["outbox"].get("completed_seq", candidate["outbox"]["baseline_seq"]))
+        candidate["outbox"].setdefault("plans", []).extend(new_plans)
+    candidate["outbox"]["records"].extend(suffix)
+    candidate["outbox"]["enqueued_seq"] = candidate["processed_seq"]
+    save_event_journal(candidate, admitting=True)
+    return candidate
+
+
+def _export_history_seen(journal: dict) -> set[int]:
+    """Ошибка совместимого экспорта не меняет авторитет журнала."""
+    seen = _journal_seen(journal)
+    try:
+        save_seen_ids(seen)
+    except Exception:
+        log.warning("История: экспорт seen_ids недоступен; журнал сохранён.")
+    return seen
 
 
 async def check_and_notify(bot: Bot, seen_ids: set[int], cur: dict | None) -> tuple[set[int], dict]:
-    """
-    Главная функция проверки:
-    1. Загружаем историю с Shikimori
-    2. Фильтруем новые записи (которых нет в seen_ids)
-    3. Для каждой новой — формируем сообщение и шлём во все чаты
-    4. Обновляем seen_ids и возвращаем его
-    5. Параллельно фиксируем значимые события в cur (статистика квартала)
-    """
-    cur = await _load_stats_current_transactional()
-    async with aiohttp.ClientSession() as session:
-        if seen_ids:
-            entries = await _fetch_history_catchup(session, seen_ids)
-        else:
-            # Первый baseline намеренно ограничен одной страницей.
-            entries = await fetch_history(session)
+    """Принять полный батч до любых отправок, затем обработать локальную очередь."""
+    try:
+        return await _check_history_journal(bot)
+    except _HistoryAttemptChanged:
+        log.info("История: restore или изменение checkpoint остановили старую попытку.")
+        async with restorable_state_transaction():
+            journal, cur = _history_state()
+        return _journal_seen(journal) if journal is not None else set(), cur
 
-    if entries is None:
-        log.info("Запрос истории не удался — пропускаем цикл.")
-        return seen_ids, await _load_stats_current_transactional()
 
-    # baseline пуст (первый запуск либо стартовая инициализация не прошла
-    # из-за 429/сети) — молча фиксируем текущую историю как baseline и
-    # НИЧЕГО не шлём. Провал старта становится безобидной доинициализацией.
-    if not seen_ids:
-        cur = await _load_stats_current_transactional()
-        seen_ids = {e["id"] for e in entries}
-        save_seen_ids(seen_ids)
-        log.info("История: baseline инициализирован в цикле (%d ID), без отправки.", len(seen_ids))
-        return seen_ids, cur
-
-    new_entries = [e for e in entries if e["id"] not in seen_ids]
-
-    if not new_entries:
-        log.info("Новых записей нет.")
-        return seen_ids, await _load_stats_current_transactional()
-
-    log.info("Найдено новых записей: %d", len(new_entries))
-
-    # Сортируем по ID: от старых к новым — хронологический порядок сообщений
-    new_entries.sort(key=lambda e: e["id"])
-
-    # Не менять переданный baseline, пока квартальная дельта не опубликована.
-    seen_ids = seen_ids.copy()
-
-    state_updates: list[tuple[dict, str, str, int | None]] = []
-    for entry in new_entries:
-        entry_id   = entry["id"]
-        media_type, kind = get_media_info(entry)
-
-        # ── Фильтр по виду (kind) ──────────────────────────────────────
-        # ID запоминаем в любом случае — чтобы не проверять повторно.
-        # Сообщение шлём только если вид «значимый».
-        seen_ids.add(entry_id)
-
-        if not is_relevant(media_type, kind):
-            log.info(
-                "Пропускаем entry id=%d (%s / kind=%s) — не входит в список значимых.",
-                entry_id, media_type, kind or "unknown",
-            )
-            continue
-        # ──────────────────────────────────────────────────────────────
-
-        log.info(
-            "Обрабатываем entry id=%d (%s / kind=%s): %s",
-            entry_id, media_type, kind, entry.get("description", ""),
-        )
-
-        # Готовим дельту квартальной статистики независимо от результата отправки.
-        description = entry.get("description", "") or ""
-        event_type  = classify_event(description)
-        if event_type == "ignored":
-            log.info(
-                "Пропускаем служебную запись истории entry id=%d: %r",
-                entry_id,
-                clean_description(description),
-            )
-            continue
-        if event_type == "score_removed":
-            state_updates.append((entry, event_type, media_type, None))
-            log.info(
-                "Отмена оценки учтена без уведомления entry id=%d: %r",
-                entry_id,
-                clean_description(description),
-            )
-            continue
-        if event_type == "unknown":
-            log.warning(
-                "Неизвестное описание истории entry id=%d: %r",
-                entry_id,
-                clean_description(description),
-            )
-        else:
-            if event_type in ("completed", "score_set"):
-                score = extract_score(description)
-            elif event_type == "score_changed":
-                chg = extract_score_change(description)
-                score = chg[1] if chg else None
-            else:
-                score = None
-            state_updates.append((entry, event_type, media_type, score))
-
-        text = build_message(entry)
-        await send_to_all_chats(bot, text)
-
-        # Пауза между разными событиями — не спамим Telegram
-        await asyncio.sleep(1)
-
+async def _check_history_journal(bot: Bot) -> tuple[set[int], dict]:
     async with restorable_state_transaction():
-        cur = load_stats_current(strict=True)
-        for entry, event_type, media_type, score in state_updates:
-            cur = record_current_event(cur, entry, event_type, media_type, score)
-        if state_updates:
-            save_stats_current(cur, strict=True)
-    save_seen_ids(seen_ids)
-    return seen_ids, cur
+        journal, cur = _history_state()
+        generation = restorable_restore_generation()
+        legacy = load_legacy_seen_ids() if journal is None else None
+    if journal is None and legacy is not None:
+        journal, cur = await _initialize_history_journal(legacy, generation)
+    elif journal is not None and PROJECTION_KEY not in cur:
+        journal, cur = await _initialize_history_journal(set(), generation)
+    if journal is not None and len(journal_json(journal).encode("utf-8")) + progress_reserve(journal) >= JOURNAL_WARN_BYTES:
+        await _journal_diagnostic(bot, capacity=True)
+    journal, cur = await _drain_history_journal(bot, expected_generation=generation)
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        published_journal, cur = _history_state()
+        if published_journal != journal and not _same_history_authority(published_journal, journal, cur):
+            raise _HistoryAttemptChanged
+        journal = published_journal
+    seen = _journal_seen(journal) if journal is not None else set()
+    if journal is None or not journal["baseline_initialized"]:
+        async with aiohttp.ClientSession() as session:
+            entries = await fetch_history(session)
+        if entries is None:
+            return seen, cur
+        journal, cur = await _initialize_history_journal({entry["id"] for entry in entries}, generation)
+        return _export_history_seen(journal), cur
+    return await _acquire_history_pages(bot, journal, generation)
+
+
+async def _publish_history_candidate(expected: dict, candidate: dict, generation: int) -> tuple[dict, dict]:
+    """Публиковать только продолжение той же authority и restore generation."""
+    async with restorable_state_transaction():
+        if restorable_restore_generation() != generation:
+            raise _HistoryAttemptChanged
+        current, cur = _history_state()
+        if not _same_history_authority(current, expected, cur):
+            raise _HistoryAttemptChanged
+        if candidate != expected:
+            candidate = deepcopy(rebase_source_candidate(candidate, current))
+            if current.get("outbox") is not None:
+                candidate["outbox"] = deepcopy(current["outbox"])
+            candidate = _save_history_progress(current, candidate, generation, cur=cur)
+        else:
+            candidate = current
+        return candidate, cur
+
+
+def _stage_history_page(state: dict, entries: list[dict], journal: dict) -> None:
+    """Сохранить первую семантику ID без приёма staged записей в журнал."""
+    baseline = set(journal["baseline_ids"])
+    by_id = {event["history_id"]: event for event in journal["events"] + state["staged"]}
+    compact_ids = dict(journal.get("source_base", {}).get("ids", []))
+    observed_at = _utcnow().replace(tzinfo=timezone.utc).isoformat()
+    conflicts = 0
+
+    for entry in entries:
+        history_id = entry["id"]
+        if history_id in baseline or history_id in compact_ids and compact_ids[history_id] is None:
+            continue
+        try:
+            event = normalize_history_event(entry, observed_at)
+            fingerprint = semantic_hash(event)
+        except (ValueError, TypeError, AttributeError, KeyError, RecursionError, UnicodeError):
+            if history_id in by_id or history_id in compact_ids:
+                conflicts += 1
+                continue
+            raise EventJournalStateError("normalization_failed") from None
+        if history_id in compact_ids:
+            if compact_ids[history_id] != fingerprint:
+                conflicts += 1
+        elif history_id in by_id:
+            if semantic_hash(by_id[history_id]) != fingerprint:
+                conflicts += 1
+        else:
+            event["seq"] = len(state["staged"]) + 1
+            state["staged"].append(event)
+            by_id[history_id] = event
+    if conflicts:
+        log.warning("История: конфликт семантики повторных ID (%d); первые записи сохранены.", conflicts)
+
+
+async def _acquire_history_pages(bot: Bot, journal: dict, generation: int) -> tuple[set[int], dict]:
+    """Ограниченный связный сбор; только полный батч получает processing seq."""
+    seen = _journal_seen(journal)
+    previous = journal.get("catchup")
+    state = resume_acquisition(previous) if previous is not None else new_acquisition()
+    async with aiohttp.ClientSession() as session:
+        for _ in range(_HISTORY_CATCHUP_MAX_PAGES):
+            page = state["page"]
+            entries = await fetch_history(session, page=page)
+            if entries is not None and (
+                not isinstance(entries, list) or len(entries) > HISTORY_PAGE_LIMIT + 1
+                or any(not isinstance(entry, dict) or type(entry.get("id")) is not int for entry in entries)
+            ):
+                entries = None
+            if entries is None:
+                # Не сохранять временный rewind после неудачного запроса:
+                # повторные ошибки должны оставлять последний checkpoint.
+                # Первая ошибка создаёт пустую отметку неполноты, чтобы
+                # ротация не закрыла квартал до проверки истории.
+                candidate = journal if journal.get("catchup") is not None else {**journal, "version": max(2, journal["version"]), "catchup": state}
+                candidate, cur = await _publish_history_candidate(journal, candidate, generation)
+                log.warning("История: страница %d недоступна; незавершённый сбор сохранён.", page)
+                return seen, cur
+            connected, complete = advance_acquisition(
+                state, [entry["id"] for entry in entries], seen, HISTORY_PAGE_LIMIT,
+            )
+            if connected:
+                _stage_history_page(state, entries, journal)
+            candidate = deepcopy(journal)
+            if complete:
+                for event in sorted(state["staged"], key=lambda value: value["history_id"]):
+                    event = deepcopy(event)
+                    event["seq"] = event_count(candidate) + 1
+                    candidate["events"].append(event)
+                if state["staged"] or previous is not None or journal.get("catchup") is not None:
+                    candidate.update(version=max(2, journal["version"]), catchup=None)
+                candidate, cur = await _publish_history_candidate(journal, candidate, generation)
+                if candidate == journal:
+                    return seen, cur
+                if len(journal_json(candidate).encode("utf-8")) + progress_reserve(candidate) >= JOURNAL_WARN_BYTES:
+                    await _journal_diagnostic(bot, capacity=True)
+                journal, cur = await _drain_history_journal(bot, expected_generation=generation)
+                return _export_history_seen(journal), cur
+            candidate.update(version=max(2, journal["version"]), catchup=deepcopy(state))
+            candidate, cur = await _publish_history_candidate(journal, candidate, generation)
+            journal = candidate
+            if len(journal_json(journal).encode("utf-8")) + progress_reserve(journal) >= JOURNAL_WARN_BYTES:
+                await _journal_diagnostic(bot, capacity=True)
+    log.warning("История: за %d страниц не найдена известная граница; сбор продолжится в следующем цикле.", _HISTORY_CATCHUP_MAX_PAGES)
+    return seen, cur
 
 
 def _should_full_sync(last_full_sync: float | None, now: float, interval: float) -> bool:
@@ -2320,6 +2711,7 @@ async def polling_loop(bot: Bot) -> None:
     privacy_error: ProfilePrivacyError | None = None
     pending_seen_ids: set[int] | None = None
     pending_seen_favs: set[str] | None = None
+    startup_generation = restorable_restore_generation()
     stats_all = load_stats_all()
     synced_ok = False
 
@@ -2327,16 +2719,26 @@ async def polling_loop(bot: Bot) -> None:
     # фиксированные паузы между фазами; избранное тянем ОДИН раз и переиспользуем.
     async with aiohttp.ClientSession() as session:
         try:
-            if not seen_ids and cur is not None:
-                log.info("Первый запуск — инициализируем историю без отправки сообщений.")
-                entries = await fetch_history(session)
-                if entries is None:
-                    log.warning(
-                        "Не удалось получить историю при инициализации — "
-                        "пропускаем, повторим на следующем цикле."
-                    )
-                else:
-                    pending_seen_ids = {e["id"] for e in entries}
+            if cur is not None:
+                try:
+                    async with restorable_state_transaction():
+                        startup_journal, cur = _history_state()
+                        startup_generation = restorable_restore_generation()
+                        legacy = load_legacy_seen_ids() if startup_journal is None else None
+                    if startup_journal is None and legacy is not None:
+                        pending_seen_ids = legacy
+                    elif startup_journal is None or not startup_journal["baseline_initialized"]:
+                        entries = await fetch_history(session)
+                        if entries is not None:
+                            pending_seen_ids = {e["id"] for e in entries}
+                    elif PROJECTION_KEY not in cur:
+                        pending_seen_ids = set()
+                except EventJournalStateError:
+                    cur = None
+                    await _journal_diagnostic(bot)
+                except QuarterDeliveryStateError as error:
+                    cur = None
+                    await _quarter_state_diagnostic(bot, error)
             await asyncio.sleep(BOOT_PHASE_DELAY)
 
             # Избранное фетчим ОДИН раз: для baseline и sync (fav=).
@@ -2380,14 +2782,16 @@ async def polling_loop(bot: Bot) -> None:
     if privacy_error is None:
         if pending_seen_ids is not None:
             try:
-                cur = await _load_stats_current_transactional()
+                journal, cur = await _initialize_history_journal(pending_seen_ids, startup_generation)
+                seen_ids = _export_history_seen(journal)
+            except _HistoryAttemptChanged:
+                cur = None
+            except EventJournalStateError:
+                cur = None
+                await _journal_diagnostic(bot)
             except QuarterDeliveryStateError as error:
                 cur = None
                 await _quarter_state_diagnostic(bot, error)
-            else:
-                seen_ids = pending_seen_ids
-                save_seen_ids(seen_ids)
-                log.info("Инициализировано %d ID истории.", len(seen_ids))
         if pending_seen_favs is not None:
             seen_favs = pending_seen_favs
             save_seen_favourites(seen_favs)
@@ -2407,7 +2811,12 @@ async def polling_loop(bot: Bot) -> None:
     # Если квартал успел смениться пока бот не работал — ротируем и шлём отчёт.
     if privacy_error is None and cur is not None:
         try:
-            cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
+            # Готовая baseline не доказывает, что после простоя нет длинного
+            # хвоста. Новый квартал ждёт первой проверки; frozen pending живёт.
+            async with restorable_state_transaction():
+                startup_ready = load_event_journal() is None or cur.get(_PENDING_QUARTER_DELIVERY) is not None
+            if startup_ready:
+                cur = await rotate_quarter_if_needed(bot, cur, stats_all, resync=False)
         except QuarterDeliveryStateError as error:
             cur = None
             await _quarter_state_diagnostic(bot, error)
@@ -2424,7 +2833,15 @@ async def polling_loop(bot: Bot) -> None:
     while True:
         try:
             log.info("Проверяем историю и избранное...")
-            seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
+            history_available = True
+            try:
+                history_generation = restorable_restore_generation()
+                seen_ids, cur = await check_and_notify(bot, seen_ids, cur)
+                history_available = restorable_restore_generation() == history_generation
+            except EventJournalStateError as error:
+                history_available = False
+                await _journal_diagnostic(bot, capacity=str(error) == "journal_capacity")
+                cur = await _load_stats_current_transactional()
             # Избранное фетчим ОДИН раз за цикл и переиспользуем — в уведомлениях
             # и в ресинке stats_all (fav=), как на старте. Дедуп убирает второй
             # фетч избранного внутри sync_stats_all → на цикл 1 запрос вместо 2.
@@ -2454,7 +2871,8 @@ async def polling_loop(bot: Bot) -> None:
 
             # Проверяем смену квартала (раз в цикл, дёшево).
             # Внутри — защита last_report_sent от повторной отправки.
-            cur = await rotate_quarter_if_needed(bot, cur, load_stats_all())
+            if history_available:
+                cur = await rotate_quarter_if_needed(bot, cur, load_stats_all())
 
             # Subscription pending имеет приоритет над weekly fallback.
             await _backup_after_subscription(bot)
@@ -2467,6 +2885,10 @@ async def polling_loop(bot: Bot) -> None:
         except asyncio.CancelledError:
             # Штатная отмена задачи — пробрасываем, не глушим
             raise
+        except EventJournalStateError as error:
+            cur = None
+            await _journal_diagnostic(bot, capacity=str(error) == "journal_capacity")
+            heartbeat()
         except QuarterDeliveryStateError as error:
             cur = None
             await _quarter_state_diagnostic(bot, error)
@@ -2509,7 +2931,35 @@ async def polling_loop(bot: Bot) -> None:
                         "Не удалось отправить уведомление владельцу об ошибке: %s",
                         notify_error,
                     )
-        await asyncio.sleep(CHECK_INTERVAL)
+        await _wait_and_dispatch_notifications(bot)
+
+
+_NOTIFICATION_INTERVAL = 60
+
+
+async def _wait_and_dispatch_notifications(bot: Bot) -> None:
+    """Обслуживать очередь в паузе, не перезапуская срок следующего acquisition."""
+    deadline = time.monotonic() + CHECK_INTERVAL
+    while True:
+        started = time.monotonic()
+        try:
+            pending = await dispatch_notifications(bot)
+        except Exception as error:
+            log.warning("Уведомления: consumer приостановлен (%s).", type(error).__name__)
+            await _journal_diagnostic(bot, delivery=True)
+            pending = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if not pending:
+            await asyncio.sleep(remaining)
+            return
+        # Даже после медленной порции отдаём управление event loop; уже
+        # начатый bounded dispatch не отменяем по сроку acquisition.
+        delay = min(remaining, max(1.0, _NOTIFICATION_INTERVAL - (time.monotonic() - started)))
+        await asyncio.sleep(delay)
+        if delay == remaining or time.monotonic() >= deadline:
+            return
 
 
 # ───────────────────────────────────────────────────────────────
@@ -2599,11 +3049,11 @@ async def probe_owner_and_start(bot: Bot) -> None:
 # ═══════════════════════════════════════════════════════════════
 #
 #  Экспорт = zip всего DATA_DIR (минус *.tmp-огрызки _atomic_write).
-#  Импорт  = по белому списку (список блокировок, subscribers, stats_current,
-#            update_state, quarters/*);
+#  Импорт  = recovery-набор журнала и квартала, политики, подписчики,
+#            факты, настройки и quarters/* (точный whitelist — в backup).
 #            всё прочее в архиве намеренно отбрасывается — seen_ids,
-#            seen_favourites и stats_all регенерируются сами, тащить их
-#            обратно незачем. Асимметрия экспорт(всё)/импорт(бел.список)
+#            seen_favourites и stats_all служат экспортными проекциями/кешами.
+#            Асимметрия экспорт(всё)/импорт(бел.список)
 #            сознательная: архив — и страховка состояния, и зонд внутрь
 #            эфемерного контейнера (apply.build без тома на /data).
 #  Доставка — всегда владельцу (OWNER_ID); в subscribers лежат chat_id.
@@ -2627,57 +3077,72 @@ class FactsStates(StatesGroup):
 
 
 def _backup_menu_kb() -> InlineKeyboardMarkup:
-    """Инлайн-меню /backup: экспорт и импорт."""
+    """Инлайн-меню /backup: резервная копия, полный экспорт и импорт."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📤 Экспорт", callback_data="backup:export"),
-            InlineKeyboardButton(text="📥 Импорт",  callback_data="backup:import"),
+            InlineKeyboardButton(text="💾 Скачать копию", callback_data="backup:recovery"),
         ],
+        [InlineKeyboardButton(text="🧰 Скачать для диагностики", callback_data="backup:export")],
+        [InlineKeyboardButton(text="📥 Восстановить из архива", callback_data="backup:import")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="backup:close")],
     ])
 
 
 async def cmd_backup(message: Message) -> None:
-    """Меню резервного копирования (только для владельца)."""
+    """Меню резервного копирования для владельца в личном чате."""
     if message.from_user is None or message.from_user.id != OWNER_ID:
         await message.answer("🚫 Эта команда только для владельца бота.")
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.answer("🔒 Резервное копирование доступно только в личном чате с ботом.")
         return
     # Отправляем ОТВЕТОМ на команду (reply): у меню появляется reply_to_message
     # = само сообщение /backup, и кнопка ❌ Закрыть удалит заодно и команду.
     await message.reply(
-        "💾 <b>Резервное копирование</b>\n\n"
-        "📤 <b>Экспорт</b> — пришлю zip-архив всего состояния "
-        "(подписчики, дополнительные факты, статистика, кварталы).\n"
-        "📥 <b>Импорт</b> — восстановлю из архива список блокировок, подписчиков, "
-        "дополнительные факты, сведения о доступных обновлениях и данные "
-        "текущего и завершённых кварталов.",
+        main_menu.owner_backup_view().text,
         reply_markup=_backup_menu_kb(),
         parse_mode=ParseMode.HTML,
     )
 
 
-async def _send_backup_export(bot: Bot, chat_id: int) -> None:
-    """Выполнить существующий экспорт для command/menu orchestration."""
+async def _send_backup_export(bot: Bot, chat_id: int, *, full_export: bool = True) -> None:
+    """Выполнить ручную выгрузку, не подтверждая автоматические обязательства."""
+    label = "Архив для диагностики" if full_export else "Резервная копия для восстановления"
     caption = (
-        "📤 Экспорт состояния.\n"
+        f"💾 {label}.\n"
         f"Подписчиков: <b>{len(load_subscribers())}</b>\n\n{BACKUP_TAG}"
     )
-    if not await send_backup(bot, caption):
+    try:
+        sent = await send_backup(bot, caption, full_export=full_export)
+    except BackupLimitError as e:
+        await bot.send_message(chat_id, f"❌ Архив для диагностики не создан: {e}.")
+        return
+    if not sent:
         await bot.send_message(
             chat_id,
             "❌ Не удалось собрать/отправить архив — см. логи.",
         )
 
 
-async def backup_export_cb(callback: CallbackQuery) -> None:
-    """Кнопка «Экспорт» — собираем и шлём архив, меню убираем."""
-    if callback.from_user is None or callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Только для владельца.", show_alert=True)
+async def backup_export_cb(callback: CallbackQuery, *, full_export: bool = True) -> None:
+    """Собрать архив после проверки владельца и личного чата, убрать меню."""
+    if (
+        callback.from_user is None
+        or callback.message is None
+        or isinstance(callback.message, InaccessibleMessage)
+        or not _menu_owner_allowed(callback.from_user.id, callback.message.chat.type)
+    ):
+        await callback.answer("🚫 Только для владельца в личном чате.", show_alert=True)
         return
     await callback.answer("Собираю архив...")
     bot, chat_id = callback.message.bot, callback.message.chat.id
     await _safe_delete(bot, chat_id, callback.message.message_id)
-    await _send_backup_export(bot, chat_id)
+    await _send_backup_export(bot, chat_id, full_export=full_export)
+
+
+async def backup_recovery_cb(callback: CallbackQuery) -> None:
+    """Кнопка копии использует общий сценарий с проверкой владельца и личного чата."""
+    await backup_export_cb(callback, full_export=False)
 
 
 async def _begin_backup_import(
@@ -2712,8 +3177,13 @@ async def _begin_backup_import(
 
 async def backup_import_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """Кнопка «Импорт» — входим в FSM ожидания .zip-файла."""
-    if callback.from_user is None or callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Только для владельца.", show_alert=True)
+    if (
+        callback.from_user is None
+        or callback.message is None
+        or isinstance(callback.message, InaccessibleMessage)
+        or not _menu_owner_allowed(callback.from_user.id, callback.message.chat.type)
+    ):
+        await callback.answer("🚫 Только для владельца в личном чате.", show_alert=True)
         return
     await _begin_backup_import(callback, state)
 
@@ -2722,8 +3192,13 @@ async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """Кнопка «❌ Закрыть» — убираем меню и саму команду /backup. Тот же
     отработанный паттерн, что и ❌ Закрыть в /stats: меню отправлено reply'ем
     на команду, поэтому reply_to_message = сообщение /backup, и его тоже чистим."""
-    if callback.from_user is None or callback.from_user.id != OWNER_ID:
-        await callback.answer("🚫 Только для владельца.", show_alert=True)
+    if (
+        callback.from_user is None
+        or callback.message is None
+        or isinstance(callback.message, InaccessibleMessage)
+        or not _menu_owner_allowed(callback.from_user.id, callback.message.chat.type)
+    ):
+        await callback.answer("🚫 Только для владельца в личном чате.", show_alert=True)
         return
     await state.clear()   # защитно: Закрыть снимает любое повисшее FSM-состояние
     await callback.answer()
@@ -2731,8 +3206,8 @@ async def backup_close_cb(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def backup_receive(message: Message, state: FSMContext) -> None:
-    """Принять .zip от владельца, восстановить по белому списку, отчитаться."""
-    if message.from_user is None or message.from_user.id != OWNER_ID:
+    """Принять .zip от владельца в личном чате, восстановить и отчитаться."""
+    if message.from_user is None or not _menu_owner_allowed(message.from_user.id, message.chat.type):
         return
     doc = message.document
     if not doc or not (doc.file_name or "").lower().endswith(".zip"):
@@ -4531,9 +5006,9 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
                 screen="owner",
             )
             return
-        if action == "menu:owner:backup:export":
+        if action in {"menu:owner:backup:recovery", "menu:owner:backup:export"}:
             bot, chat_id = await _finish_main_menu(callback, state)
-            await _send_backup_export(bot, chat_id)
+            await _send_backup_export(bot, chat_id, full_export=action.endswith(":export"))
             return
         if action == "menu:owner:backup:import":
             opened = await _begin_backup_import(
