@@ -71,6 +71,116 @@ _FETCHERS = [
 ]
 
 
+class _AchievementSession(_FakeSession):
+    """Два endpoint и 429 внутри общего HTTP-клиента."""
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = iter(responses)
+
+    def get(self, *args, **kwargs):
+        self.requests.append((args, kwargs))
+        return next(self.responses)
+
+
+@pytest.mark.asyncio
+async def test_achievement_api_resolves_user_and_retries_through_central_client(achievement_row_factory, monkeypatch):
+    sleeps = AsyncMock()
+    monkeypatch.setattr("shiki_api.asyncio.sleep", sleeps)
+    session = _AchievementSession([
+        _FakeResponse(200, json_value={"id": 42, "nickname": "WNR"}),
+        _FakeResponse(429),
+        _FakeResponse(200, json_value=[achievement_row_factory()]),
+    ])
+    result = await shiki_api.fetch_achievements(session)
+    assert result["user_id"] == 42
+    assert result["rows"][0]["level"] == 1
+    assert session.requests[0][0][0].endswith("/api/users/WNR/info")
+    assert all(request[0][0].endswith("/api/achievements?user_id=42") for request in session.requests[1:])
+    assert all(request[1]["headers"]["User-Agent"] == shiki_api.HEADERS["User-Agent"] for request in session.requests)
+    assert shiki_api._request_attempt_budget.snapshot().used == 3
+    sleeps.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", [None, {}, {"id": True, "nickname": "WNR"}, {"id": 42, "nickname": "Other"}])
+async def test_achievement_api_rejects_unresolved_or_wrong_profile(profile):
+    session = _AchievementSession([_FakeResponse(200, json_value=profile)])
+    assert await shiki_api.fetch_achievements(session) is None
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,payload", [(200, []), (200, {}), (503, None)])
+async def test_achievement_api_empty_success_and_failures(status, payload):
+    session = _AchievementSession([
+        _FakeResponse(200, json_value={"id": 42, "nickname": "WNR"}),
+        _FakeResponse(status, json_value=payload),
+    ])
+    result = await shiki_api.fetch_achievements(session)
+    assert result == ({"user_id": 42, "rows": []} if status == 200 and payload == [] else None)
+
+
+class _AchievementPageContent:
+    """Поток байтов ответа: чтение прекращается при превышении лимита."""
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.read_count = 0
+
+    async def iter_chunked(self, size):
+        for chunk in self.chunks:
+            self.read_count += 1
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_achievement_labels_use_bounded_shared_client_and_retry(monkeypatch):
+    sleeps = AsyncMock()
+    monkeypatch.setattr("shiki_api.asyncio.sleep", sleeps)
+    html = '<a class="b-badge level-1" title="Новая франшиза" href="/achievements/franchise/new_family"></a>'.encode()
+    response = _FakeResponse(200)
+    response.content = _AchievementPageContent([html[:48], html[48:]])
+    session = _AchievementSession([_FakeResponse(429), response])
+    assert await shiki_api.fetch_achievement_labels(session) == {("new_family", 1): ("Новая франшиза", "franchise")}
+    assert all(request[0][0].endswith("/WNR/achievements") for request in session.requests)
+    assert all(request[1]["headers"]["User-Agent"] == shiki_api.HEADERS["User-Agent"] for request in session.requests)
+    assert shiki_api._request_attempt_budget.snapshot().used == 2
+    sleeps.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["http", "privacy", "timeout", "invalid_utf8", "changed_markup", "oversized"])
+async def test_achievement_labels_failures_are_empty_decoration(failure):
+    response = _FakeResponse(200)
+    response.content = _AchievementPageContent([b"<html>New page</html>"])
+    session = _FakeSession(response=response)
+    if failure == "http":
+        response.status = 503
+    elif failure == "privacy":
+        response.status = 403
+        response._json_value = {"message": "You are not authorized to access this page."}
+    elif failure == "timeout":
+        session = _FakeSession(raise_exc=TimeoutError())
+    elif failure == "invalid_utf8":
+        response.content = _AchievementPageContent([b"\xff"])
+    elif failure == "oversized":
+        response.content = _AchievementPageContent([b" " * shiki_api.ACHIEVEMENT_PAGE_MAX_BYTES, b"x", b"unread"])
+    assert await shiki_api.fetch_achievement_labels(session) == {}
+    if failure == "oversized":
+        assert response.content.read_count == 2
+
+
+@pytest.mark.asyncio
+async def test_achievement_label_lookup_has_one_deadline_including_throttle_and_retries(monkeypatch):
+    original_timeout = asyncio.timeout
+    monkeypatch.setattr("shiki_api.asyncio.timeout", lambda seconds: original_timeout(0))
+
+    async def stalled(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("shiki_api._fetch", stalled)
+    assert await shiki_api.fetch_achievement_labels(object()) == {}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [
     [], False, 0, "", {"animes": False}, {"mangas": 0},

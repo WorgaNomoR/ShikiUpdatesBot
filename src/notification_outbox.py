@@ -357,15 +357,7 @@ def progress_reserve(journal: dict) -> int:
         for recipient in record.get("recipients", {}).values():
             if recipient["status"] != "pending":
                 continue
-            attempts = recipient["attempts"]
-            remaining = MAX_ATTEMPTS - len(attempts)
-            # pending/null и terminal_at=null уже входят в фактические байты.
-            reserve += _TERMINAL_JSON_BYTES - len('"pending"null')
-            reserve += _TIME_JSON_BYTES - len("null")
-            reserve += _TIME_JSON_BYTES - len(repr(recipient["next_attempt_at"]))
-            reserve += remaining * (_ATTEMPT_JSON_BYTES + 1) - int(not attempts)
-            if attempts:
-                reserve += _OUTCOME_JSON_BYTES - (len(attempts[-1]["outcome"]) + 2)
+            reserve += recipient_progress_reserve(recipient)
     # Подготовленный план оплачивает будущие event links и рост обоих cursors.
     for plan in box.get("plans", []):
         for seq, history_id in plan["events"]:
@@ -373,6 +365,21 @@ def progress_reserve(journal: dict) -> int:
                 reserve += _serialized_size({"seq": seq, "history_id": history_id, "plan_id": plan["plan_id"]}) + 1
         if plan["end_seq"] > journal["processed_seq"]:
             reserve += 2 * (len(str(plan["end_seq"])) - len(str(journal["processed_seq"])))
+    return reserve
+
+
+def recipient_progress_reserve(recipient: dict) -> int:
+    """Резерв одной валидной доставки; не зависит от audience и источника."""
+    if recipient["status"] != "pending":
+        return 0
+    attempts = recipient["attempts"]
+    remaining = MAX_ATTEMPTS - len(attempts)
+    reserve = _TERMINAL_JSON_BYTES - len('"pending"null')
+    reserve += _TIME_JSON_BYTES - len("null")
+    reserve += _TIME_JSON_BYTES - len(repr(recipient["next_attempt_at"]))
+    reserve += remaining * (_ATTEMPT_JSON_BYTES + 1) - int(not attempts)
+    if attempts:
+        reserve += _OUTCOME_JSON_BYTES - (len(attempts[-1]["outcome"]) + 2)
     return reserve
 
 

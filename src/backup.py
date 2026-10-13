@@ -31,6 +31,10 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile
 
+from achievement_state import (
+    ACHIEVEMENTS_FILE_NAME,
+    parse_achievement_member,
+)
 from config import (
     DATA_DIR,
     OWNER_ID,
@@ -127,6 +131,7 @@ _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
     "blocked_users.json", "facts.json", "subscribers.json", "stats_current.json",
     "update_state.json", "known_users.json", "user_alerts.json", "event_journal.json",
     PROGRESS_FILE_NAME,
+    ACHIEVEMENTS_FILE_NAME,
 })
 
 _STRICT_IMPORT_FILES: frozenset[str] = frozenset({
@@ -135,6 +140,7 @@ _STRICT_IMPORT_FILES: frozenset[str] = frozenset({
     "user_alerts.json",
     "event_journal.json",
     PROGRESS_FILE_NAME,
+    ACHIEVEMENTS_FILE_NAME,
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -446,6 +452,9 @@ def _ensure_backup_generation(generation: int) -> None:
 def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple:
     """Неактивированная migration preparation не входит в recovery-набор."""
     _raise_if_backup_cancelled(cancelled)
+    for member in members:
+        if member.name == ACHIEVEMENTS_FILE_NAME:
+            parse_achievement_member(member.data, profile=SHIKI_USER, owner_id=OWNER_ID)
     raw = next((member.data for member in members if member.name == "event_journal.json"), None)
     if raw is None:
         if any(member.name == PROGRESS_FILE_NAME for member in members):
@@ -970,6 +979,16 @@ async def restore_backup_zip(raw: bytes) -> dict:
                         if name == "event_journal.json"
                         else parse_progress_member(zf.read(info))
                     )
+                except (
+                    ValueError, OSError, RuntimeError, zipfile.BadZipFile,
+                    NotImplementedError, EOFError, zlib.error, lzma.LZMAError,
+                ):
+                    raise ValueError(f"Файл {name} в архиве повреждён; восстановление отменено") from None
+                pending[name] = compact_json(document)
+                continue
+            if name == ACHIEVEMENTS_FILE_NAME:
+                try:
+                    document = parse_achievement_member(zf.read(info), profile=SHIKI_USER, owner_id=OWNER_ID)
                 except (
                     ValueError, OSError, RuntimeError, zipfile.BadZipFile,
                     NotImplementedError, EOFError, zlib.error, lzma.LZMAError,

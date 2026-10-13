@@ -33,6 +33,106 @@ import storage
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_achievement_recovery_roundtrip(backup_env, achievement_state_factory, full_export):
+    state = achievement_state_factory()
+    state["pending"][0]["parts"][0]["delivery"].update(
+        attempts=[{"at": 1000, "outcome": "uncertain"}], next_attempt_at=1060,
+    )
+    storage.save_achievement_state(state)
+    original = storage.ACHIEVEMENTS_FILE.read_bytes()
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
+    with zipfile.ZipFile(io.BytesIO(archive)) as document:
+        assert document.read("achievements.json") == original
+    storage.ACHIEVEMENTS_FILE.unlink()
+    restored = await backup.restore_backup_zip(archive)
+    assert "achievements.json" in restored["restored"]
+    assert storage.load_achievement_state() == state
+
+
+@pytest.mark.asyncio
+async def test_legacy_archive_without_achievements_preserves_optional_state(backup_env, achievement_state_factory):
+    archive = _zip_bytes({"user_alerts.json": '{"enabled":true}'})
+    await backup.restore_backup_zip(archive)
+    assert storage.load_achievement_state() is None
+    # Отсутствующий optional member не стирает уже действующую authority.
+    storage.save_achievement_state(achievement_state_factory())
+    original = storage.ACHIEVEMENTS_FILE.read_bytes()
+    await backup.restore_backup_zip(archive)
+    assert storage.ACHIEVEMENTS_FILE.read_bytes() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["json", "version", "profile", "capacity"])
+async def test_invalid_achievement_member_rejects_entire_import(backup_env, achievement_state_factory, monkeypatch, damage):
+    state = achievement_state_factory()
+    storage.save_achievement_state(state)
+    original = storage.ACHIEVEMENTS_FILE.read_bytes()
+    if damage == "json":
+        payload = "{"
+    elif damage == "capacity":
+        monkeypatch.setattr("achievement_state.ACHIEVEMENTS_MAX_BYTES", len(original) + 1)
+        payload = json.dumps(state)
+    else:
+        state[damage] = 99 if damage == "version" else "Other"
+        payload = json.dumps(state)
+    archive = _zip_bytes({"achievements.json": payload, "user_alerts.json": '{"enabled":false}'})
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(archive)
+    assert storage.ACHIEVEMENTS_FILE.read_bytes() == original
+    assert not storage.USER_ALERTS_FILE.exists()
+
+
+@pytest.mark.asyncio
+async def test_achievement_restore_rolls_back_exact_damaged_bytes(backup_env, achievement_state_factory, monkeypatch):
+    original = b'{ damaged current\r\n'
+    storage.ACHIEVEMENTS_FILE.write_bytes(original)
+    alert = b'{"enabled": true}\r\n'
+    storage.USER_ALERTS_FILE.write_bytes(alert)
+    real_publish = backup._publish_staged_file
+
+    def fail(source, target):
+        if Path(target).name == "user_alerts.json":
+            raise OSError("publication failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr("backup._publish_staged_file", fail)
+    archive = _zip_bytes({"achievements.json": json.dumps(achievement_state_factory()), "user_alerts.json": '{"enabled":false}'})
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        await backup.restore_backup_zip(archive)
+    assert storage.ACHIEVEMENTS_FILE.read_bytes() == original
+    assert storage.USER_ALERTS_FILE.read_bytes() == alert
+
+
+@pytest.mark.asyncio
+async def test_achievement_send_cannot_ack_after_identical_restore(backup_env, achievement_state_factory, monkeypatch):
+    import achievement_delivery
+
+    state = achievement_state_factory(now=time.time())
+    storage.save_achievement_state(state)
+    bot = AsyncMock()
+
+    async def restored(**kwargs):
+        # Даже byte-identical restore инвалидирует старую завершившуюся отправку.
+        raw = storage.ACHIEVEMENTS_FILE.read_text(encoding="utf-8")
+        await backup.restore_backup_zip(_zip_bytes({"achievements.json": raw}))
+        return object()
+
+    bot.send_message.side_effect = restored
+    assert await achievement_delivery.dispatch_achievements(bot) is True
+    current = storage.load_achievement_state()
+    assert current["pending"][0]["parts"][0]["delivery"]["attempts"][-1]["outcome"] == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_backup_preserves_invalid_achievement_file(backup_env):
+    storage.ACHIEVEMENTS_FILE.write_bytes(b"{")
+    with pytest.raises(ValueError):
+        await backup._build_backup_zip()
+    assert storage.ACHIEVEMENTS_FILE.read_bytes() == b"{"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "schema",
     [
