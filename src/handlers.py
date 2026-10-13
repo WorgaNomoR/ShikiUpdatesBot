@@ -58,6 +58,12 @@ from access_control import (
     INLINE_ACCESS_BLOCKED,
     inline_access_status,
 )
+from achievement_delivery import (
+    achievement_diagnostic,
+    dispatch_achievements,
+    synchronize_achievements,
+)
+from achievement_state import AchievementStateError
 from backup import (
     BACKUP_TAG,
     IMPORT_DOCUMENT_MAX_BYTES,
@@ -2692,7 +2698,7 @@ async def polling_loop(bot: Bot) -> None:
 
     Первый запуск (seen_ids.json не существует):
       — бот молча запоминает все текущие ID из истории и избранного
-      — сообщения НЕ отправляются (не спамим историей за последние месяцы)
+      — старые события истории и избранного не рассылаются
       — с этого момента бот следит только за НОВЫМИ событиями
     """
     seen_ids  = load_seen_ids()
@@ -2759,7 +2765,7 @@ async def polling_loop(bot: Bot) -> None:
                     }
             await asyncio.sleep(BOOT_PHASE_DELAY)
 
-            # Сохранять baseline можно только после этой последней сетевой фазы:
+            # Сохранять baseline можно только после всех стартовых сетевых фаз:
             # privacy failure одного endpoint отменяет весь стартовый результат.
             log.info("Синхронизируем статистику за всё время (stats_all)...")
             try:
@@ -2771,6 +2777,8 @@ async def polling_loop(bot: Bot) -> None:
                 raise
             except Exception as e:
                 log.exception("Не удалось синхронизировать stats_all при старте: %s", e)
+            await asyncio.sleep(BOOT_PHASE_DELAY)
+            await _refresh_achievements(bot, session=session)
         except ProfilePrivacyError as error:
             privacy_error = error
             log.warning(
@@ -2832,6 +2840,7 @@ async def polling_loop(bot: Bot) -> None:
 
     while True:
         try:
+            await _refresh_achievements(bot)
             log.info("Проверяем историю и избранное...")
             history_available = True
             try:
@@ -2937,6 +2946,18 @@ async def polling_loop(bot: Bot) -> None:
 _NOTIFICATION_INTERVAL = 60
 
 
+async def _refresh_achievements(bot: Bot, *, session=None) -> None:
+    """Локальные сбои достижений не останавливают историю и бэкапы."""
+    try:
+        await synchronize_achievements(session=session)
+    except AchievementStateError as error:
+        await achievement_diagnostic(bot, error)
+    except (asyncio.CancelledError, ProfilePrivacyError):
+        raise
+    except Exception as error:
+        log.warning("Достижения: обновление пропущено (%s).", type(error).__name__)
+
+
 async def _wait_and_dispatch_notifications(bot: Bot) -> None:
     """Обслуживать очередь в паузе, не перезапуская срок следующего acquisition."""
     deadline = time.monotonic() + CHECK_INTERVAL
@@ -2948,6 +2969,12 @@ async def _wait_and_dispatch_notifications(bot: Bot) -> None:
             log.warning("Уведомления: consumer приостановлен (%s).", type(error).__name__)
             await _journal_diagnostic(bot, delivery=True)
             pending = True
+        try:
+            achievement_pending = await dispatch_achievements(bot)
+        except Exception as error:
+            await achievement_diagnostic(bot, error)
+            achievement_pending = True
+        pending = pending or achievement_pending
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return

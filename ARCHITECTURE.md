@@ -21,6 +21,7 @@ Read [AGENTS.md](AGENTS.md) for collaboration, verification, and delivery rules.
     - [Failures, reuse and request budgets](#failures-reuse-and-request-budgets)
     - [Synchronization, metadata and comments](#synchronization-metadata-and-comments)
     - [History and media domains](#history-and-media-domains)
+    - [Shikimori achievements and owner delivery](#shikimori-achievements-and-owner-delivery)
     - [Durable history ingestion and processing](#durable-history-ingestion-and-processing)
     - [Durable journal notification delivery](#durable-journal-notification-delivery)
     - [Durable catch-up digest](#durable-catch-up-digest)
@@ -64,6 +65,8 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [notification_outbox.py](src/notification_outbox.py) | Pure versioned recipient obligations, frozen digest plans, terminal summaries, completed-prefix retention, membership validation, retry/expiry transitions and capacity reserve; uses `source_history` and `catchup_digest`, with no runtime imports. |
 | [catchup_digest.py](src/catchup_digest.py) | Pure lossless ordinary-HTML digest rendering, safe HTML/UTF-16 validation and continuation; uses only `report_model` helpers and stdlib. |
 | [notification_delivery.py](src/notification_delivery.py) | Independent bounded journal-notification consumer over storage and Telegram outcomes; owns durable per-recipient attempts/acknowledgements. |
+| [achievement_state.py](src/achievement_state.py), [achievement_messages.py](src/achievement_messages.py), [achievement_metadata.py](src/achievement_metadata.py) | Pure strict source/state/import schemas, monotonic earned-level deduplication and frozen owner plans; safe ordinary presentation and an optional profile-page label parser. Uses outbox policy helpers and HTML boundaries, with no runtime imports. |
+| [achievement_delivery.py](src/achievement_delivery.py) | Source capture and bounded owner-only consumer over API/storage/Telegram; no subscriber membership, history records or statistics authority. |
 | [history_catchup.py](src/history_catchup.py) | Pure connected-page traversal, exact frontier reconnection and head bridging; owns no I/O, normalization or publication. |
 | [storage.py](src/storage.py) | JSON persistence, cache read states, strict validators, restorable-state transaction and restore generation; frozen-plan validation uses `report_plan`. |
 | [shiki_api.py](src/shiki_api.py) | REST/GraphQL acquisition, metadata, relevance/kind definitions, translations, throttle, HTTP-attempt budget, 429 retry and privacy classification. |
@@ -121,6 +124,17 @@ graph TD
     notification_progress_schema --> notification_outbox
     event_journal_schema --> notification_outbox
     handlers --> notification_delivery
+    handlers --> achievement_delivery
+    achievement_delivery --> shiki_api
+    achievement_delivery --> storage
+    achievement_delivery --> telegram_delivery
+    storage --> achievement_state
+    backup --> achievement_state
+    shiki_api --> achievement_state
+    shiki_api --> achievement_metadata
+    achievement_state --> achievement_messages
+    achievement_state --> notification_outbox
+    achievement_messages --> catchup_digest
     handlers --> catchup_digest
     notification_outbox --> catchup_digest
     catchup_digest --> report_model
@@ -170,6 +184,7 @@ Persistent JSON state lives under `DATA_DIR`; the complete file inventory is in 
 |---|---|
 | `event_journal.json` | Strict history ingestion authority, silent baseline, immutable admitted events and separate unfinished acquisition; accepted exact IDs/seq and source facts survive completed-payload compaction; activated history binds separate progress. See the [format reference](#supported-state-formats-and-migration). |
 | `notification_progress.json` | Activated progress v1: logical processed checkpoint and complete frozen outbox, enqueue/completion boundaries, recipient attempts and terminal outcomes. Bound to physical history identity/profile/lineage. |
+| `achievements.json` | Separate achievement v1 authority: configured profile/numeric user/owner binding, initialized baseline, latest complete source rows, highest earned level per family and frozen pending owner plans. Independent of history and quarters. |
 | `seen_ids.json`, `seen_favourites.json` | Export-only journal ID projection; separate favourites baseline/deduplication. Both excluded from restore. |
 | `stats_all.json` | Rebuildable current public lists, metadata, comments, favourites and aggregates; cached locally and excluded from restore. |
 | `stats_current.json`, `quarters/` | Source-quarter projections and correction revisions, journal-bound checkpoint and frozen report delivery; original historical snapshots. |
@@ -294,6 +309,92 @@ Display-name grammar is initialized once in `messages`. Eligible Cyrillic first 
 
 Evidence: [API tests](tests/test_shiki_api.py), [statistics tests](tests/test_stats.py), [favourites tests](tests/test_favourites.py), [favourites orchestration tests](tests/test_handlers_favourites.py), [message tests](tests/test_messages.py), [polling tests](tests/test_handlers_polling.py), [status tests](tests/test_handlers_status.py), [name grammar tests](tests/test_name_grammar.py).
 
+### Shikimori achievements and owner delivery
+
+`shiki_api.fetch_achievements` resolves the configured nickname through `/api/users/{profile}/info`
+and obtains the complete `/api/achievements?user_id={numeric_id}` response. Both attempts use
+`_fetch`, the application User-Agent, central min-gap/global budget and 429 retries. Startup
+shares the existing session and phase delay; subsequent refreshes run once per polling cycle,
+independently of the six-hour list synchronization. There is no standalone task or local achievement catalog.
+Wrong-profile/malformed/duplicate-family-level rows invalidate the complete response; valid
+emptiness initializes normally. Only positive levels count as earned. Bounded live verification
+on 2026-10-13 found both level-zero rows at 100% and positive rows below 100% on the public WNR
+profile, including multiple earned levels in one family. `created_at`/`updated_at` remain raw
+source observations and never claim exact unlock times.
+
+`achievement_state` owns version 1 independently of journal/outbox versions. Each captured state
+binds the configured profile, numeric user ID and owner plus a UUID identity. It retains the latest
+valid source rows separately from a monotonic `earned[neko_id]` maximum. Stable deduplication is
+profile/family/earned level; source row IDs are diagnostic fields. Removal, reduction, progress-only
+changes and row-ID replacement update the snapshot without lowering maxima. Missing files allow
+one silent baseline plus one compact frozen owner-summary plan, even for an empty response.
+Later captures group new families/promotions and freeze only each family's highest newly observed
+level. Initialization, snapshot, maxima and appended plans publish in one atomic replacement
+before dispatch. Existing plans survive all source refreshes/failures. Rendering happens outside
+the state transaction; publication reloads authority and checks generation/equality, so an obsolete
+source request cannot overwrite a restore or concurrent acknowledgement.
+
+Malformed, unreadable, oversized, unsupported or mismatched authority is preserved and fails
+closed with a debounced static owner notice. Configured-profile/owner mismatch blocks reads and
+delivery. A newly verified numeric-profile mismatch also suspends old obligations in the current
+runtime until a successful matching source refresh, including through subsequent source failures;
+it never rebases old obligations onto another user. Restart resolves the source again before the
+polling consumer starts. Restore with a different identity requires fresh authority. Source failures
+alone do not prevent pending delivery. `handlers._refresh_achievements` isolates unexpected
+achievement-refresh errors with type-only warnings, allowing startup/cycle history and backups
+to continue. Strict-state errors retain the safe owner diagnostic; cancellation and
+`ProfilePrivacyError` propagate to the existing global policies.
+When a non-baseline refresh observes new families/promotions,
+`shiki_api.fetch_achievement_labels` optionally reads the configured profile's achievement page through
+`_fetch`. One 15-second total deadline includes throttle/retry waits; streamed bytes are bounded at
+1 MiB. No per-achievement requests, image downloads or additional state/cache are introduced.
+The pure `achievement_metadata` parser reads titles and relative category links from cards/badges
+for exact `(neko_id, level)` pairs, with no family/category whitelist. Conflicting or unusable labels,
+changed markup, privacy/HTTP errors and timeouts fall back without rejecting the valid API snapshot.
+Level-mismatched titles are never applied to another tier. HTML escapes source labels/links and
+freezes them only in newly captured plans; metadata changes cannot rerender pending messages.
+Unknown entries use escaped identifiers and the profile's achievement link. HTML continuations
+preserve complete content at 4096 visible UTF-16 units. Source timestamps and successful decoration
+are never prerequisites for capture/delivery. Profile/card/badge markup was verified live on 2026-10-13.
+
+Each plan freezes kind, awards, creation/expiry, UUID, total parts and indexed text parts; only a
+contiguous remaining suffix is retained. Each part holds pending attempt evidence and due time,
+without subscriber audiences/membership tokens. Delivery goes directly to the bound owner even
+when absent from subscribers. Shared durable policy helpers supply six attempts, a 72-hour TTL,
+60/300/1800/7200/21600-second backoffs and capped RetryAfter. Each batch starts at most 20 requests
+within a 20-second budget, allowing a full ten-second Telegram timeout per request and 0.3-second
+spacing. The existing polling wait services history and achievement consumers independently at
+its 60-second cadence; sequential duties and batches can delay either. No throughput guarantee
+or exactly-once promise is added.
+
+Attempt markers publish conservative uncertainty before Telegram. One `send_with_retry` attempt
+preserves confirmed success, rejection, proven non-dispatch and uncertainty; later rejection cannot
+erase an earlier possible delivery. Generation, state/plan/part identity and the exact attempt lease
+guard both dispatch and acknowledgement; restore never waits for Telegram. A successful part,
+permanent refusal, expiry or exhausted budget removes that terminal obligation immediately, logging
+outcome/possible acceptance/possible duplicates without message content. It does not erase `earned`.
+Failed acknowledgement leaves the marker, and restart can repeat the unacknowledged frozen part.
+Old complete restores may roll progress back and replay; terminal delivery audit is deliberately absent.
+
+The common disk/import parser rejects duplicate JSON keys and checks full snapshot/dedup/plan/
+pending-attempt consistency. Actual compact UTF-8 bytes plus `recipient_progress_reserve` for all
+remaining attempt/outcome growth must fit the inclusive 8 MiB member limit. Terminal removal only
+shrinks the member, so admitted work has capacity for marker/ack/retirement. A rejected candidate
+advances no source or dedup checkpoint. Current rows and observed family maxima still have finite
+capacity; an API failure cannot prune the deduplication authority.
+
+Recovery and full export include the optional member in coherent capture and validate it with the
+same parser. Import rejects a malformed member before any publication; exact-byte rollback restores
+even damaged original bytes. Existing 32 MiB uncompressed/20 MiB ZIP/256-entry archive limits apply.
+Older archives without the member leave local achievements untouched; if missing, the next valid
+refresh initializes once. Quarter rotation does not touch this file. Public menu/artwork and bot
+awards remain separate stages of #61 and do not alter report aggregates.
+
+Evidence: [source/state](tests/test_achievement_state.py), [presentation](tests/test_achievement_messages.py),
+[metadata](tests/test_achievement_metadata.py),
+[capture/delivery](tests/test_achievement_delivery.py), [runtime](tests/test_handlers_achievements.py),
+[API](tests/test_shiki_api.py), [recovery/rollback](tests/test_backup.py).
+
 ### Durable history ingestion and processing
 
 `messages.normalize_history_event` owns normalization v1; `event_journal_schema` owns strict logical validation; `notification_progress_schema` binds physical history/progress; `storage` owns bounded reads and publication. Handlers coordinate admission, projection and enqueue. `notification_delivery` dispatches recipients independently. Published events are never reclassified with newer metadata or templates.
@@ -393,6 +494,7 @@ Versions below describe independent formats, not one application-wide schema. Va
 | State family | Supported versions and meaning |
 |---|---|
 | Normalized events | Normalization v1 across all journal formats; immutable accepted semantics. |
+| Shikimori achievements | Separate `achievements.json` v1 only; initialized source snapshot, monotonic family maxima and pending owner plans/attempts. Optional in old archives. |
 | Logical/legacy journal | v1/v2 store embedded processing; v2 supports unfinished acquisition. Logical v3 adds embedded outbox for consumers/legacy recovery; supported v2/v3 may carry an explicitly versioned source base. |
 | Physical `event_journal.json` | Legacy v1/v2/v3 remain readable. Activated v4 separates progress and forbids a source base; v5 requires base v1 with every compact fingerprint; v6 requires base v2 with the 4096-seq window. All activated versions retain the same progress lineage. |
 | `notification_progress.json` | v1 only: `progress_id`, `journal_id`, `profile`, processed cursor and complete outbox must match history. Missing/orphan/inconsistent progress is an error, never an empty queue. |

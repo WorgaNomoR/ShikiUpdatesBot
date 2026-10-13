@@ -24,7 +24,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
+from achievement_state import (
+    ACHIEVEMENTS_MAX_BYTES,
+    AchievementStateError,
+    achievement_state_json,
+    parse_achievement_member,
+)
 from config import (
+    ACHIEVEMENTS_FILE,
     BLOCKED_USERS_FILE,
     EVENT_JOURNAL_FILE,
     KNOWN_USERS_FILE,
@@ -154,6 +161,31 @@ def _atomic_write(path: "Path | str", data: str) -> None:
     tmp  = path.with_name(path.name + ".tmp")
     tmp.write_text(data, encoding="utf-8")
     tmp.replace(path)  # атомарная операция на уровне ОС
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ДОСТИЖЕНИЯ SHIKIMORI
+# ═══════════════════════════════════════════════════════════════════
+
+def load_achievement_state() -> dict | None:
+    """Только отсутствие файла разрешает инициализацию; ошибки сохраняем."""
+    try:
+        with ACHIEVEMENTS_FILE.open("rb") as stream:
+            raw = stream.read(ACHIEVEMENTS_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AchievementStateError("achievement_read") from exc
+    return parse_achievement_member(raw, profile=SHIKI_USER, owner_id=OWNER_ID)
+
+
+def save_achievement_state(state: dict) -> None:
+    """Вызывается под общей транзакцией; ошибка не подтверждает capture/ack."""
+    payload = achievement_state_json(state, profile=SHIKI_USER, owner_id=OWNER_ID)
+    try:
+        _atomic_write(ACHIEVEMENTS_FILE, payload)
+    except OSError as exc:
+        raise AchievementStateError("achievement_write") from exc
 
 
 # ═══════════════════════════════════════════════════════════════════

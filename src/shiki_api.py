@@ -3,19 +3,31 @@
 """
 Клиент Shikimori и media-домен ShikiUpdatesBot.
 
-Сетевой слой (list_export / GraphQL / history / favourites / rates) плюс
+Сетевой слой (list_export / GraphQL / history / favourites / achievements / rates) плюс
 низкоуровневая классификация медиа (get_media_info, is_relevant, фильтры
-типов, категории избранного, словари перевода). Зависит только от config и
-utils; messages/stats/handlers зависят от него, не наоборот.
+типов, категории избранного, словари перевода). Использует чистые схемы
+достижений, config, request_budget и utils; messages/stats/handlers зависят
+от него, не наоборот.
 """
 
 import asyncio
 import json
 import time
-from urllib.parse import urlsplit
+from urllib.parse import (
+    quote,
+    urlsplit,
+)
 
 import aiohttp
 
+from achievement_metadata import (
+    ACHIEVEMENT_PAGE_MAX_BYTES,
+    parse_achievement_labels,
+)
+from achievement_state import (
+    AchievementSourceError,
+    parse_achievement_source,
+)
 from config import (
     SHIKI_BASE_URL,
     SHIKI_USER,
@@ -741,6 +753,56 @@ async def fetch_favourites(session: aiohttp.ClientSession) -> dict | None:
         log.warning("fetch_favourites: некорректная структура ответа, избранное недоступно.")
         return None
     return payload
+
+
+async def fetch_achievement_labels(session: aiohttp.ClientSession) -> dict:
+    """Одна ограниченная страница для подписей; сбой не отменяет ответ API."""
+    async def parse(response):
+        body = bytearray()
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            if len(body) + len(chunk) > ACHIEVEMENT_PAGE_MAX_BYTES:
+                return {}
+            body.extend(chunk)
+        try:
+            return parse_achievement_labels(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            return {}
+
+    try:
+        async with asyncio.timeout(15):
+            labels = await _fetch(
+                session, "GET", f"{SHIKI_BASE_URL.rstrip('/')}/{quote(SHIKI_USER, safe='')}/achievements",
+                parse=parse, label="fetch_achievement_labels", timeout=15,
+            )
+    except (ProfilePrivacyError, TimeoutError):
+        return {}
+    return labels or {}
+
+
+async def fetch_achievements(session: aiohttp.ClientSession) -> dict | None:
+    """Получить числовой ID профиля и полный список через общий HTTP-контракт."""
+    info = await _fetch(
+        session, "GET", f"{SHIKI_BASE_URL}/api/users/{SHIKI_USER}/info",
+        parse=lambda resp: resp.json(), label="fetch_achievement_profile", timeout=15,
+    )
+    if (
+        not isinstance(info, dict) or type(info.get("id")) is not int or info["id"] <= 0
+        or not isinstance(info.get("nickname"), str)
+        or info["nickname"].casefold() != SHIKI_USER.casefold()
+    ):
+        log.warning("Достижения: профиль не получен или не соответствует настройке.")
+        return None
+    user_id = info["id"]
+    payload = await _fetch(
+        session, "GET", f"{SHIKI_BASE_URL}/api/achievements?user_id={user_id}",
+        parse=lambda resp: resp.json(), label="fetch_achievements", timeout=15,
+    )
+    try:
+        rows = parse_achievement_source(payload, user_id)
+    except AchievementSourceError:
+        log.warning("Достижения: некорректный ответ; snapshot сохранён.")
+        return None
+    return {"user_id": user_id, "rows": rows}
 
 
 async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | None:

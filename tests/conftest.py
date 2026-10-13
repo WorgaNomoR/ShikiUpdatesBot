@@ -43,6 +43,16 @@ def _isolated_history_state(tmp_path, monkeypatch):
     monkeypatch.setattr("storage.EVENT_JOURNAL_FILE", tmp_path / "event_journal.json")
     monkeypatch.setattr("storage.SEEN_IDS_FILE", tmp_path / "seen_ids.json")
     monkeypatch.setattr("storage.STATS_CURRENT_FILE", tmp_path / "stats_current.json")
+    monkeypatch.setattr("storage.ACHIEVEMENTS_FILE", tmp_path / "achievements.json")
+
+
+@pytest.fixture(autouse=True)
+def _no_achievement_http(monkeypatch):
+    """Поллинг не ходит в сеть; focused API-тесты используют свои HTTP stubs."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr("achievement_delivery.fetch_achievements", AsyncMock(return_value=None))
+    monkeypatch.setattr("achievement_delivery.fetch_achievement_labels", AsyncMock(return_value={}))
 
 
 @pytest.fixture(autouse=True)
@@ -84,11 +94,13 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "STATS_ALL_FILE", data / "stats_all.json")
     monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
     monkeypatch.setattr(storage, "EVENT_JOURNAL_FILE", data / "event_journal.json")
+    monkeypatch.setattr(storage, "ACHIEVEMENTS_FILE", data / "achievements.json")
     monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
     monkeypatch.setattr(storage, "UPDATE_STATE_FILE", data / "update_state.json")
     monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
     monkeypatch.setattr("handlers.OWNER_ID", 999)
     monkeypatch.setattr("backup.OWNER_ID", 999)
+    monkeypatch.setattr("achievement_delivery.OWNER_ID", 999)
     monkeypatch.setattr(storage, "OWNER_ID", 999)
     fact_bank.reload_fact_bank()
     yield data
@@ -132,6 +144,31 @@ def journal_factory():
             "baseline_ids": [1], "events": events, "processed_seq": processed,
         }
 
+    return factory
+
+
+@pytest.fixture
+def achievement_row_factory():
+    """Полный source row; source timestamps не означают unlock time."""
+    def factory(family="animelist", level=1, **changes):
+        return {
+            "id": level + 1, "user_id": 42, "neko_id": family, "level": level,
+            "progress": 28, "created_at": "2026-07-25T15:45:21.678Z",
+            "updated_at": "2026-10-10T16:21:58.064Z", **changes,
+        }
+    return factory
+
+
+@pytest.fixture
+def achievement_state_factory(achievement_row_factory):
+    """Реальный capture для delivery/storage/recovery контрактов."""
+    from achievement_state import capture_achievements
+
+    def factory(rows=None, *, now=1000, owner_id=999):
+        return capture_achievements(
+            None, [achievement_row_factory()] if rows is None else rows,
+            profile="WNR", user_id=42, owner_id=owner_id, now=now, base_url="https://shikimori.io",
+        )
     return factory
 
 
