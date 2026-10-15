@@ -5,7 +5,10 @@
 import re
 from urllib.parse import urlsplit
 
-from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES
+from report_asset_ids import (
+    REPORT_ASSET_MEDIA_REFERENCES,
+    REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES,
+)
 
 RICH_TEXT_LIMIT = 32768
 RICH_BLOCK_LIMIT = 500
@@ -42,11 +45,14 @@ def is_safe_https_media_url(value: object) -> bool:
 class _Counter:
     """Накопить официальные лимиты без привязки к aiogram."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, durable: bool = False) -> None:
         self.characters = 0
         self.blocks = 0
         self.depth = 0
         self.media = 0
+        self.local_media = (
+            REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES if durable else REPORT_ASSET_MEDIA_REFERENCES
+        )
 
     def _record_depth(self, depth: int) -> None:
         """Зафиксировать глубину до обхода дочернего содержимого."""
@@ -58,7 +64,7 @@ class _Counter:
         """Проверить внешний HTTPS URL или известный локальный asset id."""
         if (
             isinstance(value, str)
-            and value in REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES
+            and value in self.local_media
         ):
             return
         if not is_safe_https_media_url(value):
@@ -228,8 +234,8 @@ class _Counter:
             raise RichMessageValidationError("table_columns")
 
 
-def validate_rich_payload(payload: object) -> dict:
-    """Проверить точный сериализованный payload и вернуть исходный dict."""
+def validate_rich_payload(payload: object, *, durable: bool = False) -> dict:
+    """Проверить payload; сохранённым планам разрешены только хэшированные локальные ресурсы."""
     if (
         not isinstance(payload, dict)
         or set(payload) != {"blocks", "skip_entity_detection"}
@@ -238,7 +244,7 @@ def validate_rich_payload(payload: object) -> dict:
         or not payload["blocks"]
     ):
         raise RichMessageValidationError("message_fields")
-    counter = _Counter()
+    counter = _Counter(durable=durable)
     for block in payload["blocks"]:
         counter.block(block, 1)
     if counter.characters > RICH_TEXT_LIMIT:

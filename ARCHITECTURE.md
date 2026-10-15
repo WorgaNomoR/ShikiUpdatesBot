@@ -55,9 +55,9 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [utils.py](src/utils.py), [request_budget.py](src/request_budget.py) | Pure stdlib helpers for text, URLs, numbers, dates, Russian count forms, and rolling-window reservations. |
 | [name_grammar.py](src/name_grammar.py) | Immutable display-name context and template grammar over `pytrovich`, with no project imports. |
 | [telegram_delivery.py](src/telegram_delivery.py) | Explicit send outcomes/ordered attempt evidence, caller-selected bounded retry policy and observed aiogram session, with no project imports. |
-| [report_model.py](src/report_model.py), [report_asset_ids.py](src/report_asset_ids.py) | Pure typed reports/ordinary HTML chunking; import-light versioned asset identifiers and hashes. Neither imports project modules. |
+| [report_model.py](src/report_model.py), [report_asset_ids.py](src/report_asset_ids.py) | Pure typed reports/ordinary HTML chunking; import-light allowlisted local asset identifiers and hashes for durable resources. Neither imports project modules. |
 | [rich_message_schema.py](src/rich_message_schema.py), [report_plan.py](src/report_plan.py) | Pure serialized Rich validation over asset identifiers; frozen transport-unit validation over that schema. No runtime or aiogram dependency. |
-| [rich_report.py](src/rich_report.py), [report_assets.py](src/report_assets.py), [report_delivery.py](src/report_delivery.py) | Rich rendering/pagination; hash-checked local uploads; freezing, sequential delivery, fallback and results. Producers remain outside Bot API payload construction. |
+| [rich_report.py](src/rich_report.py), [report_assets.py](src/report_assets.py), [report_delivery.py](src/report_delivery.py) | Rich rendering/pagination; allowlisted local uploads with hash checks for durable resources; freezing, sequential delivery, fallback and results. Producers remain outside Bot API payload construction. |
 | [event_time_stats.py](src/event_time_stats.py) | Pure UTC attribution, deterministic post-migration quarter projections, compact source facts, correction revisions and shared validation; uses `source_history`, with no runtime imports. |
 | [source_history.py](src/source_history.py) | Pure absolute-seq/suffix access, exact accepted IDs, bounded diagnostic fingerprints and safe rebasing after prefix/fingerprint maintenance; stdlib only. |
 | [event_journal_schema.py](src/event_journal_schema.py) | Pure logical journal/acquisition/source-base/recovery validation and bounded parsing; uses `event_time_stats` and `source_history`, with no runtime imports. |
@@ -65,8 +65,9 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [notification_outbox.py](src/notification_outbox.py) | Pure versioned recipient obligations, frozen digest plans, terminal summaries, completed-prefix retention, membership validation, retry/expiry transitions and capacity reserve; uses `source_history` and `catchup_digest`, with no runtime imports. |
 | [catchup_digest.py](src/catchup_digest.py) | Pure lossless ordinary-HTML digest rendering, safe HTML/UTF-16 validation and continuation; uses only `report_model` helpers and stdlib. |
 | [notification_delivery.py](src/notification_delivery.py) | Independent bounded journal-notification consumer over storage and Telegram outcomes; owns durable per-recipient attempts/acknowledgements. |
-| [achievement_state.py](src/achievement_state.py), [achievement_messages.py](src/achievement_messages.py), [achievement_metadata.py](src/achievement_metadata.py) | Pure strict source/state/import schemas, monotonic earned-level deduplication and frozen owner plans; safe ordinary presentation and an optional profile-page label parser. Uses outbox policy helpers and HTML boundaries, with no runtime imports. |
+| [achievement_state.py](src/achievement_state.py), [achievement_messages.py](src/achievement_messages.py), [achievement_metadata.py](src/achievement_metadata.py) | Pure strict source/state/import schemas, monotonic earned-level deduplication and frozen owner plans; safe ordinary presentation and an optional exact-tier profile-page label/issuance-criterion parser. Uses outbox policy helpers and HTML boundaries, with no runtime imports. |
 | [achievement_delivery.py](src/achievement_delivery.py) | Source capture and bounded owner-only consumer over API/storage/Telegram; no subscriber membership, history records or statistics authority. |
+| [achievement_view.py](src/achievement_view.py) | Pure current-family selection, compact count and typed public reports from source rows; never reads historical maxima, owner identity or pending delivery. |
 | [history_catchup.py](src/history_catchup.py) | Pure connected-page traversal, exact frontier reconnection and head bridging; owns no I/O, normalization or publication. |
 | [storage.py](src/storage.py) | JSON persistence, cache read states, strict validators, restorable-state transaction and restore generation; frozen-plan validation uses `report_plan`. |
 | [shiki_api.py](src/shiki_api.py) | REST/GraphQL acquisition, metadata, relevance/kind definitions, translations, throttle, HTTP-attempt budget, 429 retry and privacy classification. |
@@ -132,6 +133,11 @@ graph TD
     backup --> achievement_state
     shiki_api --> achievement_state
     shiki_api --> achievement_metadata
+    achievement_state --> achievement_view
+    achievement_view --> achievement_messages
+    achievement_view --> report_model
+    achievement_view --> report_asset_ids
+    handlers --> achievement_view
     achievement_state --> achievement_messages
     achievement_state --> notification_outbox
     achievement_messages --> catchup_digest
@@ -174,7 +180,7 @@ Focused tests follow module ownership; handler orchestration lives in `tests/tes
 
 A missing portable `.env` is copied once from the adjacent example and never overwritten. Rotating `logs/` stay outside `DATA_DIR` and backups. A named mutex excludes a second process in the same folder. Source/Docker runs the healthcheck and shutdown-backup hook; frozen mode skips both. The ZIP's opt-in autostart helpers own only the current user's Startup shortcut and are never invoked by the exe or first-run flow. Setup/update steps belong in [README](README.md#быстрый-старт-portable-версия-для-windows).
 
-The startup owner probe sends a local escaped HTML health snapshot whose persisted timestamps describe the previous run, with an exception-safe bare restart signal as fallback. Successful delivery starts notification polling; failure leaves it off while Telegram update polling remains available. Owner `/start` re-arms it idempotently. Runtime owner-send failures do not stop the loop: doing so would deprive other subscribers of notifications. Process start, successful full-sync time and polling activity are observations in `runtime_status`, not restored state. Callers signal actual task launch/completion to the import-independent healthcheck. Owner-gate waiting remains healthy; a launched task has three `CHECK_INTERVAL` to produce its first heartbeat, completion is immediately unhealthy, and a legitimate restart resets that grace without inventing a heartbeat. A stale callback cannot stop a newer task's liveness observation. The healthcheck observes liveness and does not restart processes; endpoint/watchdog behaviour and external restart responsibilities are in [README](README.md#healthcheck-и-ответственность-за-перезапуск).
+The startup owner probe sends a local escaped HTML health snapshot whose persisted timestamps describe the previous run, with an exception-safe restart signal as fallback. Both include a compact local achievement count or an explicit unavailable/not-initialized status; neither waits for Shikimori. Successful delivery starts notification polling; failure leaves it off while Telegram update polling remains available. Owner `/start` re-arms it idempotently. Runtime owner-send failures do not stop the loop: doing so would deprive other subscribers of notifications. Process start, successful full-sync time and polling activity are observations in `runtime_status`, not restored state. Callers signal actual task launch/completion to the import-independent healthcheck. Owner-gate waiting remains healthy; a launched task has three `CHECK_INTERVAL` to produce its first heartbeat, completion is immediately unhealthy, and a legitimate restart resets that grace without inventing a heartbeat. A stale callback cannot stop a newer task's liveness observation. The healthcheck observes liveness and does not restart processes; endpoint/watchdog behaviour and external restart responsibilities are in [README](README.md#healthcheck-и-ответственность-за-перезапуск).
 
 ### State ownership and transactions
 
@@ -184,7 +190,7 @@ Persistent JSON state lives under `DATA_DIR`; the complete file inventory is in 
 |---|---|
 | `event_journal.json` | Strict history ingestion authority, silent baseline, immutable admitted events and separate unfinished acquisition; accepted exact IDs/seq and source facts survive completed-payload compaction; activated history binds separate progress. See the [format reference](#supported-state-formats-and-migration). |
 | `notification_progress.json` | Activated progress v1: logical processed checkpoint and complete frozen outbox, enqueue/completion boundaries, recipient attempts and terminal outcomes. Bound to physical history identity/profile/lineage. |
-| `achievements.json` | Separate achievement v1 authority: configured profile/numeric user/owner binding, initialized baseline, latest complete source rows, highest earned level per family and frozen pending owner plans. Independent of history and quarters. |
+| `achievements.json` | Separate achievement v1/v2 authority: configured profile/numeric user/owner binding, initialized baseline, latest complete source rows, highest earned level per family and frozen pending owner plans. Independent of history and quarters. |
 | `seen_ids.json`, `seen_favourites.json` | Export-only journal ID projection; separate favourites baseline/deduplication. Both excluded from restore. |
 | `stats_all.json` | Rebuildable current public lists, metadata, comments, favourites and aggregates; cached locally and excluded from restore. |
 | `stats_current.json`, `quarters/` | Source-quarter projections and correction revisions, journal-bound checkpoint and frozen report delivery; original historical snapshots. |
@@ -208,7 +214,7 @@ Every successful restore publication advances a process-local generation, includ
 
 `/info` and private `start=info` read only persisted/local runtime state, without subscribing, waking polling or fetching remote data. Owner `/version` and the guarded info refresh action share the safe renderer; refresh edits a caption or text and tolerates normal non-editable responses. Absolute HTTP(S) repository/release links must have no credentials; malformed values/timestamps/links degrade safely without revealing raw exceptions, identifiers, environment values or local paths. The local info illustration reuses a process-local Telegram `file_id`; missing/rejected media clears it and falls back to the same text information.
 
-The Windows spec and [Dockerfile](Dockerfile)/[.dockerignore](.dockerignore) retain the info illustration, the complete versioned `assets/main-menu/*.jpg` set, both report placeholders and [examples/facts.json](examples/facts.json). New collages use `report-poster-placeholder-v2.jpg`; `report-poster-placeholder-v1.png` remains materializable for already frozen/restored content-addressed plans. Removing it would break recovery. The Windows icon/editable PNG are build/design inputs; Windows autostart helpers stay outside Docker. Packaging tests and Docker build-time existence checks protect the effective resource set.
+The Windows spec and [Dockerfile](Dockerfile)/[.dockerignore](.dockerignore) retain the info illustration, the complete versioned `assets/main-menu/*.jpg` set including the achievement illustration, both report placeholders and [examples/facts.json](examples/facts.json). New collages use `report-poster-placeholder-v2.jpg`; `report-poster-placeholder-v1.png` remains materializable for already frozen/restored content-addressed plans. Removing it would break recovery. The Windows icon/editable PNG are build/design inputs; Windows autostart helpers stay outside Docker. Packaging tests and Docker build-time existence checks protect the effective resource set.
 
 Runtime/dev/build dependency definitions stay in the three root `requirements*.txt` manifests. The build-time [dependency submission workflow](.github/workflows/dependency-submission.yml) resolves each separately and validates exact versions/transitive edges before submission: managed plain-pip data lacks that resolution, while Component Detection's `PipReport` discovery cannot preserve all three manifest identities. The [submitter](.github/scripts/submit_dependency_snapshot.py) retains the legacy detector identity and alphabetically-first correlator to select the resolved manual snapshot deterministically, without introducing an adapter or lockfile policy.
 
@@ -236,7 +242,7 @@ Only `/start` is advertised; historical commands and inline handlers remain hidd
 
 `main_menu.py` retains complete fallback text for every allowlisted versioned JPEG. Missing/empty artwork opens text; rejected media invalidates its process-local `file_id`. Initial rejection falls back to text; rejected photo-to-photo navigation replaces the control with text, rebinds its ID, then removes the obsolete photo. Ambiguous transport failures do not send an alternative. Text sessions stay text-only, and owner prompts edit their current caption/text rather than creating another FSM implementation.
 
-Terminal reports/documents/results clear state before best-effort removal of control and `/start` anchor, then delegate existing use-cases. Cleared state makes replay inert; cleanup failure cannot suppress the selected action. Lists retain the control for their shared progress lifecycle below. Owner tools reuse picker, broadcast, directory, fact-bank and backup flows; information-card refresh already serves the hidden `/version` operation. The hidden `/stats` registry owns its own keyboard/dispatch; unified statistics navigation has separate declarations/dispatch and must be considered when adding a report.
+Terminal reports/documents/results clear state before best-effort removal of control and `/start` anchor, then delegate existing use-cases. Cleared state makes replay inert; cleanup failure cannot suppress the selected action. Lists retain the control for their shared progress lifecycle below. Owner tools reuse picker, broadcast, directory, fact-bank and backup flows; information-card refresh already serves the hidden `/version` operation. The hidden `/stats` command opens the same session-bound statistics screen, without reading subscriptions. The top-level achievements button and hidden `/achievs` directly deliver one combined report without an intermediate submenu. All unified submenus offer Back to the parent; only home offers Close. `/stats all` retains its direct report path; the old `stats:*` callbacks and registry remain compatible entrypoints for the former report controls.
 
 Personal subscribers/owner open home search with `switch_inline_query_current_chat=""`. An unsubscribed private user enters confirmation; a group user receives a private `start=inline_search` URL from `Bot.me()`, or an inert alert if username lookup fails. This never changes group subscription. Private deep-link return uses `switch_inline_query=""` because Telegram cannot preserve the originating chat. Owner/existing personal subscribers return directly; others confirm first. `start=info` and `start=inline_search_limit` are read-only and do not wake polling; group/unknown payloads open the ordinary neutral home.
 
@@ -319,15 +325,19 @@ independently of the six-hour list synchronization. There is no standalone task 
 Wrong-profile/malformed/duplicate-family-level rows invalidate the complete response; valid
 emptiness initializes normally. Only positive levels count as earned. Bounded live verification
 on 2026-10-13 found both level-zero rows at 100% and positive rows below 100% on the public WNR
-profile, including multiple earned levels in one family. `created_at`/`updated_at` remain raw
+profile, including multiple earned levels in one family. Verification on 2026-10-14 returned
+`animelist` levels 1/2/3 at 100% and level 4 at 28%; the profile page shows only its current
+level-4 card, with the 150-anime criterion and current-tier title. There is no separate
+level-5 source row: the latest positive-level percentage describes progress to the next level,
+and must not be discarded as merely an earned row. `created_at`/`updated_at` remain raw
 source observations and never claim exact unlock times.
 
-`achievement_state` owns version 1 independently of journal/outbox versions. Each captured state
+`achievement_state` reads versions 1 and 2 independently of journal/outbox versions. New runtime initialization uses v2 with a frozen startup-edit baseline; existing v1 state and baseline/award plans keep their exact content and evidence. Each captured state
 binds the configured profile, numeric user ID and owner plus a UUID identity. It retains the latest
 valid source rows separately from a monotonic `earned[neko_id]` maximum. Stable deduplication is
 profile/family/earned level; source row IDs are diagnostic fields. Removal, reduction, progress-only
 changes and row-ID replacement update the snapshot without lowering maxima. Missing files allow
-one silent baseline plus one compact frozen owner-summary plan, even for an empty response.
+one silent baseline plus one compact frozen startup-edit plan, even for an empty response. The v2 plan freezes the original owner startup message ID and complete HTML replacement; if a newly assembled replacement exceeds Telegram's UTF-16 limit, capture uses a compact startup header plus the same count before freezing, preserving the single edit instead of blocking initialization; a zero target explicitly means no valid startup address for the captured restore generation. Standalone legacy capture without a startup context retains its v1 summary contract.
 Later captures group new families/promotions and freeze only each family's highest newly observed
 level. Initialization, snapshot, maxima and appended plans publish in one atomic replacement
 before dispatch. Existing plans survive all source refreshes/failures. Rendering happens outside
@@ -347,9 +357,9 @@ to continue. Strict-state errors retain the safe owner diagnostic; cancellation 
 When a non-baseline refresh observes new families/promotions,
 `shiki_api.fetch_achievement_labels` optionally reads the configured profile's achievement page through
 `_fetch`. One 15-second total deadline includes throttle/retry waits; streamed bytes are bounded at
-1 MiB. No per-achievement requests, image downloads or additional state/cache are introduced.
+1 MiB. No per-achievement requests, image downloads or persistent metadata state are introduced. Public reads use `cached_achievement_metadata`: one coalesced configured-profile page per event loop, with a ten-minute successful TTL, a one-minute empty/failure TTL, and at most 4096 immutable exact-tier decorations. The one-page 1 MiB/15-second acquisition bounds remain; cancellation propagates, and failures leave local-data views usable. `fetch_achievement_labels` projects the same acquisition to its original two-field notification-label contract.
 The pure `achievement_metadata` parser reads titles and relative category links from cards/badges
-for exact `(neko_id, level)` pairs, with no family/category whitelist. Conflicting or unusable labels,
+for exact `(neko_id, level)` pairs including level zero, with no family/category whitelist. Card/badge `data-hint` supplies an optional source issuance criterion, normalized for whitespace and bounded at 512 characters. Missing, oversized, conflicting or title-repeating hints are omitted independently of valid labels. Source hints may describe a concrete count, a genre/level or just an author; the view never invents thresholds or presents `.text` flavour prose as an issuance condition. Profile `b-badge`/`is-badge` markup marks binary badges only for tiers 0/1; contradictory card markup or any visible higher tier prevents that classification without losing labels. Live franchise and author pages on 2026-10-14 showed only 0/1 badge states, while the Drama page showed four cumulative tiers; presentation does not infer a maximum from API rows or fetch a per-family catalog. Public level-zero labels and current-tier criteria were verified with bounded application-User-Agent requests on 2026-10-14. Positive-level recognition and newly captured award notifications are unchanged. Conflicting or unusable labels,
 changed markup, privacy/HTTP errors and timeouts fall back without rejecting the valid API snapshot.
 Level-mismatched titles are never applied to another tier. HTML escapes source labels/links and
 freezes them only in newly captured plans; metadata changes cannot rerender pending messages.
@@ -357,10 +367,10 @@ Unknown entries use escaped identifiers and the profile's achievement link. HTML
 preserve complete content at 4096 visible UTF-16 units. Source timestamps and successful decoration
 are never prerequisites for capture/delivery. Profile/card/badge markup was verified live on 2026-10-13.
 
-Each plan freezes kind, awards, creation/expiry, UUID, total parts and indexed text parts; only a
+Each plan freezes kind, awards, creation/expiry, UUID, total parts and indexed text parts; v2 startup plans additionally freeze `startup_message_id` and exactly one edit part; only a
 contiguous remaining suffix is retained. Each part holds pending attempt evidence and due time,
 without subscriber audiences/membership tokens. Delivery goes directly to the bound owner even
-when absent from subscribers. Shared durable policy helpers supply six attempts, a 72-hour TTL,
+when absent from subscribers. Startup plans edit the frozen message rather than sending another summary. Confirmed success acknowledges under the same generation/state/plan/part/attempt lease; a typed Telegram edit refusal containing `message is not modified` (case-insensitive, independent of prefix or explanatory suffix) proves the specified content is already present and completes idempotently. Other permanent edit refusals retire as rejected, never delivered. An unavailable zero target retires with an explicit rejection log and no Telegram call. Uncertain/cancelled edits retain their marker, exact address/text and bounded retry policy, with no alternative-message fallback. A later process start sends its ordinary saved-data count but cannot acknowledge or rerender this older obligation. Shared durable policy helpers supply six attempts, a 72-hour TTL,
 60/300/1800/7200/21600-second backoffs and capped RetryAfter. Each batch starts at most 20 requests
 within a 20-second budget, allowing a full ten-second Telegram timeout per request and 0.3-second
 spacing. The existing polling wait services history and achievement consumers independently at
@@ -372,7 +382,7 @@ preserves confirmed success, rejection, proven non-dispatch and uncertainty; lat
 erase an earlier possible delivery. Generation, state/plan/part identity and the exact attempt lease
 guard both dispatch and acknowledgement; restore never waits for Telegram. A successful part,
 permanent refusal, expiry or exhausted budget removes that terminal obligation immediately, logging
-outcome/possible acceptance/possible duplicates without message content. It does not erase `earned`.
+the Russian operation/result, family count, part and attempt without message content or private addresses. Pending results distinguish uncertainty, proven non-dispatch and Telegram refusal with bounded retry timing. Expiry/exhaustion/unavailable startup address are explicit, and prior possible acceptance/duplicate evidence stays visible in Russian. Logging does not change attempt/acknowledgement policy or erase `earned`.
 Failed acknowledgement leaves the marker, and restart can repeat the unacknowledged frozen part.
 Old complete restores may roll progress back and replay; terminal delivery audit is deliberately absent.
 
@@ -387,10 +397,41 @@ Recovery and full export include the optional member in coherent capture and val
 same parser. Import rejects a malformed member before any publication; exact-byte rollback restores
 even damaged original bytes. Existing 32 MiB uncompressed/20 MiB ZIP/256-entry archive limits apply.
 Older archives without the member leave local achievements untouched; if missing, the next valid
-refresh initializes once. Quarter rotation does not touch this file. Public menu/artwork and bot
-awards remain separate stages of #61 and do not alter report aggregates.
+refresh initializes once. Quarter rotation does not touch this file. Public views/artwork do not alter report aggregates; complementary bot awards remain deferred in #61. Already frozen v1 baseline obligations can therefore produce a separate legacy summary after upgrading, even though the new startup count is visible. This compatibility exception preserves original content, attempts, uncertainty and expiry; displayed counts alone never acknowledge it. Downgrade from v2 requires a compatible pre-update backup.
 
-Evidence: [source/state](tests/test_achievement_state.py), [presentation](tests/test_achievement_messages.py),
+`/start -> Achievements` and `/achievs` deliver the same combined typed Rich report, with a
+local `assets/main-menu/achievements-v1.jpg` header and complete HTML fallback/pagination.
+This interactive illustration uses an exact allowlisted named reference without a pinned hash;
+replacing or recompressing it does not require code changes. Missing/empty artwork selects the
+complete HTML fallback. It is not captured in durable quarterly plans, whose placeholders keep
+their original content-addressed references and byte verification.
+There is no intermediate achievement menu, redundant overview count or generic profile footer.
+The home pairs Achievements with Fact and puts Info on a separate lower row; `/stats` contains
+only statistical reports. One validated local snapshot is read under the state transaction,
+then optional cached decoration is acquired outside it. The main title and native lists follow
+favourites; default-open Earned/In progress details supply group counts and the renderer's
+message-local back-to-top navigation. Earned shows one highest current positive level per
+family, with nonzero/below-100% progress explicitly labelled as progress to the next level.
+Earned rows sort by exact-tier source category (common, genre, franchise, author), then
+case-folded title and family ID. Unfamiliar categories remain after known categories, and
+entries without exact-tier metadata remain last; the category order never filters the view
+or guesses classification from an identifier. Native list structure and group counts stay intact.
+Verified binary badges omit the redundant level-1 label; missing/conflicting metadata retains
+numeric levels, including the first tier of cumulative families. A higher current source level
+always remains visible, and a binary percentage never claims a next tier.
+In progress sorts level-zero families by positive progress descending with a stable family-ID
+tie-break, so no family repeats across
+groups. Passive level-zero/0% entries are omitted; earned 0%/100% percentages are omitted, while
+level-zero/100% entries remain unearned and visible without a percentage. Each row may include
+its exact-tier source issuance criterion. Current removal/reduction never consults monotonic
+notification maxima.
+Missing/uninitialized, valid emptiness and invalid/profile-owner-mismatched authority have
+distinct short safe output. Unknown identifiers retain lossless escaped text; exact available
+titles retain category links. User prose stays concise. Viewing never synchronizes the
+achievement API, mutates baseline/dedup/pending delivery or reads/writes subscriptions.
+API timestamps, next-tier titles/thresholds and remaining-title formulas are not inferred.
+
+Evidence: [source/state](tests/test_achievement_state.py), [notifications](tests/test_achievement_messages.py), [public presentation](tests/test_achievement_view.py),
 [metadata](tests/test_achievement_metadata.py),
 [capture/delivery](tests/test_achievement_delivery.py), [runtime](tests/test_handlers_achievements.py),
 [API](tests/test_shiki_api.py), [recovery/rollback](tests/test_backup.py).
@@ -494,7 +535,7 @@ Versions below describe independent formats, not one application-wide schema. Va
 | State family | Supported versions and meaning |
 |---|---|
 | Normalized events | Normalization v1 across all journal formats; immutable accepted semantics. |
-| Shikimori achievements | Separate `achievements.json` v1 only; initialized source snapshot, monotonic family maxima and pending owner plans/attempts. Optional in old archives. |
+| Shikimori achievements | Separate `achievements.json` v1/v2; initialized source snapshot, monotonic family maxima and pending owner plans/attempts. V2 adds a frozen startup edit target; v1 baseline/award plans stay readable and unchanged. Optional in old archives. |
 | Logical/legacy journal | v1/v2 store embedded processing; v2 supports unfinished acquisition. Logical v3 adds embedded outbox for consumers/legacy recovery; supported v2/v3 may carry an explicitly versioned source base. |
 | Physical `event_journal.json` | Legacy v1/v2/v3 remain readable. Activated v4 separates progress and forbids a source base; v5 requires base v1 with every compact fingerprint; v6 requires base v2 with the 4096-seq window. All activated versions retain the same progress lineage. |
 | `notification_progress.json` | v1 only: `progress_id`, `journal_id`, `profile`, processed cursor and complete outbox must match history. Missing/orphan/inconsistent progress is an error, never an empty queue. |
@@ -535,7 +576,7 @@ The ordinary renderer packs complete sections/items/rows and splits grouped tabl
 
 Rich rendering deterministically maps nodes to native blocks. Oversized catalogs binary-search the largest prefix whose actual serialized payload validates, and greedily combine subsequent statuses only when the result still validates. Title-card rows remain indivisible; only external oversized plain-text continuation fields can split. Continuations retain numbering, heading context and message-local generated navigation. Details summaries contain no links because observed clients reserve their click for toggling; a standalone navigation anchor follows details instead. Exact visual labels, emoji and spacing belong in producers/renderers, with semantic parity protected by tests.
 
-`rich_message_schema` independently validates the exact serialized subset: 32768 Unicode characters, 500 recursively counted blocks, 16 nesting levels, 20 table columns and 50 media. Payloads set `skip_entity_detection=True`; anchors come from the renderer. Media must be safe HTTPS or an exact versioned local reference containing SHA-256. `report_assets` verifies packaged bytes and makes a fresh in-memory upload before every attempt. Top collages preserve rank and fill unusable slots with the current placeholder; explicit galleries instead omit invalid/missing posters without placeholders. `/status` has at most one gallery of up to three usable posters per watching/reading group; decorative subsets never imply ranking/completeness.
+`rich_message_schema` independently validates the exact serialized subset: 32768 Unicode characters, 500 recursively counted blocks, 16 nesting levels, 20 table columns and 50 media. Payloads set `skip_entity_detection=True`; anchors come from the renderer. Media must be safe HTTPS or an exact allowlisted local reference. Durable quarterly placeholders retain SHA-256 references and packaged-byte verification; the interactive achievement illustration uses its named main-menu resource without a pinned hash. Quarterly plan admission and runtime/import validation use the schema's durable mode, which excludes unpinned interactive references even inside nested blocks; such an illustration can never become part of a persisted report. Arbitrary local paths and unregistered references remain invalid. `report_assets` loads nonempty packaged bytes and makes a fresh in-memory upload before every attempt. Top collages preserve rank and fill unusable slots with the current placeholder; explicit galleries instead omit invalid/missing posters without placeholders. `/status` has at most one gallery of up to three usable posters per watching/reading group; decorative subsets never imply ranking/completeness.
 
 `report_delivery` freezes all presentation before its first Telegram await and sends units sequentially through `send_with_retry`, stopping on permanent/exhausted failure with an explicit result/resume index and per-unit send results. The outcome/retry contract is defined below. Upload retries reuse captured content with fresh upload objects. Notification iteration/removal remains in handlers; backup ownership remains in backup.
 

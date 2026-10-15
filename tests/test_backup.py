@@ -34,8 +34,9 @@ import storage
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("full_export", [False, True])
-async def test_achievement_recovery_roundtrip(backup_env, achievement_state_factory, full_export):
-    state = achievement_state_factory()
+@pytest.mark.parametrize("startup", [None, (321, "🟢 Бот запущен")])
+async def test_achievement_recovery_roundtrip(backup_env, achievement_state_factory, full_export, startup):
+    state = achievement_state_factory(startup=startup)
     state["pending"][0]["parts"][0]["delivery"].update(
         attempts=[{"at": 1000, "outcome": "uncertain"}], next_attempt_at=1060,
     )
@@ -84,7 +85,8 @@ async def test_invalid_achievement_member_rejects_entire_import(backup_env, achi
 
 
 @pytest.mark.asyncio
-async def test_achievement_restore_rolls_back_exact_damaged_bytes(backup_env, achievement_state_factory, monkeypatch):
+@pytest.mark.parametrize("startup", [None, (321, "🟢 Бот запущен")])
+async def test_achievement_restore_rolls_back_exact_damaged_bytes(backup_env, achievement_state_factory, monkeypatch, startup):
     original = b'{ damaged current\r\n'
     storage.ACHIEVEMENTS_FILE.write_bytes(original)
     alert = b'{"enabled": true}\r\n'
@@ -97,7 +99,7 @@ async def test_achievement_restore_rolls_back_exact_damaged_bytes(backup_env, ac
         real_publish(source, target)
 
     monkeypatch.setattr("backup._publish_staged_file", fail)
-    archive = _zip_bytes({"achievements.json": json.dumps(achievement_state_factory()), "user_alerts.json": '{"enabled":false}'})
+    archive = _zip_bytes({"achievements.json": json.dumps(achievement_state_factory(startup=startup)), "user_alerts.json": '{"enabled":false}'})
     with pytest.raises(ValueError, match="исходное состояние восстановлено"):
         await backup.restore_backup_zip(archive)
     assert storage.ACHIEVEMENTS_FILE.read_bytes() == original

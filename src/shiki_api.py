@@ -13,6 +13,7 @@
 import asyncio
 import json
 import time
+import weakref
 from urllib.parse import (
     quote,
     urlsplit,
@@ -22,7 +23,7 @@ import aiohttp
 
 from achievement_metadata import (
     ACHIEVEMENT_PAGE_MAX_BYTES,
-    parse_achievement_labels,
+    parse_achievement_metadata,
 )
 from achievement_state import (
     AchievementSourceError,
@@ -755,8 +756,31 @@ async def fetch_favourites(session: aiohttp.ClientSession) -> dict | None:
     return payload
 
 
-async def fetch_achievement_labels(session: aiohttp.ClientSession) -> dict:
-    """Одна ограниченная страница для подписей; сбой не отменяет ответ API."""
+_achievement_metadata_caches = weakref.WeakKeyDictionary()
+
+
+async def cached_achievement_metadata() -> dict:
+    """Один профиль/страница на loop: coalescing, 10 минут успеха, минута отказа."""
+    loop = asyncio.get_running_loop()
+    cache = _achievement_metadata_caches.setdefault(loop, {"lock": asyncio.Lock()})
+    key = (SHIKI_BASE_URL, SHIKI_USER)
+    async with cache["lock"]:
+        if cache.get("key") == key and time.monotonic() < cache.get("until", 0):
+            return dict(cache["labels"])
+        try:
+            async with aiohttp.ClientSession() as session:
+                labels = await fetch_achievement_metadata(session)
+        except Exception as error:
+            log.warning("Подписи достижений недоступны (%s).", type(error).__name__)
+            labels = {}
+        # Лимит страницы уже ограничивает parser; cache дополнительно ограничен числом пар.
+        labels = dict(list(labels.items())[:4096])
+        cache.update(key=key, labels=labels, until=time.monotonic() + (600 if labels else 60))
+        return dict(labels)
+
+
+async def fetch_achievement_metadata(session: aiohttp.ClientSession) -> dict:
+    """Одна ограниченная страница для подписей и условий выдачи; сбой не отменяет API."""
     async def parse(response):
         body = bytearray()
         async for chunk in response.content.iter_chunked(64 * 1024):
@@ -764,7 +788,7 @@ async def fetch_achievement_labels(session: aiohttp.ClientSession) -> dict:
                 return {}
             body.extend(chunk)
         try:
-            return parse_achievement_labels(body.decode("utf-8"))
+            return parse_achievement_metadata(body.decode("utf-8"))
         except UnicodeDecodeError:
             return {}
 
@@ -772,11 +796,19 @@ async def fetch_achievement_labels(session: aiohttp.ClientSession) -> dict:
         async with asyncio.timeout(15):
             labels = await _fetch(
                 session, "GET", f"{SHIKI_BASE_URL.rstrip('/')}/{quote(SHIKI_USER, safe='')}/achievements",
-                parse=parse, label="fetch_achievement_labels", timeout=15,
+                parse=parse, label="fetch_achievement_metadata", timeout=15,
             )
     except (ProfilePrivacyError, TimeoutError):
         return {}
     return labels or {}
+
+
+async def fetch_achievement_labels(session: aiohttp.ClientSession) -> dict:
+    """Сохранить контракт точных подписей для захвата новых уведомлений."""
+    return {
+        key: (value.title, value.category)
+        for key, value in (await fetch_achievement_metadata(session)).items()
+    }
 
 
 async def fetch_achievements(session: aiohttp.ClientSession) -> dict | None:

@@ -1569,7 +1569,7 @@ def new_quarter_delivery_plan(
 ) -> dict:
     """Заморозить v2 transport/content или v3 с ревизиями корректировок."""
     try:
-        validate_frozen_report_units(units)
+        validate_frozen_report_units(units, durable=True)
     except FrozenReportPlanError:
         raise QuarterDeliveryStateError("report_units") from None
     pending = {
@@ -1701,7 +1701,7 @@ def validate_pending_quarter_delivery(cur: dict) -> dict | None:
         total_units = len(messages)
     else:
         try:
-            validate_frozen_report_units(units)
+            validate_frozen_report_units(units, durable=True)
         except FrozenReportPlanError:
             raise QuarterDeliveryStateError("report_units") from None
         total_units = len(units)

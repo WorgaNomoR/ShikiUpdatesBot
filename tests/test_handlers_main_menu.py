@@ -28,6 +28,99 @@ from storage import (
 
 
 @pytest.mark.asyncio
+async def test_stats_command_opens_shared_guarded_public_menu(monkeypatch):
+    state = _State()
+    message = _callback("unused").message
+    message.from_user = MagicMock(id=777)
+    message.text = "/stats"
+    control = MagicMock(message_id=200)
+    send = AsyncMock(return_value=control)
+    monkeypatch.setattr("handlers._send_main_menu_view", send)
+    monkeypatch.setattr("handlers._discard_active_flow_for_menu", AsyncMock())
+    monkeypatch.setattr("handlers.load_subscribers", lambda: pytest.fail("subscription read"))
+    await handlers.cmd_stats(message, state)
+    assert state.data["main_menu_screen"] == "stats"
+    send.assert_awaited_once()
+    callbacks = {button.callback_data for row in send.await_args.args[1].keyboard.inline_keyboard for button in row}
+    assert {"menu:stats:current", "menu:stats:all"} <= callbacks
+    assert not any("achievements" in (value or "") for value in callbacks)
+
+
+@pytest.mark.asyncio
+async def test_achievs_command_opens_same_public_section_without_subscription(backup_env, monkeypatch):
+    state = _state()
+    message = _callback("unused").message
+    message.from_user = MagicMock(id=777)
+    message.text = "/achievs"
+    report = plain_report("achievements")
+    build = AsyncMock(return_value=report)
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr("handlers._achievement_report", build)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+    monkeypatch.setattr("handlers.load_subscribers", lambda: pytest.fail("subscription read"))
+    await handlers.cmd_achievs(message, state)
+    assert state.state is None
+    build.assert_awaited_once_with()
+    assert delivery.await_args.args == (message.bot, message.chat.id, report)
+    assert delivery.await_args.kwargs == {"disable_preview": True, "notify_partial": True}
+
+
+@pytest.mark.asyncio
+async def test_achievements_home_button_delivers_one_guarded_report_without_submenu(backup_env, monkeypatch):
+    state = _state(screen="home")
+    callback = _callback("menu:achievements")
+    source = AsyncMock(side_effect=AssertionError("sync forbidden"))
+    monkeypatch.setattr("handlers.synchronize_achievements", source)
+    monkeypatch.setattr("handlers.load_subscribers", lambda: pytest.fail("subscription read"))
+    report = plain_report("source snapshot")
+    build = AsyncMock(return_value=report)
+    delivery = AsyncMock(return_value=ReportDeliveryResult(True, 1, 1))
+    monkeypatch.setattr("handlers._achievement_report", build)
+    monkeypatch.setattr("handlers.deliver_report", delivery)
+    await handlers.main_menu_cb(callback, state)
+    build.assert_awaited_once_with()
+    assert delivery.await_args.args[2] == report
+    assert state.state is None
+    await handlers.main_menu_cb(callback, state)
+    build.assert_awaited_once()
+    assert "Меню устарело" in callback.answer.await_args.args[0]
+    source.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["initiator", "chat", "control", "expired", "wrong_screen"])
+async def test_invalid_achievement_navigation_cannot_read_snapshot(monkeypatch, invalid):
+    state = _state(screen="home")
+    callback = _callback("menu:achievements")
+    if invalid == "initiator":
+        callback.from_user.id += 1
+    elif invalid == "chat":
+        callback.message.chat.id += 1
+    elif invalid == "control":
+        callback.message.message_id += 1
+    elif invalid == "expired":
+        state.state = None
+    else:
+        state.data["main_menu_screen"] = "stats"
+    snapshot = MagicMock()
+    monkeypatch.setattr("handlers.load_achievement_state", snapshot)
+    await handlers.main_menu_cb(callback, state)
+    snapshot.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_forged_submenu_close_is_inert(monkeypatch):
+    state = _state(screen="stats")
+    callback = _callback("menu:close")
+    builder = AsyncMock()
+    monkeypatch.setattr("handlers._stats_report_all", builder)
+    await handlers.main_menu_cb(callback, state)
+    assert state.state is not None and state.data["main_menu_screen"] == "stats"
+    callback.message.delete.assert_not_awaited()
+    builder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("full_export", [False, True])
 async def test_owner_backup_menu_dispatches_selected_mode_once(backup_env, monkeypatch, full_export):
     state = _state(screen="owner:backup", user_id=handlers.OWNER_ID)

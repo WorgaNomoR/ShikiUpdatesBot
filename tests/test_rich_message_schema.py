@@ -5,6 +5,7 @@
 import pytest
 
 from report_asset_ids import (
+    REPORT_ACHIEVEMENTS_MEDIA,
     REPORT_POSTER_PLACEHOLDER_MEDIA,
     REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
 )
@@ -238,6 +239,7 @@ def test_collage_accepts_two_or_three_photos_and_counts_nested_blocks():
         "https://user:password@cdn.example.test/poster.jpg",
         "https://cdn.example.test/poster.jpg\nignored",
         "asset://unknown",
+        "asset://main-menu/home-v1.jpg",
         [],
         {},
     ],
@@ -263,13 +265,19 @@ def test_rich_text_urls_use_the_safe_https_policy(url):
 
 
 @pytest.mark.parametrize("reference", [
+    REPORT_ACHIEVEMENTS_MEDIA,
     REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
     REPORT_POSTER_PLACEHOLDER_MEDIA,
 ])
-def test_exact_versioned_local_asset_reference_is_allowed(reference):
+@pytest.mark.parametrize("durable", [False, True])
+def test_local_asset_policy_distinguishes_interactive_and_durable_payloads(reference, durable):
     payload = _message(_photo(reference))
 
-    assert validate_rich_payload(payload) is payload
+    if durable and reference == REPORT_ACHIEVEMENTS_MEDIA:
+        with pytest.raises(RichMessageValidationError, match="^media_url$"):
+            validate_rich_payload(payload, durable=durable)
+    else:
+        assert validate_rich_payload(payload, durable=durable) is payload
 
 
 def test_hostile_anchor_names_are_rejected_in_targets_and_links():

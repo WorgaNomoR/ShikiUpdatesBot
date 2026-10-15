@@ -194,6 +194,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         main.cmd_broadcast,
         main.cmd_cancel,
         main.cmd_stats,
+        main.cmd_achievs,
         main.cmd_lists,
         main.cmd_favs,
         main.cmd_fact,
@@ -207,6 +208,15 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         main.cmd_useralerts,
         main.cmd_users,
     }.issubset(registered_messages)
+    achievement_registrations = [
+        call
+        for call in app.dispatcher.message.register.call_args_list
+        if call.args[0] is main.cmd_achievs
+    ]
+    assert len(achievement_registrations) == 1
+    achievement_filter = achievement_registrations[0].args[1]
+    assert isinstance(achievement_filter, main.Command)
+    assert achievement_filter.commands == ("achievs",)
     lists_registrations = [
         call
         for call in app.dispatcher.message.register.call_args_list

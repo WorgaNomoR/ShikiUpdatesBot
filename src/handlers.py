@@ -61,9 +61,15 @@ from access_control import (
 from achievement_delivery import (
     achievement_diagnostic,
     dispatch_achievements,
+    ensure_achievement_profile,
+    register_achievement_startup,
     synchronize_achievements,
 )
 from achievement_state import AchievementStateError
+from achievement_view import (
+    achievement_summary,
+    build_achievement_report,
+)
 from backup import (
     BACKUP_TAG,
     IMPORT_DOCUMENT_MAX_BYTES,
@@ -215,6 +221,7 @@ from shiki_api import (
     ANIME_ALLOWED_KINDS,
     HISTORY_PAGE_LIMIT,
     ProfilePrivacyError,
+    cached_achievement_metadata,
     fetch_current_rates,
     fetch_favourites,
     fetch_history,
@@ -258,6 +265,7 @@ from storage import (
     compact_event_journal,
     downgrade_quarter_delivery,
     list_blocked_users,
+    load_achievement_state,
     load_blocked_users,
     load_event_journal,
     load_legacy_seen_ids,
@@ -878,6 +886,43 @@ async def _stats_report_favourites() -> Report:
     return build_favourites_messages(stats_all)
 
 
+async def _achievement_rows() -> tuple[list[dict] | None, bool]:
+    """Один проверенный снимок; владельца и очередь не передаём в представление."""
+    try:
+        async with restorable_state_transaction():
+            state = load_achievement_state()
+            if state is not None:
+                ensure_achievement_profile(state)
+        return (None if state is None else state["snapshot"]), False
+    except AchievementStateError:
+        return None, True
+
+
+async def _achievement_report() -> Report:
+    """Необязательная декорация после локального чтения, без sync и записи состояния."""
+    rows, invalid = await _achievement_rows()
+    metadata = await cached_achievement_metadata() if rows else {}
+    return build_achievement_report(
+        rows, base_url=SHIKI_BASE_URL, profile=SHIKI_USER,
+        metadata=metadata, invalid=invalid,
+    )
+
+
+async def cmd_achievs(message: Message, state: FSMContext) -> None:
+    """Показать тот же общий отчёт без подписки и промежуточного меню."""
+    if message.from_user is None:
+        await message.answer("⚠️ Не удалось определить отправителя команды.")
+        return
+    await _discard_active_flow_for_menu(message, state)
+    try:
+        report = await _achievement_report()
+    except Exception as error:
+        log.error("Достижения: не удалось сформировать отчёт (%s).", type(error).__name__)
+        await message.answer("⚠️ Не удалось загрузить достижения, попробуй позже.")
+        return
+    await deliver_report(message.bot, message.chat.id, report, disable_preview=True, notify_partial=True)
+
+
 # Реестр вариантов отчёта. Кортеж: (ключ callback_data, подпись кнопки, builder, ряд)
 # callback_data будет вида "stats:<ключ>".
 _STATS_MENU: list[tuple[str, str, "callable", int]] = [
@@ -908,12 +953,12 @@ def _stats_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def cmd_stats(message: Message) -> None:
+async def cmd_stats(message: Message, state: FSMContext | None = None) -> None:
     """
     /stats      — показывает меню выбора отчёта (кнопки).
     /stats all  — сразу полный отчёт за всё время (быстрый путь, без меню).
 
-    Доступна всем подписчикам. Не делает сетевых запросов (читает файлы) —
+    Доступна без подписки. Не делает сетевых запросов (читает файлы) —
     мгновенно и не может упасть из-за недоступности API.
     """
     arg = ""
@@ -945,6 +990,11 @@ async def cmd_stats(message: Message) -> None:
             )
         return
 
+    if state is not None:
+        await _open_main_menu(message, state, screen="stats", origin="stats")
+        return
+
+    # Совместимость вызова без FSM; реальные команды получают общую guarded-сессию.
     # Иначе — показываем меню с кнопками. Отправляем ОТВЕТОМ на команду
     # (reply): так у меню появляется reply_to_message — само сообщение /stats,
     # и кнопка ❌ Закрыть сможет удалить заодно и команду.
@@ -3027,14 +3077,19 @@ def start_polling_loop(bot: Bot) -> bool:
 
 
 def _build_startup_text() -> str:
-    """Стартовый health-снапшот для owner-gate. При любой ошибке сборки —
-    голое '🟢 Бот запущен': проба доставки (тест аварийного канала + гейт
-    фонового цикла) не должна падать из-за кривого таймстемпа. Все источники —
+    """Стартовый health-снапшот для owner-gate со счётчиком достижений.
+    При ошибке сборки остаётся короткий сигнал со статусом достижений:
+    проба доставки не должна падать из-за кривого таймстемпа. Все источники —
     локальные загрузчики (без сети); времена берутся от прошлого запуска, их
     протухлость и есть диагностика."""
     try:
+        state = load_achievement_state()
+        summary = achievement_summary(None if state is None else state["snapshot"])
+    except Exception:
+        summary = achievement_summary(None, invalid=True)
+    try:
         stats_all = load_stats_all()
-        return build_startup_snapshot(
+        text = build_startup_snapshot(
             display_name=DISPLAY_NAME,
             shiki_user=SHIKI_USER,
             check_interval_sec=CHECK_INTERVAL,
@@ -3044,9 +3099,10 @@ def _build_startup_text() -> str:
             stats_updated_at=stats_all.get("updated_at"),
             last_backup_at=load_subscription_backup_state().get("last_backup_at"),
         )
+        return text + "\n\n" + summary
     except Exception as e:
         log.warning("Не удалось собрать стартовый снапшот, шлём голый пинг: %s", e)
-        return "🟢 Бот запущен"
+        return "🟢 Бот запущен\n\n" + summary
 
 
 async def probe_owner_and_start(bot: Bot) -> None:
@@ -3055,10 +3111,12 @@ async def probe_owner_and_start(bot: Bot) -> None:
     фоновый цикл; не доставилось (владелец заблокировал бота / TelegramForbiddenError
     и т.п.) → WARNING, цикл НЕ стартуем. Апдейт-поллинг (dp.start_polling) жив всегда:
     бот отвечает на команды, владелец /start добудит цикл без рестарта контейнера."""
+    text = _build_startup_text()
+    register_achievement_startup(0, text)
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             OWNER_ID,
-            _build_startup_text(),
+            text,
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
@@ -3067,6 +3125,9 @@ async def probe_owner_and_start(bot: Bot) -> None:
             "Разбудить: владелец шлёт /start.", type(e).__name__, e,
         )
         return
+    message_id = getattr(sent, "message_id", None)
+    if type(message_id) is int and message_id > 0:
+        register_achievement_startup(message_id, text)
     if start_polling_loop(bot):
         log.info("Владелец на связи — фоновый цикл запущен.")
 
@@ -4417,7 +4478,10 @@ async def _open_main_menu(
         return
     await _discard_active_flow_for_menu(message, state)
     try:
-        if screen == "subscription":
+        if screen == "stats":
+            target = None
+            view = main_menu.stats_view()
+        elif screen == "subscription":
             subscribed = _chat_is_subscribed(message.chat.id)
             target = bool(target_subscription)
             view = main_menu.subscription_view(
@@ -4829,6 +4893,12 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
                 state,
                 main_menu.stats_view(),
                 screen="stats",
+            )
+            return
+        if action == "menu:achievements":
+            await _deliver_main_report(
+                callback, state, _achievement_report,
+                label="achievements", disable_preview=True,
             )
             return
         if action == "menu:lists":

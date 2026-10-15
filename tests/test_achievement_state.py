@@ -130,11 +130,12 @@ def test_source_numeric_identity_mismatch_cannot_capture(achievement_state_facto
 
 
 @pytest.mark.parametrize("outcome", ["confirmed_rejection", "not_dispatched", "uncertain"])
-def test_capacity_reserves_all_future_attempt_growth(achievement_state_factory, monkeypatch, outcome):
+@pytest.mark.parametrize("startup", [None, (321, "🟢 Бот запущен")])
+def test_capacity_reserves_all_future_attempt_growth(achievement_state_factory, monkeypatch, outcome, startup):
     import achievement_state
     from notification_outbox import recipient_progress_reserve
 
-    state = achievement_state_factory()
+    state = achievement_state_factory(startup=startup)
     delivery = state["pending"][0]["parts"][0]["delivery"]
     budget = len(_json(state).encode()) + recipient_progress_reserve(delivery)
     monkeypatch.setattr("achievement_state.ACHIEVEMENTS_MAX_BYTES", budget - 1)
@@ -154,3 +155,59 @@ def test_capacity_reserves_all_future_attempt_growth(achievement_state_factory, 
             now = delivery["next_attempt_at"]
     # Реальные bytes, включая reserve, определяют inclusive границу.
     assert len(original.encode()) < achievement_state.ACHIEVEMENTS_MAX_BYTES
+
+
+@pytest.mark.parametrize("change", ["version", "target_bool", "target_negative", "parts", "extra"])
+def test_startup_plan_strict_schema_rejects_invalid_operation(achievement_state_factory, change):
+    state = achievement_state_factory(startup=(321, "🟢 Бот запущен"))
+    plan = state["pending"][0]
+    if change == "version":
+        state["version"] = 1
+    elif change == "target_bool":
+        plan["startup_message_id"] = True
+    elif change == "target_negative":
+        plan["startup_message_id"] = -1
+    elif change == "parts":
+        plan["total_parts"] = 2
+    else:
+        plan["replacement_text"] = "silently rewrite"
+    with pytest.raises(AchievementStateError):
+        _json(state)
+
+
+def test_v2_capture_preserves_legacy_frozen_plans_and_current_snapshot(achievement_state_factory, achievement_row_factory):
+    state = achievement_state_factory(startup=(321, "🟢 Бот запущен"))
+    frozen = deepcopy(state["pending"])
+    restored = parse_achievement_member(_json(state).encode(), profile="WNR", owner_id=999)
+    current = _capture(restored, [achievement_row_factory(level=2)])
+    assert current["version"] == 2
+    assert current["pending"][:1] == frozen
+    assert current["pending"][1]["kind"] == "awards"
+
+
+@pytest.mark.parametrize("astral,extra", [(False, 0), (False, 1), (True, 1)])
+def test_startup_summary_fits_one_edit_at_the_telegram_length_boundary(achievement_row_factory, astral, extra):
+    from achievement_view import achievement_summary
+    from catchup_digest import html_length
+    from report_model import TELEGRAM_TEXT_LIMIT
+
+    rows = [achievement_row_factory()]
+    summary = achievement_summary(rows)
+    room = TELEGRAM_TEXT_LIMIT - html_length("\n\n" + summary)
+    base = ("😀" * (room // 2) + "x" * (room % 2)) if astral else "x" * room
+    base = "<b>" + base + "x" * extra + "</b>"
+    state = capture_achievements(
+        None, rows, profile="WNR", user_id=42, owner_id=999,
+        now=1000, base_url="https://shikimori.io", startup=(321, base),
+    )
+
+    restored = parse_achievement_member(_json(state).encode(), profile="WNR", owner_id=999)
+
+    assert len(restored["pending"]) == 1
+    plan = restored["pending"][0]
+    assert plan["kind"] == "startup" and plan["startup_message_id"] == 321
+    assert plan["total_parts"] == 1
+    text = plan["parts"][0]["text"]
+    expected_base = "🟢 Бот запущен" if extra else base
+    assert text == expected_base + "\n\n" + summary
+    assert html_length(text) <= TELEGRAM_TEXT_LIMIT

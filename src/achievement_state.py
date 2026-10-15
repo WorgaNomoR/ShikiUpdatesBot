@@ -9,6 +9,7 @@ from copy import deepcopy
 from uuid import uuid4
 
 from achievement_messages import render_achievement_messages
+from achievement_view import achievement_summary
 from catchup_digest import html_length
 from notification_outbox import (
     LIFETIME,
@@ -87,6 +88,7 @@ def capture_achievements(
     state: dict | None, rows: list[dict], *, profile: str, user_id: int,
     owner_id: int, now: float, base_url: str,
     labels: dict[tuple[str, int], tuple[str, str]] | None = None,
+    startup: tuple[int, str] | None = None,
 ) -> dict:
     """Единый кандидат: снимок, максимумы и замороженный план до отправки."""
     rows = parse_achievement_source(rows, user_id)
@@ -96,7 +98,7 @@ def capture_achievements(
             raise AchievementStateError("achievement_profile")
     baseline = state is None
     result = deepcopy(state) if state is not None else {
-        "version": 1, "state_id": uuid4().hex, "profile": profile,
+        "version": 2 if startup is not None else 1, "state_id": uuid4().hex, "profile": profile,
         "user_id": user_id, "owner_id": owner_id, "initialized": True,
         "snapshot": [], "earned": {}, "pending": [],
     }
@@ -110,8 +112,15 @@ def capture_achievements(
             observed if baseline else changes, previous,
             baseline=baseline, profile=profile, base_url=base_url, labels=labels,
         )
-        result["pending"].append({
-            "plan_id": uuid4().hex, "kind": "baseline" if baseline else "awards",
+        startup_baseline = baseline and startup is not None
+        if startup_baseline:
+            summary = achievement_summary(rows)
+            text = startup[1] + "\n\n" + summary
+            if html_length(text) > TELEGRAM_TEXT_LIMIT:
+                text = "🟢 Бот запущен\n\n" + summary
+            chunks = [text]
+        plan = {
+            "plan_id": uuid4().hex, "kind": "startup" if startup_baseline else "baseline" if baseline else "awards",
             "awards": observed if baseline else changes,
             "created_at": now, "expires_at": now + LIFETIME,
             "total_parts": len(chunks),
@@ -122,7 +131,10 @@ def capture_achievements(
                     "reason": None, "duplicate_possible": False,
                 },
             } for index, text in enumerate(chunks)],
-        })
+        }
+        if startup_baseline:
+            plan["startup_message_id"] = startup[0]
+        result["pending"].append(plan)
     return result
 
 
@@ -132,7 +144,7 @@ def validate_achievement_state(state: object, *, profile: str, owner_id: int) ->
         not isinstance(state, dict) or set(state) != {
             "version", "state_id", "profile", "user_id", "owner_id", "initialized",
             "snapshot", "earned", "pending",
-        } or type(state["version"]) is not int or state["version"] != 1
+        } or type(state["version"]) is not int or state["version"] not in (1, 2)
         or not _identity(state["state_id"]) or state["initialized"] is not True
         or not _integer(state["user_id"], 1) or not _integer(state["owner_id"], 1)
     ):
@@ -155,11 +167,16 @@ def validate_achievement_state(state: object, *, profile: str, owner_id: int) ->
     identities = set()
     baseline_count = 0
     for plan in state["pending"]:
+        startup = isinstance(plan, dict) and plan.get("kind") == "startup"
+        fields = {"plan_id", "kind", "awards", "created_at", "expires_at", "total_parts", "parts"}
+        if startup:
+            fields.add("startup_message_id")
         if (
-            not isinstance(plan, dict) or set(plan) != {
-                "plan_id", "kind", "awards", "created_at", "expires_at", "total_parts", "parts",
-            } or not _identity(plan["plan_id"]) or plan["plan_id"] in identities
-            or plan["kind"] not in ("baseline", "awards")
+            not isinstance(plan, dict) or set(plan) != fields
+            or not _identity(plan["plan_id"]) or plan["plan_id"] in identities
+            or plan["kind"] not in ("baseline", "awards", "startup")
+            or (startup and (state["version"] != 2 or not _integer(plan["startup_message_id"])
+                            or plan["total_parts"] != 1))
             or not _time(plan["created_at"]) or not _time(plan["expires_at"])
             or plan["expires_at"] != plan["created_at"] + LIFETIME
             or not _integer(plan["total_parts"], 1)
@@ -170,7 +187,7 @@ def validate_achievement_state(state: object, *, profile: str, owner_id: int) ->
         ):
             raise AchievementStateError("achievement_plan")
         identities.add(plan["plan_id"])
-        baseline_count += plan["kind"] == "baseline"
+        baseline_count += plan["kind"] in {"baseline", "startup"}
         indices = []
         for part in plan["parts"]:
             if (

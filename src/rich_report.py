@@ -26,7 +26,10 @@ from aiogram.types import (
     RichTextUrl,
 )
 
-from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA
+from report_asset_ids import (
+    REPORT_ACHIEVEMENTS_MEDIA,
+    REPORT_POSTER_PLACEHOLDER_MEDIA,
+)
 from report_model import (
     Bold,
     Code,
@@ -284,6 +287,8 @@ def _gallery_blocks(value: Gallery) -> list:
         if not isinstance(poster, Poster):
             raise RichReportRenderError("render")
         source = _safe_poster_url(poster.url)
+        if poster.url == REPORT_ACHIEVEMENTS_MEDIA:
+            source = poster.url
         if source is not None:
             sources.append(source)
     photos = [
