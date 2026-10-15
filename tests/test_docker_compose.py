@@ -86,11 +86,12 @@ def test_docker_build_requires_runtime_assets_in_effective_context():
     asset_loop_end = dockerfile.index("done;", asset_loop_start)
     asset_loop = dockerfile[asset_loop_start:asset_loop_end]
     assert 'test -f "/app/assets/main-menu/$asset"' in asset_loop
-    for filename in MAIN_MENU_ASSETS.values():
+    expected_artwork = set(MAIN_MENU_ASSETS.values()) | {"achievements-v1.jpg"}
+    for filename in expected_artwork:
         assert filename in asset_loop
     assert (
         "find /app/assets/main-menu -maxdepth 1 -type f -name '*.jpg'"
         in dockerfile
     )
-    assert f'wc -l)" -eq {len(MAIN_MENU_ASSETS)}' in dockerfile
+    assert f'wc -l)" -eq {len(expected_artwork)}' in dockerfile
     assert "RUN test -f /app/examples/facts.json" in instructions

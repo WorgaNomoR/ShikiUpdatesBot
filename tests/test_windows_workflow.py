@@ -56,10 +56,9 @@ def test_pyinstaller_bundles_complete_main_menu_artwork_set():
         in PYINSTALLER_SPEC
     )
     asset_dir = ROOT / "assets" / "main-menu"
-    assert {path.name for path in asset_dir.glob("*.jpg")} == set(
-        MAIN_MENU_ASSETS.values()
-    )
-    for filename in MAIN_MENU_ASSETS.values():
+    expected_artwork = set(MAIN_MENU_ASSETS.values()) | {"achievements-v1.jpg"}
+    assert {path.name for path in asset_dir.glob("*.jpg")} == expected_artwork
+    for filename in expected_artwork:
         content = (asset_dir / filename).read_bytes()
         assert content.startswith(b"\xff\xd8\xff")
         assert content.endswith(b"\xff\xd9")

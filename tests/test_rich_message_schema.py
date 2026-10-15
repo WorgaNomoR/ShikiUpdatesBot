@@ -5,6 +5,7 @@
 import pytest
 
 from report_asset_ids import (
+    REPORT_ACHIEVEMENTS_MEDIA,
     REPORT_POSTER_PLACEHOLDER_MEDIA,
     REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
 )
@@ -238,6 +239,7 @@ def test_collage_accepts_two_or_three_photos_and_counts_nested_blocks():
         "https://user:password@cdn.example.test/poster.jpg",
         "https://cdn.example.test/poster.jpg\nignored",
         "asset://unknown",
+        "asset://main-menu/home-v1.jpg",
         [],
         {},
     ],
@@ -263,10 +265,11 @@ def test_rich_text_urls_use_the_safe_https_policy(url):
 
 
 @pytest.mark.parametrize("reference", [
+    REPORT_ACHIEVEMENTS_MEDIA,
     REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
     REPORT_POSTER_PLACEHOLDER_MEDIA,
 ])
-def test_exact_versioned_local_asset_reference_is_allowed(reference):
+def test_exact_allowlisted_local_asset_reference_is_allowed(reference):
     payload = _message(_photo(reference))
 
     assert validate_rich_payload(payload) is payload

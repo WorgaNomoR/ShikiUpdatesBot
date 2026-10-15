@@ -44,6 +44,15 @@ def _texts(view):
     ]
 
 
+def test_close_is_offered_only_on_home_not_unified_submenus():
+    views = [main_menu.stats_view(), main_menu.lists_view(), main_menu.owner_view(),
+             main_menu.owner_backup_view(), main_menu.owner_broadcast_view(),
+             main_menu.subscription_view(subscribed=False, target=True)]
+    views.extend(main_menu.list_media_view(key) for key in main_menu.LIST_MEDIA)
+    assert "menu:close" in _callbacks(_home())
+    assert all("menu:close" not in _callbacks(view) for view in views)
+
+
 def _home(**overrides):
     values = {
         "display_name": "WNR",
@@ -71,6 +80,7 @@ def test_public_home_exact_actions_and_subscription_label():
         "menu:stats",
         "menu:lists",
         "menu:favs",
+        "menu:achievements",
         "menu:fact",
         "menu:info",
         "menu:close",
@@ -99,6 +109,15 @@ def test_home_explains_sections_search_and_links_escaped_profile():
     assert view.text.index("<b>Поиск</b>") > view.text.index("<b>О боте</b>")
     assert "<code>аниме</code> (<code>а</code>)" in view.text
     assert "<code>а Фрирен</code>" in view.text
+    assert "<b>Достижения</b> — полученные достижения и прогресс" in view.text
+
+
+def test_achievements_have_their_own_home_row_and_no_statistics_entry():
+    home = _home()
+    rows = [[button.callback_data for button in row] for row in home.keyboard.inline_keyboard]
+    assert rows[4] == ["menu:achievements", "menu:fact"]
+    assert rows[5] == ["menu:info"]
+    assert not any("achievements" in (callback or "") for callback in _callbacks(main_menu.stats_view()))
 
 
 def test_group_non_subscriber_search_uses_private_deep_link():

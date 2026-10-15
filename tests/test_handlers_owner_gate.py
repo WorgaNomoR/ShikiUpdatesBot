@@ -145,6 +145,21 @@ async def test_non_owner_start_does_not_touch_loop(monkeypatch, fake_loop):
     assert handlers._polling_task is None                 # обычный юзер цикл не трогает
 
 
+@pytest.mark.asyncio
+async def test_failed_probe_owner_start_rearms_without_another_startup_send(fake_loop):
+    bot = AsyncMock()
+    bot.send_message.side_effect = TimeoutError()
+    await handlers.probe_owner_and_start(bot)
+    assert handlers._polling_task is None
+    msg = AsyncMock()
+    msg.from_user = MagicMock(id=handlers.OWNER_ID, full_name="Owner")
+    msg.chat = MagicMock(id=handlers.OWNER_ID)
+    msg.bot = bot
+    await handlers.cmd_start(msg)
+    assert handlers._polling_task is not None
+    bot.send_message.assert_awaited_once()
+
+
 # ── стартовый health-снапшот в пинге owner-gate ──
 def test_build_startup_text_renders_snapshot(monkeypatch):
     monkeypatch.setattr(handlers, "load_subscribers", lambda: {1: "a", 2: "b", 3: "c"})
@@ -169,7 +184,7 @@ def test_build_startup_text_falls_back_on_error(monkeypatch):
         raise RuntimeError("disk gone")
     monkeypatch.setattr(handlers, "load_stats_all", boom)
     # сборка снапшота упала -> голый пинг, проба доставки не должна ломаться
-    assert handlers._build_startup_text() == "🟢 Бот запущен"
+    assert handlers._build_startup_text().startswith("🟢 Бот запущен\n\n🏆")
 
 
 @pytest.mark.asyncio
@@ -199,7 +214,7 @@ async def test_probe_sends_bare_fallback_with_html_and_starts_loop(
 
     bot.send_message.assert_awaited_once_with(
         handlers.OWNER_ID,
-        "🟢 Бот запущен",
+        "🟢 Бот запущен\n\n🏆 Достижения пока не загружены.",
         parse_mode=ParseMode.HTML,
     )
     assert handlers._polling_task is not None

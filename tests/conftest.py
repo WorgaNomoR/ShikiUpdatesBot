@@ -164,10 +164,10 @@ def achievement_state_factory(achievement_row_factory):
     """Реальный capture для delivery/storage/recovery контрактов."""
     from achievement_state import capture_achievements
 
-    def factory(rows=None, *, now=1000, owner_id=999):
+    def factory(rows=None, *, now=1000, owner_id=999, startup=None):
         return capture_achievements(
             None, [achievement_row_factory()] if rows is None else rows,
-            profile="WNR", user_id=42, owner_id=owner_id, now=now, base_url="https://shikimori.io",
+            profile="WNR", user_id=42, owner_id=owner_id, now=now, base_url="https://shikimori.io", startup=startup,
         )
     return factory
 

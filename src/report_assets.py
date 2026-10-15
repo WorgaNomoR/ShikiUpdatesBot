@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Versioned локальные media assets для замороженных Rich Message plans."""
+"""Локальные иллюстрации Rich-сообщений и проверка сохранённых ресурсов."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from aiogram.types import (
 )
 
 from report_asset_ids import (
+    REPORT_ACHIEVEMENTS_MEDIA,
     REPORT_POSTER_PLACEHOLDER_MEDIA,
     REPORT_POSTER_PLACEHOLDER_SHA256,
     REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
@@ -21,6 +22,7 @@ from report_asset_ids import (
 from runtime import RESOURCE_ROOT
 
 _REPORT_ASSETS = {
+    REPORT_ACHIEVEMENTS_MEDIA: ("main-menu/achievements-v1.jpg", None),
     REPORT_POSTER_PLACEHOLDER_V1_MEDIA: (
         "report-poster-placeholder-v1.png",
         REPORT_POSTER_PLACEHOLDER_V1_SHA256,
@@ -33,11 +35,11 @@ _REPORT_ASSETS = {
 
 
 class ReportAssetError(ValueError):
-    """Замороженный локальный asset отсутствует или изменился."""
+    """Локальная иллюстрация недоступна или изменилась вопреки сохранённому хэшу."""
 
 
 def is_report_asset_media(value: object) -> bool:
-    """Распознать только известный versioned media identifier."""
+    """Распознать только явно разрешённую ссылку на встроенную иллюстрацию."""
     return isinstance(value, str) and value in _REPORT_ASSETS
 
 
@@ -48,13 +50,15 @@ def _materialized_asset(reference: str) -> BufferedInputFile:
         content = path.read_bytes()
     except OSError as exc:
         raise ReportAssetError("asset_unavailable") from exc
-    if sha256(content).hexdigest() != expected_hash:
+    if not content:
+        raise ReportAssetError("asset_unavailable")
+    if expected_hash is not None and sha256(content).hexdigest() != expected_hash:
         raise ReportAssetError("asset_hash")
-    return BufferedInputFile(content, filename=filename)
+    return BufferedInputFile(content, filename=path.name)
 
 
 def materialize_rich_message(payload: dict) -> InputRichMessage:
-    """Заменить frozen asset identifiers точными проверенными байтами."""
+    """Загрузить разрешённые иллюстрации и проверить хэши сохранённых ресурсов."""
     content = deepcopy(payload)
 
     def visit(value: object) -> None:

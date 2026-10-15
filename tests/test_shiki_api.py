@@ -71,6 +71,58 @@ _FETCHERS = [
 ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("labels", [{}, {("future", 0): ("Будущая победа", "genre")}])
+async def test_public_achievement_metadata_coalesces_caches_and_expires(monkeypatch, labels):
+    now = [100.0]
+    monkeypatch.setattr("shiki_api.time.monotonic", lambda: now[0])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(session):
+        entered.set()
+        await release.wait()
+        return labels
+
+    fetcher = AsyncMock(side_effect=fetch)
+    monkeypatch.setattr("shiki_api.fetch_achievement_metadata", fetcher)
+    calls = [asyncio.create_task(shiki_api.cached_achievement_metadata()) for _ in range(5)]
+    await entered.wait()
+    assert fetcher.await_count == 1
+    release.set()
+    assert await asyncio.gather(*calls) == [labels] * 5
+    result = await shiki_api.cached_achievement_metadata()
+    result.clear()
+    assert await shiki_api.cached_achievement_metadata() == labels
+    assert fetcher.await_count == 1
+    now[0] += 600 if labels else 60
+    assert await shiki_api.cached_achievement_metadata() == labels
+    assert fetcher.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_public_metadata_failure_and_cancellation_do_not_poison_cache(monkeypatch):
+    fetch = AsyncMock(side_effect=RuntimeError("PRIVATE DETAILS"))
+    monkeypatch.setattr("shiki_api.fetch_achievement_metadata", fetch)
+    assert await shiki_api.cached_achievement_metadata() == {}
+    assert await shiki_api.cached_achievement_metadata() == {}
+    assert fetch.await_count == 1
+    shiki_api._achievement_metadata_caches.pop(asyncio.get_running_loop())
+    fetch.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await shiki_api.cached_achievement_metadata()
+    fetch.side_effect = None
+    fetch.return_value = {("zero", 0): ("Значок", "genre")}
+    assert await shiki_api.cached_achievement_metadata() == fetch.return_value
+
+
+@pytest.mark.asyncio
+async def test_public_metadata_cache_has_finite_entry_bound(monkeypatch):
+    labels = {(f"family-{index}", 0): ("Название", "genre") for index in range(5000)}
+    monkeypatch.setattr("shiki_api.fetch_achievement_metadata", AsyncMock(return_value=labels))
+    assert len(await shiki_api.cached_achievement_metadata()) == 4096
+
+
 class _AchievementSession(_FakeSession):
     """Два endpoint и 429 внутри общего HTTP-клиента."""
     def __init__(self, responses):

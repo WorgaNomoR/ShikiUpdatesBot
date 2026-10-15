@@ -4,13 +4,17 @@
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+)
 
 import pytest
 
 import handlers
 import storage
 from achievement_state import AchievementStateError
+from report_model import rendered_html
 from shiki_api import ProfilePrivacyError
 
 
@@ -149,3 +153,80 @@ async def test_history_delivery_failure_does_not_block_achievement_consumer(monk
     with pytest.raises(asyncio.CancelledError):
         await handlers._wait_and_dispatch_notifications(object())
     achievements.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+async def test_probe_and_initialization_share_one_startup_message(
+    achievement_polling_env, achievement_row_factory, monkeypatch, empty,
+):
+    source = AsyncMock(return_value={"user_id": 42, "rows": [] if empty else [achievement_row_factory()]})
+    monkeypatch.setattr("achievement_delivery.fetch_achievements", source)
+    monkeypatch.setattr("handlers.start_polling_loop", lambda bot: True)
+    bot = AsyncMock()
+    bot.send_message.return_value = MagicMock(message_id=321)
+    await handlers.probe_owner_and_start(bot)
+    source.assert_not_awaited()
+    assert "пока не загружены" in bot.send_message.await_args.args[1]
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(bot)
+    bot.send_message.assert_awaited_once()
+    bot.edit_message_text.assert_awaited_once()
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 321
+    assert f"<b>{0 if empty else 1}</b>" in bot.edit_message_text.await_args.kwargs["text"]
+    assert storage.load_achievement_state()["pending"] == []
+    await handlers.probe_owner_and_start(bot)
+    assert f"<b>{0 if empty else 1}</b>" in bot.send_message.await_args.args[1]
+    assert storage.load_achievement_state()["pending"] == []
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_source_keeps_startup_and_unrelated_duties(achievement_polling_env, monkeypatch):
+    source = AsyncMock(return_value=None)
+    monkeypatch.setattr("achievement_delivery.fetch_achievements", source)
+    monkeypatch.setattr("handlers.start_polling_loop", lambda bot: True)
+    bot = AsyncMock()
+    bot.send_message.return_value = MagicMock(message_id=321)
+    await handlers.probe_owner_and_start(bot)
+    with pytest.raises(asyncio.CancelledError):
+        await handlers.polling_loop(bot)
+    history, subscription, weekly = achievement_polling_env
+    history.assert_awaited_once()
+    assert subscription.await_count == weekly.await_count == 2
+    bot.send_message.assert_awaited_once()
+    bot.edit_message_text.assert_not_awaited()
+    assert storage.load_achievement_state() is None
+
+
+@pytest.mark.asyncio
+async def test_public_snapshot_read_and_metadata_do_not_mutate_authority(
+    backup_env, achievement_state_factory, monkeypatch,
+):
+    state = achievement_state_factory()
+    state["earned"]["removed"] = 5
+    storage.save_achievement_state(state)
+    original = storage.ACHIEVEMENTS_FILE.read_bytes()
+    metadata = AsyncMock(return_value={})
+    monkeypatch.setattr("handlers.cached_achievement_metadata", metadata)
+    monkeypatch.setattr("handlers.synchronize_achievements", AsyncMock(side_effect=AssertionError("sync")))
+    monkeypatch.setattr("handlers.mutate_subscription", AsyncMock(side_effect=AssertionError("subscription")))
+    text = "\n".join(rendered_html(await handlers._achievement_report()))
+    assert "animelist" in text and "removed" not in text
+    assert storage.ACHIEVEMENTS_FILE.read_bytes() == original
+    metadata.assert_awaited_once()
+    assert storage.load_subscribers() == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [None, b'{', b'{"version":99}'])
+async def test_public_missing_invalid_state_has_safe_local_fallback(backup_env, monkeypatch, raw):
+    if raw is not None:
+        storage.ACHIEVEMENTS_FILE.write_bytes(raw)
+    metadata = AsyncMock()
+    monkeypatch.setattr("handlers.cached_achievement_metadata", metadata)
+    text = "\n".join(rendered_html(await handlers._achievement_report()))
+    assert "не загружены" in text if raw is None else "недоступны" in text
+    metadata.assert_not_awaited()
+    assert "owner" not in text and "pending" not in text and str(storage.ACHIEVEMENTS_FILE) not in text
+    if raw is not None:
+        assert storage.ACHIEVEMENTS_FILE.read_bytes() == raw

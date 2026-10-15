@@ -194,6 +194,7 @@ async def test_frozen_main_wires_updates_without_shutdown_backup(monkeypatch):
         main.cmd_broadcast,
         main.cmd_cancel,
         main.cmd_stats,
+        main.cmd_achievs,
         main.cmd_lists,
         main.cmd_favs,
         main.cmd_fact,

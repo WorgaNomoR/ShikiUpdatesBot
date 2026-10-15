@@ -5,7 +5,7 @@
 import re
 from urllib.parse import urlsplit
 
-from report_asset_ids import REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES
+from report_asset_ids import REPORT_ASSET_MEDIA_REFERENCES
 
 RICH_TEXT_LIMIT = 32768
 RICH_BLOCK_LIMIT = 500
@@ -58,7 +58,7 @@ class _Counter:
         """Проверить внешний HTTPS URL или известный локальный asset id."""
         if (
             isinstance(value, str)
-            and value in REPORT_POSTER_PLACEHOLDER_MEDIA_REFERENCES
+            and value in REPORT_ASSET_MEDIA_REFERENCES
         ):
             return
         if not is_safe_https_media_url(value):

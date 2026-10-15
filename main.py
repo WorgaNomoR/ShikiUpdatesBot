@@ -51,6 +51,7 @@ from handlers import (
     broadcast_cancel_cb,
     broadcast_confirm_cb,
     broadcast_receive,
+    cmd_achievs,
     cmd_backup,
     cmd_block,
     cmd_blocklist,
@@ -146,6 +147,7 @@ async def main() -> None:
     dp.message.register(cmd_broadcast, Command("broadcast"))
     dp.message.register(cmd_cancel,    Command("cancel"))
     dp.message.register(cmd_stats,     Command("stats"))
+    dp.message.register(cmd_achievs,   Command("achievs"))
     dp.message.register(cmd_lists,     Command("lists"))
     dp.message.register(cmd_favs,      Command("favs"))
     dp.message.register(cmd_fact,      Command("fact"))
