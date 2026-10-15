@@ -183,3 +183,31 @@ def test_v2_capture_preserves_legacy_frozen_plans_and_current_snapshot(achieveme
     assert current["version"] == 2
     assert current["pending"][:1] == frozen
     assert current["pending"][1]["kind"] == "awards"
+
+
+@pytest.mark.parametrize("astral,extra", [(False, 0), (False, 1), (True, 1)])
+def test_startup_summary_fits_one_edit_at_the_telegram_length_boundary(achievement_row_factory, astral, extra):
+    from achievement_view import achievement_summary
+    from catchup_digest import html_length
+    from report_model import TELEGRAM_TEXT_LIMIT
+
+    rows = [achievement_row_factory()]
+    summary = achievement_summary(rows)
+    room = TELEGRAM_TEXT_LIMIT - html_length("\n\n" + summary)
+    base = ("😀" * (room // 2) + "x" * (room % 2)) if astral else "x" * room
+    base = "<b>" + base + "x" * extra + "</b>"
+    state = capture_achievements(
+        None, rows, profile="WNR", user_id=42, owner_id=999,
+        now=1000, base_url="https://shikimori.io", startup=(321, base),
+    )
+
+    restored = parse_achievement_member(_json(state).encode(), profile="WNR", owner_id=999)
+
+    assert len(restored["pending"]) == 1
+    plan = restored["pending"][0]
+    assert plan["kind"] == "startup" and plan["startup_message_id"] == 321
+    assert plan["total_parts"] == 1
+    text = plan["parts"][0]["text"]
+    expected_base = "🟢 Бот запущен" if extra else base
+    assert text == expected_base + "\n\n" + summary
+    assert html_length(text) <= TELEGRAM_TEXT_LIMIT

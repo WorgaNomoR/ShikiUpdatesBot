@@ -10,6 +10,7 @@ import pytest
 
 import storage
 from report_asset_ids import (
+    REPORT_ACHIEVEMENTS_MEDIA,
     REPORT_POSTER_PLACEHOLDER_MEDIA,
     REPORT_POSTER_PLACEHOLDER_V1_MEDIA,
 )
@@ -1688,6 +1689,37 @@ def test_version2_quarter_plan_rejects_foreign_local_media_reference(foreign_med
 
     with pytest.raises(storage.QuarterDeliveryStateError, match="^report_units$"):
         storage.validate_pending_quarter_delivery(cur)
+
+
+@pytest.mark.parametrize("version", [2, 3])
+@pytest.mark.parametrize("phase", ["capture", "restore"])
+def test_durable_quarter_plan_rejects_unpinned_interactive_artwork(version, phase):
+    media_unit = _rich_frozen_unit("interactive artwork")
+    media_unit["content"]["blocks"] = [{
+        "type": "collage",
+        "blocks": [
+            {"type": "photo", "photo": {"type": "photo", "media": "https://cdn.example.test/first.jpg"}},
+            {"type": "photo", "photo": {"type": "photo", "media": REPORT_ACHIEVEMENTS_MEDIA}},
+        ],
+    }]
+    revisions = {"2026-Q2": 0} if version == 3 else None
+
+    if phase == "capture":
+        with pytest.raises(storage.QuarterDeliveryStateError, match="^report_units$"):
+            storage.new_quarter_delivery_plan(
+                "2026-Q2", "2026-Q3", [media_unit], event_time_revisions=revisions,
+            )
+        return
+
+    pending = storage.new_quarter_delivery_plan(
+        "2026-Q2", "2026-Q3", [_rich_frozen_unit("valid")], event_time_revisions=revisions,
+    )
+    pending["report_units"] = [media_unit]
+    pending["plan_hash"] = storage._quarter_plan_hash(pending)
+    original = deepcopy(pending)
+    with pytest.raises(storage.QuarterDeliveryStateError, match="^report_units$"):
+        storage.validate_pending_quarter_delivery({"period": "2026-Q3", "pending_quarter_delivery": pending})
+    assert pending == original
 
 
 @pytest.mark.parametrize(

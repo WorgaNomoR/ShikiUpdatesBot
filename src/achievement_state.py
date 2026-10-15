@@ -114,7 +114,11 @@ def capture_achievements(
         )
         startup_baseline = baseline and startup is not None
         if startup_baseline:
-            chunks = [startup[1] + "\n\n" + achievement_summary(rows)]
+            summary = achievement_summary(rows)
+            text = startup[1] + "\n\n" + summary
+            if html_length(text) > TELEGRAM_TEXT_LIMIT:
+                text = "🟢 Бот запущен\n\n" + summary
+            chunks = [text]
         plan = {
             "plan_id": uuid4().hex, "kind": "startup" if startup_baseline else "baseline" if baseline else "awards",
             "awards": observed if baseline else changes,

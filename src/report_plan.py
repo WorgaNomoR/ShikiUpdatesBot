@@ -4,7 +4,10 @@
 
 from copy import deepcopy
 
-from rich_message_schema import RichMessageValidationError, validate_rich_payload
+from rich_message_schema import (
+    RichMessageValidationError,
+    validate_rich_payload,
+)
 
 
 class FrozenReportPlanError(ValueError):
@@ -49,8 +52,8 @@ def _valid_html(value: object) -> bool:
     return True
 
 
-def validate_frozen_report_units(units: object) -> list[dict]:
-    """Строго проверить transport/content без Telegram или файловой системы."""
+def validate_frozen_report_units(units: object, *, durable: bool = False) -> list[dict]:
+    """Проверить transport/content; durable запрещает изменяемые локальные иллюстрации."""
     if not isinstance(units, list):
         raise FrozenReportPlanError("units_type")
     for unit in units:
@@ -81,7 +84,7 @@ def validate_frozen_report_units(units: object) -> list[dict]:
             ):
                 raise FrozenReportPlanError("rich_unit")
             try:
-                validate_rich_payload(unit.get("content"))
+                validate_rich_payload(unit.get("content"), durable=durable)
             except RichMessageValidationError as exc:
                 raise FrozenReportPlanError("rich_payload") from exc
             continue

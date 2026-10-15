@@ -40,7 +40,10 @@ async def test_stats_command_opens_shared_guarded_public_menu(monkeypatch):
     monkeypatch.setattr("handlers.load_subscribers", lambda: pytest.fail("subscription read"))
     await handlers.cmd_stats(message, state)
     assert state.data["main_menu_screen"] == "stats"
-    assert not any("achievements" in (b.callback_data or "") for row in send.await_args.args[1].keyboard.inline_keyboard for b in row)
+    send.assert_awaited_once()
+    callbacks = {button.callback_data for row in send.await_args.args[1].keyboard.inline_keyboard for button in row}
+    assert {"menu:stats:current", "menu:stats:all"} <= callbacks
+    assert not any("achievements" in (value or "") for value in callbacks)
 
 
 @pytest.mark.asyncio
@@ -80,6 +83,7 @@ async def test_achievements_home_button_delivers_one_guarded_report_without_subm
     assert state.state is None
     await handlers.main_menu_cb(callback, state)
     build.assert_awaited_once()
+    assert "Меню устарело" in callback.answer.await_args.args[0]
     source.assert_not_awaited()
 
 
@@ -98,10 +102,10 @@ async def test_invalid_achievement_navigation_cannot_read_snapshot(monkeypatch, 
         state.state = None
     else:
         state.data["main_menu_screen"] = "stats"
-    snapshot = AsyncMock()
-    monkeypatch.setattr("handlers._achievement_rows", snapshot)
+    snapshot = MagicMock()
+    monkeypatch.setattr("handlers.load_achievement_state", snapshot)
     await handlers.main_menu_cb(callback, state)
-    snapshot.assert_not_awaited()
+    snapshot.assert_not_called()
 
 
 @pytest.mark.asyncio
