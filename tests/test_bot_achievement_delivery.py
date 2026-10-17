@@ -29,7 +29,15 @@ async def _sync(count):
     )
 
 
-async def _pending():
+async def _pending(*, catalog=False):
+    if catalog:
+        from achievement_helpers import catalog_inputs
+
+        for count in (0, 5):
+            await bot_achievement_delivery.capture_bot_achievement_sync(
+                catalog_inputs(count), generation=storage.restorable_restore_generation(),
+            )
+        return storage.load_bot_achievement_state()
     await _sync(0)
     await _sync(1)
     return storage.load_bot_achievement_state()
@@ -45,7 +53,7 @@ async def test_silent_baseline_and_frozen_owner_job_are_independent_of_shikimori
     await _sync(100)
     captured = storage.load_bot_achievement_state()
     frozen = captured["pending"][0]["parts"][0]["text"]
-    assert captured["earned"] == {"reader": 100}
+    assert captured["earned"] == {"reader": 7}
     assert storage.load_achievement_state() is None
     assert await bot_achievement_delivery.dispatch_bot_achievements(bot) is False
     bot.send_message.assert_awaited_once_with(
@@ -53,7 +61,7 @@ async def test_silent_baseline_and_frozen_owner_job_are_independent_of_shikimori
     )
     assert storage.load_subscribers() == {}
     assert storage.load_bot_achievement_state()["pending"] == []
-    assert storage.load_bot_achievement_state()["earned"] == {"reader": 100}
+    assert storage.load_bot_achievement_state()["earned"] == {"reader": 7}
 
 
 @pytest.mark.asyncio
@@ -95,9 +103,11 @@ async def test_publication_failures_preserve_checkpoint_or_attempt_marker(readin
 
 
 @pytest.mark.asyncio
-async def test_uncertain_job_survives_restart_decrease_and_refresh_failure(reading_env, monkeypatch):
+@pytest.mark.parametrize("catalog", [False, True])
+async def test_uncertain_job_survives_restart_decrease_and_refresh_failure(reading_env, monkeypatch, catalog):
     clock = reading_env
-    state = await _pending()
+    state = await _pending(catalog=catalog)
+    earned = deepcopy(state["earned"])
     frozen = state["pending"][0]["parts"][0]["text"]
     bot = AsyncMock()
     bot.send_message.side_effect = TimeoutError()
@@ -113,13 +123,14 @@ async def test_uncertain_job_survives_restart_decrease_and_refresh_failure(readi
     assert await bot_achievement_delivery.dispatch_bot_achievements(bot) is False
     assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [frozen, frozen]
     state = storage.load_bot_achievement_state()
-    assert state["earned"] == {"reader": 1} and state["families"]["reader"]["current_value"] == 0 and state["pending"] == []
+    assert state["earned"] == earned and state["families"]["reader"]["current_value"] == 0 and state["pending"] == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["generation", "identity", "plan", "lease"])
-async def test_stale_completion_cannot_acknowledge_restored_or_replaced_reader(reading_env, change):
-    await _pending()
+@pytest.mark.parametrize("catalog", [False, True])
+async def test_stale_completion_cannot_acknowledge_restored_or_replaced_reader(reading_env, change, catalog):
+    await _pending(catalog=catalog)
     replacement = None
 
     async def send(**kwargs):
@@ -265,7 +276,8 @@ async def test_multiple_families_share_capture_frozen_queue_and_owner_consumer(r
     await capture({"reader": {"1": True}, "anime_minutes": {"minutes": 185}})
     saved = storage.load_bot_achievement_state()
     frozen = [part["text"] for plan in saved["pending"] for part in plan["parts"]]
-    assert [plan["awards"] for plan in saved["pending"]] == [{"reader": 1}, {"anime_minutes": 180}]
+    assert [plan["awards"] for plan in saved["pending"]] == [{"reader": 1, "anime_minutes": 180}]
+    assert len(frozen) == 1
     bot = AsyncMock()
     assert await bot_achievement_delivery.dispatch_bot_achievements(bot) is False
     assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == frozen
@@ -276,7 +288,8 @@ async def test_multiple_families_share_capture_frozen_queue_and_owner_consumer(r
 
 
 @pytest.mark.asyncio
-async def test_family_calculation_failure_preserves_old_job_and_usable_sibling(reading_env, bot_catalog, monkeypatch, caplog):
+@pytest.mark.parametrize("failure", ["calculation", "html"])
+async def test_family_calculation_failure_preserves_old_job_and_usable_sibling(reading_env, bot_catalog, monkeypatch, caplog, failure):
     from dataclasses import replace
 
     from bot_achievements import achievement_catalog
@@ -287,18 +300,20 @@ async def test_family_calculation_failure_preserves_old_job_and_usable_sibling(r
     def failed(previous, source):
         raise RuntimeError("PRIVATE_CALCULATOR_DATA")
 
-    broken = replace(bot_catalog["reader"], calculate=failed)
+    broken = replace(bot_catalog["reader"], **(
+        {"calculate": failed} if failure == "calculation" else {"award_text": lambda level, value: "<b>"}
+    ))
     monkeypatch.setattr("bot_achievement_catalog.BOT_ACHIEVEMENTS", achievement_catalog(broken, bot_catalog["anime_minutes"]))
     caplog.set_level("WARNING", logger="shikiupdatesbot")
     assert await bot_achievement_delivery.capture_bot_achievement_sync(
-        {"reader": {"2": True}, "anime_minutes": {"minutes": 120}},
+        {"reader": {str(index): True for index in range(1, 6)}, "anime_minutes": {"minutes": 120}},
         generation=storage.restorable_restore_generation(),
     )
     current = storage.load_bot_achievement_state()
     assert current["families"]["reader"] == original["families"]["reader"]
     assert current["pending"] == original["pending"]
     assert current["earned"] == {"reader": 1, "anime_minutes": 60}
-    assert "RuntimeError" in caplog.text and "PRIVATE_" not in caplog.text
+    assert ("RuntimeError" if failure == "calculation" else "ValueError") in caplog.text and "PRIVATE_" not in caplog.text
     assert await bot_achievement_delivery.dispatch_bot_achievements(AsyncMock()) is False
 
 

@@ -24,6 +24,7 @@ class PublicBotAchievement:
     value: int | None
     target: int
     criterion: str
+    earned_target: int = 0
 
 
 def bot_achievement_snapshot(state, *, catalog):
@@ -35,7 +36,8 @@ def bot_achievement_snapshot(state, *, catalog):
         target = definition.next_level(level)
         rows.append(PublicBotAchievement(
             family, definition.title, bool(saved and saved["initialized"]), level,
-            saved["current_value"] if saved else None, target, definition.criterion(level or target),
+            saved["current_value"] if saved else None, target,
+            definition.criterion(level or definition.level_for(target)), definition.level_threshold(level),
         ))
     return tuple(rows)
 
@@ -65,7 +67,7 @@ def bot_achievement_sections(snapshot=None, *, invalid=False):
                 progress = f"{percentage}%" if percentage or row.value == 0 else "менее 1%"
                 status += f" · {progress} до следующего уровня" if row.level else f" — {progress}"
             items.append(line("  • ", Bold(row.title), status, "\n", Italic(row.criterion)))
-            if row.value is not None and row.value < row.level:
+            if row.value is not None and row.value < row.earned_target:
                 items.append(line(Italic("Полученный уровень сохранён, хотя текущий прогресс уменьшился.")))
         sections.append(section(*items))
     notices = [

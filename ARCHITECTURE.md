@@ -70,7 +70,7 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [achievement_plans.py](src/achievement_plans.py) | Shared strict frozen owner-plan/attempt schema, bounded JSON and capacity reserve; no award catalog or runtime imports. |
 | [achievement_delivery.py](src/achievement_delivery.py) | Shikimori source capture and shared bounded owner-plan consumer over storage/Telegram; source profile guards remain independent. |
 | [bot_achievements.py](src/bot_achievements.py), [bot_achievement_catalog.py](src/bot_achievement_catalog.py) | Pure shared bot definitions, per-family evaluation/checkpoints, strict common authority and frozen plans; explicit production registration. No source-owned Shikimori rows or runtime imports. |
-| [reading_milestones.py](src/reading_milestones.py) | Reader definition/calculator: eligibility checkpoint, correction-first count, numeric thresholds, criterion and notification wording. No persistence, queue or report branching. |
+| [achievement_scales.py](src/achievement_scales.py), [reading_milestones.py](src/reading_milestones.py), [reading_catalog.py](src/reading_catalog.py) | Five ordinal scales; Reader and 16 complementary reading definitions/calculators; explicit GraphQL evidence parsing and per-metric inputs. No persistence, HTTP, queue or report branching. |
 | [bot_achievement_delivery.py](src/bot_achievement_delivery.py), [bot_achievement_view.py](src/bot_achievement_view.py) | Shared bot capture/publication and bounded owner delivery; pure public projection and earned/progress presentation for all registered families. |
 | [achievement_view.py](src/achievement_view.py) | Pure current-family selection, Shikimori startup count and public report over source rows plus the shared bot-family projection; never reads pending delivery or owner identity. |
 | [history_catchup.py](src/history_catchup.py) | Pure connected-page traversal, exact frontier reconnection and head bridging; owns no I/O, normalization or publication. |
@@ -137,6 +137,10 @@ graph TD
     storage --> bot_achievement_catalog
     storage --> bot_achievements
     bot_achievement_catalog --> reading_milestones
+    bot_achievement_catalog --> reading_catalog
+    reading_catalog --> reading_milestones
+    reading_catalog --> achievement_scales
+    reading_milestones --> achievement_scales
     reading_milestones --> bot_achievements
     bot_achievements --> achievement_plans
     achievement_state --> achievement_plans
@@ -183,6 +187,8 @@ graph TD
     report_assets --> report_asset_ids
     report_assets --> runtime
     shiki_api --> request_budget
+    shiki_api --> reading_catalog
+    stats --> reading_catalog
     config --> runtime
 ```
 
@@ -208,7 +214,7 @@ Persistent JSON state lives under `DATA_DIR`; the complete file inventory is in 
 | `notification_progress.json` | Activated progress v1: logical processed checkpoint and complete frozen outbox, enqueue/completion boundaries, recipient attempts and terminal outcomes. Bound to physical history identity/profile/lineage. |
 | `achievements.json` | Separate achievement v1/v2 authority: configured profile/numeric user/owner binding, initialized baseline, latest complete source rows, highest earned level per family and frozen pending owner plans. Independent of history and quarters. |
 | `seen_ids.json`, `seen_favourites.json` | Export-only journal ID projection; separate favourites baseline/deduplication. Both excluded from restore. |
-| `bot_achievements.json` | Shared bot-achievement v1 authority: configured-profile/owner binding, UUID, independent family initialization/current values/checkpoints, retained numeric levels and one frozen owner queue. Independent of source achievements, history and quarters. |
+| `bot_achievements.json` | Shared bot-achievement v2 authority: configured-profile/owner binding, UUID, independent family initialization/current values/checkpoints, retained ordinal levels and one frozen owner queue. Independent of source achievements, history and quarters. |
 | `stats_all.json` | Rebuildable current public lists, metadata, comments, favourites and aggregates; cached locally and excluded from restore. |
 | `stats_current.json`, `quarters/` | Source-quarter projections and correction revisions, journal-bound checkpoint and frozen report delivery; original historical snapshots. |
 | `subscribers.json` | One atomic notification-chat map, versioned membership tokens and automatic-backup schedule. |
@@ -305,6 +311,16 @@ Public `/status` shares successful raw anime+manga rates for a fixed 60-second m
 ### Synchronization, metadata and comments
 
 Each successfully applied metadata record gets `meta_updated_at`; failed/omitted/parsing records keep good metadata and timestamp for retry. Legacy, malformed and future timestamps are stale with oldest priority. Current `planned`, `watching`, `rewatching` and `on_hold` records age after seven days, `completed`/`dropped` after thirty. Each successful export half spends at most one oldest-first maintenance batch of 50 anime and one of 50 shared manga/ranobe records, with stable numeric-ID ties. New titles, missing-kind repair and malformed values still present in export use the higher-priority correctness batch outside that allowance. Failed repair leaves a canonical missing-kind record without a timestamp; export cleanup removes absent records. Refresh replaces the metadata portion, including poster/release status, while current export owns score/status/progress/rewatches. Aggregates are recomputed. Existing startup/periodic full sync is the only scheduler, and privacy prevents all working publication/cache changes.
+
+Shared manga metadata additionally stores `reading_evidence`: explicitly acquired chapter total,
+publication-start year and stable `[Manga ID, GraphQL kind]` taxonomy pairs. Missing or malformed
+fields stay absent; explicit null length/year and zero chapter totals mean source-declared unknown,
+and an explicitly empty taxonomy is known emptiness. The parser preserves usable independent fields.
+Legacy/incomplete evidence receives oldest priority within the same 50-record manga maintenance
+allowance, even with a fresh general timestamp; no per-family fetch or scheduler exists.
+Report-facing `genres`, `themes`, `demographic`, totals and completed-only aggregates retain their
+meanings. Evidence is revalidated from the rebuildable cache and excluded from quarter-title
+projections; current export marks, rather than sanitized report numbers, feed achievements.
 
 Synchronization repairs malformed domain, `titles`, and `aggregates` containers only in its isolated working copy for a successfully exported domain. Container repair counts as a change even with an empty export or aggregate-only damage; valid title records and supported `by_quarter` survive, and an unavailable sibling domain remains untouched. Report readers retain their damaged-versus-empty distinction.
 
@@ -456,26 +472,33 @@ Evidence: [source/state](tests/test_achievement_state.py), [notifications](tests
 ### Bot-owned achievements
 
 `bot_achievement_catalog.BOT_ACHIEVEMENTS` is the explicit production registration point.
-A `BotAchievement` definition supplies stable family ID, public title, criterion, numeric level
-rules, a pure calculator, checkpoint validation/value derivation and notification wording.
-The current production catalog contains only Reader. Future anime or reading families use the
+A `BotAchievement` definition supplies stable family ID, public title, criterion, ordinal level
+rules and level-to-threshold mapping, a pure calculator, checkpoint validation/value derivation
+and notification wording. The production catalog contains Reader plus 16 complementary reading
+families described below. Future anime or reading families use the
 same state, publication, queue, backup member and public projection; their data acquisition
 remains explicit work. No rule language or arbitrary plugin loader exists. An isolated anime-time
 test definition with different thresholds exercises the common paths without entering production.
 
-`bot_achievements` owns the common v1 envelope: profile/owner binding, UUID, `families`, retained
+`bot_achievements` owns the common v2 envelope: profile/owner binding, UUID, `families`, retained
 `earned` maxima and `pending` plans. Every family has independent `initialized`, nullable
 `current_value` and calculator-owned `checkpoint`. A missing family has no baseline; its first
 trustworthy value initializes silently without affecting existing families. An unavailable value
 preserves initialization/earned levels, never asserts zero, and may retain new incomplete evidence.
 The calculator separately reports the value attributable to quiet corrections. Common evaluation
-first retains the maximum of old earned and corrected levels, then captures at most one plan for
-the highest genuinely new tier. Subsequent decreases/re-crossings never revoke or repeat awards.
+first retains the maximum of old earned and corrected levels, then collects each family's highest
+genuinely new tier into one plan for the evaluation, split only at Telegram's HTML/UTF-16 limit.
+Subsequent decreases/re-crossings never revoke or repeat awards; newly initialized siblings remain silent.
 
-`bot_achievements.json` is the single physical bot authority, using strict bounded v1 reads.
+`bot_achievements.json` is the single physical bot authority, using strict bounded v2 reads.
 Unsupported/corrupt/profile-owner-mismatched state fails closed, without a replacement baseline.
 Viewing never writes state. Backup capture validates while retaining original bytes; restore
 validates the same schema before publication and preserves frozen text and attempt evidence.
+The explicit #210 waiver covers only the immediately preceding Reader threshold scale in #212:
+its intermediate bot v1 authority is unsupported, with no dual-scale interpreter or migration.
+V2 distinguishes ordinal levels from those old threshold numbers; unsupported files fail closed
+and remain untouched rather than being reinterpreted or silently replaced. This exception does
+not waive Shikimori v1/v2, journal/quarter, durable frozen-plan or normal recovery contracts.
 
 `bot_achievement_delivery.capture_bot_achievement_sync` accepts explicit family inputs and the
 restore generation captured before acquisition. It renders/calculates outside the state lock,
@@ -509,32 +532,72 @@ capture, initialize, sync, acknowledge, subscribe or write state. Source snapsho
 control Shikimori current levels, while bot levels use their own retained authority. Existing
 startup source counts/edits remain unchanged; bot families add no startup message or edit.
 
-#### Reader calculator
+#### Reading calculators and production catalog
 
-`stats.reading_observation` joins an explicitly successful current manga-domain list export with
-that sync's metadata before relevance cleanup. Every row needs a canonical positive target ID,
+`stats.reading_catalog_observation` joins an explicitly successful current manga-domain list export with
+that sync's shared metadata before relevance cleanup. Every row needs a canonical positive target ID,
 known status and, when present, `target_type=Manga`; conflicting duplicate statuses invalidate
-the observation. Equal IDs collapse and only completed titles participate. Classification reuses
+the observation. Equal IDs collapse; conflicting chapter/volume marks invalidate only that metric.
+Classification reuses
 `classify_manga_presentation_kind` and `is_relevant`: manga/manhwa/manhua and supported ranobe
 share one count, one-shot/doujin are excluded, rereads do not multiply it. Unknown/missing kinds
 remain unresolved, never inferred from titles/progress/URLs. Anime-only sync success, stale cache,
-failed/absent export and malformed/incomplete lists supply no Reader observation.
+failed/absent export and malformed/incomplete lists supply no reading observation.
 
-`reading_milestones` owns only this metric/definition. Its checkpoint maps completed IDs to
+`reading_milestones` owns Reader's metric/definition. Its checkpoint maps completed IDs to
 true/false/null (eligible/excluded/unresolved). A fully known empty list is zero; unresolved kinds
 produce an unavailable value and cannot initialize or advance earned tiers. Observed IDs survive
 a metadata gap so repair cannot resemble new reading. The calculator quietly reconciles currently
 eligible IDs already in the previous map before adding genuinely new completions, including when
-repairs and additions arrive together. Numeric thresholds are 1, 5, 10, 25, 50, 100, 250, 500, then
-every 500 starting at 1000, never ordinal catalog positions. Thus 51 silently baselines at 50, with
-100 next. This is an observed current list, not lifetime reading or reconstructed unlock time.
+repairs and additions arrive together. This count calculator is also used for completed-work
+length/era/taxonomy families, each with its own complete eligibility map and independent state.
+Missing required evidence is unresolved; known unknown length/year does not qualify.
 
-Existing full-list sync supplies Reader input at startup, the default six-hour cadence and
+`reading_catalog` owns Глава за главой (explicit read chapters), Книжная полка (explicit read
+volumes), Долгая история (completed with known total >=100 chapters), У истоков (completed with
+known positive publication-start year <2000), eight genres and four demographics. Chapter/volume
+checkpoints retain `{eligible: true/false/null, marks: nonnegative integer/null}` for every current
+status, including unfinished/planned/dropped works. Missing, malformed and conflicting marks are
+unknown, never zero; completion does not infer progress or substitute metadata totals. Quiet
+correction applies current eligibility to old marks capped at current marks, then evaluates real
+increases/new IDs. Repair of an unknown mark alone is quiet. Counts/marks never multiply rereads.
+Each metric is a current-list observation, not lifetime reading or reconstructed unlock time.
+
+Taxonomy membership requires both the stable Manga ID and GraphQL category. The same namespace
+covers supported ranobe. Genre families are Магия между строк (Fantasy 57), Сердце в переплёте
+(Romance 62), Смех сквозь страницы (Comedy 49), Истории на разрыв (Drama 50), Читать при включённом
+свете (Horror 80), Распутыватель сюжетов (Mystery 46), За пределами возможного (Sci-Fi 53), На пути
+к чемпионству (Sports 76), all `kind=genre`. Demographics are Читатель сёнэна (Shounen 47),
+Читатель сёдзё (Shoujo 63), Читатель сэйнэна (Seinen 52), Читатель дзёсэя (Josei 87), all
+`kind=demographic`. Themes and similarly named tags such as Shounen Ai do not qualify. One title
+may belong to several families but counts once in each. Bounded live verification on 2026-10-17
+queried GraphQL mangas 2/34053/21525/123812 with an application User-Agent and confirmed all four
+demographic categories alongside separate genres/themes. #210 records the wider calibration and
+the REST `/api/genres` limitation: it labels these demographics `genre`, so REST kind is not evidence.
+
+`achievement_scales` maps ordinal public levels to fixed thresholds; every tail has a constant
+step, with no final level or profile-dependent tuning:
+
+| Scale / families | Levels 1..5 | Step after level 5 | Level 20 / 21 |
+|---|---|---|---|
+| A / Reader | 1, 5, 10, 25, 50 works | +25 works | 425 / 450 |
+| B / chapters | 25, 100, 250, 500, 1000 chapters | +1000 chapters | 16000 / 17000 |
+| C / volumes | 1, 5, 10, 50, 100 volumes | +150 volumes | 2350 / 2500 |
+| D / long / pre-2000 | 1, 3, 5, 10, 15 works | +5 works | 90 / 95 |
+| E / genres / demographics | 5, 10, 25, 50, 75 works | +25 works | 450 / 475 |
+
+Public rows show the ordinal earned level and its threshold in an italic criterion, retaining
+the full-next-threshold percentage. Reader at 51 is level 5 (criterion 50), with 68% toward
+level 6 at 75. Chapter/volume values 1815/298 independently yield levels 5/6 with next 2000/400.
+Retained-level decrease notices compare current value with the earned threshold, not the ordinal.
+
+Existing full-list sync supplies all reading inputs at startup, the default six-hour cadence and
 pre-rotation refresh after privacy-sensitive acquisition. There is no extra scheduler or setting.
 Quarter rotation and source failures cannot lower retained levels or erase captured plans;
 `stats_all.json` remains a rebuildable cache excluded from restore.
 
-Evidence: [common core](tests/test_bot_achievements.py), [Reader calculator](tests/test_reading_milestones.py),
+Evidence: [common core](tests/test_bot_achievements.py), [scales](tests/test_achievement_scales.py),
+[Reader calculator](tests/test_reading_milestones.py), [reading catalog](tests/test_reading_catalog.py),
 [sync evidence](tests/test_stats.py), [common capture/delivery](tests/test_bot_achievement_delivery.py),
 [common view](tests/test_bot_achievement_view.py), [runtime](tests/test_handlers_achievements.py),
 [multiple-family recovery and rollback](tests/test_backup.py).
@@ -639,7 +702,7 @@ Versions below describe independent formats, not one application-wide schema. Va
 |---|---|
 | Normalized events | Normalization v1 across all journal formats; immutable accepted semantics. |
 | Shikimori achievements | Separate `achievements.json` v1/v2; initialized source snapshot, monotonic family maxima and pending owner plans/attempts. V2 adds a frozen startup edit target; v1 baseline/award plans stay readable and unchanged. Optional in old archives. |
-| Bot-owned achievements | Shared `bot_achievements.json` v1 with independent family baselines/current values/checkpoints, retained numeric tiers and one frozen owner queue. Optional in old archives; no Shikimori rows or startup plans. |
+| Bot-owned achievements | Shared `bot_achievements.json` v2 with independent family baselines/current values/checkpoints, retained ordinal tiers and one frozen owner queue. The interim Reader-scale v1 is excluded by the scoped #210 compatibility waiver; invalid/unsupported authority is preserved. Optional in old archives; no Shikimori rows or startup plans. |
 | Logical/legacy journal | v1/v2 store embedded processing; v2 supports unfinished acquisition. Logical v3 adds embedded outbox for consumers/legacy recovery; supported v2/v3 may carry an explicitly versioned source base. |
 | Physical `event_journal.json` | Legacy v1/v2/v3 remain readable. Activated v4 separates progress and forbids a source base; v5 requires base v1 with every compact fingerprint; v6 requires base v2 with the 4096-seq window. All activated versions retain the same progress lineage. |
 | `notification_progress.json` | v1 only: `progress_id`, `journal_id`, `profile`, processed cursor and complete outbox must match history. Missing/orphan/inconsistent progress is an error, never an empty queue. |

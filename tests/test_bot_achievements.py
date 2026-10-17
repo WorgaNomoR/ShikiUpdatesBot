@@ -31,8 +31,11 @@ def capture(state=None, inputs=None, *, catalog=BOT_ACHIEVEMENTS):
     )
 
 
-def test_production_catalog_contains_only_reader():
-    assert tuple(BOT_ACHIEVEMENTS) == ("reader",)
+def test_production_catalog_has_exact_approved_families():
+    assert tuple(BOT_ACHIEVEMENTS) == (
+        "reader", "chapters", "volumes", "long_works", "pre_2000", "fantasy", "romance",
+        "comedy", "drama", "horror", "mystery", "sci_fi", "sports", "shounen", "shoujo", "seinen", "josei",
+    )
 
 
 def test_distinct_metrics_share_authority_and_new_family_baselines(bot_catalog):
@@ -109,7 +112,7 @@ def _json(state):
     return bot_state_json(state, catalog=BOT_ACHIEVEMENTS, profile="WNR", owner_id=999)
 
 
-@pytest.mark.parametrize("count,tier", [(0, 0), (1, 1), (51, 50), (500, 500), (1002, 1000)])
+@pytest.mark.parametrize("count,tier", [(0, 0), (1, 1), (51, 5), (500, 23), (1002, 43)])
 def test_first_complete_snapshot_is_silent_including_valid_zero(count, tier):
     state = _capture(count=count)
     assert state["families"]["reader"]["initialized"] is True
@@ -124,15 +127,15 @@ def test_crossings_coalesce_highest_and_survive_decrease_and_recrossing():
     state = _capture(count=99)
     state = _capture(state, count=100)
     first = deepcopy(state["pending"])
-    assert state["earned"] == {"reader": 100}
-    assert len(first) == 1 and first[0]["awards"] == {"reader": 100}
+    assert state["earned"] == {"reader": 7}
+    assert len(first) == 1 and first[0]["awards"] == {"reader": 7}
     state = _capture(state, count=1501)
     assert len(state["pending"]) == 2
-    assert state["pending"][-1]["awards"] == {"reader": 1500}
+    assert state["pending"][-1]["awards"] == {"reader": 63}
     assert state["pending"][:1] == first
     frozen = deepcopy(state["pending"])
     state = _capture(state, count=1)
-    assert state["families"]["reader"]["current_value"] == 1 and state["earned"] == {"reader": 1500}
+    assert state["families"]["reader"]["current_value"] == 1 and state["earned"] == {"reader": 63}
     state = _capture(state, count=1501)
     assert state["pending"] == frozen
     _json(state)
@@ -154,17 +157,17 @@ def test_metadata_reclassification_is_silent_but_later_source_progress_is_not(pr
     state = _capture(state, completed={**_completed(4), "5": previous})
     assert state["earned"] == {"reader": 1}
     state = _capture(state, count=5)
-    assert state["earned"] == {"reader": 5} and state["pending"] == []
+    assert state["earned"] == {"reader": 2} and state["pending"] == []
     state = _capture(state, count=10)
-    assert state["pending"][0]["awards"] == {"reader": 10}
+    assert state["pending"][0]["awards"] == {"reader": 3}
 
 
 def test_repair_and_new_completion_in_same_snapshot_reconcile_in_that_order():
     state = _capture(count=4)
     state = _capture(state, completed={**_completed(4), "5": None})
     state = _capture(state, count=10)
-    assert state["earned"] == {"reader": 10}
-    assert [plan["awards"] for plan in state["pending"]] == [{"reader": 10}]
+    assert state["earned"] == {"reader": 3}
+    assert [plan["awards"] for plan in state["pending"]] == [{"reader": 3}]
 
 
 @pytest.mark.parametrize("damage", [
@@ -189,7 +192,7 @@ def test_invalid_authority_fails_closed(damage):
     elif damage == "bool_count":
         state["families"]["reader"]["current_value"] = True
     elif damage == "earned":
-        state["earned"]["reader"] = 2
+        state["earned"]["reader"] = -1
     elif damage == "bool_earned":
         state["earned"]["reader"] = True
     elif damage == "dedup":
@@ -233,3 +236,61 @@ def test_reader_capacity_pays_future_attempts_inclusive_boundary():
         complete_attempt(delivery, "uncertain", delivery["attempts"][-1]["at"], retry_delay=0)
         encode_owner_state(state, max_bytes=budget)
         _json(state)
+
+
+def test_catalog_baselines_independently_and_groups_highest_genuine_crossings():
+    from achievement_helpers import catalog_inputs
+
+    state = capture(inputs={"reader": {"1": True}})
+    state = capture(state, catalog_inputs(1))
+    assert state["pending"] == [] and len(state["families"]) == 17
+    state = capture(state, catalog_inputs(5))
+    assert len(state["pending"]) == 1
+    awards = state["pending"][0]["awards"]
+    assert set(awards) == set(BOT_ACHIEVEMENTS)
+    assert awards["reader"] == 2 and awards["chapters"] == 4 and awards["volumes"] == 3
+    assert awards["long_works"] == awards["pre_2000"] == 3
+    assert awards["fantasy"] == awards["josei"] == 1
+    assert state["pending"][0]["total_parts"] == 1
+    text = state["pending"][0]["parts"][0]["text"]
+    assert "уровень 4" in text and text.count("Новые достижения бота!") == 1
+    assert capture(state, catalog_inputs(5)) == state
+    frozen = deepcopy(state["pending"])
+    state = capture(state, catalog_inputs(0))
+    state = capture(state, catalog_inputs(5))
+    assert state["pending"] == frozen and state["earned"] == awards
+    assert parse_bot_member(_json(state).encode(), catalog=BOT_ACHIEVEMENTS, profile="WNR", owner_id=999) == state
+
+
+def test_new_independent_family_does_not_congratulate_historical_progress():
+    state = capture(inputs={"chapters": {"1": {"eligible": True, "marks": None}}, "volumes": {}})
+    state = capture(state, {"chapters": {"1": {"eligible": True, "marks": 3000}},
+                            "volumes": {"1": {"eligible": True, "marks": 100}}})
+    assert state["earned"] == {"chapters": 7, "volumes": 5}
+    assert [plan["awards"] for plan in state["pending"]] == [{"volumes": 5}]
+
+
+def test_mixed_mark_eligibility_correction_and_real_growth_awards_only_after_quiet_tier():
+    state = capture(inputs={"chapters": {"1": {"eligible": False, "marks": 99}}})
+    state = capture(state, {"chapters": {"1": {"eligible": True, "marks": 100}}})
+    assert state["pending"][0]["awards"] == {"chapters": 2}
+
+
+def test_grouped_congratulations_split_only_at_telegram_limit_and_keep_frozen_old_plan():
+    from dataclasses import replace
+
+    from bot_achievements import achievement_catalog
+
+    reader = replace(BOT_ACHIEVEMENTS["reader"], award_text=lambda level, value: "<b>" + "😀" * 3000 + "</b>")
+    catalog = achievement_catalog(reader, BOT_ACHIEVEMENTS["volumes"])
+    state = capture(inputs={"reader": {}, "volumes": {}}, catalog=catalog)
+    state = capture(state, {"reader": {"1": True}, "volumes": {"1": {"eligible": True, "marks": 100}}}, catalog=catalog)
+    plan = state["pending"][0]
+    assert plan["awards"] == {"reader": 1, "volumes": 5}
+    assert len(plan["parts"]) == 2
+    for part in plan["parts"]:
+        from catchup_digest import html_length
+        assert html_length(part["text"]) <= 4096
+    old = deepcopy(plan)
+    state = capture(state, {"reader": _completed(5)}, catalog=catalog)
+    assert state["pending"][0] == old

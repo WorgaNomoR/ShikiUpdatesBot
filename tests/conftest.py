@@ -138,7 +138,7 @@ def bot_catalog(monkeypatch):
         calculate=lambda previous, source: Evaluation(dict(source), value(source)),
         checkpoint_value=value, award_text=lambda level, count: f"🎉 Аниме: уровень {level}!",
     )
-    catalog = achievement_catalog(*BOT_ACHIEVEMENTS.values(), anime)
+    catalog = achievement_catalog(BOT_ACHIEVEMENTS["reader"], anime)
     monkeypatch.setattr("bot_achievement_catalog.BOT_ACHIEVEMENTS", catalog)
     return catalog
 

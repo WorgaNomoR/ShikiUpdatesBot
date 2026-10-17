@@ -37,19 +37,15 @@ async def capture_bot_achievement_sync(inputs, *, generation):
         if generation != restorable_restore_generation():
             return False
         expected = load_bot_achievement_state()
-    candidate = expected
-    for family, source in inputs.items():
-        try:
-            candidate = capture_bot_achievements(
-                candidate, {family: source}, catalog=bot_catalog.BOT_ACHIEVEMENTS,
-                profile=SHIKI_USER, owner_id=OWNER_ID, now=time.time(),
-            )
-        except (asyncio.CancelledError, ProfilePrivacyError):
-            raise
-        except Exception as error:
-            log.warning("Достижения бота: расчёт семьи %s пропущен (%s).", family, type(error).__name__)
-    if candidate is None:
-        return False
+    def failed(family, error):
+        if isinstance(error, ProfilePrivacyError):
+            raise error
+        log.warning("Достижения бота: расчёт семьи %s пропущен (%s).", family, type(error).__name__)
+
+    candidate = capture_bot_achievements(
+        expected, inputs, catalog=bot_catalog.BOT_ACHIEVEMENTS,
+        profile=SHIKI_USER, owner_id=OWNER_ID, now=time.time(), on_error=failed,
+    )
     async with restorable_state_transaction():
         if generation != restorable_restore_generation() or load_bot_achievement_state() != expected:
             return False

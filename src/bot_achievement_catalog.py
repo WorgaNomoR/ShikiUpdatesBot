@@ -3,6 +3,7 @@
 """Явный производственный каталог; новые семьи добавляются определениями."""
 
 from bot_achievements import achievement_catalog
+from reading_catalog import READING_ACHIEVEMENTS
 from reading_milestones import READER
 
-BOT_ACHIEVEMENTS = achievement_catalog(READER)
+BOT_ACHIEVEMENTS = achievement_catalog(READER, *READING_ACHIEVEMENTS)

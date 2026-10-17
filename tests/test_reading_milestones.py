@@ -12,15 +12,9 @@ from reading_milestones import (
 )
 
 
-@pytest.mark.parametrize("tier,next_tier", [
-    (0, 1), (1, 5), (5, 10), (10, 25), (25, 50), (50, 100),
-    (100, 250), (250, 500), (500, 1000), (1000, 1500), (1500, 2000), (10000, 10500),
-])
-def test_threshold_boundaries_and_numeric_identity(tier, next_tier):
-    assert reading_tier(tier) == tier
-    assert reading_tier(next_tier - 1) == tier
-    assert reading_tier(next_tier) == next_tier
-    assert next_reading_tier(tier) == next_tier
+def test_reader_uses_ordinal_levels_and_approved_thresholds():
+    assert reading_tier(51) == 5
+    assert next_reading_tier(5) == 75
 
 
 

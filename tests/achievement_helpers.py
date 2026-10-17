@@ -11,3 +11,17 @@ def capture_reader(state, completed, *, profile, owner_id, now):
         state, {"reader": completed}, catalog=bot_catalog.BOT_ACHIEVEMENTS,
         profile=profile, owner_id=owner_id, now=now,
     )
+
+
+def catalog_inputs(count, *, chapters=100, volumes=5):
+    """Общий реальный вход каталога для доставки и восстановления."""
+    from reading_catalog import TAXONOMY_FAMILIES
+    from stats import reading_catalog_observation
+
+    rows = [{"target_id": index, "status": "completed", "chapters": chapters, "volumes": volumes}
+            for index in range(1, count + 1)]
+    metadata = {str(index): {"kind": "novel", "reading_evidence": {
+        "chapters": 100, "year": 1999,
+        "taxonomy": [[tag_id, kind] for _, _, kind, tag_id, _ in TAXONOMY_FAMILIES],
+    }} for index in range(1, count + 1)}
+    return reading_catalog_observation(rows, metadata)

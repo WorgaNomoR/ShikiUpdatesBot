@@ -250,7 +250,7 @@ async def test_public_achievement_sources_fail_independently_without_mutation(
     monkeypatch.setattr("handlers.cached_achievement_metadata", AsyncMock(return_value={}))
     text = "\n".join(rendered_html(await handlers._achievement_report()))
     if broken != "reader":
-        assert "51% до следующего уровня" in text and "уровень 50" in text
+        assert "68% до следующего уровня" in text and "уровень 5" in text
     else:
         assert "Достижения бота временно недоступны" in text
     if broken != "shikimori":

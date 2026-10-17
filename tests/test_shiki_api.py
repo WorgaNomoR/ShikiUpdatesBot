@@ -1185,6 +1185,36 @@ async def test_fetch_meta_batch_parses_manga_meta():
     assert "rating" not in meta and "origin" not in meta and "studios" not in meta
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("genres", [
+    [{"id": "47", "name": "Shounen", "russian": "Сёнэн", "kind": "demographic"},
+     {"id": "57", "name": "Fantasy", "russian": "Фэнтези", "kind": "genre"},
+     {"id": "126", "name": "Award Winning", "russian": "Удостоено наград", "kind": "theme"}],
+    None,
+])
+async def test_manga_acquisition_adds_evidence_without_repurposing_report_taxonomy(genres):
+    item = {"id": "2", "kind": "manga", "chapters": 0, "airedOn": {"year": 1989}, "genres": genres}
+    session = _SeqSession([_gql_response({"mangas": [item]})])
+    meta = (await shiki_api.fetch_meta_batch("manga", ["2"], session=session))["2"]
+    assert "genres { id russian name kind }" in session.requests[0]["query"]
+    assert meta["kind"] == "manga" and meta["reading_evidence"]["chapters"] == 0
+    assert meta["reading_evidence"]["year"] == 1989
+    if genres is None:
+        assert "taxonomy" not in meta["reading_evidence"] and meta["genres"] == []
+    else:
+        assert meta["genres"] == ["Фэнтези"] and meta["demographic"] == ["Сёнэн"]
+        assert meta["themes"] == ["Удостоено наград"]
+        assert meta["reading_evidence"]["taxonomy"] == [[47, "demographic"], [57, "genre"], [126, "theme"]]
+
+
+@pytest.mark.asyncio
+async def test_malformed_taxonomy_or_date_preserves_independent_manga_evidence():
+    item = {"id": "2", "kind": "manga", "chapters": 100, "airedOn": [], "genres": 42}
+    session = _SeqSession([_gql_response({"mangas": [item]})])
+    meta = (await shiki_api.fetch_meta_batch("manga", ["2"], session=session))["2"]
+    assert meta["kind"] == "manga" and meta["reading_evidence"] == {"chapters": 100}
+
+
 @pytest.mark.parametrize(
     ("poster", "expected"),
     [
