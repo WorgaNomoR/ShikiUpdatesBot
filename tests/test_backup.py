@@ -3981,14 +3981,26 @@ async def test_automatic_backups_capture_unfinished_digest_and_keep_its_authorit
         assert after["last_backup_at"] > old and after["pending"] is None
 
 
-@pytest.fixture
-def reading_recovery_state():
-    """Один неизменяемый долг Reader; схема попыток проверяется у владельца."""
-    from achievement_helpers import capture_reader
+@pytest.fixture(params=["reader", "catalog"])
+def reading_recovery_state(request):
+    """Текущая шкала Reader и весь каталог проходят одинаковый путь recovery."""
+    from achievement_helpers import (
+        capture_reader,
+        catalog_inputs,
+    )
 
+    from bot_achievement_catalog import BOT_ACHIEVEMENTS
+    from bot_achievements import capture_bot_achievements
     from notification_outbox import begin_attempt
-    state = capture_reader(None, {}, profile="WNR", owner_id=999, now=1000)
-    state = capture_reader(state, {"1": True}, profile="WNR", owner_id=999, now=1000)
+    if request.param == "catalog":
+        state = None
+        for count in (0, 5):
+            state = capture_bot_achievements(
+                state, catalog_inputs(count), catalog=BOT_ACHIEVEMENTS, profile="WNR", owner_id=999, now=1000,
+            )
+    else:
+        state = capture_reader(None, {}, profile="WNR", owner_id=999, now=1000)
+        state = capture_reader(state, {"1": True}, profile="WNR", owner_id=999, now=1000)
     begin_attempt(state["pending"][0]["parts"][0]["delivery"], 1001)
     return state
 
@@ -4106,7 +4118,7 @@ async def test_reader_inflight_success_cannot_ack_after_unrelated_restore(
     assert await bot_achievement_delivery.dispatch_bot_achievements(bot)
     assert storage.restorable_restore_generation() == generation + 1
     state = storage.load_bot_achievement_state()
-    assert state["earned"] == {"reader": 1} and state["pending"]
+    assert state["earned"] == reading_recovery_state["earned"] and state["pending"]
     assert state["pending"][0]["parts"][0]["delivery"]["attempts"][-1]["outcome"] == "uncertain"
 
 

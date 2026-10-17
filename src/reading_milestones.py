@@ -5,24 +5,21 @@
 import re
 
 from achievement_plans import AchievementStateError
+from achievement_scales import READER_SCALE
 from bot_achievements import (
     BotAchievement,
     Evaluation,
 )
 
-_THRESHOLDS = (1, 5, 10, 25, 50, 100, 250, 500)
-
 
 def reading_tier(count: int) -> int:
-    """Порог является идентификатором уровня, без конечного каталога."""
-    if count >= 1000:
-        return count // 500 * 500
-    return max((threshold for threshold in _THRESHOLDS if threshold <= count), default=0)
+    """Порядковый уровень по числу завершённых произведений."""
+    return READER_SCALE.level_for(count)
 
 
 def next_reading_tier(tier: int) -> int:
     """Следующий ещё не полученный порог, включая нулевой старт."""
-    return next((threshold for threshold in _THRESHOLDS if threshold > tier), max(1000, tier + 500))
+    return READER_SCALE.next_threshold(tier)
 
 
 def reading_count(completed):
@@ -45,15 +42,15 @@ def calculate_reader(previous, completed):
 
 def reading_criterion(tier):
     """Критерий полученного порога, общий для манги и ранобэ."""
-    works = "1 завершённое произведение" if tier == 1 else f"{tier} завершённых произведений"
+    threshold = READER_SCALE.threshold(tier)
+    works = "1 завершённое произведение" if threshold == 1 else f"{threshold} завершённых произведений"
     return f"{works} манги и ранобэ"
 
 
 def reading_award_text(tier, count):
     """Семейство задаёт свою обычную поздравительную формулировку."""
     return (
-        "🎉 <b>Новая глава читательских побед!</b> 📚\n\n"
-        f"✨ <b>Читатель — {tier}</b>\n"
+        f"✨ <b>Читатель — уровень {tier}</b>\n"
         f"Завершённых произведений в списке: <b>{count}</b>. "
         "Манга и ранобэ вместе — книжная полка растёт! 🏆"
     )
@@ -63,4 +60,5 @@ READER = BotAchievement(
     family="reader", title="Читатель", criterion=reading_criterion,
     level_for=reading_tier, next_level=next_reading_tier, calculate=calculate_reader,
     checkpoint_value=reading_count, award_text=reading_award_text,
+    level_threshold=READER_SCALE.threshold,
 )

@@ -538,7 +538,7 @@ def test_quarter_projection_allowlist_covers_title_record_schema(media):
         {},
         meta_updated_at="2026-01-01T00:00:00",
     )
-    denylist = {"comment"}
+    denylist = {"comment", "reading_evidence"}
     record_before = copy.deepcopy(record)
 
     assert set(record) <= set(smod._QUARTER_TITLE_FIELDS) | denylist
@@ -612,6 +612,57 @@ async def test_comment_only_sync_saves_create_change_delete_and_repeated_noop(
     await smod.sync_stats_all(session=object())
     assert "comment" not in state["anime"]["titles"]["1"]
     assert len(saves) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damaged_media", ["anime", "manga"])
+@pytest.mark.parametrize("sibling_available", [False, True])
+@pytest.mark.parametrize("damage", ["missing", None, 0, False, [], {}, "future", "non_object"])
+async def test_sync_incomplete_status_preserves_entire_media_half(
+    monkeypatch, damaged_media, sibling_available, damage,
+):
+    state = storage._empty_stats_all()
+    for media in ("anime", "manga"):
+        record = _anime_rec() if media == "anime" else _manga_record("Манга", "manga")
+        state[media]["titles"] = {
+            str(tid): {**record, "comment": "сохранить"} for tid in (1, 2, 3)
+        }
+        state[media]["aggregates"] = smod.recompute_aggregates(media, state[media]["titles"])
+    before = copy.deepcopy(state)
+    sibling = "manga" if damaged_media == "anime" else "anime"
+    broken = {"target_id": 1}
+    if damage != "missing":
+        broken["status"] = damage
+    exports = {
+        damaged_media: [
+            None if damage == "non_object" else broken,
+            {"target_id": 2, "status": "completed", "score": 10, "text": "не публиковать"},
+        ],
+        sibling: [] if sibling_available else None,
+    }
+    saved = []
+    meta = AsyncMock(return_value={})
+    capture = AsyncMock()
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=lambda session, media: exports[media]))
+    monkeypatch.setattr("stats.fetch_meta_batch", meta)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: saved.append(value))
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda session, data, **kw: data))
+    monkeypatch.setattr("stats.capture_bot_achievement_sync", capture)
+
+    result, ok = await smod.sync_stats_all(session=object(), fav={})
+
+    assert ok is sibling_available
+    assert result[damaged_media] == before[damaged_media]
+    assert state == before
+    assert saved == ([result] if sibling_available else [])
+    meta.assert_not_awaited()
+    assert capture.await_count == int(sibling_available and damaged_media == "anime")
+    if sibling_available:
+        assert result[sibling]["titles"] == {}
+        assert result[sibling]["aggregates"]["total_completed"] == 0
+    else:
+        assert result == before
 
 
 @pytest.mark.asyncio
@@ -2286,6 +2337,7 @@ async def test_sync_fully_recovers_malformed_record_outside_maintenance_limit(
         "20": {
             **_manga_record("Соседняя манга", "manga", status="watching"),
             "meta_updated_at": current_stamp,
+            "reading_evidence": {"chapters": None, "year": None, "taxonomy": []},
         },
     }
     anime_rows = [
@@ -3809,7 +3861,7 @@ async def test_reading_sync_combines_51_manga_and_ranobe_excludes_oneshots(reade
     meta.return_value = {str(i): {"kind": "manga" if i < 50 else "novel" if i < 52 else "one_shot"} for i in range(1, 56)}
     await smod.sync_stats_all(session=object())
     state = storage.load_bot_achievement_state()
-    assert state["families"]["reader"]["current_value"] == 51 and state["earned"] == {"reader": 50}
+    assert state["families"]["reader"]["current_value"] == 51 and state["earned"] == {"reader": 5, "chapters": 1}
     assert state["pending"] == []
     assert sum(value is False for value in state["families"]["reader"]["checkpoint"].values()) == 4
 
@@ -3828,13 +3880,13 @@ async def test_reading_sync_repair_then_genuine_completion(reader_sync_env):
     meta.return_value = {"5": {"kind": "novel"}}
     await smod.sync_stats_all(session=object())
     state = storage.load_bot_achievement_state()
-    assert state["families"]["reader"]["current_value"] == 5 and state["earned"] == {"reader": 5}
+    assert state["families"]["reader"]["current_value"] == 5 and state["earned"] == {"reader": 2}
     assert state["pending"] == []
     rows.extend(_export_manga_row(i) for i in range(6, 11))
     meta.return_value = {str(i): {"kind": "manga"} for i in range(6, 11)}
     await smod.sync_stats_all(session=object())
     state = storage.load_bot_achievement_state()
-    assert state["pending"][0]["awards"] == {"reader": 10}
+    assert state["pending"][0]["awards"] == {"reader": 3}
 
 
 @pytest.mark.asyncio
@@ -3889,7 +3941,7 @@ async def test_reading_capture_failure_keeps_successful_list_sync(reader_sync_en
     assert state["manga"]["titles"]["1"]["status"] == "completed"
     assert saved == [state]
     assert storage.BOT_ACHIEVEMENTS_FILE.read_bytes() == original
-    assert "Читатель: наблюдение не опубликовано" in caplog.text
+    assert "Достижения бота: наблюдение не опубликовано" in caplog.text
     assert type(error).__name__ in caplog.text and "PRIVATE_READER" not in caplog.text
 
 
@@ -3901,4 +3953,67 @@ async def test_reading_capture_propagates_cancellation_and_privacy(reader_sync_e
     with pytest.raises(type(error)):
         await smod.sync_stats_all(session=object())
 
-    assert "Читатель: наблюдение не опубликовано" not in caplog.text
+    assert "Достижения бота: наблюдение не опубликовано" not in caplog.text
+
+
+@pytest.mark.parametrize("kind,eligible", [("manga", True), ("novel", True), ("one_shot", False), ("doujin", False), (None, None)])
+def test_catalog_shares_reader_eligibility_and_canonical_ids(kind, eligible):
+    rows = [_export_manga_row(1, status="watching", chapters=10), _export_manga_row("1", status="watching", chapters=10)]
+    inputs = smod.reading_catalog_observation(rows, {"1": {"kind": kind}})
+    assert inputs["reader"] == {}
+    assert inputs["chapters"] == {"1": {"eligible": eligible, "marks": 10}}
+    assert inputs["fantasy"] == {}
+
+
+def test_conflicting_duplicate_progress_is_unavailable_only_for_its_metric():
+    rows = [_export_manga_row(1, chapters=1), _export_manga_row("1", chapters=True)]
+    inputs = smod.reading_catalog_observation(rows, {"1": {"kind": "manga"}})
+    assert inputs["reader"] == {"1": True}
+    assert inputs["chapters"] == {"1": {"eligible": True, "marks": None}}
+    assert inputs["volumes"] == {"1": {"eligible": True, "marks": 0}}
+
+
+@pytest.mark.asyncio
+async def test_catalog_backfills_new_evidence_in_shared_bounded_batches(reader_sync_env, monkeypatch):
+    data, export, meta = reader_sync_env
+    now = datetime(2026, 10, 17, 12)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+    rows = [_export_manga_row(index) for index in range(1, 52)]
+    data["manga"]["titles"] = {str(index): {
+        **_manga_record("x", "manga"), "meta_updated_at": now.isoformat(),
+    } for index in range(1, 52)}
+    export.side_effect = lambda session, media: rows if media == "manga" else []
+
+    async def acquired(media, ids, **kwargs):
+        assert media == "manga" and len(ids) <= 50
+        return {key: {"kind": "manga", "reading_evidence": {"chapters": 100, "year": None, "taxonomy": []}}
+                for key in ids}
+
+    meta.side_effect = acquired
+    await smod.sync_stats_all(session=object())
+    first = storage.load_bot_achievement_state()
+    assert first["families"]["reader"]["current_value"] == 51
+    assert first["families"]["long_works"]["current_value"] is None
+    assert len(meta.await_args_list) == 1 and len(meta.await_args.args[1]) == 50
+    await smod.sync_stats_all(session=object())
+    second = storage.load_bot_achievement_state()
+    assert second["families"]["long_works"]["current_value"] == 51 and second["pending"] == []
+    assert len(meta.await_args_list) == 2 and meta.await_args.args[1] == ["51"]
+    await smod.sync_stats_all(session=object())
+    assert len(meta.await_args_list) == 2
+
+
+@pytest.mark.asyncio
+async def test_catalog_marks_use_export_while_report_aggregates_stay_completed_only(reader_sync_env):
+    _, export, meta = reader_sync_env
+    export.side_effect = lambda session, media: [
+        _export_manga_row(1, chapters=10), _export_manga_row(2, status="watching", chapters=50),
+    ] if media == "manga" else []
+    meta.return_value = {str(index): {"kind": "manga", "chapters_total": 999,
+                                    "reading_evidence": {"chapters": 999, "year": None, "taxonomy": []}}
+                         for index in (1, 2)}
+    result, _ = await smod.sync_stats_all(session=object())
+    assert result["manga"]["aggregates"]["total_chapters_read"] == 10
+    saved = storage.load_bot_achievement_state()
+    assert saved["families"]["chapters"]["current_value"] == 60
+    assert saved["families"]["long_works"]["current_value"] == 1

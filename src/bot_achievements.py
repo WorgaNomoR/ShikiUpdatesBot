@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Общие определения, независимые checkpoint и замороженные награды бота."""
+"""Общие определения, независимые checkpoint и замороженные сообщения о достижениях."""
 
 import re
 from collections.abc import (
@@ -21,11 +21,19 @@ from achievement_plans import (
     encode_owner_state,
     validate_pending_plans,
 )
-from catchup_digest import split_html
+from catchup_digest import (
+    html_length,
+    split_html,
+)
 from notification_outbox import LIFETIME
 
 BOT_ACHIEVEMENTS_FILE_NAME = "bot_achievements.json"
 BOT_ACHIEVEMENTS_MAX_BYTES = ACHIEVEMENTS_MAX_BYTES
+
+
+def _numeric_threshold(level):
+    """Определения с числовыми уровнями сохраняют свой явный контракт."""
+    return level
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,7 @@ class BotAchievement:
     calculate: Callable[[dict | None, object], Evaluation]
     checkpoint_value: Callable[[dict], int | None]
     award_text: Callable[[int, int], str]
+    level_threshold: Callable[[int], int] = _numeric_threshold
 
 
 def achievement_catalog(*definitions: BotAchievement) -> Mapping[str, BotAchievement]:
@@ -79,48 +88,70 @@ def _checkpoint_value(definition, checkpoint):
         raise AchievementStateError("bot_achievement_checkpoint") from error
 
 
-def capture_bot_achievements(state, inputs, *, catalog, profile, owner_id, now):
+def _evaluate_family(definition, previous, source, earned):
+    """Проверяем одну метрику до изменения общего кандидата."""
+    observation = definition.calculate(deepcopy(previous["checkpoint"]) if previous else None, source)
+    if (
+        not isinstance(observation, Evaluation) or not _integer(observation.quiet_value)
+        or (observation.current_value is not None and not _integer(observation.current_value))
+        or _checkpoint_value(definition, observation.checkpoint) != observation.current_value
+        or (observation.current_value is not None and observation.quiet_value > observation.current_value)
+    ):
+        raise AchievementStateError("bot_achievement_evaluation")
+    initialized = bool(previous and previous["initialized"])
+    saved = {
+        "initialized": initialized or observation.current_value is not None,
+        "current_value": observation.current_value, "checkpoint": deepcopy(observation.checkpoint),
+    }
+    if observation.current_value is None:
+        return saved, earned, None
+    quiet_level = max(earned, definition.level_for(observation.quiet_value))
+    level = max(quiet_level, definition.level_for(observation.current_value))
+    text = definition.award_text(level, observation.current_value) if initialized and level > quiet_level else None
+    if initialized and level > quiet_level:
+        if not isinstance(text, str) or not text.strip():
+            raise AchievementStateError("bot_achievement_award_text")
+        html_length(text)
+    return saved, level, text
+
+
+def capture_bot_achievements(state, inputs, *, catalog, profile, owner_id, now, on_error=None):
     """Публикуемый кандидат: baseline каждой семьи и высший новый порог."""
     if state is not None:
         validate_bot_state(state, catalog=catalog, profile=profile, owner_id=owner_id)
     result = deepcopy(state) if state is not None else {
-        "version": 1, "state_id": uuid4().hex, "profile": profile, "owner_id": owner_id,
+        "version": 2, "state_id": uuid4().hex, "profile": profile, "owner_id": owner_id,
         "families": {}, "earned": {}, "pending": [],
     }
     if set(inputs) - set(catalog):
         raise AchievementStateError("bot_achievement_input")
+    awards, award_texts = {}, []
     for family, source in inputs.items():
         definition = catalog[family]
         previous = result["families"].get(family)
-        observation = definition.calculate(deepcopy(previous["checkpoint"]) if previous else None, source)
-        if (
-            not isinstance(observation, Evaluation) or not _integer(observation.quiet_value)
-            or (observation.current_value is not None and not _integer(observation.current_value))
-            or _checkpoint_value(definition, observation.checkpoint) != observation.current_value
-            or (observation.current_value is not None and observation.quiet_value > observation.current_value)
-        ):
-            raise AchievementStateError("bot_achievement_evaluation")
-        initialized = bool(previous and previous["initialized"])
-        result["families"][family] = {
-            "initialized": initialized or observation.current_value is not None,
-            "current_value": observation.current_value, "checkpoint": deepcopy(observation.checkpoint),
-        }
-        if observation.current_value is None:
+        try:
+            saved, level, text = _evaluate_family(definition, previous, source, result["earned"].get(family, 0))
+        except Exception as error:
+            if on_error is None:
+                raise
+            on_error(family, error)
             continue
-        quiet_level = max(result["earned"].get(family, 0), definition.level_for(observation.quiet_value))
-        level = max(quiet_level, definition.level_for(observation.current_value))
+        result["families"][family] = saved
         if level:
             result["earned"][family] = level
-        if initialized and level > quiet_level:
-            texts = split_html(definition.award_text(level, observation.current_value))
-            result["pending"].append({
-                "plan_id": uuid4().hex, "kind": "awards", "awards": {family: level},
-                "created_at": now, "expires_at": now + LIFETIME, "total_parts": len(texts),
-                "parts": [{"index": index, "text": text, "delivery": {
-                    "status": "pending", "attempts": [], "prior_possible": False,
-                    "next_attempt_at": now, "terminal_at": None, "reason": None, "duplicate_possible": False,
-                }} for index, text in enumerate(texts)],
-            })
+        if text is not None:
+            awards[family] = level
+            award_texts.append(text)
+    if awards:
+        texts = split_html("🎉 <b>Новые достижения бота!</b> 🏆\n\n" + "\n\n".join(award_texts))
+        result["pending"].append({
+            "plan_id": uuid4().hex, "kind": "awards", "awards": awards,
+            "created_at": now, "expires_at": now + LIFETIME, "total_parts": len(texts),
+            "parts": [{"index": index, "text": text, "delivery": {
+                "status": "pending", "attempts": [], "prior_possible": False,
+                "next_attempt_at": now, "terminal_at": None, "reason": None, "duplicate_possible": False,
+            }} for index, text in enumerate(texts)],
+        })
     validate_bot_state(result, catalog=catalog, profile=profile, owner_id=owner_id)
     return result
 
@@ -130,7 +161,7 @@ def validate_bot_state(state, *, catalog, profile, owner_id):
     if (
         not isinstance(state, dict) or set(state) != {
             "version", "state_id", "profile", "owner_id", "families", "earned", "pending",
-        } or type(state["version"]) is not int or state["version"] != 1
+        } or type(state["version"]) is not int or state["version"] != 2
         or not _identity(state["state_id"]) or not _integer(state["owner_id"], 1)
         or not isinstance(state["families"], dict) or set(state["families"]) - set(catalog)
         or not isinstance(state["earned"], dict) or set(state["earned"]) - set(state["families"])
@@ -149,11 +180,11 @@ def validate_bot_state(state, *, catalog, profile, owner_id):
             raise AchievementStateError("bot_achievement_checkpoint")
         level = state["earned"].get(family, 0)
         if (
-            not _integer(level) or definition.level_for(level) != level
+            not _integer(level) or definition.level_for(definition.level_threshold(level)) != level
             or (family in state["earned"] and not level)
             or (not saved["initialized"] and (level or saved["current_value"] is not None))
             or (saved["current_value"] is not None and definition.level_for(saved["current_value"]) > level)
-            or not _integer(definition.next_level(level), level + 1)
+            or not _integer(definition.next_level(level), definition.level_threshold(level) + 1)
         ):
             raise AchievementStateError("bot_achievement_level")
     validate_pending_plans(state["pending"], state["earned"])
@@ -163,7 +194,7 @@ def validate_bot_state(state, *, catalog, profile, owner_id):
             raise AchievementStateError("bot_achievement_plan")
         for family, level in plan["awards"].items():
             if (
-                family not in catalog or catalog[family].level_for(level) != level
+                family not in catalog or catalog[family].level_for(catalog[family].level_threshold(level)) != level
                 or level <= previous.get(family, 0)
             ):
                 raise AchievementStateError("bot_achievement_plan")

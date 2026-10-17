@@ -39,7 +39,7 @@ def _identity(value):
 
 
 def validate_pending_plans(pending, earned, *, version=1):
-    """Общая схема замороженных владельческих сообщений, без каталога наград."""
+    """Общая схема замороженных владельческих сообщений, без каталога достижений."""
     if not isinstance(pending, list):
         raise AchievementStateError("achievement_pending")
     identities = set()

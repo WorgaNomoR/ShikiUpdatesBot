@@ -44,6 +44,10 @@ from messages import (
     _avg_score_from_dist,
     _pct_diff,
 )
+from reading_catalog import (
+    reading_evidence,
+    reading_family_inputs,
+)
 from report_model import (
     Bold,
     Heading,
@@ -512,6 +516,7 @@ def _merge_title_record(
             "chapters_total": meta.get("chapters_total"),
             "volumes_total":  meta.get("volumes_total"),
             "publishers":     meta.get("publishers") or [],
+            "reading_evidence": reading_evidence(meta),
         })
     if meta_updated_at is not None:
         record["meta_updated_at"] = meta_updated_at
@@ -555,6 +560,7 @@ def _select_metadata_refresh_ids(
     valid_rows: dict[str, dict],
     titles: dict[str, dict],
     now: datetime,
+    *, reading: bool = False,
 ) -> list[str]:
     """Выбрать oldest-first кандидатов одного media-домена в фиксированный бюджет."""
     candidates: list[tuple[datetime, tuple[int, int, str], str]] = []
@@ -572,6 +578,8 @@ def _select_metadata_refresh_ids(
             continue
 
         updated_at = _parse_iso_utc(record.get("meta_updated_at"))
+        if reading and set(reading_evidence(record)) != {"chapters", "year", "taxonomy"}:
+            updated_at = None
         if updated_at is not None and updated_at > now:
             updated_at = None
         if updated_at is not None and now - updated_at < max_age:
@@ -697,11 +705,11 @@ def recompute_aggregates(media: str, titles: dict, existing_by_quarter: dict | N
     return agg
 
 
-def reading_observation(export, kinds):
-    """Полный текущий экспорт; неизвестная мета не превращается в пригодный ноль."""
+def _reading_rows(export):
+    """Полнота ID/статусов общая, конфликт отметок портит только свою метрику."""
     if not isinstance(export, list):
         return None
-    statuses = {}
+    rows = {}
     for row in export:
         if not isinstance(row, dict):
             return None
@@ -714,22 +722,49 @@ def reading_observation(export, kinds):
         if row.get("target_type", "Manga") != "Manga":
             return None
         tid, status = str(raw_id), status.lower()
-        if tid in statuses and statuses[tid] != status:
+        if tid in rows and rows[tid]["status"].lower() != status:
             return None
-        statuses[tid] = status
-    completed = {}
-    for tid, status in statuses.items():
-        if status != "completed":
-            continue
-        kind = kinds.get(tid)
-        normalized = kind.strip().lower() if isinstance(kind, str) else ""
-        if normalized and not is_relevant("manga", normalized):
-            completed[tid] = False
-        elif classify_manga_presentation_kind(normalized) != PICK_CATEGORY_UNKNOWN:
-            completed[tid] = True
+        if tid in rows:
+            for field in ("chapters", "volumes"):
+                if rows[tid].get(field) != row.get(field) or type(rows[tid].get(field)) is not type(row.get(field)):
+                    rows[tid][field] = None
         else:
-            completed[tid] = None
+            rows[tid] = dict(row)
+    return rows
+
+
+def _reading_eligibility(kind):
+    """Единая политика видов для всех метрик чтения."""
+    normalized = kind.strip().lower() if isinstance(kind, str) else ""
+    if normalized and not is_relevant("manga", normalized):
+        return False
+    return True if classify_manga_presentation_kind(normalized) != PICK_CATEGORY_UNKNOWN else None
+
+
+def reading_observation(export, kinds):
+    """Полный текущий экспорт; неизвестная мета не превращается в пригодный ноль."""
+    rows = _reading_rows(export)
+    if rows is None:
+        return None
+    completed = {}
+    for tid, row in rows.items():
+        if row["status"].lower() != "completed":
+            continue
+        completed[tid] = _reading_eligibility(kinds.get(tid))
     return completed
+
+
+def reading_catalog_observation(export, metadata):
+    """Общий подтверждённый вход каталога до очистки исключённых произведений."""
+    rows = _reading_rows(export)
+    if rows is None:
+        return None
+    eligibility = {
+        key: _reading_eligibility(metadata[key].get("kind") if isinstance(metadata.get(key), dict) else None)
+        for key in rows
+    }
+    result = reading_family_inputs(rows, eligibility, metadata)
+    return {"reader": {key: eligibility[key] for key, row in rows.items() if row["status"].lower() == "completed"}, **result}
 
 
 async def sync_stats_all(
@@ -746,10 +781,10 @@ async def sync_stats_all(
        батчем GraphQL. Для остальных обновляем пользовательский стейт из экспорта.
     4. Отдельно обновляем до 50 самых старых метаданных каждого media-домена.
     5. Пересчитываем агрегаты, сохраняем.
-    6. При явном корректном manga-экспорте отдельно захватываем «Читателя».
+    6. При явном корректном manga-экспорте захватываем общий каталог чтения.
 
     Вызывается при старте бота и периодически из цикла. Уведомлений не шлёт.
-    Возвращает (stats_all, ok): ok=False, если ни один экспорт не скачался
+    Возвращает (stats_all, ok): ok=False, если нет ни одного корректного экспорта
     (тогда stats_all — прежний, нетронутый); ok=True при частичном/полном успехе.
     """
     # boot-throttle: переданную сессию переиспользуем (одну на весь старт),
@@ -760,12 +795,24 @@ async def sync_stats_all(
 
     stats = load_stats_all(use_cache=False)
     reading_generation = restorable_restore_generation()
-    reading_completed = None
+    reading_inputs = None
 
-    export_anime = await fetch_list_export(session, "anime")
-    export_manga = await fetch_list_export(session, "manga")
+    exports = {
+        "anime": await fetch_list_export(session, "anime"),
+        "manga": await fetch_list_export(session, "manga"),
+    }
+    # Пропущенная строка не доказывает удаление тайтла. Неполный экспорт
+    # сохраняет весь прежний домен, как и недоступный ответ API.
+    for media, export in exports.items():
+        if export is not None and any(
+            not isinstance(row, dict) or not isinstance(row.get("status"), str)
+            or row["status"].lower() not in _STAT_STATUSES
+            for row in export
+        ):
+            log.warning("sync_stats_all: неполный экспорт %s — пропускаем эту половину.", media)
+            exports[media] = None
 
-    if export_anime is None and export_manga is None:
+    if all(export is None for export in exports.values()):
         log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
         return stats, False
 
@@ -778,7 +825,7 @@ async def sync_stats_all(
 
     changed = False
 
-    for media, export in (("anime", export_anime), ("manga", export_manga)):
+    for media, export in exports.items():
         if export is None:
             log.info("sync_stats_all: экспорт %s недоступен, пропускаем эту половину.", media)
             continue
@@ -857,6 +904,7 @@ async def sync_stats_all(
             valid_rows,
             titles,
             sync_time,
+            reading=media == "manga",
         )
         maintenance_meta: dict[str, dict] = {}
         if maintenance_ids:
@@ -1013,11 +1061,11 @@ async def sync_stats_all(
         if media == "manga":
             # Исключённые новые записи уже отсутствуют в titles; их точный kind
             # остаётся в ответе correctness-батча. Экспорт доказывает статус/ID.
-            kinds = {tid: rec.get("kind") for tid, rec in titles.items() if isinstance(rec, dict)}
+            reading_metadata = {tid: rec for tid, rec in titles.items() if isinstance(rec, dict)}
             for tid, meta in meta_map.items():
-                if tid not in kinds and isinstance(meta, dict):
-                    kinds[tid] = meta.get("kind")
-            reading_completed = reading_observation(export, kinds)
+                if tid not in reading_metadata and isinstance(meta, dict):
+                    reading_metadata[tid] = meta
+            reading_inputs = reading_catalog_observation(export, reading_metadata)
 
         # Чистка существующих записей, чей kind не проходит фильтр
         # (самоочистка при изменении критерия или после обновления метаданных).
@@ -1073,14 +1121,14 @@ async def sync_stats_all(
     else:
         log.info("sync_stats_all: изменений нет.")
 
-    if reading_completed is not None:
+    if reading_inputs is not None:
         try:
-            await capture_bot_achievement_sync({"reader": reading_completed}, generation=reading_generation)
+            await capture_bot_achievement_sync(reading_inputs, generation=reading_generation)
         except (asyncio.CancelledError, ProfilePrivacyError):
             raise
         except Exception as error:
             # Ошибка отдельной authority не отменяет успешный список/историю.
-            log.warning("Читатель: наблюдение не опубликовано (%s).", type(error).__name__)
+            log.warning("Достижения бота: наблюдение не опубликовано (%s).", type(error).__name__)
     return stats, True
 
 

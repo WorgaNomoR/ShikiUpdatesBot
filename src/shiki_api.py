@@ -34,6 +34,7 @@ from config import (
     SHIKI_USER,
     log,
 )
+from reading_catalog import manga_metadata_evidence
 from request_budget import (
     BudgetSnapshot,
     RollingBudget,
@@ -186,7 +187,7 @@ query($ids: String!) {
     airedOn { year }
     poster { originalUrl mainUrl }
     publishers { name }
-    genres { russian name kind }
+    genres { id russian name kind }
   }
 }
 """
@@ -312,9 +313,12 @@ def is_relevant(media_type: str, kind: str) -> bool:
 def _parse_genres(genres_raw: list, kind_filter: str) -> list[str]:
     """Имена жанров заданного kind (genre|theme|demographic). Предпочитаем русское."""
     out = []
+    if not isinstance(genres_raw, list):
+        return out
     for g in genres_raw or []:
         if isinstance(g, dict) and g.get("kind") == kind_filter:
-            name = (g.get("russian") or g.get("name") or "").strip()
+            raw = g.get("russian") or g.get("name") or ""
+            name = raw.strip() if isinstance(raw, str) else ""
             if name:
                 out.append(name)
     return out
@@ -665,7 +669,7 @@ async def fetch_meta_batch(media: str, ids: list[str],
                     "poster_url":  _poster_url(item.get("poster")),
                     "kind":        (item.get("kind") or "").lower(),
                     "release_status": (item.get("status") or "").lower(),
-                    "year":        (item.get("airedOn") or {}).get("year"),
+                    "year":        item["airedOn"].get("year") if isinstance(item.get("airedOn"), dict) else None,
                     "shiki_score": _safe_float(item.get("score")),
                     "genres":      _parse_genres(genres_raw, "genre"),
                     "themes":      _parse_genres(genres_raw, "theme"),
@@ -686,6 +690,7 @@ async def fetch_meta_batch(media: str, ids: list[str],
                         "chapters_total": item.get("chapters"),
                         "volumes_total":  item.get("volumes"),
                         "publishers":     [p["name"] for p in (item.get("publishers") or []) if p.get("name")],
+                        "reading_evidence": manga_metadata_evidence(item),
                     })
                 result[item_id] = meta
             except Exception as e:
