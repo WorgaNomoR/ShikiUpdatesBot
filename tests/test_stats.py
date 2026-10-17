@@ -615,6 +615,57 @@ async def test_comment_only_sync_saves_create_change_delete_and_repeated_noop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("damaged_media", ["anime", "manga"])
+@pytest.mark.parametrize("sibling_available", [False, True])
+@pytest.mark.parametrize("damage", ["missing", None, 0, False, [], {}, "future", "non_object"])
+async def test_sync_incomplete_status_preserves_entire_media_half(
+    monkeypatch, damaged_media, sibling_available, damage,
+):
+    state = storage._empty_stats_all()
+    for media in ("anime", "manga"):
+        record = _anime_rec() if media == "anime" else _manga_record("Манга", "manga")
+        state[media]["titles"] = {
+            str(tid): {**record, "comment": "сохранить"} for tid in (1, 2, 3)
+        }
+        state[media]["aggregates"] = smod.recompute_aggregates(media, state[media]["titles"])
+    before = copy.deepcopy(state)
+    sibling = "manga" if damaged_media == "anime" else "anime"
+    broken = {"target_id": 1}
+    if damage != "missing":
+        broken["status"] = damage
+    exports = {
+        damaged_media: [
+            None if damage == "non_object" else broken,
+            {"target_id": 2, "status": "completed", "score": 10, "text": "не публиковать"},
+        ],
+        sibling: [] if sibling_available else None,
+    }
+    saved = []
+    meta = AsyncMock(return_value={})
+    capture = AsyncMock()
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=lambda session, media: exports[media]))
+    monkeypatch.setattr("stats.fetch_meta_batch", meta)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: saved.append(value))
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda session, data, **kw: data))
+    monkeypatch.setattr("stats.capture_bot_achievement_sync", capture)
+
+    result, ok = await smod.sync_stats_all(session=object(), fav={})
+
+    assert ok is sibling_available
+    assert result[damaged_media] == before[damaged_media]
+    assert state == before
+    assert saved == ([result] if sibling_available else [])
+    meta.assert_not_awaited()
+    assert capture.await_count == int(sibling_available and damaged_media == "anime")
+    if sibling_available:
+        assert result[sibling]["titles"] == {}
+        assert result[sibling]["aggregates"]["total_completed"] == 0
+    else:
+        assert result == before
+
+
+@pytest.mark.asyncio
 async def test_authoritative_export_removes_title_together_with_comment(monkeypatch):
     state = storage._empty_stats_all()
     state["anime"]["titles"]["1"] = {

@@ -784,7 +784,7 @@ async def sync_stats_all(
     6. При явном корректном manga-экспорте захватываем общий каталог чтения.
 
     Вызывается при старте бота и периодически из цикла. Уведомлений не шлёт.
-    Возвращает (stats_all, ok): ok=False, если ни один экспорт не скачался
+    Возвращает (stats_all, ok): ok=False, если нет ни одного корректного экспорта
     (тогда stats_all — прежний, нетронутый); ok=True при частичном/полном успехе.
     """
     # boot-throttle: переданную сессию переиспользуем (одну на весь старт),
@@ -797,10 +797,22 @@ async def sync_stats_all(
     reading_generation = restorable_restore_generation()
     reading_inputs = None
 
-    export_anime = await fetch_list_export(session, "anime")
-    export_manga = await fetch_list_export(session, "manga")
+    exports = {
+        "anime": await fetch_list_export(session, "anime"),
+        "manga": await fetch_list_export(session, "manga"),
+    }
+    # Пропущенная строка не доказывает удаление тайтла. Неполный экспорт
+    # сохраняет весь прежний домен, как и недоступный ответ API.
+    for media, export in exports.items():
+        if export is not None and any(
+            not isinstance(row, dict) or not isinstance(row.get("status"), str)
+            or row["status"].lower() not in _STAT_STATUSES
+            for row in export
+        ):
+            log.warning("sync_stats_all: неполный экспорт %s — пропускаем эту половину.", media)
+            exports[media] = None
 
-    if export_anime is None and export_manga is None:
+    if all(export is None for export in exports.values()):
         log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
         return stats, False
 
@@ -813,7 +825,7 @@ async def sync_stats_all(
 
     changed = False
 
-    for media, export in (("anime", export_anime), ("manga", export_manga)):
+    for media, export in exports.items():
         if export is None:
             log.info("sync_stats_all: экспорт %s недоступен, пропускаем эту половину.", media)
             continue
@@ -835,8 +847,6 @@ async def sync_stats_all(
         # Релевантные строки экспорта: с валидным id и известным статусом
         valid_rows: dict[str, dict] = {}
         for row in export:
-            if not isinstance(row, dict) or not isinstance(row.get("status"), str):
-                continue
             tid = str(row.get("target_id") or "")
             status = (row.get("status") or "").lower()
             if tid and status in _STAT_STATUSES:

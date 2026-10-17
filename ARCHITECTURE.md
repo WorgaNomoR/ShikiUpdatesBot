@@ -310,6 +310,12 @@ Public `/status` shares successful raw anime+manga rates for a fixed 60-second m
 
 ### Synchronization, metadata and comments
 
+A media export with a non-object row, missing/non-string status or unknown status is
+unavailable as a whole: it cannot authorize title removals, partial record/aggregate changes,
+container repair or reading-achievement capture. A usable sibling export still synchronizes;
+when neither export is usable, synchronization returns the unchanged snapshot with `ok=False`.
+A valid empty export remains authoritative and removes absent titles normally.
+
 Each successfully applied metadata record gets `meta_updated_at`; failed/omitted/parsing records keep good metadata and timestamp for retry. Legacy, malformed and future timestamps are stale with oldest priority. Current `planned`, `watching`, `rewatching` and `on_hold` records age after seven days, `completed`/`dropped` after thirty. Each successful export half spends at most one oldest-first maintenance batch of 50 anime and one of 50 shared manga/ranobe records, with stable numeric-ID ties. New titles, missing-kind repair and malformed values still present in export use the higher-priority correctness batch outside that allowance. Failed repair leaves a canonical missing-kind record without a timestamp; export cleanup removes absent records. Refresh replaces the metadata portion, including poster/release status, while current export owns score/status/progress/rewatches. Aggregates are recomputed. Existing startup/periodic full sync is the only scheduler, and privacy prevents all working publication/cache changes.
 
 Shared manga metadata additionally stores `reading_evidence`: explicitly acquired chapter total,
