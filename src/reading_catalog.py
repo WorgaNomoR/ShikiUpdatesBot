@@ -93,10 +93,10 @@ TAXONOMY_FAMILIES = (
     ("mystery", "Распутыватель сюжетов", "genre", 46, "детектив"),
     ("sci_fi", "За пределами возможного", "genre", 53, "фантастика"),
     ("sports", "На пути к чемпионству", "genre", 76, "спорт"),
-    ("shounen", "Читатель сёнэна", "demographic", 47, "сёнэн"),
-    ("shoujo", "Читатель сёдзё", "demographic", 63, "сёдзё"),
-    ("seinen", "Читатель сэйнэна", "demographic", 52, "сэйнэн"),
-    ("josei", "Читатель дзёсэя", "demographic", 87, "дзёсэй"),
+    ("shounen", "Дорога к мечте", "demographic", 47, "сёнэн"),
+    ("shoujo", "Палитра чувств", "demographic", 63, "сёдзё"),
+    ("seinen", "Истории со вторым дном", "demographic", 52, "сэйнэн"),
+    ("josei", "Жизнь крупным планом", "demographic", 87, "дзёсэй"),
 )
 READING_ACHIEVEMENTS = (
     CHAPTERS, VOLUMES, LONG_WORKS, PRE_2000,

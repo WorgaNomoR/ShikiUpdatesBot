@@ -567,8 +567,8 @@ Taxonomy membership requires both the stable Manga ID and GraphQL category. The 
 covers supported ranobe. Genre families are Магия между строк (Fantasy 57), Сердце в переплёте
 (Romance 62), Смех сквозь страницы (Comedy 49), Истории на разрыв (Drama 50), Читать при включённом
 свете (Horror 80), Распутыватель сюжетов (Mystery 46), За пределами возможного (Sci-Fi 53), На пути
-к чемпионству (Sports 76), all `kind=genre`. Demographics are Читатель сёнэна (Shounen 47),
-Читатель сёдзё (Shoujo 63), Читатель сэйнэна (Seinen 52), Читатель дзёсэя (Josei 87), all
+к чемпионству (Sports 76), all `kind=genre`. Demographics are Дорога к мечте (Shounen 47),
+Палитра чувств (Shoujo 63), Истории со вторым дном (Seinen 52), Жизнь крупным планом (Josei 87), all
 `kind=demographic`. Themes and similarly named tags such as Shounen Ai do not qualify. One title
 may belong to several families but counts once in each. Bounded live verification on 2026-10-17
 queried GraphQL mangas 2/34053/21525/123812 with an application User-Agent and confirmed all four
