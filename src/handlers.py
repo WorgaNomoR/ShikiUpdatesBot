@@ -52,6 +52,7 @@ from aiogram.types import (
     ReplyParameters,
 )
 
+import bot_achievement_catalog as bot_catalog
 import main_menu
 from access_control import (
     INLINE_ACCESS_ALLOWED,
@@ -81,6 +82,11 @@ from backup import (
     restore_backup_zip,
     send_backup,
 )
+from bot_achievement_delivery import (
+    bot_achievement_diagnostic,
+    dispatch_bot_achievements,
+)
+from bot_achievement_view import bot_achievement_snapshot
 from catchup_digest import (
     render_digest,
     render_ordinary_entries,
@@ -267,6 +273,7 @@ from storage import (
     list_blocked_users,
     load_achievement_state,
     load_blocked_users,
+    load_bot_achievement_state,
     load_event_journal,
     load_legacy_seen_ids,
     load_seen_favourites,
@@ -886,25 +893,27 @@ async def _stats_report_favourites() -> Report:
     return build_favourites_messages(stats_all)
 
 
-async def _achievement_rows() -> tuple[list[dict] | None, bool]:
-    """Один проверенный снимок; владельца и очередь не передаём в представление."""
-    try:
-        async with restorable_state_transaction():
+async def _achievement_report() -> Report:
+    """Два независимых локальных источника под одним lock, затем декорация."""
+    rows, bot_achievements = None, None
+    invalid, bot_invalid = False, False
+    async with restorable_state_transaction():
+        try:
             state = load_achievement_state()
             if state is not None:
                 ensure_achievement_profile(state)
-        return (None if state is None else state["snapshot"]), False
-    except AchievementStateError:
-        return None, True
-
-
-async def _achievement_report() -> Report:
-    """Необязательная декорация после локального чтения, без sync и записи состояния."""
-    rows, invalid = await _achievement_rows()
+                rows = state["snapshot"]
+        except AchievementStateError:
+            invalid = True
+        try:
+            state = load_bot_achievement_state()
+            bot_achievements = bot_achievement_snapshot(state, catalog=bot_catalog.BOT_ACHIEVEMENTS)
+        except AchievementStateError:
+            bot_invalid = True
     metadata = await cached_achievement_metadata() if rows else {}
     return build_achievement_report(
         rows, base_url=SHIKI_BASE_URL, profile=SHIKI_USER,
-        metadata=metadata, invalid=invalid,
+        metadata=metadata, invalid=invalid, bot_achievements=bot_achievements, bot_invalid=bot_invalid,
     )
 
 
@@ -3024,7 +3033,12 @@ async def _wait_and_dispatch_notifications(bot: Bot) -> None:
         except Exception as error:
             await achievement_diagnostic(bot, error)
             achievement_pending = True
-        pending = pending or achievement_pending
+        try:
+            bot_achievement_pending = await dispatch_bot_achievements(bot)
+        except Exception as error:
+            await bot_achievement_diagnostic(bot, error)
+            bot_achievement_pending = True
+        pending = pending or achievement_pending or bot_achievement_pending
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return

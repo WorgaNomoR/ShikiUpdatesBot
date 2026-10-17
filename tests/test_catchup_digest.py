@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Точное HTML-покрытие, доверенные даты и порядок presentation parts."""
+"""Точное HTML-покрытие, лаконичный заголовок и порядок presentation parts."""
 
 import re
 from copy import deepcopy
@@ -66,19 +66,24 @@ def test_mixed_types_media_scores_and_unknown_order(journal_factory, monkeypatch
     assert _visible(build_message(history_entry_from_event(events[1]), normalized=events[1])) in _visible(text)
     assert '&lt;Title &amp; &quot;😀&quot;&gt;' in text
     assert 'href="https://shikimori.io/animes/11"' in text
-    assert "31.03.2026 23:00 UTC" in text
+    assert "31.03.2026 23:00" not in text and "UTC" not in text
     assert events == before
 
 
-@pytest.mark.parametrize("quality", ["missing", "naive", "invalid", "future"])
-def test_period_omitted_when_any_source_time_is_untrusted(journal_factory, quality):
-    events = journal_factory(count=10)["events"]
-    if quality == "future":
+@pytest.mark.parametrize("quality", ["aware", "range", "missing", "naive", "invalid", "future"])
+def test_digest_heading_has_no_date_or_time_regardless_of_source_times(journal_factory, quality):
+    events = journal_factory(count=2)["events"]
+    if quality == "range":
+        events[1]["event_at"] = "2026-04-01T02:30:00+00:00"
+    elif quality == "future":
         events[0]["event_at"] = "2099-01-01T00:00:00+00:00"
-    else:
+    elif quality != "aware":
         events[0].update(time_quality=quality, event_at=None)
-    assert "UTC" not in _render(events)[0]["text"]
-    assert "02.04.2026" not in _render(events)[0]["text"]
+    before = deepcopy(events)
+    heading = "📬 <b>Что нового у Сергея:</b>"
+    parts = render_digest(events, ordinary=lambda event: f"Событие {event['seq']}", heading=heading)
+    assert parts[0]["text"] == heading + "\n\nСобытие 1\n\nСобытие 2"
+    assert events == before
 
 
 def test_long_title_emoji_links_and_every_character_survive(journal_factory):
@@ -87,6 +92,7 @@ def test_long_title_emoji_links_and_every_character_survive(journal_factory):
     events[0]["title"].update(name=title, url="/animes/11")
     parts = _render(events)
     assert all(0 < html_length(part["text"]) <= 4096 for part in parts)
+    assert all(part["text"].startswith(build_history_digest_heading() + "\n\n") for part in parts)
     first_parts = [part for part in parts if part["events"][0][0] == 1]
     assert len(first_parts) > 1
     assert all('href="https://shikimori.io/animes/11"' in part["text"] for part in first_parts)

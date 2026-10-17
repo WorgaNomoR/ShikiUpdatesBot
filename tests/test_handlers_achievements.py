@@ -230,3 +230,66 @@ async def test_public_missing_invalid_state_has_safe_local_fallback(backup_env, 
     assert "owner" not in text and "pending" not in text and str(storage.ACHIEVEMENTS_FILE) not in text
     if raw is not None:
         assert storage.ACHIEVEMENTS_FILE.read_bytes() == raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", ["reader", "shikimori", "neither"])
+async def test_public_achievement_sources_fail_independently_without_mutation(
+    backup_env, achievement_state_factory, monkeypatch, broken,
+):
+    from achievement_helpers import capture_reader
+    storage.save_achievement_state(achievement_state_factory())
+    storage.save_bot_achievement_state(capture_reader(
+        None, {str(i): True for i in range(1, 52)}, profile="WNR", owner_id=999, now=1000,
+    ))
+    if broken == "reader":
+        storage.BOT_ACHIEVEMENTS_FILE.write_bytes(b'{')
+    elif broken == "shikimori":
+        storage.ACHIEVEMENTS_FILE.write_bytes(b'{')
+    before = {path: path.read_bytes() for path in [storage.ACHIEVEMENTS_FILE, storage.BOT_ACHIEVEMENTS_FILE]}
+    monkeypatch.setattr("handlers.cached_achievement_metadata", AsyncMock(return_value={}))
+    text = "\n".join(rendered_html(await handlers._achievement_report()))
+    if broken != "reader":
+        assert "51% до следующего уровня" in text and "уровень 50" in text
+    else:
+        assert "Достижения бота временно недоступны" in text
+    if broken != "shikimori":
+        assert "animelist" in text
+    else:
+        assert "недоступны" in text
+    assert {path: path.read_bytes() for path in before} == before
+    assert storage.load_subscribers() == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", ["reader", "shikimori"])
+async def test_polling_services_independent_achievement_consumers_after_source_failure(
+    backup_env, monkeypatch, achievement_state_factory, broken,
+):
+    from achievement_helpers import capture_reader
+    reader = capture_reader(None, {}, profile="WNR", owner_id=999, now=1000)
+    reader = capture_reader(reader, {"1": True}, profile="WNR", owner_id=999, now=1000)
+    storage.save_bot_achievement_state(reader)
+    storage.save_achievement_state(achievement_state_factory())
+    if broken == "reader":
+        storage.BOT_ACHIEVEMENTS_FILE.write_bytes(b'{')
+    else:
+        storage.ACHIEVEMENTS_FILE.write_bytes(b'{')
+    monkeypatch.setattr("achievement_delivery.time.time", lambda: 1000)
+    monkeypatch.setattr("handlers.dispatch_notifications", AsyncMock(return_value=False))
+    monkeypatch.setattr("handlers.achievement_diagnostic", AsyncMock())
+    monkeypatch.setattr("handlers.bot_achievement_diagnostic", AsyncMock())
+    real_sleep = asyncio.sleep
+    async def stop(seconds):
+        if seconds > 1:
+            raise asyncio.CancelledError()
+        await real_sleep(0)
+    monkeypatch.setattr("handlers.asyncio.sleep", stop)
+    bot = AsyncMock()
+    with pytest.raises(asyncio.CancelledError):
+        await handlers._wait_and_dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    if broken == "reader":
+        assert storage.load_achievement_state()["pending"] == []
+    else:
+        assert storage.load_bot_achievement_state()["pending"] == []

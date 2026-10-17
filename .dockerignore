@@ -13,6 +13,7 @@ subscribers.json
 seen_favourites.json
 stats_all.json
 stats_current.json
+bot_achievements.json
 update_state.json
 quarters/
 data/

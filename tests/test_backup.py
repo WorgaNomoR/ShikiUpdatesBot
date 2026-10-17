@@ -3979,3 +3979,154 @@ async def test_automatic_backups_capture_unfinished_digest_and_keep_its_authorit
         assert after == schedule
     else:
         assert after["last_backup_at"] > old and after["pending"] is None
+
+
+@pytest.fixture
+def reading_recovery_state():
+    """Один неизменяемый долг Reader; схема попыток проверяется у владельца."""
+    from achievement_helpers import capture_reader
+
+    from notification_outbox import begin_attempt
+    state = capture_reader(None, {}, profile="WNR", owner_id=999, now=1000)
+    state = capture_reader(state, {"1": True}, profile="WNR", owner_id=999, now=1000)
+    begin_attempt(state["pending"][0]["parts"][0]["delivery"], 1001)
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+@pytest.mark.parametrize("source_version", [1, 2])
+async def test_reader_recovery_roundtrip_keeps_frozen_jobs_and_legacy_source_plans(
+    backup_env, reading_recovery_state, achievement_state_factory, full_export, source_version,
+):
+    reader = reading_recovery_state
+    source = achievement_state_factory(startup=(321, "🟢 Бот запущен") if source_version == 2 else None)
+    storage.save_bot_achievement_state(reader)
+    storage.save_achievement_state(source)
+    storage.STATS_ALL_FILE.write_bytes(b'{"cache":"diagnostic only"}')
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+        assert json.loads(zipped.read("bot_achievements.json")) == reader
+        assert json.loads(zipped.read("achievements.json")) == source
+        assert ("stats_all.json" in zipped.namelist()) is full_export
+    storage.BOT_ACHIEVEMENTS_FILE.unlink()
+    storage.ACHIEVEMENTS_FILE.unlink()
+    generation = storage.restorable_restore_generation()
+    await backup.restore_backup_zip(archive)
+    assert storage.load_bot_achievement_state() == reader
+    assert storage.load_achievement_state() == source
+    assert storage.restorable_restore_generation() == generation + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present", [False, True])
+async def test_legacy_archive_without_reader_preserves_local_state(backup_env, reading_recovery_state, present):
+    if present:
+        storage.save_bot_achievement_state(reading_recovery_state)
+        original = storage.BOT_ACHIEVEMENTS_FILE.read_bytes()
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("user_alerts.json", '{"enabled":true}')
+    await backup.restore_backup_zip(archive.getvalue())
+    if present:
+        assert storage.BOT_ACHIEVEMENTS_FILE.read_bytes() == original
+    else:
+        assert storage.load_bot_achievement_state() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["capture", "import"])
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_corrupt_reader_rejects_whole_recovery_without_changing_bytes(backup_env, phase, full_export):
+    damaged = b'{"version":1,"version":1}'
+    storage.BOT_ACHIEVEMENTS_FILE.write_bytes(damaged)
+    before = storage.restorable_restore_generation()
+    with pytest.raises(ValueError):
+        if phase == "capture":
+            await backup._build_backup_zip(full_export=full_export)
+        else:
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w") as zipped:
+                zipped.writestr("bot_achievements.json", damaged)
+                zipped.writestr("achievements.json", '{}')
+            await backup.restore_backup_zip(archive.getvalue())
+    assert storage.BOT_ACHIEVEMENTS_FILE.read_bytes() == damaged
+    assert not storage.ACHIEVEMENTS_FILE.exists()
+    assert storage.restorable_restore_generation() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("fail_name", ["bot_achievements.json", "stats_current.json"])
+async def test_reader_restore_rollback_returns_exact_bytes_and_removes_new_files(
+    backup_env, reading_recovery_state, achievement_state_factory, monkeypatch, missing, fail_name,
+):
+    storage.save_bot_achievement_state(reading_recovery_state)
+    storage.save_achievement_state(achievement_state_factory())
+    storage.save_stats_current(storage._empty_stats_current("2026-Q4"), strict=True)
+    archive, _ = await backup._build_backup_zip()
+    files = [storage.BOT_ACHIEVEMENTS_FILE, storage.ACHIEVEMENTS_FILE, storage.STATS_CURRENT_FILE]
+    original = {path: b'\xff damaged ' + path.name.encode() + b'\r\n' for path in files}
+    for path, content in original.items():
+        path.write_bytes(content)
+    if missing:
+        storage.BOT_ACHIEVEMENTS_FILE.unlink()
+        original.pop(storage.BOT_ACHIEVEMENTS_FILE)
+    publish = backup._publish_staged_file
+    def fail(source, target):
+        if target.name == fail_name:
+            raise OSError("publication failure")
+        return publish(source, target)
+    monkeypatch.setattr("backup._publish_staged_file", fail)
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError, match="исходное состояние восстановлено"):
+        await backup.restore_backup_zip(archive)
+    assert {path: path.read_bytes() for path in original} == original
+    if missing:
+        assert not storage.BOT_ACHIEVEMENTS_FILE.exists()
+    assert storage.restorable_restore_generation() == generation
+
+
+@pytest.mark.asyncio
+async def test_reader_inflight_success_cannot_ack_after_unrelated_restore(
+    backup_env, reading_recovery_state, monkeypatch,
+):
+    import bot_achievement_delivery
+    storage.save_bot_achievement_state(reading_recovery_state)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("user_alerts.json", '{"enabled":true}')
+    monkeypatch.setattr("achievement_delivery.time.time", lambda: 1061)
+    generation = storage.restorable_restore_generation()
+    async def send(**kw):
+        await backup.restore_backup_zip(archive.getvalue())
+        return object()
+    bot = AsyncMock()
+    bot.send_message.side_effect = send
+    assert await bot_achievement_delivery.dispatch_bot_achievements(bot)
+    assert storage.restorable_restore_generation() == generation + 1
+    state = storage.load_bot_achievement_state()
+    assert state["earned"] == {"reader": 1} and state["pending"]
+    assert state["pending"][0]["parts"][0]["delivery"]["attempts"][-1]["outcome"] == "uncertain"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_shared_bot_recovery_preserves_multiple_families(backup_env, bot_catalog, full_export):
+    from bot_achievements import capture_bot_achievements
+
+    def capture(state, inputs):
+        return capture_bot_achievements(
+            state, inputs, catalog=bot_catalog, profile="WNR", owner_id=999, now=1000,
+        )
+
+    state = capture(None, {"reader": {}, "anime_minutes": {"minutes": 0}})
+    state = capture(state, {"reader": {"1": True}, "anime_minutes": {"minutes": 185}})
+    storage.save_bot_achievement_state(state)
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+        assert zipped.namelist() == ["bot_achievements.json"]
+        assert json.loads(zipped.read("bot_achievements.json")) == state
+    storage.BOT_ACHIEVEMENTS_FILE.unlink()
+    await backup.restore_backup_zip(archive)
+    assert storage.load_bot_achievement_state() == state

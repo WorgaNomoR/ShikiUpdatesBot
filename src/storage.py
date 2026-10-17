@@ -24,15 +24,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
+import bot_achievement_catalog as bot_catalog
 from achievement_state import (
     ACHIEVEMENTS_MAX_BYTES,
     AchievementStateError,
     achievement_state_json,
     parse_achievement_member,
 )
+from bot_achievements import (
+    bot_state_json,
+    parse_bot_member,
+)
 from config import (
     ACHIEVEMENTS_FILE,
     BLOCKED_USERS_FILE,
+    BOT_ACHIEVEMENTS_FILE,
     EVENT_JOURNAL_FILE,
     KNOWN_USERS_FILE,
     OWNER_ID,
@@ -164,8 +170,29 @@ def _atomic_write(path: "Path | str", data: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ДОСТИЖЕНИЯ SHIKIMORI
+#  ДОСТИЖЕНИЯ
 # ═══════════════════════════════════════════════════════════════════
+
+def load_bot_achievement_state() -> dict | None:
+    """Отсутствие позволяет baseline; ошибка не подменяет сохранённые пороги."""
+    try:
+        with BOT_ACHIEVEMENTS_FILE.open("rb") as stream:
+            raw = stream.read(ACHIEVEMENTS_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AchievementStateError("bot_achievement_read") from exc
+    return parse_bot_member(raw, catalog=bot_catalog.BOT_ACHIEVEMENTS, profile=SHIKI_USER, owner_id=OWNER_ID)
+
+
+def save_bot_achievement_state(state: dict) -> None:
+    """Публикация под общей транзакцией с полным резервом будущей доставки."""
+    payload = bot_state_json(state, catalog=bot_catalog.BOT_ACHIEVEMENTS, profile=SHIKI_USER, owner_id=OWNER_ID)
+    try:
+        _atomic_write(BOT_ACHIEVEMENTS_FILE, payload)
+    except OSError as exc:
+        raise AchievementStateError("bot_achievement_write") from exc
+
 
 def load_achievement_state() -> dict | None:
     """Только отсутствие файла разрешает инициализацию; ошибки сохраняем."""

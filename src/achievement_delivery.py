@@ -215,34 +215,44 @@ async def dispatch_achievements(bot) -> bool:
     """Порция в существующей паузе поллинга; одна доставка на event loop."""
     lock = _locks.setdefault(asyncio.get_running_loop(), asyncio.Lock())
     async with lock:
-        try:
-            return await _dispatch(bot)
-        except _AchievementChanged:
-            log.info("Достижения: изменение сохранённого состояния остановило прежнюю попытку доставки.")
-            return True
+        return await dispatch_owner_achievements(
+            bot, load_state=load_achievement_state, save_state=save_achievement_state,
+            ensure_profile=ensure_achievement_profile,
+        )
 
 
-async def _dispatch(bot):
+async def dispatch_owner_achievements(bot, *, load_state, save_state, ensure_profile=None):
+    """Общие попытки и lease для двух независимых владельческих очередей."""
+    try:
+        return await _dispatch(bot, load_state, save_state, ensure_profile)
+    except _AchievementChanged:
+        log.info("Достижения: изменение сохранённого состояния остановило прежнюю попытку доставки.")
+        return True
+
+
+async def _dispatch(bot, load_state, save_state, ensure_profile):
     started = time.monotonic()
     async with restorable_state_transaction():
-        state = load_achievement_state()
+        state = load_state()
         if state is None:
             return False
-        ensure_achievement_profile(state)
+        if ensure_profile:
+            ensure_profile(state)
         generation = restorable_restore_generation()
         identity = state["state_id"]
     for _ in range(MAX_DISPATCHES):
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
                 raise _AchievementChanged
-            state = load_achievement_state()
+            state = load_state()
             if state is None or state["state_id"] != identity:
                 raise _AchievementChanged
-            ensure_achievement_profile(state)
+            if ensure_profile:
+                ensure_profile(state)
             now = time.time()
             maintained = _retire(state, now)
             if maintained != state:
-                save_achievement_state(maintained)
+                save_state(maintained)
                 state = maintained
             if not state["pending"]:
                 return False
@@ -255,16 +265,16 @@ async def _dispatch(bot):
             ):
                 return True
             begin_attempt(delivery, max(now, plan["created_at"]))
-            save_achievement_state(state)
+            save_state(state)
             lease = deepcopy(part)
             plan_id = plan["plan_id"]
             operation = (plan["kind"], plan.get("startup_message_id"))
 
         async def guard():
             async with restorable_state_transaction():
-                current = load_achievement_state()
-                if current is not None:
-                    ensure_achievement_profile(current)
+                current = load_state()
+                if current is not None and ensure_profile:
+                    ensure_profile(current)
                 if (
                     restorable_restore_generation() != generation or current is None
                     or current["state_id"] != identity or not current["pending"]
@@ -297,9 +307,9 @@ async def _dispatch(bot):
         async with restorable_state_transaction():
             if restorable_restore_generation() != generation:
                 raise _AchievementChanged
-            current = load_achievement_state()
-            if current is not None:
-                ensure_achievement_profile(current)
+            current = load_state()
+            if current is not None and ensure_profile:
+                ensure_profile(current)
             if (
                 current is None or current["state_id"] != identity or not current["pending"]
                 or current["pending"][0]["plan_id"] != plan_id
@@ -321,7 +331,7 @@ async def _dispatch(bot):
                 current["pending"][0]["parts"].pop(0)
                 if not current["pending"][0]["parts"]:
                     current["pending"].pop(0)
-            save_achievement_state(current)
+            save_state(current)
         remaining = DISPATCH_SECONDS - (time.monotonic() - started)
         if remaining > 0:
             await asyncio.sleep(min(0.3, remaining))
