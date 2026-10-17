@@ -22,6 +22,7 @@ Read [AGENTS.md](AGENTS.md) for collaboration, verification, and delivery rules.
     - [Synchronization, metadata and comments](#synchronization-metadata-and-comments)
     - [History and media domains](#history-and-media-domains)
     - [Shikimori achievements and owner delivery](#shikimori-achievements-and-owner-delivery)
+    - [Bot-owned achievements](#bot-owned-achievements)
     - [Durable history ingestion and processing](#durable-history-ingestion-and-processing)
     - [Durable journal notification delivery](#durable-journal-notification-delivery)
     - [Durable catch-up digest](#durable-catch-up-digest)
@@ -66,8 +67,12 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [catchup_digest.py](src/catchup_digest.py) | Pure lossless ordinary-HTML digest rendering, safe HTML/UTF-16 validation and continuation; uses only `report_model` helpers and stdlib. |
 | [notification_delivery.py](src/notification_delivery.py) | Independent bounded journal-notification consumer over storage and Telegram outcomes; owns durable per-recipient attempts/acknowledgements. |
 | [achievement_state.py](src/achievement_state.py), [achievement_messages.py](src/achievement_messages.py), [achievement_metadata.py](src/achievement_metadata.py) | Pure strict source/state/import schemas, monotonic earned-level deduplication and frozen owner plans; safe ordinary presentation and an optional exact-tier profile-page label/issuance-criterion parser. Uses outbox policy helpers and HTML boundaries, with no runtime imports. |
-| [achievement_delivery.py](src/achievement_delivery.py) | Source capture and bounded owner-only consumer over API/storage/Telegram; no subscriber membership, history records or statistics authority. |
-| [achievement_view.py](src/achievement_view.py) | Pure current-family selection, compact count and typed public reports from source rows; never reads historical maxima, owner identity or pending delivery. |
+| [achievement_plans.py](src/achievement_plans.py) | Shared strict frozen owner-plan/attempt schema, bounded JSON and capacity reserve; no award catalog or runtime imports. |
+| [achievement_delivery.py](src/achievement_delivery.py) | Shikimori source capture and shared bounded owner-plan consumer over storage/Telegram; source profile guards remain independent. |
+| [bot_achievements.py](src/bot_achievements.py), [bot_achievement_catalog.py](src/bot_achievement_catalog.py) | Pure shared bot definitions, per-family evaluation/checkpoints, strict common authority and frozen plans; explicit production registration. No source-owned Shikimori rows or runtime imports. |
+| [reading_milestones.py](src/reading_milestones.py) | Reader definition/calculator: eligibility checkpoint, correction-first count, numeric thresholds, criterion and notification wording. No persistence, queue or report branching. |
+| [bot_achievement_delivery.py](src/bot_achievement_delivery.py), [bot_achievement_view.py](src/bot_achievement_view.py) | Shared bot capture/publication and bounded owner delivery; pure public projection and earned/progress presentation for all registered families. |
+| [achievement_view.py](src/achievement_view.py) | Pure current-family selection, Shikimori startup count and public report over source rows plus the shared bot-family projection; never reads pending delivery or owner identity. |
 | [history_catchup.py](src/history_catchup.py) | Pure connected-page traversal, exact frontier reconnection and head bridging; owns no I/O, normalization or publication. |
 | [storage.py](src/storage.py) | JSON persistence, cache read states, strict validators, restorable-state transaction and restore generation; frozen-plan validation uses `report_plan`. |
 | [shiki_api.py](src/shiki_api.py) | REST/GraphQL acquisition, metadata, relevance/kind definitions, translations, throttle, HTTP-attempt budget, 429 retry and privacy classification. |
@@ -129,6 +134,17 @@ graph TD
     achievement_delivery --> shiki_api
     achievement_delivery --> storage
     achievement_delivery --> telegram_delivery
+    storage --> bot_achievement_catalog
+    storage --> bot_achievements
+    bot_achievement_catalog --> reading_milestones
+    reading_milestones --> bot_achievements
+    bot_achievements --> achievement_plans
+    achievement_state --> achievement_plans
+    achievement_view --> bot_achievement_view
+    stats --> bot_achievement_delivery
+    bot_achievement_delivery --> achievement_delivery
+    bot_achievement_delivery --> storage
+    handlers --> bot_achievement_delivery
     storage --> achievement_state
     backup --> achievement_state
     shiki_api --> achievement_state
@@ -192,6 +208,7 @@ Persistent JSON state lives under `DATA_DIR`; the complete file inventory is in 
 | `notification_progress.json` | Activated progress v1: logical processed checkpoint and complete frozen outbox, enqueue/completion boundaries, recipient attempts and terminal outcomes. Bound to physical history identity/profile/lineage. |
 | `achievements.json` | Separate achievement v1/v2 authority: configured profile/numeric user/owner binding, initialized baseline, latest complete source rows, highest earned level per family and frozen pending owner plans. Independent of history and quarters. |
 | `seen_ids.json`, `seen_favourites.json` | Export-only journal ID projection; separate favourites baseline/deduplication. Both excluded from restore. |
+| `bot_achievements.json` | Shared bot-achievement v1 authority: configured-profile/owner binding, UUID, independent family initialization/current values/checkpoints, retained numeric levels and one frozen owner queue. Independent of source achievements, history and quarters. |
 | `stats_all.json` | Rebuildable current public lists, metadata, comments, favourites and aggregates; cached locally and excluded from restore. |
 | `stats_current.json`, `quarters/` | Source-quarter projections and correction revisions, journal-bound checkpoint and frozen report delivery; original historical snapshots. |
 | `subscribers.json` | One atomic notification-chat map, versioned membership tokens and automatic-backup schedule. |
@@ -321,7 +338,7 @@ Evidence: [API tests](tests/test_shiki_api.py), [statistics tests](tests/test_st
 and obtains the complete `/api/achievements?user_id={numeric_id}` response. Both attempts use
 `_fetch`, the application User-Agent, central min-gap/global budget and 429 retries. Startup
 shares the existing session and phase delay; subsequent refreshes run once per polling cycle,
-independently of the six-hour list synchronization. There is no standalone task or local achievement catalog.
+independently of the six-hour list synchronization. There is no standalone Shikimori achievement task or local source-award catalog.
 Wrong-profile/malformed/duplicate-family-level rows invalidate the complete response; valid
 emptiness initializes normally. Only positive levels count as earned. Bounded live verification
 on 2026-10-13 found both level-zero rows at 100% and positive rows below 100% on the public WNR
@@ -397,7 +414,7 @@ Recovery and full export include the optional member in coherent capture and val
 same parser. Import rejects a malformed member before any publication; exact-byte rollback restores
 even damaged original bytes. Existing 32 MiB uncompressed/20 MiB ZIP/256-entry archive limits apply.
 Older archives without the member leave local achievements untouched; if missing, the next valid
-refresh initializes once. Quarter rotation does not touch this file. Public views/artwork do not alter report aggregates; complementary bot awards remain deferred in #61. Already frozen v1 baseline obligations can therefore produce a separate legacy summary after upgrading, even though the new startup count is visible. This compatibility exception preserves original content, attempts, uncertainty and expiry; displayed counts alone never acknowledge it. Downgrade from v2 requires a compatible pre-update backup.
+refresh initializes once. Quarter rotation does not touch this file. Public views/artwork do not alter report aggregates; bot-owned achievements do not change their state or aggregates. Already frozen v1 baseline obligations can therefore produce a separate legacy summary after upgrading, even though the new startup count is visible. This compatibility exception preserves original content, attempts, uncertainty and expiry; displayed counts alone never acknowledge it. Downgrade from v2 requires a compatible pre-update backup.
 
 `/start -> Achievements` and `/achievs` deliver the same combined typed Rich report, with a
 local `assets/main-menu/achievements-v1.jpg` header and complete HTML fallback/pagination.
@@ -409,7 +426,7 @@ There is no intermediate achievement menu, redundant overview count or generic p
 The home pairs Achievements with Fact and puts Info on a separate lower row; `/stats` contains
 only statistical reports. One validated local snapshot is read under the state transaction,
 then optional cached decoration is acquired outside it. The main title and native lists follow
-favourites; default-open Earned/In progress details supply group counts and the renderer's
+favourites; Shikimori and Bot origin headings each contain default-open Earned/In progress details with group counts and the renderer's
 message-local back-to-top navigation. Earned shows one highest current positive level per
 family, with nonzero/below-100% progress explicitly labelled as progress to the next level.
 Earned rows sort by exact-tier source category (common, genre, franchise, author), then
@@ -435,6 +452,92 @@ Evidence: [source/state](tests/test_achievement_state.py), [notifications](tests
 [metadata](tests/test_achievement_metadata.py),
 [capture/delivery](tests/test_achievement_delivery.py), [runtime](tests/test_handlers_achievements.py),
 [API](tests/test_shiki_api.py), [recovery/rollback](tests/test_backup.py).
+
+### Bot-owned achievements
+
+`bot_achievement_catalog.BOT_ACHIEVEMENTS` is the explicit production registration point.
+A `BotAchievement` definition supplies stable family ID, public title, criterion, numeric level
+rules, a pure calculator, checkpoint validation/value derivation and notification wording.
+The current production catalog contains only Reader. Future anime or reading families use the
+same state, publication, queue, backup member and public projection; their data acquisition
+remains explicit work. No rule language or arbitrary plugin loader exists. An isolated anime-time
+test definition with different thresholds exercises the common paths without entering production.
+
+`bot_achievements` owns the common v1 envelope: profile/owner binding, UUID, `families`, retained
+`earned` maxima and `pending` plans. Every family has independent `initialized`, nullable
+`current_value` and calculator-owned `checkpoint`. A missing family has no baseline; its first
+trustworthy value initializes silently without affecting existing families. An unavailable value
+preserves initialization/earned levels, never asserts zero, and may retain new incomplete evidence.
+The calculator separately reports the value attributable to quiet corrections. Common evaluation
+first retains the maximum of old earned and corrected levels, then captures at most one plan for
+the highest genuinely new tier. Subsequent decreases/re-crossings never revoke or repeat awards.
+
+`bot_achievements.json` is the single physical bot authority, using strict bounded v1 reads.
+Unsupported/corrupt/profile-owner-mismatched state fails closed, without a replacement baseline.
+Viewing never writes state. Backup capture validates while retaining original bytes; restore
+validates the same schema before publication and preserves frozen text and attempt evidence.
+
+`bot_achievement_delivery.capture_bot_achievement_sync` accepts explicit family inputs and the
+restore generation captured before acquisition. It renders/calculates outside the state lock,
+reloads authority and checks generation/equality before one atomic replacement. A failed write
+or capacity check preserves the previous checkpoint and newly owed work remains retryable.
+Unexpected local calculation failure preserves that family's state and does not suppress usable
+siblings or existing pending delivery; logs contain stable family IDs and exception types only.
+Cancellation and profile privacy propagate before publication. The existing list sync contains
+unexpected bot capture failures after successful rebuildable cache publication. A single bot
+consumer/lock uses the shared owner-plan dispatcher independently of Shikimori source guards.
+
+The common strict validator checks each family's checkpoint/value/initialization/level consistency
+and invokes its definition for metric validation. Plans allow only awards, with increasing numeric
+tiers per family, and reuse `achievement_plans` HTML/attempt validation, six attempts, 72-hour TTL,
+backoffs, uncertainty and immediate terminal removal. Generation/state/plan/part/attempt guards,
+20-request/20-second batch starts and exact frozen content retain the existing owner-delivery
+contract. The complete common member plus future-attempt reserve fits 8 MiB; family observations
+and owed work are finite. Recovery/full export include this same member with strict import and
+exact-byte rollback. Archives without it preserve local bot state. Existing 32 MiB total, 20 MiB
+ZIP and 256-entry limits remain; older snapshots may replay, and exactly-once is not promised.
+Shikimori v1/v2, history/progress, quarter ownership and durable assets retain their contracts.
+
+`bot_achievement_view` builds queue/identity-free projections from definitions and saved families.
+The public report groups by Shikimori / Bot, each with earned and positive first-unlock progress.
+Earned bot rows retain next-level progress and an italic earned criterion without duplication.
+Integer percentages use the whole next threshold, floor whole numbers and show a positive fraction
+below one percent as «менее 1%». Passive unearned zero rows are hidden. Unavailable/uninitialized
+families receive honest notices; retained levels remain visible after decreases. Public acquisition
+reads both authorities under one lock and handles their errors independently. Viewing does not
+capture, initialize, sync, acknowledge, subscribe or write state. Source snapshots continue to
+control Shikimori current levels, while bot levels use their own retained authority. Existing
+startup source counts/edits remain unchanged; bot families add no startup message or edit.
+
+#### Reader calculator
+
+`stats.reading_observation` joins an explicitly successful current manga-domain list export with
+that sync's metadata before relevance cleanup. Every row needs a canonical positive target ID,
+known status and, when present, `target_type=Manga`; conflicting duplicate statuses invalidate
+the observation. Equal IDs collapse and only completed titles participate. Classification reuses
+`classify_manga_presentation_kind` and `is_relevant`: manga/manhwa/manhua and supported ranobe
+share one count, one-shot/doujin are excluded, rereads do not multiply it. Unknown/missing kinds
+remain unresolved, never inferred from titles/progress/URLs. Anime-only sync success, stale cache,
+failed/absent export and malformed/incomplete lists supply no Reader observation.
+
+`reading_milestones` owns only this metric/definition. Its checkpoint maps completed IDs to
+true/false/null (eligible/excluded/unresolved). A fully known empty list is zero; unresolved kinds
+produce an unavailable value and cannot initialize or advance earned tiers. Observed IDs survive
+a metadata gap so repair cannot resemble new reading. The calculator quietly reconciles currently
+eligible IDs already in the previous map before adding genuinely new completions, including when
+repairs and additions arrive together. Numeric thresholds are 1, 5, 10, 25, 50, 100, 250, 500, then
+every 500 starting at 1000, never ordinal catalog positions. Thus 51 silently baselines at 50, with
+100 next. This is an observed current list, not lifetime reading or reconstructed unlock time.
+
+Existing full-list sync supplies Reader input at startup, the default six-hour cadence and
+pre-rotation refresh after privacy-sensitive acquisition. There is no extra scheduler or setting.
+Quarter rotation and source failures cannot lower retained levels or erase captured plans;
+`stats_all.json` remains a rebuildable cache excluded from restore.
+
+Evidence: [common core](tests/test_bot_achievements.py), [Reader calculator](tests/test_reading_milestones.py),
+[sync evidence](tests/test_stats.py), [common capture/delivery](tests/test_bot_achievement_delivery.py),
+[common view](tests/test_bot_achievement_view.py), [runtime](tests/test_handlers_achievements.py),
+[multiple-family recovery and rollback](tests/test_backup.py).
 
 ### Durable history ingestion and processing
 
@@ -502,7 +605,7 @@ One complete newly admitted batch first examines adjacent original records, then
 
 After pairing/filtering, zero entries are silent, one uses ordinary wording without a heading, two or more use an ordinary-HTML summary. Unknown notifying events stay in admission order; ignored/excluded events and score removal stay silent. Multi-cycle acquisition waits for completion. Bootstrap never notifies. Favourites, broadcast, weekly digests and subscriber preferences have separate scope.
 
-`catchup_digest` uses the caller's existing `build_message` once per surviving entry: playful wording, emoji, escaped title/link, media label and known owner score remain. The heading comes from `messages.build_history_digest_heading` and shared name grammar. Safe HTML continuation decodes entities once, splits by code point, reopens styles/links, and validates each part at 4096 visible UTF-16 units without losing characters. A UTC range uses all included source timestamps only when each is trusted; observation time never substitutes. Local rendering failure before publication permits ordinary presentation; a paired fallback still freezes both sources in one entry. Publication failure stops without dispatch. Published content/representation never changes after a rejection or ambiguous send.
+`catchup_digest` uses the caller's existing `build_message` once per surviving entry: playful wording, emoji, escaped title/link, media label and known owner score remain. The heading comes from `messages.build_history_digest_heading` and shared name grammar, without a displayed source date/time or range. Safe HTML continuation decodes entities once, splits by code point, reopens styles/links, and validates each part at 4096 visible UTF-16 units without losing characters. Source timestamps remain unchanged for pairing, statistics and recovery. Local rendering failure before publication permits ordinary presentation; a paired fallback still freezes both sources in one entry. Publication failure stops without dispatch. Published content/representation never changes after a rejection or ambiguous send, including older frozen summaries with dates.
 
 Each plan freezes UUID identity, absolute interval, exact contiguous source pairs including silent events, audience/clocks and ordered units with stable `plan_id:index` IDs. Source links publish one by one after their own deltas; no unit dispatches until the whole source interval is processed. Preparing plans cannot have attempts, though maintenance may cancel/expire them. A unit's atomic recipient marker/ack covers all its sources; oversized entries may owe several independent parts and are complete only when every part is terminal. Missing recipient fields on a source link never prove success. Continuations of a paired entry repeat both sources. Runtime/import validates complete ordered source/entry/part coverage and representation without selecting grouping/templates again.
 
@@ -536,6 +639,7 @@ Versions below describe independent formats, not one application-wide schema. Va
 |---|---|
 | Normalized events | Normalization v1 across all journal formats; immutable accepted semantics. |
 | Shikimori achievements | Separate `achievements.json` v1/v2; initialized source snapshot, monotonic family maxima and pending owner plans/attempts. V2 adds a frozen startup edit target; v1 baseline/award plans stay readable and unchanged. Optional in old archives. |
+| Bot-owned achievements | Shared `bot_achievements.json` v1 with independent family baselines/current values/checkpoints, retained numeric tiers and one frozen owner queue. Optional in old archives; no Shikimori rows or startup plans. |
 | Logical/legacy journal | v1/v2 store embedded processing; v2 supports unfinished acquisition. Logical v3 adds embedded outbox for consumers/legacy recovery; supported v2/v3 may carry an explicitly versioned source base. |
 | Physical `event_journal.json` | Legacy v1/v2/v3 remain readable. Activated v4 separates progress and forbids a source base; v5 requires base v1 with every compact fingerprint; v6 requires base v2 with the 4096-seq window. All activated versions retain the same progress lineage. |
 | `notification_progress.json` | v1 only: `progress_id`, `journal_id`, `profile`, processed cursor and complete outbox must match history. Missing/orphan/inconsistent progress is an error, never an empty queue. |

@@ -31,9 +31,14 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile
 
+import bot_achievement_catalog as bot_catalog
 from achievement_state import (
     ACHIEVEMENTS_FILE_NAME,
     parse_achievement_member,
+)
+from bot_achievements import (
+    BOT_ACHIEVEMENTS_FILE_NAME,
+    parse_bot_member,
 )
 from config import (
     DATA_DIR,
@@ -132,6 +137,7 @@ _IMPORT_ALLOWED_FILES: frozenset[str] = frozenset({
     "update_state.json", "known_users.json", "user_alerts.json", "event_journal.json",
     PROGRESS_FILE_NAME,
     ACHIEVEMENTS_FILE_NAME,
+    BOT_ACHIEVEMENTS_FILE_NAME,
 })
 
 _STRICT_IMPORT_FILES: frozenset[str] = frozenset({
@@ -141,6 +147,7 @@ _STRICT_IMPORT_FILES: frozenset[str] = frozenset({
     "event_journal.json",
     PROGRESS_FILE_NAME,
     ACHIEVEMENTS_FILE_NAME,
+    BOT_ACHIEVEMENTS_FILE_NAME,
 })
 
 _IMPORT_ALLOWED_DIR = "quarters"
@@ -455,6 +462,8 @@ def _active_history_members(cancelled: threading.Event, members: tuple) -> tuple
     for member in members:
         if member.name == ACHIEVEMENTS_FILE_NAME:
             parse_achievement_member(member.data, profile=SHIKI_USER, owner_id=OWNER_ID)
+        if member.name == BOT_ACHIEVEMENTS_FILE_NAME:
+            parse_bot_member(member.data, catalog=bot_catalog.BOT_ACHIEVEMENTS, profile=SHIKI_USER, owner_id=OWNER_ID)
     raw = next((member.data for member in members if member.name == "event_journal.json"), None)
     if raw is None:
         if any(member.name == PROGRESS_FILE_NAME for member in members):
@@ -986,9 +995,15 @@ async def restore_backup_zip(raw: bytes) -> dict:
                     raise ValueError(f"Файл {name} в архиве повреждён; восстановление отменено") from None
                 pending[name] = compact_json(document)
                 continue
-            if name == ACHIEVEMENTS_FILE_NAME:
+            if name in {ACHIEVEMENTS_FILE_NAME, BOT_ACHIEVEMENTS_FILE_NAME}:
                 try:
-                    document = parse_achievement_member(zf.read(info), profile=SHIKI_USER, owner_id=OWNER_ID)
+                    if name == ACHIEVEMENTS_FILE_NAME:
+                        document = parse_achievement_member(zf.read(info), profile=SHIKI_USER, owner_id=OWNER_ID)
+                    else:
+                        document = parse_bot_member(
+                            zf.read(info), catalog=bot_catalog.BOT_ACHIEVEMENTS,
+                            profile=SHIKI_USER, owner_id=OWNER_ID,
+                        )
                 except (
                     ValueError, OSError, RuntimeError, zipfile.BadZipFile,
                     NotImplementedError, EOFError, zlib.error, lzma.LZMAError,

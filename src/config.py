@@ -106,6 +106,7 @@ except OSError as e:
 SEEN_IDS_FILE  = DATA_DIR / "seen_ids.json"         # экспорт ID принятой истории
 EVENT_JOURNAL_FILE = DATA_DIR / "event_journal.json"  # история; рядом notification_progress.json
 ACHIEVEMENTS_FILE = DATA_DIR / "achievements.json"  # достижения Shikimori и доставка владельцу
+BOT_ACHIEVEMENTS_FILE = DATA_DIR / "bot_achievements.json"  # достижения бота и общая очередь владельцу
 SUBS_FILE      = DATA_DIR / "subscribers.json"      # список подписчиков
 BLOCKED_USERS_FILE = DATA_DIR / "blocked_users.json"  # список блокировок Telegram user ID
 KNOWN_USERS_FILE = DATA_DIR / "known_users.json"    # впервые замеченные пользователи бота

@@ -11,6 +11,7 @@ HTML rendering и chunking имеют отдельный авторитетны�
 Дисциплина: падает на непропатченном, проходит на пропатченном.
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -3737,3 +3738,167 @@ def test_legacy_quarter_cache_keeps_invalid_period_entry(damaged_media, damaged)
     assert "completed" not in cached
     assert cached["event_time_partial"]["completed"] == 1
     assert cached["event_time_partial"]["avg_score"] == 8
+
+
+@pytest.mark.asyncio
+async def test_reading_sync_captures_only_confirmed_reading_export(monkeypatch):
+    """Общий True при anime-only не доказывает прочитанный список."""
+    monkeypatch.setattr("stats.load_stats_all", lambda **kw: storage._empty_stats_all())
+    monkeypatch.setattr("stats.save_stats_all", lambda data: None)
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda session, data, **kw: data))
+    monkeypatch.setattr("stats.fetch_meta_batch", AsyncMock(return_value={"1": {"kind": "manga"}}))
+    export = AsyncMock(side_effect=[[], None, [], [_export_manga_row(1)]])
+    monkeypatch.setattr("stats.fetch_list_export", export)
+    await smod.sync_stats_all(session=object())
+    assert storage.load_bot_achievement_state() is None
+    await smod.sync_stats_all(session=object())
+    state = storage.load_bot_achievement_state()
+    assert state["families"]["reader"]["current_value"] == 1
+    assert state["earned"] == {"reader": 1}
+    assert state["pending"] == []
+
+
+@pytest.mark.parametrize("kind,eligible", [
+    ("manga", True), ("manhwa", True), ("manhua", True), ("light_novel", True),
+    ("novel", True), ("ranobe", True), (" Manga ", True),
+    ("one_shot", False), ("doujin", False), ("future_kind", None),
+    ("", None), (None, None), (True, None), ([], None),
+])
+def test_reading_observation_reuses_kind_policy(kind, eligible):
+    rows = [_export_manga_row(1), _export_manga_row(1)]
+    rows[0]["rewatches"] = 9
+    assert smod.reading_observation(rows, {"1": kind}) == {"1": eligible}
+
+
+@pytest.mark.parametrize("rows", [
+    None, {}, [None], [{"target_id": 1}], [_export_manga_row(True)],
+    [_export_manga_row(0)], [_export_manga_row(-1)], [_export_manga_row("01")],
+    [_export_manga_row(1, status="future")], [_export_manga_row(1, status=None)],
+    [_export_manga_row(1), _export_manga_row(1, status="planned")],
+    [{**_export_manga_row(1), "target_type": "Anime"}],
+])
+def test_reading_observation_rejects_incomplete_export_as_whole(rows):
+    assert smod.reading_observation(rows, {"1": "manga"}) is None
+
+
+def test_reading_observation_empty_and_noncompleted_are_valid_zero():
+    assert smod.reading_observation([], {}) == {}
+    assert smod.reading_observation([_export_manga_row(1, status="planned")], {}) == {}
+
+
+@pytest.fixture
+def reader_sync_env(monkeypatch):
+    """Настоящая синхронизация; экспорт и метаданные — границы HTTP."""
+    data = storage._empty_stats_all()
+    monkeypatch.setattr("stats.load_stats_all", lambda **kw: data)
+    monkeypatch.setattr("stats.save_stats_all", lambda value: data.update(value))
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda session, data, **kw: data))
+    export = AsyncMock(side_effect=lambda session, media: [] if media == "anime" else [])
+    meta = AsyncMock(return_value={})
+    monkeypatch.setattr("stats.fetch_list_export", export)
+    monkeypatch.setattr("stats.fetch_meta_batch", meta)
+    return data, export, meta
+
+
+@pytest.mark.asyncio
+async def test_reading_sync_combines_51_manga_and_ranobe_excludes_oneshots(reader_sync_env):
+    _, export, meta = reader_sync_env
+    rows = [_export_manga_row(i) for i in range(1, 56)]
+    rows.append(_export_manga_row(1))
+    export.side_effect = lambda session, media: rows if media == "manga" else []
+    meta.return_value = {str(i): {"kind": "manga" if i < 50 else "novel" if i < 52 else "one_shot"} for i in range(1, 56)}
+    await smod.sync_stats_all(session=object())
+    state = storage.load_bot_achievement_state()
+    assert state["families"]["reader"]["current_value"] == 51 and state["earned"] == {"reader": 50}
+    assert state["pending"] == []
+    assert sum(value is False for value in state["families"]["reader"]["checkpoint"].values()) == 4
+
+
+@pytest.mark.asyncio
+async def test_reading_sync_repair_then_genuine_completion(reader_sync_env):
+    data, export, meta = reader_sync_env
+    rows = [_export_manga_row(i) for i in range(1, 5)]
+    data["manga"]["titles"] = {str(i): _manga_record("x", "manga") for i in range(1, 5)}
+    export.side_effect = lambda session, media: rows if media == "manga" else []
+    await smod.sync_stats_all(session=object())
+    rows.append(_export_manga_row(5))
+    await smod.sync_stats_all(session=object())
+    state = storage.load_bot_achievement_state()
+    assert state["families"]["reader"]["current_value"] is None and state["earned"] == {"reader": 1}
+    meta.return_value = {"5": {"kind": "novel"}}
+    await smod.sync_stats_all(session=object())
+    state = storage.load_bot_achievement_state()
+    assert state["families"]["reader"]["current_value"] == 5 and state["earned"] == {"reader": 5}
+    assert state["pending"] == []
+    rows.extend(_export_manga_row(i) for i in range(6, 11))
+    meta.return_value = {str(i): {"kind": "manga"} for i in range(6, 11)}
+    await smod.sync_stats_all(session=object())
+    state = storage.load_bot_achievement_state()
+    assert state["pending"][0]["awards"] == {"reader": 10}
+
+
+@pytest.mark.asyncio
+async def test_reading_sync_stale_cache_failures_and_incomplete_input_do_not_reset(reader_sync_env):
+    _, export, _ = reader_sync_env
+    await smod.sync_stats_all(session=object())
+    original = storage.BOT_ACHIEVEMENTS_FILE.read_bytes()
+    for reading in [None, [{"target_id": 1}], [_export_manga_row(1, status="future")]]:
+        export.side_effect = lambda session, media: reading if media == "manga" else []
+        _, success = await smod.sync_stats_all(session=object())
+        assert success is True
+        assert storage.BOT_ACHIEVEMENTS_FILE.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_reading_sync_late_privacy_and_restore_cannot_capture_old_export(reader_sync_env):
+    _, export, _ = reader_sync_env
+    from shiki_api import ProfilePrivacyError
+    export.side_effect = lambda session, media: []
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("stats._collect_favourites", AsyncMock(side_effect=ProfilePrivacyError("favourites")))
+        with pytest.raises(ProfilePrivacyError):
+            await smod.sync_stats_all(session=object())
+        assert storage.load_bot_achievement_state() is None
+        async def restored(session, data, **kw):
+            storage.mark_restorable_state_restored()
+            return data
+        monkey.setattr("stats._collect_favourites", restored)
+        await smod.sync_stats_all(session=object())
+        assert storage.load_bot_achievement_state() is None
+    finally:
+        monkey.undo()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("PRIVATE_READER_ERROR"), OSError("PRIVATE_READER_PATH")])
+async def test_reading_capture_failure_keeps_successful_list_sync(reader_sync_env, monkeypatch, caplog, error):
+    _, export, meta = reader_sync_env
+    await smod.sync_stats_all(session=object())
+    original = storage.BOT_ACHIEVEMENTS_FILE.read_bytes()
+    export.side_effect = lambda session, media: [_export_manga_row(1)] if media == "manga" else []
+    meta.return_value = {"1": {"kind": "manga"}}
+    saved = []
+    monkeypatch.setattr("stats.save_stats_all", lambda value: saved.append(copy.deepcopy(value)))
+    monkeypatch.setattr("stats.capture_bot_achievement_sync", AsyncMock(side_effect=error))
+    caplog.set_level(logging.WARNING, logger="shikiupdatesbot")
+
+    state, success = await smod.sync_stats_all(session=object())
+
+    assert success is True
+    assert state["manga"]["titles"]["1"]["status"] == "completed"
+    assert saved == [state]
+    assert storage.BOT_ACHIEVEMENTS_FILE.read_bytes() == original
+    assert "Читатель: наблюдение не опубликовано" in caplog.text
+    assert type(error).__name__ in caplog.text and "PRIVATE_READER" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), shiki_api.ProfilePrivacyError("reader_capture")])
+async def test_reading_capture_propagates_cancellation_and_privacy(reader_sync_env, monkeypatch, caplog, error):
+    monkeypatch.setattr("stats.capture_bot_achievement_sync", AsyncMock(side_effect=error))
+
+    with pytest.raises(type(error)):
+        await smod.sync_stats_all(session=object())
+
+    assert "Читатель: наблюдение не опубликовано" not in caplog.text

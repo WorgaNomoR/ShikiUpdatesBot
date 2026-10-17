@@ -5,6 +5,7 @@
 from html import unescape
 
 from achievement_messages import achievement_link
+from bot_achievement_view import bot_achievement_sections
 from report_asset_ids import REPORT_ACHIEVEMENTS_MEDIA
 from report_model import (
     Bold,
@@ -58,10 +59,12 @@ def achievement_summary(rows: list[dict] | None, *, invalid: bool = False) -> st
 def build_achievement_report(
     rows: list[dict] | None, *, base_url: str, profile: str,
     metadata: dict | None = None, invalid: bool = False,
+    bot_achievements: tuple | None = None, bot_invalid: bool = False,
 ) -> Report:
     """Одна строка на семейство без повторов; безопасные поля и полные continuations."""
     title = heading("🏆 ", Bold("ДОСТИЖЕНИЯ"), level=1)
-    sections = [section(Gallery((Poster(REPORT_ACHIEVEMENTS_MEDIA),)), title)]
+    sections = [section(Gallery((Poster(REPORT_ACHIEVEMENTS_MEDIA),)), title),
+                section(heading("🌸 ", Bold("Shikimori"), level=2))]
     if invalid:
         sections.append(section(line(Italic("Достижения временно недоступны. Попробуй позже."))))
     elif rows is None:
@@ -80,7 +83,7 @@ def build_achievement_report(
         for emoji, name, group, is_progress in groups:
             if not group:
                 continue
-            items = [heading(f"{emoji} ", Bold(name), f" · {len(group)}", level=2, collapsible=True)]
+            items = [heading(f"{emoji} ", Bold(name), f" · {len(group)}", level=3, collapsible=True)]
             for row in group:
                 family, level = row["neko_id"], row["level"]
                 decoration = (metadata or {}).get((family, level))
@@ -100,4 +103,5 @@ def build_achievement_report(
                 parts = ("\n", Italic(criterion)) if criterion else ()
                 items.append(line("  • ", label, status, *parts))
             sections.append(section(*items))
+    sections.extend(bot_achievement_sections(bot_achievements, invalid=bot_invalid))
     return Report((unit(*sections),))

@@ -228,6 +228,7 @@ user_alerts.json
 seen_favourites.json
 stats_all.json
 stats_current.json
+bot_achievements.json
 update_state.json
 /facts.json
 quarters/

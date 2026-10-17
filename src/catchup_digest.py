@@ -2,7 +2,6 @@
 # Copyright (C) 2026  WorgaNomoR
 """Чистое lossless HTML-представление завершённой порции истории."""
 
-from datetime import datetime
 from html import escape
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
@@ -102,20 +101,6 @@ def _styled(text, style):
     )
 
 
-def _source_period(events):
-    times = []
-    for event in events:
-        if event["time_quality"] != "aware" or not event["event_at"]:
-            return ""
-        source = datetime.fromisoformat(event["event_at"])
-        if source > datetime.fromisoformat(event["observed_at"]):
-            return ""
-        times.append(source)
-    first, last = min(times), max(times)
-    start, end = first.strftime("%d.%m.%Y %H:%M"), last.strftime("%d.%m.%Y %H:%M")
-    return f"\n{start}" + (f" — {end}" if start != end else "") + " UTC"
-
-
 def render_digest(
     events: list[dict], *, ordinary, heading: str, entries: list[list[dict]] | None = None,
 ) -> list[dict]:
@@ -123,7 +108,7 @@ def render_digest(
     if not events:
         return []
     parts = []
-    header = heading + _source_period(events) + "\n\n"
+    header = heading + "\n\n"
     header_size = html_length(header)
     if header_size >= TELEGRAM_TEXT_LIMIT:
         raise ValueError("digest_heading_limit")

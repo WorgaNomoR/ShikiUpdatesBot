@@ -9,6 +9,7 @@
 Синхронизация делегирует сбор избранного модулю favourites.
 """
 
+import asyncio
 import json
 import math
 import random
@@ -23,6 +24,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from bot_achievement_delivery import capture_bot_achievement_sync
 from config import (
     QUARTERS_DIR,
     SHIKI_BASE_URL,
@@ -75,6 +77,7 @@ from storage import (
     json_publication_size,
     load_stats_all,
     load_stats_current,
+    restorable_restore_generation,
     save_stats_all,
 )
 from utils import (
@@ -694,6 +697,41 @@ def recompute_aggregates(media: str, titles: dict, existing_by_quarter: dict | N
     return agg
 
 
+def reading_observation(export, kinds):
+    """Полный текущий экспорт; неизвестная мета не превращается в пригодный ноль."""
+    if not isinstance(export, list):
+        return None
+    statuses = {}
+    for row in export:
+        if not isinstance(row, dict):
+            return None
+        raw_id, status = row.get("target_id"), row.get("status")
+        if not (
+            (type(raw_id) is int and raw_id > 0)
+            or (isinstance(raw_id, str) and re.fullmatch(r"[1-9][0-9]*", raw_id))
+        ) or not isinstance(status, str) or status.lower() not in _STAT_STATUSES:
+            return None
+        if row.get("target_type", "Manga") != "Manga":
+            return None
+        tid, status = str(raw_id), status.lower()
+        if tid in statuses and statuses[tid] != status:
+            return None
+        statuses[tid] = status
+    completed = {}
+    for tid, status in statuses.items():
+        if status != "completed":
+            continue
+        kind = kinds.get(tid)
+        normalized = kind.strip().lower() if isinstance(kind, str) else ""
+        if normalized and not is_relevant("manga", normalized):
+            completed[tid] = False
+        elif classify_manga_presentation_kind(normalized) != PICK_CATEGORY_UNKNOWN:
+            completed[tid] = True
+        else:
+            completed[tid] = None
+    return completed
+
+
 async def sync_stats_all(
     session: "aiohttp.ClientSession | None" = None,
     fav=FAVOURITES_UNSET,
@@ -708,6 +746,7 @@ async def sync_stats_all(
        батчем GraphQL. Для остальных обновляем пользовательский стейт из экспорта.
     4. Отдельно обновляем до 50 самых старых метаданных каждого media-домена.
     5. Пересчитываем агрегаты, сохраняем.
+    6. При явном корректном manga-экспорте отдельно захватываем «Читателя».
 
     Вызывается при старте бота и периодически из цикла. Уведомлений не шлёт.
     Возвращает (stats_all, ok): ok=False, если ни один экспорт не скачался
@@ -720,6 +759,8 @@ async def sync_stats_all(
             return await sync_stats_all(session=own, fav=fav)
 
     stats = load_stats_all(use_cache=False)
+    reading_generation = restorable_restore_generation()
+    reading_completed = None
 
     export_anime = await fetch_list_export(session, "anime")
     export_manga = await fetch_list_export(session, "manga")
@@ -969,6 +1010,15 @@ async def sync_stats_all(
                 media,
                 len(malformed_ids),
             )
+        if media == "manga":
+            # Исключённые новые записи уже отсутствуют в titles; их точный kind
+            # остаётся в ответе correctness-батча. Экспорт доказывает статус/ID.
+            kinds = {tid: rec.get("kind") for tid, rec in titles.items() if isinstance(rec, dict)}
+            for tid, meta in meta_map.items():
+                if tid not in kinds and isinstance(meta, dict):
+                    kinds[tid] = meta.get("kind")
+            reading_completed = reading_observation(export, kinds)
+
         # Чистка существующих записей, чей kind не проходит фильтр
         # (самоочистка при изменении критерия или после обновления метаданных).
         stale_kind = [
@@ -1023,6 +1073,14 @@ async def sync_stats_all(
     else:
         log.info("sync_stats_all: изменений нет.")
 
+    if reading_completed is not None:
+        try:
+            await capture_bot_achievement_sync({"reader": reading_completed}, generation=reading_generation)
+        except (asyncio.CancelledError, ProfilePrivacyError):
+            raise
+        except Exception as error:
+            # Ошибка отдельной authority не отменяет успешный список/историю.
+            log.warning("Читатель: наблюдение не опубликовано (%s).", type(error).__name__)
     return stats, True
 
 

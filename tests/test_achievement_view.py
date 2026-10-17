@@ -186,7 +186,8 @@ def test_achievement_report_uses_native_rich_lists_with_complete_html_fallback(a
     assert any(block["type"] == "heading" and block["size"] == 1 for block in blocks)
     details = [block for block in blocks if block["type"] == "details"]
     assert len(details) == 2 and all(block["is_open"] for block in details)
-    assert all(any(child["type"] == "list" for child in block["blocks"]) for block in details)
+    assert all(any(child["type"] == "list" for child in block["blocks"]) for block in details[:2])
+    assert any(block["type"] == "heading" and "Бота" in str(block) for block in blocks)
     assert blocks[0]["type"] == "anchor" and blocks[1]["type"] == "photo"
     assert "↑ К началу" in str(blocks[-1])
     fallback = "\n".join(frozen[0]["fallback_html"])

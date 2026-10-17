@@ -44,6 +44,7 @@ def _isolated_history_state(tmp_path, monkeypatch):
     monkeypatch.setattr("storage.SEEN_IDS_FILE", tmp_path / "seen_ids.json")
     monkeypatch.setattr("storage.STATS_CURRENT_FILE", tmp_path / "stats_current.json")
     monkeypatch.setattr("storage.ACHIEVEMENTS_FILE", tmp_path / "achievements.json")
+    monkeypatch.setattr("storage.BOT_ACHIEVEMENTS_FILE", tmp_path / "bot_achievements.json")
 
 
 @pytest.fixture(autouse=True)
@@ -95,17 +96,51 @@ def backup_env(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "SEEN_IDS_FILE", data / "seen_ids.json")
     monkeypatch.setattr(storage, "EVENT_JOURNAL_FILE", data / "event_journal.json")
     monkeypatch.setattr(storage, "ACHIEVEMENTS_FILE", data / "achievements.json")
+    monkeypatch.setattr(storage, "BOT_ACHIEVEMENTS_FILE", data / "bot_achievements.json")
     monkeypatch.setattr(storage, "SEEN_FAVS_FILE", data / "seen_favourites.json")
     monkeypatch.setattr(storage, "UPDATE_STATE_FILE", data / "update_state.json")
     monkeypatch.setattr(stats, "QUARTERS_DIR", quarters)
     monkeypatch.setattr("handlers.OWNER_ID", 999)
     monkeypatch.setattr("backup.OWNER_ID", 999)
     monkeypatch.setattr("achievement_delivery.OWNER_ID", 999)
+    monkeypatch.setattr("bot_achievement_delivery.OWNER_ID", 999)
     monkeypatch.setattr(storage, "OWNER_ID", 999)
     fact_bank.reload_fact_bank()
     yield data
     monkeypatch.setattr(fact_bank, "FACTS_FILE", original_facts_file)
     fact_bank.reload_fact_bank()
+
+
+@pytest.fixture
+def bot_catalog(monkeypatch):
+    """Только тестовая anime-семья: другая метрика, пороги и проверка checkpoint."""
+    from bot_achievement_catalog import BOT_ACHIEVEMENTS
+    from bot_achievements import (
+        BotAchievement,
+        Evaluation,
+        achievement_catalog,
+    )
+
+    def value(checkpoint):
+        if (
+            not isinstance(checkpoint, dict) or set(checkpoint) != {"minutes"}
+            or (checkpoint["minutes"] is not None and (
+                type(checkpoint["minutes"]) is not int or checkpoint["minutes"] < 0
+            ))
+        ):
+            raise ValueError("anime_checkpoint")
+        return checkpoint["minutes"]
+
+    anime = BotAchievement(
+        family="anime_minutes", title="Аниме <&> время", criterion=lambda level: f"{level} минут аниме",
+        level_for=lambda count: count // 180 * 180 if count >= 180 else (60 if count >= 60 else 0),
+        next_level=lambda level: 60 if level == 0 else (180 if level == 60 else level + 180),
+        calculate=lambda previous, source: Evaluation(dict(source), value(source)),
+        checkpoint_value=value, award_text=lambda level, count: f"🎉 Аниме: уровень {level}!",
+    )
+    catalog = achievement_catalog(*BOT_ACHIEVEMENTS.values(), anime)
+    monkeypatch.setattr("bot_achievement_catalog.BOT_ACHIEVEMENTS", catalog)
+    return catalog
 
 
 @pytest.fixture
