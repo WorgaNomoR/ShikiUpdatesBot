@@ -53,11 +53,7 @@ def test_public_reader_has_exact_progress_and_honest_availability(reading, inval
         assert f"уровень {reading['tier']}" in text and "уровень сохранён" in text
     if reading and reading["initialized"]:
         if reading["tier"]:
-            criterion = (
-                "1 завершённое произведение" if reading["tier"] == 1
-                else f"{READER_SCALE.threshold(reading['tier'])} завершённых произведений"
-            )
-            assert f"<i>{criterion} манги и ранобэ</i>" in text
+            assert f"<i>{reading_criterion(reading['tier'])}</i>" in text
         elif reading["count"] == 0:
             assert "Читатель" not in text and "0%" not in text
         if reading["count"] is None:
@@ -72,15 +68,15 @@ def test_reader_is_complete_in_rich_and_missing_artwork_html_fallback(monkeypatc
     assert units[0]["transport"] == "rich"
     assert "Бота" in str(units[0]["content"])
     assert "68% до следующего уровня" in str(units[0]["content"])
-    assert "50 завершённых произведений манги и ранобэ" in str(units[0]["content"])
-    assert "<i>50 завершённых произведений манги и ранобэ</i>" in "\n".join(units[0]["fallback_html"])
+    assert "Прочитано манги и ранобэ: 50" in str(units[0]["content"])
+    assert "<i>Прочитано манги и ранобэ: 50</i>" in "\n".join(units[0]["fallback_html"])
     assert "68% до следующего уровня" in "\n".join(units[0]["fallback_html"])
     monkeypatch.setattr("report_assets.RESOURCE_ROOT", tmp_path)
     fallback = freeze_report(report)
     assert all(unit["transport"] == "html" for unit in fallback)
     text = "\n".join(unit["content"] for unit in fallback)
     assert "68% до следующего уровня" in text
-    assert "<i>50 завершённых произведений манги и ранобэ</i>" in text
+    assert "<i>Прочитано манги и ранобэ: 50</i>" in text
 
 
 def test_both_origins_have_common_groups_with_test_anime_and_no_duplicate_families(bot_catalog, achievement_row_factory):
@@ -136,9 +132,9 @@ def test_full_catalog_ordinal_levels_criteria_and_independent_unavailability_are
     report = build_achievement_report(None, bot_achievements=snapshot, base_url="https://shikimori.io", profile="WNR")
     text = "\n".join(rendered_html(report))
     assert "уровень 5 · 68%" in text and "уровень 5 · 90%" in text and "уровень 6 · 74%" in text
-    assert "<i>50 завершённых произведений манги и ранобэ</i>" in text
-    assert "<i>Отмечено прочитанных глав: 1000</i>" in text
-    assert "<i>Отмечено прочитанных томов: 250</i>" in text
+    assert "<i>Прочитано манги и ранобэ: 50</i>" in text
+    assert "<i>Прочитано глав манги и ранобэ: 1000</i>" in text
+    assert "<i>Прочитано томов манги и ранобэ: 250</i>" in text
     assert "прогресс пока неизвестен" in text and "Shikimori" in text
     units = freeze_report(report)
     assert units[0]["transport"] == "rich"

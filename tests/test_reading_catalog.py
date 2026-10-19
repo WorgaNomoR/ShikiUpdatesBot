@@ -23,6 +23,21 @@ def _inputs(*, status="completed", eligible=True, chapters=100, volumes=2, evide
     return reading_family_inputs({"1": row}, {"1": eligible}, {"1": {"reading_evidence": evidence or {}}})
 
 
+@pytest.mark.parametrize("definition", READING_ACHIEVEMENTS, ids=lambda definition: definition.family)
+@pytest.mark.parametrize("surface", ["criterion", "congratulations"])
+def test_reading_text_identifies_activity_and_media_without_report_context(definition, surface):
+    text = definition.criterion(5) if surface == "criterion" else definition.award_text(5, 84)
+    assert "Прочитано" in text
+    assert "манги и ранобэ" in text
+    assert "произведений" not in text
+
+
+def test_pre_2000_text_identifies_publication_start_rather_than_reading_start():
+    definition = next(item for item in READING_ACHIEVEMENTS if item.family == "pre_2000")
+    for text in (definition.criterion(5), definition.award_text(5, 16)):
+        assert "начавших выходить до 2000 года" in text
+
+
 @pytest.mark.parametrize("status", ["completed", "watching", "rewatching", "on_hold", "dropped", "planned"])
 def test_marks_include_every_current_status_without_completion_inference(status):
     inputs = _inputs(status=status, chapters=33, volumes=2, evidence={"chapters": 900})
@@ -112,6 +127,9 @@ def test_each_approved_manga_taxon_requires_id_and_graphql_kind(family, title, k
     assert definition.title == title
     assert definition.level_for(5) == 1 and definition.next_level(5) == 100
     assert definition.criterion(5).endswith("75")
+    qualifier = "в жанре" if kind == "genre" else "категории"
+    for text in (definition.criterion(5), definition.award_text(5, 84)):
+        assert f"{qualifier} «{label}»" in text
 
 
 def test_exact_taxonomy_ids_and_overlapping_memberships_do_not_use_names_or_rest_category():
