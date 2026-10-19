@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 import os
 import tempfile
+from functools import partial
 
 import dotenv
 import pytest
@@ -210,11 +211,11 @@ def achievement_state_factory(achievement_row_factory):
 @pytest.fixture
 def coalescing_journal_factory(journal_factory):
     """Новая порция с соседней парой на границе секунды и квартала."""
-    def factory(count=2, *, long_title=False):
+    def factory(count=2, *, long_title=False, status="completed"):
         journal = journal_factory(count=count)
         first, last = journal["events"][:2]
         first.update(event_type="planned", score=None, created_at="2026-03-31T23:59:59.990+00:00", event_at="2026-03-31T23:59:59.990000+00:00")
-        last.update(target_id=first["target_id"], created_at="2026-04-01T00:00:00.010+00:00", event_at="2026-04-01T00:00:00.010000+00:00")
+        last.update(event_type=status, target_id=first["target_id"], created_at="2026-04-01T00:00:00.010+00:00", event_at="2026-04-01T00:00:00.010000+00:00")
         if long_title:
             last["title"].update(name="😀<&>" * 2500, url="/animes/11")
         return journal
@@ -224,7 +225,7 @@ def coalescing_journal_factory(journal_factory):
 
 @pytest.fixture
 def coalescing_factory(coalescing_journal_factory):
-    """Plan v3 с явно связанными источниками, включая много частей completion."""
+    """Планы v3/v4 с явно связанными источниками и продолжениями статуса."""
     from unittest.mock import patch
 
     from catchup_digest import (
@@ -241,10 +242,11 @@ def coalescing_factory(coalescing_journal_factory):
         migrate_outbox,
         notification_entries,
         prepare_digest,
+        validate_outbox,
     )
 
-    def factory(*, ready=True, audience=1, long_title=False, count=10):
-        journal = migrate_outbox(coalescing_journal_factory(count=count, long_title=long_title), 0)
+    def factory(*, ready=True, audience=1, long_title=False, count=10, status="completed", version=4):
+        journal = migrate_outbox(coalescing_journal_factory(count=count, long_title=long_title, status=status), 0)
         entries = notification_entries(journal["events"])
         def ordinary(event):
             return build_message(history_entry_from_event(event), normalized=event)
@@ -254,6 +256,8 @@ def coalescing_factory(coalescing_journal_factory):
                 journal["events"], ordinary=ordinary, heading=build_history_digest_heading(), entries=entries,
             )
         journal = prepare_digest(journal, parts, {10 + i: "b" * 32 for i in range(audience)}, 1800000000.0, entries=entries, presentation=presentation)
+        journal["outbox"]["plans"][0]["version"] = version
+        validate_outbox(journal)
         if ready:
             for event in journal["events"]:
                 journal = enqueue(journal, event, None, {}, 1800000000.0)
@@ -262,16 +266,20 @@ def coalescing_factory(coalescing_journal_factory):
     return factory
 
 
-@pytest.fixture(params=["digest", "coalesced"])
+@pytest.fixture(params=["digest", "coalesced_v3", "coalesced_v4"])
 def frozen_history_factory(request, digest_factory, coalescing_factory):
     """Одна матрица archive/reserve contract для старого и нового frozen plan."""
-    return coalescing_factory if request.param == "coalesced" else digest_factory
+    if request.param == "digest":
+        return digest_factory
+    return partial(coalescing_factory, version=3) if request.param == "coalesced_v3" else partial(coalescing_factory, status="watching")
 
 
-@pytest.fixture(params=["ordinary", "coalesced"])
+@pytest.fixture(params=["ordinary", "coalesced", "watching"])
 def notification_batch_factory(request, journal_factory, coalescing_journal_factory):
     """Одна матрица crash/delivery для независимых записей и связанной пары."""
-    return coalescing_journal_factory if request.param == "coalesced" else journal_factory
+    if request.param == "ordinary":
+        return journal_factory
+    return partial(coalescing_journal_factory, status="watching") if request.param == "watching" else coalescing_journal_factory
 
 
 @pytest.fixture

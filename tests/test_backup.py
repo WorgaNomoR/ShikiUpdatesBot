@@ -3927,6 +3927,66 @@ async def test_digest_restore_rolls_back_exact_damaged_bytes(backup_env, frozen_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("full_export", [False, True])
+@pytest.mark.parametrize("ready", [False, True])
+async def test_mixed_notification_policies_roundtrip_and_reject_v3_relabelling(
+    backup_env, coalescing_factory, coalescing_journal_factory, full_export, ready,
+):
+    from catchup_digest import render_ordinary_entries
+    from event_time_stats import (
+        ensure_event_time,
+        project_event,
+    )
+    from messages import (
+        build_message,
+        history_entry_from_event,
+    )
+    from notification_outbox import (
+        begin_attempt,
+        enqueue,
+        prepare_digest,
+    )
+
+    journal = coalescing_factory(count=2, version=3)
+    old = journal["outbox"]["plans"][0]["units"][0]
+    begin_attempt(old["recipients"]["10"], old["created_at"])
+    pair = coalescing_journal_factory(status="watching")["events"]
+    for event in pair:
+        event["seq"] += 2
+        event["history_id"] += 2
+    journal["events"].extend(pair)
+    parts = render_ordinary_entries([pair], ordinary=lambda event: build_message(history_entry_from_event(event), normalized=event))
+    journal = prepare_digest(journal, parts, {10: "b" * 32}, 1800000000.0, entries=[pair], presentation="ordinary")
+    if ready:
+        for event in pair:
+            journal = enqueue(journal, event, None, {}, 1800000000.0)
+    cur = {"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}
+    ensure_event_time(cur)
+    for event in journal["events"][:journal["processed_seq"]]:
+        project_event(cur, journal, event["seq"])
+        cur["event_projection"]["applied_seq"] = event["seq"]
+    storage.save_stats_current(cur, strict=True)
+    storage.save_event_journal(journal)
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
+    await backup.restore_backup_zip(archive)
+    assert storage.load_event_journal() == journal
+    assert [plan["version"] for plan in journal["outbox"]["plans"]] == [3, 4]
+
+    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
+        members = {name: zipped.read(name) for name in zipped.namelist()}
+    payload = json.loads(members["notification_progress.json"])
+    payload["outbox"]["plans"][1]["version"] = 3
+    members["notification_progress.json"] = json.dumps(payload).encode()
+    files = [storage.EVENT_JOURNAL_FILE, storage.notification_progress_file(), storage.STATS_CURRENT_FILE]
+    before = {path: path.read_bytes() for path in files}
+    generation = storage.restorable_restore_generation()
+    with pytest.raises(ValueError):
+        await backup.restore_backup_zip(_zip_bytes(members))
+    assert {path: path.read_bytes() for path in files} == before
+    assert storage.restorable_restore_generation() == generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_export", [False, True])
 async def test_digest_capture_rejects_malformed_plan_without_normalizing_bytes(backup_env, frozen_history_factory, full_export):
     journal = frozen_history_factory(ready=False)
     storage.save_stats_current({"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}, strict=True)
