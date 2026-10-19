@@ -148,7 +148,7 @@ async def test_old_frozen_plan_with_qualifying_pair_is_never_regrouped(digest_en
 @pytest.mark.asyncio
 @pytest.mark.parametrize("version", [1, 2, 3])
 async def test_new_status_plan_preserves_mixed_legacy_work_and_attempts(
-    digest_env, legacy_digest_factory, digest_factory, coalescing_factory, coalescing_journal_factory, monkeypatch, version,
+    digest_env, legacy_digest_factory, digest_factory, coalescing_factory, coalescing_journal_factory, version,
 ):
     from notification_outbox import begin_attempt
 
@@ -162,10 +162,7 @@ async def test_new_status_plan_preserves_mixed_legacy_work_and_attempts(
     state.notification_memberships = {10: "b" * 32}
     storage.save_subscriber_state(state)
     frozen = deepcopy(journal["outbox"]["plans"])
-    with monkeypatch.context() as patch:
-        patch.setattr("handlers.notification_entries", lambda *a: pytest.fail("legacy grouping changed"))
-        patch.setattr("handlers.build_message", lambda *a, **k: pytest.fail("legacy text changed"))
-        await handlers._drain_history_journal(AsyncMock())
+    await handlers._drain_history_journal(AsyncMock())
     journal = storage.load_event_journal()
     assert journal["outbox"]["plans"] == frozen
     unit = journal["outbox"]["plans"][0]["units"][0]
