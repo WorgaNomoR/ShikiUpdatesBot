@@ -51,10 +51,11 @@ from notification_outbox import (
     ("bad", "2026-04-01T00:00:00+00:00", False),
     ("2026-04-02T00:00:00+00:00", "2026-04-02T00:00:00.000001+00:00", False),
 ])
-def test_coalescing_uses_full_trusted_source_interval(coalescing_journal_factory, first, last, paired):
+@pytest.mark.parametrize("status", ["watching", "completed", "dropped", "on_hold", "rewatching"])
+def test_coalescing_uses_full_trusted_source_interval(coalescing_journal_factory, first, last, paired, status):
     from event_journal_schema import source_time
 
-    events = coalescing_journal_factory()["events"]
+    events = coalescing_journal_factory(status=status)["events"]
     for event, timestamp in zip(events, (first, last)):
         event["event_at"], event["time_quality"] = source_time(timestamp)
     before = deepcopy(events)
@@ -74,8 +75,9 @@ def test_coalescing_uses_full_trusted_source_interval(coalescing_journal_factory
     ("event_at", "2026-04-01T00:00:00+24:00"),
     ("event_at", 42),
 ])
-def test_coalescing_rejects_invalid_timestamps_without_mutation(coalescing_factory, index, field, value):
-    journal = coalescing_factory(count=2)
+@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching")])
+def test_coalescing_rejects_invalid_timestamps_without_mutation(coalescing_factory, index, field, value, version, status):
+    journal = coalescing_factory(count=2, version=version, status=status)
     events = journal["events"]
     events[index][field] = value
     before = deepcopy(journal)
@@ -89,13 +91,18 @@ def test_coalescing_rejects_invalid_timestamps_without_mutation(coalescing_facto
     assert journal == before
 
 
-@pytest.mark.parametrize("damage", ["media", "empty_id", "other_id", "irrelevant_first", "irrelevant_last", "watching", "rating", "gap"])
-def test_coalescing_requires_same_nonempty_relevant_adjacent_target(coalescing_journal_factory, damage):
-    first, last = coalescing_journal_factory()["events"]
+@pytest.mark.parametrize("damage", ["media", "empty_id", "other_id", "irrelevant_first", "irrelevant_last", "no_media", "blank_id", "rating", "gap"])
+@pytest.mark.parametrize("status", ["watching", "completed", "dropped", "on_hold", "rewatching"])
+def test_coalescing_requires_same_nonempty_relevant_adjacent_target(coalescing_journal_factory, damage, status):
+    first, last = coalescing_journal_factory(status=status)["events"]
     if damage == "media":
         last.update(media="manga", kind="manga")
     elif damage == "empty_id":
         first["target_id"] = last["target_id"] = ""
+    elif damage == "no_media":
+        first["media"] = last["media"] = ""
+    elif damage == "blank_id":
+        first["target_id"] = last["target_id"] = "  "
     elif damage == "other_id":
         last["target_id"] = "other"
     elif damage.startswith("irrelevant"):
@@ -103,13 +110,14 @@ def test_coalescing_requires_same_nonempty_relevant_adjacent_target(coalescing_j
     elif damage == "gap":
         last["seq"] += 1
     else:
-        last["event_type"] = "watching" if damage == "watching" else "score_set"
+        last["event_type"] = "score_set"
     assert not coalescible_pair(first, last)
 
 
 @pytest.mark.parametrize("intervening", ["ignored", "unknown", "score_removed", "score_set", "watching", "other_title", "excluded"])
-def test_coalescing_checks_adjacency_before_filtering(coalescing_journal_factory, intervening):
-    journal = coalescing_journal_factory(count=3)
+@pytest.mark.parametrize("status", ["watching", "completed", "dropped", "on_hold", "rewatching"])
+def test_coalescing_checks_adjacency_before_filtering(coalescing_journal_factory, intervening, status):
+    journal = coalescing_journal_factory(count=3, status=status)
     first, last, middle = journal["events"]
     middle["seq"], last["seq"] = 2, 3
     if intervening == "excluded":
@@ -122,8 +130,9 @@ def test_coalescing_checks_adjacency_before_filtering(coalescing_journal_factory
 
 
 @pytest.mark.parametrize("damage", ["survivor", "missing_source", "pair_order", "target", "time", "part_source", "continuation_source", "part_entry", "boolean", "presentation", "extra"])
-def test_coalescing_mapping_is_strict_in_runtime_and_import(coalescing_factory, damage):
-    journal = coalescing_factory(count=2, long_title=True)
+@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching")])
+def test_coalescing_mapping_is_strict_in_runtime_and_import(coalescing_factory, damage, version, status):
+    journal = coalescing_factory(count=2, long_title=True, version=version, status=status)
     plan = journal["outbox"]["plans"][0]
     entry, unit = plan["entries"][0], plan["units"][0]
     if damage == "survivor":
@@ -154,8 +163,9 @@ def test_coalescing_mapping_is_strict_in_runtime_and_import(coalescing_factory, 
         parse_event_journal(json.dumps(journal).encode())
 
 
-def test_coalesced_retention_pins_both_sources_until_last_part_terminal(coalescing_factory):
-    journal = coalescing_factory(count=2, long_title=True)
+@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching")])
+def test_coalesced_retention_pins_both_sources_until_last_part_terminal(coalescing_factory, version, status):
+    journal = coalescing_factory(count=2, long_title=True, version=version, status=status)
     units = journal["outbox"]["plans"][0]["units"]
     for unit in units[:-1]:
         begin_attempt(unit["recipients"]["10"], unit["created_at"])
@@ -168,6 +178,66 @@ def test_coalesced_retention_pins_both_sources_until_last_part_terminal(coalesci
     validate_outbox(partial)
     complete = retain_outbox(partial)
     assert complete["outbox"]["completed_seq"] == 2 and complete["outbox"]["plans"] == []
+
+
+@pytest.mark.parametrize("first_status", ["planned", "watching", "completed", "dropped", "on_hold", "rewatching", "score_set", "score_changed", "score_removed", "ignored", "unknown"])
+@pytest.mark.parametrize("last_status", ["planned", "watching", "completed", "dropped", "on_hold", "rewatching", "score_set", "score_changed", "score_removed", "ignored", "unknown"])
+def test_coalescing_allows_only_addition_then_supported_status(coalescing_journal_factory, first_status, last_status):
+    events = coalescing_journal_factory(status=last_status)["events"]
+    events[0]["event_type"] = first_status
+    before = deepcopy(events)
+    allowed = first_status == "planned" and last_status in {"watching", "completed", "dropped", "on_hold", "rewatching"}
+    assert coalescible_pair(*events) is allowed
+    assert any(len(entry) == 2 for entry in notification_entries(events)) is allowed
+    assert events == before
+
+
+@pytest.mark.parametrize("statuses,lengths", [
+    (("planned", "watching", "completed"), [2, 1]),
+    (("planned", "planned", "watching"), [1, 2]),
+    (("planned", "on_hold", "rewatching"), [2, 1]),
+    (("watching", "planned", "dropped"), [1, 2]),
+])
+def test_coalescing_never_recursively_collapses_longer_chains(coalescing_journal_factory, statuses, lengths):
+    events = coalescing_journal_factory(count=3)["events"]
+    for event, status in zip(events, statuses):
+        event.update(event_type=status, target_id="11", event_at="2026-04-01T00:00:00+00:00")
+    before = deepcopy(events)
+    entries = notification_entries(events)
+    assert [len(entry) for entry in entries] == lengths
+    assert [event for entry in entries for event in entry] == before
+    assert events == before
+
+
+@pytest.mark.parametrize("status", ["watching", "completed", "dropped", "on_hold", "rewatching"])
+def test_saved_pair_policy_is_explicitly_versioned(coalescing_factory, status):
+    journal = coalescing_factory(count=2, status=status)
+    assert journal["outbox"]["plans"][0]["version"] == 4
+    raw = journal_json(journal).encode()
+    assert parse_event_journal(raw) == journal
+    journal["outbox"]["plans"][0]["version"] = 3
+    before = deepcopy(journal)
+    if status == "completed":
+        validate_outbox(journal)
+        assert parse_event_journal(journal_json(journal).encode()) == journal
+    else:
+        with pytest.raises(OutboxStateError, match="outbox_plan_entries"):
+            validate_outbox(journal)
+        with pytest.raises(EventJournalStateError):
+            parse_event_journal(json.dumps(journal).encode())
+    assert journal == before
+
+
+@pytest.mark.parametrize("version", [None, True, False, 4.0, [], {}, "4", 0, 5])
+def test_saved_pair_rejects_invalid_version_without_mutation(coalescing_factory, version):
+    journal = coalescing_factory(count=2)
+    journal["outbox"]["plans"][0]["version"] = version
+    before = deepcopy(journal)
+    with pytest.raises(OutboxStateError, match="outbox_plan"):
+        validate_outbox(journal)
+    with pytest.raises(EventJournalStateError):
+        parse_event_journal(json.dumps(journal).encode())
+    assert journal == before
 
 
 def _box(factory):
