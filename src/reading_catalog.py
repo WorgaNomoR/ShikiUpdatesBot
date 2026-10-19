@@ -78,10 +78,13 @@ def _definition(family, title, scale, metric, *, marks=False):
     )
 
 
-CHAPTERS = _definition("chapters", "Глава за главой", CHAPTER_SCALE, "Отмечено прочитанных глав", marks=True)
-VOLUMES = _definition("volumes", "Книжная полка", VOLUME_SCALE, "Отмечено прочитанных томов", marks=True)
-LONG_WORKS = _definition("long_works", "Долгая история", RARE_SCALE, "Завершено произведений длиной от 100 глав")
-PRE_2000 = _definition("pre_2000", "У истоков", RARE_SCALE, "Завершено произведений, начатых до 2000 года")
+CHAPTERS = _definition("chapters", "Глава за главой", CHAPTER_SCALE, "Прочитано глав манги и ранобэ", marks=True)
+VOLUMES = _definition("volumes", "Книжная полка", VOLUME_SCALE, "Прочитано томов манги и ранобэ", marks=True)
+LONG_WORKS = _definition("long_works", "Долгая история", RARE_SCALE, "Прочитано манги и ранобэ длиной от 100 глав")
+PRE_2000 = _definition(
+    "pre_2000", "У истоков", RARE_SCALE,
+    "Прочитано манги и ранобэ, начавших выходить до 2000 года",
+)
 
 # Только ID пространства Manga и категории GraphQL; имена и REST kind не являются доказательством.
 TAXONOMY_FAMILIES = (
@@ -100,8 +103,10 @@ TAXONOMY_FAMILIES = (
 )
 READING_ACHIEVEMENTS = (
     CHAPTERS, VOLUMES, LONG_WORKS, PRE_2000,
-    *(_definition(family, title, TAXONOMY_SCALE, f"Завершено произведений категории «{label}»")
-      for family, title, _, _, label in TAXONOMY_FAMILIES),
+    *(_definition(
+        family, title, TAXONOMY_SCALE,
+        f"Прочитано манги и ранобэ {'в жанре' if kind == 'genre' else 'категории'} «{label}»",
+    ) for family, title, kind, _, label in TAXONOMY_FAMILIES),
 )
 
 

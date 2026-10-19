@@ -7,7 +7,9 @@ import pytest
 from reading_milestones import (
     calculate_reader,
     next_reading_tier,
+    reading_award_text,
     reading_count,
+    reading_criterion,
     reading_tier,
 )
 
@@ -15,6 +17,12 @@ from reading_milestones import (
 def test_reader_uses_ordinal_levels_and_approved_thresholds():
     assert reading_tier(51) == 5
     assert next_reading_tier(5) == 75
+
+
+@pytest.mark.parametrize("level,threshold,count", [(1, 1, 1), (5, 50, 51)])
+def test_reader_text_identifies_reading_manga_and_ranobe(level, threshold, count):
+    assert reading_criterion(level) == f"Прочитано манги и ранобэ: {threshold}"
+    assert f"Прочитано манги и ранобэ: <b>{count}</b>" in reading_award_text(level, count)
 
 
 

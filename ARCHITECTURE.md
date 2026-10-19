@@ -485,6 +485,9 @@ families described below. Future anime or reading families use the
 same state, publication, queue, backup member and public projection; their data acquisition
 remains explicit work. No rule language or arbitrary plugin loader exists. An isolated anime-time
 test definition with different thresholds exercises the common paths without entering production.
+Reading criteria and newly captured congratulations explicitly identify reading manga and ranobe.
+Genre wording distinguishes genres from demographic categories; pre-2000 wording identifies the
+publication-start year. Text revisions never rerender already frozen pending congratulations.
 
 `bot_achievements` owns the common v2 envelope: profile/owner binding, UUID, `families`, retained
 `earned` maxima and `pending` plans. Every family has independent `initialized`, nullable

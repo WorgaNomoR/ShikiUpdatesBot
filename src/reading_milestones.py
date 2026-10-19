@@ -43,16 +43,15 @@ def calculate_reader(previous, completed):
 def reading_criterion(tier):
     """Критерий полученного порога, общий для манги и ранобэ."""
     threshold = READER_SCALE.threshold(tier)
-    works = "1 завершённое произведение" if threshold == 1 else f"{threshold} завершённых произведений"
-    return f"{works} манги и ранобэ"
+    return f"Прочитано манги и ранобэ: {threshold}"
 
 
 def reading_award_text(tier, count):
     """Семейство задаёт свою обычную поздравительную формулировку."""
     return (
         f"✨ <b>Читатель — уровень {tier}</b>\n"
-        f"Завершённых произведений в списке: <b>{count}</b>. "
-        "Манга и ранобэ вместе — книжная полка растёт! 🏆"
+        f"Прочитано манги и ранобэ: <b>{count}</b>. "
+        "Книжная полка растёт! 🏆"
     )
 
 
