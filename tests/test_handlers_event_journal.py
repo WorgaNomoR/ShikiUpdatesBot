@@ -204,7 +204,9 @@ async def test_old_ignored_removal_is_not_reclassified_or_replayed(history_env, 
 
 
 @pytest.mark.asyncio
-async def test_removal_render_failure_leaves_new_obligation_retryable(history_env, removal_journal_factory, monkeypatch):
+@pytest.mark.parametrize("template_index", range(len(MESSAGES["anime"]["list_removed"])))
+async def test_removal_render_failure_leaves_new_obligation_retryable(history_env, removal_journal_factory, monkeypatch, template_index):
+    template = MESSAGES["anime"]["list_removed"][template_index]
     journal = removal_journal_factory()
     storage.save_event_journal(journal)
     storage.save_stats_current({
@@ -221,10 +223,18 @@ async def test_removal_render_failure_leaves_new_obligation_retryable(history_en
     bot.send_message.assert_not_awaited()
     assert storage.load_event_journal()["processed_seq"] == 0
     storage._journal_history_cache = storage._journal_progress_cache = None
+    monkeypatch.setitem(MESSAGES["anime"], "list_removed", [template])
     await handlers._drain_history_journal(bot)
+    ready = storage.load_event_journal()
+    assert ready["processed_seq"] == 1
+    record = ready["outbox"]["records"][0]
+    event = journal["events"][0]
+    assert (record["seq"], record["history_id"]) == (event["seq"], event["history_id"])
+    assert record["recipients"]["10"]["status"] == "pending"
+    payload = deepcopy(record["payload"])
     await dispatch_notifications(bot)
-    bot.send_message.assert_awaited_once()
-    assert "из списка" in bot.send_message.await_args.kwargs["text"]
+    bot.send_message.assert_awaited_once_with(chat_id=10, **payload)
+    assert storage.load_event_journal()["outbox"]["records"][0]["recipients"]["10"]["status"] == "delivered"
 
 
 @pytest.mark.asyncio
