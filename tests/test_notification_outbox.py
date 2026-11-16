@@ -114,7 +114,7 @@ def test_coalescing_requires_same_nonempty_relevant_adjacent_target(coalescing_j
     assert not coalescible_pair(first, last)
 
 
-@pytest.mark.parametrize("intervening", ["ignored", "unknown", "score_removed", "score_set", "watching", "other_title", "excluded"])
+@pytest.mark.parametrize("intervening", ["ignored", "list_removed", "unknown", "score_removed", "score_set", "watching", "other_title", "excluded"])
 @pytest.mark.parametrize("status", ["watching", "completed", "dropped", "on_hold", "rewatching"])
 def test_coalescing_checks_adjacency_before_filtering(coalescing_journal_factory, intervening, status):
     journal = coalescing_journal_factory(count=3, status=status)
@@ -180,8 +180,8 @@ def test_coalesced_retention_pins_both_sources_until_last_part_terminal(coalesci
     assert complete["outbox"]["completed_seq"] == 2 and complete["outbox"]["plans"] == []
 
 
-@pytest.mark.parametrize("first_status", ["planned", "watching", "completed", "dropped", "on_hold", "rewatching", "score_set", "score_changed", "score_removed", "ignored", "unknown"])
-@pytest.mark.parametrize("last_status", ["planned", "watching", "completed", "dropped", "on_hold", "rewatching", "score_set", "score_changed", "score_removed", "ignored", "unknown"])
+@pytest.mark.parametrize("first_status", ["planned", "watching", "completed", "dropped", "on_hold", "rewatching", "score_set", "score_changed", "score_removed", "list_removed", "ignored", "unknown"])
+@pytest.mark.parametrize("last_status", ["planned", "watching", "completed", "dropped", "on_hold", "rewatching", "score_set", "score_changed", "score_removed", "list_removed", "ignored", "unknown"])
 def test_coalescing_allows_only_addition_then_supported_status(coalescing_journal_factory, first_status, last_status):
     events = coalescing_journal_factory(status=last_status)["events"]
     events[0]["event_type"] = first_status

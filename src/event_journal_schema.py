@@ -30,7 +30,7 @@ JOURNAL_CHECKPOINT_RESERVE = 4096
 PROJECTION_KEY = "event_projection"
 EVENT_TYPES = frozenset({
     "planned", "watching", "rewatching", "on_hold", "dropped", "completed",
-    "score_set", "score_changed", "score_removed", "ignored", "unknown",
+    "score_set", "score_changed", "score_removed", "list_removed", "ignored", "unknown",
 })
 
 

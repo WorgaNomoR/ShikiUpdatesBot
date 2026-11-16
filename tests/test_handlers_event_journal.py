@@ -15,6 +15,7 @@ import backup
 import handlers
 import storage
 from event_journal_schema import EventJournalStateError
+from messages import MESSAGES
 from notification_delivery import dispatch_notifications
 from notification_outbox import progress_reserve
 from source_history import (
@@ -178,6 +179,78 @@ async def test_index_maintenance_during_render_keeps_enqueue_lease_until_restore
 async def _ready():
     await handlers._initialize_history_journal({1}, storage.restorable_restore_generation())
     return await handlers._drain_history_journal(AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_old_ignored_removal_is_not_reclassified_or_replayed(history_env, journal_factory, monkeypatch):
+    journal = journal_factory(processed=1)
+    journal["events"][0].update(event_type="ignored", description="Удалено из списка", score=None)
+    storage.save_event_journal(journal)
+    storage.save_stats_current({
+        "period": "2026-Q2", "events": [],
+        "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 1},
+    }, strict=True)
+    storage.save_subscribers({10: "only"})
+    bot = AsyncMock()
+    await handlers._drain_history_journal(bot)
+    # Повторный source ID также не получает нового решения о доставке.
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[{**_entry(), "description": "Удалено из списка"}]))
+    await handlers.check_and_notify(bot, set(), None)
+    await dispatch_notifications(bot)
+    bot.send_message.assert_not_awaited()
+    saved = storage.load_event_journal()
+    assert saved["events"] == journal["events"]
+    assert saved["processed_seq"] == 1 and not saved["outbox"]["records"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template_index", range(len(MESSAGES["anime"]["list_removed"])))
+async def test_removal_render_failure_leaves_new_obligation_retryable(history_env, removal_journal_factory, monkeypatch, template_index):
+    template = MESSAGES["anime"]["list_removed"][template_index]
+    journal = removal_journal_factory()
+    storage.save_event_journal(journal)
+    storage.save_stats_current({
+        "period": "2026-Q2", "events": [],
+        "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0},
+    }, strict=True)
+    storage.save_subscribers({10: "only"})
+    bot = AsyncMock()
+    with monkeypatch.context() as patch:
+        patch.setitem(MESSAGES["anime"], "list_removed", ["{"])
+        with pytest.raises(ValueError):
+            await handlers._drain_history_journal(bot)
+    await dispatch_notifications(bot)
+    bot.send_message.assert_not_awaited()
+    assert storage.load_event_journal()["processed_seq"] == 0
+    storage._journal_history_cache = storage._journal_progress_cache = None
+    monkeypatch.setitem(MESSAGES["anime"], "list_removed", [template])
+    await handlers._drain_history_journal(bot)
+    ready = storage.load_event_journal()
+    assert ready["processed_seq"] == 1
+    record = ready["outbox"]["records"][0]
+    event = journal["events"][0]
+    assert (record["seq"], record["history_id"]) == (event["seq"], event["history_id"])
+    assert record["recipients"]["10"]["status"] == "pending"
+    payload = deepcopy(record["payload"])
+    await dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once_with(chat_id=10, **payload)
+    assert storage.load_event_journal()["outbox"]["records"][0]["recipients"]["10"]["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", [None, [], 7, {"kind": None}, {"kind": "special"}, {"kind": "pv"}, {"kind": "one_shot"}, {"kind": "doujin"}])
+async def test_removal_keeps_safe_target_and_relevance_policy(history_env, monkeypatch, target):
+    storage.save_seen_ids({1})
+    storage.save_subscribers({10: "only"})
+    monkeypatch.setattr("handlers.fetch_history", AsyncMock(return_value=[{**_entry(), "description": "Удалено из списка", "target": target}]))
+    bot = AsyncMock()
+    await handlers.check_and_notify(bot, set(), None)
+    await dispatch_notifications(bot)
+    bot.send_message.assert_not_awaited()
+    saved = storage.load_event_journal()
+    assert saved["events"][0]["event_type"] == "list_removed"
+    assert not saved["events"][0]["relevant"]
+    assert saved["processed_seq"] == 1
 
 
 @pytest.mark.asyncio
@@ -749,8 +822,11 @@ async def test_exhausted_uncertain_recipient_still_means_only_durable_enqueue(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["migration", "membership", "enqueue_capacity"])
-async def test_outbox_publication_failure_keeps_recoverable_authority(history_env, journal_factory, monkeypatch, phase):
+@pytest.mark.parametrize("removal", [False, True])
+async def test_outbox_publication_failure_keeps_recoverable_authority(history_env, journal_factory, monkeypatch, phase, removal):
     journal = journal_factory()
+    if removal:
+        journal["events"][0].update(event_type="list_removed", description="Удалено из списка", score=None)
     storage.save_event_journal(journal)
     storage.save_stats_current({
         "period": "2026-Q2", "events": [],

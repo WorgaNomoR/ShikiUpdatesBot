@@ -145,9 +145,10 @@ async def test_partial_restart_order_and_independence(outbox_env, journal_factor
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("later", ["rejection", "success"])
-async def test_accepted_lost_response_then_late_outcome(outbox_env, journal_factory, later):
+@pytest.mark.parametrize("removal", [False, True])
+async def test_accepted_lost_response_then_late_outcome(outbox_env, journal_factory, removal_journal_factory, later, removal):
     storage.save_subscribers({10: "only"})
-    await _enqueue(journal_factory, count=1)
+    await _enqueue(removal_journal_factory if removal else journal_factory, count=1)
     bot = AsyncMock()
     bot.send_message.side_effect = TelegramNetworkError(
         SendMessage(chat_id=10, text="x"), "lost response"
@@ -322,8 +323,9 @@ async def test_cycle_count_budget(outbox_env, journal_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["identical", "older", "unrelated", "legacy"])
-async def test_restore_during_dispatch_invalidates_ack(outbox_env, journal_factory, kind):
-    await _enqueue(journal_factory, count=1)
+@pytest.mark.parametrize("removal", [False, True])
+async def test_restore_during_dispatch_invalidates_ack(outbox_env, journal_factory, removal_journal_factory, kind, removal):
+    await _enqueue(removal_journal_factory if removal else journal_factory, count=1)
     older = _recovery()
     bot = AsyncMock()
 
@@ -1094,10 +1096,18 @@ async def test_index_maintenance_preserves_inflight_recipient_ack_and_delivery_f
 
 
 @pytest.mark.asyncio
-async def test_digest_lost_response_retries_frozen_part_with_shared_ack(outbox_env, notification_batch_factory, monkeypatch):
+@pytest.mark.parametrize("removal", [False, True])
+async def test_digest_lost_response_retries_frozen_part_with_shared_ack(outbox_env, notification_batch_factory, monkeypatch, removal):
     storage.save_subscribers({10: "only"})
-    await _enqueue(notification_batch_factory, count=10, digest=True)
+    def factory(**kwargs):
+        journal = notification_batch_factory(**kwargs)
+        if removal:
+            journal["events"][4].update(event_type="list_removed", description="Удалено из списка", score=None)
+        return journal
+    await _enqueue(factory, count=10, digest=True)
     plan = storage.load_event_journal()["outbox"]["plans"][0]
+    if removal:
+        assert [5, 6] in plan["units"][0]["events"]
     key = plan["units"][0]["unit_id"]
     bot = AsyncMock()
     bot.send_message.side_effect = TelegramNetworkError(SendMessage(chat_id=10, text="x"), "accepted but lost")

@@ -3839,6 +3839,72 @@ async def test_source_restore_failure_rolls_back_exact_bytes_and_cache(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["staged", "admitted", "ordinary", "summary", "compacted"])
+@pytest.mark.parametrize("full_export", [False, True])
+async def test_removal_recovery_preserves_old_ignored_and_new_obligations(backup_env, journal_factory, monkeypatch, mode, full_export):
+    from copy import deepcopy
+
+    from event_journal_schema import validate_recovery_set
+    from event_time_stats import ensure_event_time
+    from history_catchup import new_acquisition
+    from messages import MESSAGES
+    from source_history import known_history_ids
+
+    journal = journal_factory(count=3 if mode == "summary" else 2)
+    journal.update(version=2, catchup=None)
+    for event, kind in zip(journal["events"], ["ignored", "list_removed"]):
+        event.update(event_type=kind, description="Удалено из списка", score=None)
+    if mode == "staged":
+        journal["events"], events = [], journal["events"]
+        journal["catchup"] = new_acquisition()
+        journal["catchup"].update(staged=events, frontier=[3, 2], head_ids=[3, 2])
+    if mode == "compacted":
+        for event in journal["events"]:
+            event["description"] += " " * 2000
+    cur = {"period": "2026-Q2", "events": [], "event_projection": {"journal_id": journal["journal_id"], "baseline_seq": 0, "applied_seq": 0}}
+    ensure_event_time(cur)
+    storage.save_stats_current(cur, strict=True)
+    storage.save_event_journal(journal)
+    storage.save_subscribers({} if mode == "compacted" else {10: "only"})
+    if mode in {"ordinary", "summary", "compacted"}:
+        await handlers._drain_history_journal(AsyncMock())
+    if mode == "compacted":
+        storage.compact_event_journal(
+            storage.load_event_journal(), cur=storage.load_stats_current(strict=True),
+            expected_generation=storage.restorable_restore_generation(), force_history=True,
+        )
+        assert storage.load_event_journal()["events"] == []
+        assert known_history_ids(storage.load_event_journal()) == {1, 2, 3}
+    before = deepcopy(storage.load_event_journal())
+    current = storage.load_stats_current(strict=True)
+    archive, _ = await backup._build_backup_zip(full_export=full_export)
+    replacement = journal_factory(count=0)
+    replacement["journal_id"] = "d" * 32
+    replacement_current = {
+        "period": "2026-Q3", "events": [],
+        "event_projection": {"journal_id": replacement["journal_id"], "baseline_seq": 0, "applied_seq": 0},
+    }
+    ensure_event_time(replacement_current)
+    storage.save_event_journal(replacement)
+    storage.save_stats_current(replacement_current, strict=True)
+    if storage.notification_progress_file().exists():
+        storage.notification_progress_file().unlink()
+    validate_recovery_set(storage.load_event_journal(), storage.load_stats_current(strict=True))
+    assert storage.load_event_journal() != before
+    assert storage.load_stats_current(strict=True) != current
+    await backup.restore_backup_zip(archive)
+    assert storage.load_event_journal() == before
+    assert storage.load_stats_current(strict=True) == current
+    if mode in {"ordinary", "summary"}:
+        monkeypatch.setitem(MESSAGES["anime"], "list_removed", ["{"])
+        await handlers._drain_history_journal(AsyncMock())
+        resumed = storage.load_event_journal()
+        assert resumed["events"] == before["events"]
+        assert resumed["outbox"]["records"][-1] == before["outbox"]["records"][-1]
+        assert resumed["outbox"].get("plans") == before["outbox"].get("plans")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version", [1, 2, 3])
 @pytest.mark.parametrize("full_export", [False, True])
 @pytest.mark.parametrize("ready", [False, True])

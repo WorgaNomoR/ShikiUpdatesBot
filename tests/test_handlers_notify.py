@@ -383,7 +383,7 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
         },
         {
             "id": 124,
-            "description": "Удалено из списка",
+            "description": "Сброшено число эпизодов",
             "target": {"id": 78, "type": "Anime", "kind": "tv"},
         },
     ]
@@ -406,6 +406,53 @@ async def test_ignored_events_are_seen_without_send_stats_or_warning(
     assert saved == [{999, 123, 124}]
     assert sent == []
     assert returned_cur["events"] == expected_cur["events"]
+    assert not caplog.messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,label", [("tv", "аниме"), ("manga", "манга"), ("novel", "ранобэ")])
+@pytest.mark.parametrize("mixed", [False, True])
+async def test_new_removal_acquisition_delivers_once_in_source_order(backup_env, monkeypatch, caplog, kind, label, mixed):
+    from unittest.mock import AsyncMock
+
+    from catchup_digest import split_html
+    from notification_delivery import dispatch_notifications
+
+    storage.save_stats_current(_empty_cur(), strict=True)
+    storage.save_seen_ids({1})
+    storage.save_subscribers({10: "only"})
+    monkeypatch.setattr("messages.random.choice", lambda bank: bank[0])
+    target = {"id": 77, "kind": kind, "name": "Title", "url": "/animes/77" if kind == "tv" else "/mangas/77"}
+    rows = [{"id": 3, "description": "Удалено из списка", "created_at": "2026-04-01T00:00:00Z", "target": target}]
+    if mixed:
+        rows = [
+            {**rows[0], "id": 4, "description": "Просмотрено и оценено на 8"},
+            rows[0], rows[0],
+            {**rows[0], "id": 2, "description": "Добавлено в список"},
+        ]
+    _patch_history(monkeypatch, rows)
+    bot = AsyncMock()
+    with caplog.at_level(logging.WARNING):
+        seen, cur = await handlers.check_and_notify(bot, set(), None)
+    saved = storage.load_event_journal()
+    assert seen == ({1, 2, 3, 4} if mixed else {1, 3})
+    assert [event["history_id"] for event in saved["events"]] == ([2, 3, 4] if mixed else [3])
+    expected = [handlers.build_message(handlers.history_entry_from_event(event), normalized=event) for event in saved["events"]]
+    if mixed:
+        expected = [split_html(text)[0] for text in expected]
+    await dispatch_notifications(bot)
+    bot.send_message.assert_awaited_once()
+    text = bot.send_message.await_args.kwargs["text"]
+    assert ("Что нового у" in text) is mixed
+    assert text.count(f"({label})") == len(expected)
+    assert text.count(expected[1] if mixed else expected[0]) == 1
+    assert [text.index(message) for message in expected] == sorted(text.index(message) for message in expected)
+    if mixed:
+        plan = saved["outbox"]["plans"][0]
+        assert plan["version"] == 2
+        assert plan["units"][0]["events"] == [[1, 2], [2, 3], [3, 4]]
+    assert [event["event"] for event in cur["events"]] == (["planned", "completed"] if mixed else [])
+    assert not storage.ACHIEVEMENTS_FILE.exists() and not storage.BOT_ACHIEVEMENTS_FILE.exists()
     assert not caplog.messages
 
 
