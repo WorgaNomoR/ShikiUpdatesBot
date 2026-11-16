@@ -184,6 +184,17 @@ def journal_factory():
 
 
 @pytest.fixture
+def removal_journal_factory(journal_factory):
+    """Удаление использует общий журнал без статистического события."""
+    def factory(count=1, processed=0):
+        journal = journal_factory(count=count, processed=processed)
+        for event in journal["events"]:
+            event.update(event_type="list_removed", description="Удалено из списка", score=None)
+        return journal
+    return factory
+
+
+@pytest.fixture
 def achievement_row_factory():
     """Полный source row; source timestamps не означают unlock time."""
     def factory(family="animelist", level=1, **changes):

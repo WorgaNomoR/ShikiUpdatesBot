@@ -69,17 +69,29 @@
     "Прочитана манга",
     "Сброшено число эпизодов",
     "Сброшено число томов и глав",
-    "Удалено из списка",
     "Watched movie",
     "Watched all episodes",
     "Read novel",
     "Read manga",
     "Reset episodes count",
-    "Reset volumes and chapters count",
-    "Removed from list"
+    "Reset volumes and chapters count"
   ],
   "score_removed_descriptions": [
     "Отменена оценка",
     "Score removed"
-  ]
+  ],
+  "list_removal": {
+    "source": "Minimal fields confirmed by issue #211: public WNR API on 2026-10-16; unrecorded fields omitted",
+    "entry": {
+      "id": 487493389,
+      "description": "Удалено из списка",
+      "target": {
+        "id": 40221,
+        "name": "Kami no Tou",
+        "russian": "Башня Бога",
+        "url": "/animes/40221-kami-no-tou",
+        "kind": "tv"
+      }
+    }
+  }
 }

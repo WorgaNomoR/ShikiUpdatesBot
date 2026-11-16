@@ -64,6 +64,27 @@ def _project(events, cur=None):
     return cur
 
 
+@pytest.mark.parametrize("when", ["2026-04-05T00:00:00Z", "2026-01-05T00:00:00Z", None, "2028-01-01T00:00:00Z"])
+def test_list_removal_preserves_all_source_statistics_and_compaction(journal_factory, when):
+    events = [
+        _event(1, "2026-04-01T00:00:00Z", "completed", 8),
+        _event(2, "2026-04-02T00:00:00Z", "dropped"),
+        _event(3, "2026-04-03T00:00:00Z", "rewatching"),
+        _event(4, when, "list_removed"),
+    ]
+    before = _project(events[:3])
+    after = _project(events)
+    assert after["event_time"] == before["event_time"]
+    assert after["events"] == before["events"]
+    journal = journal_factory(count=0, processed=0)
+    journal.update(version=2, processed_seq=4, baseline_ids=[], catchup=None, events=[{**event, "seq": seq} for seq, event in enumerate(events, 1)])
+    compacted = compact_source_history(journal, after, 4)
+    validate_source_base(compacted)
+    validate_event_time(after, compacted)
+    assert [row[0] for row in compacted["source_base"]["ids"]] == [1, 2, 3, 4]
+    assert all(event["event_type"] != "list_removed" for source in compacted["source_base"]["periods"].values() for event in source)
+
+
 @pytest.mark.parametrize(
     ("source", "period"),
     [

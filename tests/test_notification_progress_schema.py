@@ -33,6 +33,44 @@ def _pair(factory):
     return journal, history_document(journal, "c" * 32), progress_document(journal, "c" * 32)
 
 
+@pytest.mark.parametrize("version,split,staged", [
+    (1, False, False), (2, False, False), (3, False, False), (3, True, False),
+    (2, False, True), (3, False, True), (3, True, True),
+])
+def test_removal_and_legacy_ignored_semantics_roundtrip(journal_factory, version, split, staged):
+    from history_catchup import new_acquisition
+
+    journal = journal_factory(count=2)
+    journal["events"][0].update(event_type="ignored", description="Удалено из списка", score=None)
+    journal["events"][1].update(event_type="list_removed", description="Removed from list", score=None)
+    if version >= 2:
+        journal.update(version=2, catchup=None)
+    if staged:
+        journal["events"], events = [], journal["events"]
+        journal["catchup"] = new_acquisition()
+        journal["catchup"].update(staged=events, frontier=[3, 2], head_ids=[3, 2])
+    if version == 3:
+        journal = migrate_outbox(journal, 0)
+    before = deepcopy(journal)
+    if split:
+        raw = compact_json(history_document(journal, "c" * 32)).encode()
+        progress = compact_json(progress_document(journal, "c" * 32)).encode()
+    else:
+        raw, progress = journal_json(journal).encode(), None
+    assert parse_recovery_journal(raw, progress) == before
+    assert journal == before
+
+
+@pytest.mark.parametrize("base_version,physical_version", [(1, 5), (2, 6)])
+def test_removal_suffix_preserves_compact_source_formats(source_index_factory, base_version, physical_version):
+    journal, _ = source_index_factory(prefix=4, version=base_version, facts=False)
+    journal["events"][-1].update(event_type="list_removed", description="Удалено из списка", score=None)
+    history = history_document(journal, "c" * 32)
+    progress = progress_document(journal, "c" * 32)
+    assert history["version"] == physical_version
+    assert parse_recovery_journal(compact_json(history).encode(), compact_json(progress).encode()) == journal
+
+
 @pytest.mark.parametrize("version", [1, 2, 3])
 def test_split_roundtrip_preserves_every_outbox_version(journal_factory, version):
     journal, history, progress = _pair(journal_factory)

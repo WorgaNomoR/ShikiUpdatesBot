@@ -285,6 +285,7 @@ def test_score_set_has_own_notification_and_is_not_completion(monkeypatch):
     ("читаю", "watching", "?"),
     ("перечитываю", "rewatching", "?"),
     ("брошено", "dropped", "?"),
+    ("Удалено из списка", "list_removed", "?"),
     ("прочитано", "completed_no_score", "?"),
     ("прочитано и оценено на 3", "completed_score_low", 3),
     ("прочитано и оценено на 6", "completed_score_mid", 6),
@@ -456,6 +457,7 @@ def _history_description(bank_key, message_key):
         "rewatching": "перечитываю" if reading else "пересматриваю",
         "on_hold": "отложено",
         "dropped": "брошено",
+        "list_removed": "Удалено из списка",
         "completed_no_score": "прочитано" if reading else "просмотрено",
         "completed_score_low": (
             "прочитано и оценено на 3" if reading
@@ -1204,6 +1206,79 @@ def test_classify_official_non_product_descriptions_as_ignored(history_event_fix
 def test_classify_rating_removal_as_silent_state_correction(history_event_fixtures):
     for description in history_event_fixtures["score_removed_descriptions"]:
         assert classify_event(description) == "score_removed"
+
+
+@pytest.mark.parametrize("description", [
+    "Удалено из списка", "Removed from list",
+    "  УДАЛЕНО   из\nсписка  ", "<b>Удалено</b> из списка",
+    "<span>Удалено из списка</span>", " ReMoVeD  FROM\tLIST ",
+])
+def test_classify_exact_cleaned_list_removal(description):
+    assert classify_event(description) == "list_removed"
+
+
+@pytest.mark.parametrize("description", [
+    "Не удалено из списка", "Удалено из списка навсегда",
+    "Removed from list yesterday", "Not removed from list",
+])
+def test_list_removal_does_not_match_substrings(description):
+    assert classify_event(description) == "unknown"
+
+
+def test_live_shaped_list_removal_normalizes_without_target_type(history_event_fixtures):
+    entry = history_event_fixtures["list_removal"]["entry"]
+    before = deepcopy(entry)
+    event = messages.normalize_history_event(entry, "2026-10-17T00:00:00+00:00")
+    assert event["history_id"] == 487493389
+    assert event["event_type"] == "list_removed"
+    assert (event["media"], event["kind"], event["target_id"], event["relevant"]) == ("anime", "tv", "40221", True)
+    assert event["score"] is None and event["score_change"] is None
+    assert entry == before
+
+
+@pytest.mark.parametrize("bank_key", HISTORY_MEDIA_CASES)
+@pytest.mark.parametrize("name,mode,verb", [
+    ("Сергей", "auto", "удалил"), ("Анна", "auto", "удалила"),
+    ('A<&"😀', "female", "удалила"), ("WNR", "none", "удалил"),
+])
+def test_every_list_removal_template_uses_grammar_safe_links_and_own_bank(monkeypatch, bank_key, name, mode, verb):
+    target_type, kind, label, url = HISTORY_MEDIA_CASES[bank_key]
+    context = build_display_name_context(name, mode)
+    monkeypatch.setattr("messages.DISPLAY_NAME_CONTEXT", context)
+    entry = make_entry("Removed from list", '<Title & "😀">', url + '?a=1&b="2"', target_type=target_type, kind=kind)
+    entry["id"] = 1
+    entry["target"]["score"] = "9.99"
+    event = messages.normalize_history_event(entry, "2026-10-17T00:00:00+00:00")
+    bank = messages.MESSAGES[bank_key]["list_removed"]
+    assert len(bank) >= 6 and len(set(bank)) == len(bank)
+    for template in bank:
+        def choose(actual):
+            assert actual is bank
+            return template
+        monkeypatch.setattr("messages.random.choice", choose)
+        text = build_message(messages.history_entry_from_event(event), normalized=event)
+        assert '&lt;Title &amp; &quot;😀&quot;&gt;' in text
+        assert f'href="{messages.SHIKI_BASE_URL}{url}?a=1&amp;b=&quot;2&quot;"' in text
+        assert text.count(f"({label})") == 1
+        assert "из списка" in text or re.search(r"покинул[ао] список", text)
+        assert "{" not in text and "}" not in text and "/10" not in text
+        assert "дроп" not in text.casefold() and "бросил" not in text.casefold()
+        if "{g:удалил|удалила}" in template:
+            assert f"{h(name)} {verb}" in text
+
+
+@pytest.mark.parametrize("bank_key", HISTORY_MEDIA_CASES)
+def test_list_removal_agrees_with_media_gender(bank_key):
+    label = HISTORY_MEDIA_CASES[bank_key][2]
+    expected = "удалена" if bank_key == "manga" else "удалено"
+    forbidden = ("удалено", "вычеркнуто", "покинуло") if bank_key == "manga" else ("удалена", "вычеркнута", "покинула")
+    texts = [
+        _strip_html(render_message_template(template, FALLBACK_NAME_CONTEXT, media_key=bank_key, title="AuditTitle"))
+        for template in messages.MESSAGES[bank_key]["list_removed"]
+    ]
+    for text in texts:
+        assert all(f"AuditTitle ({label}) {verb}" not in text for verb in forbidden)
+    assert any(f"AuditTitle ({label}) {expected}" in text for text in texts)
 
 
 @pytest.mark.parametrize("description", [
