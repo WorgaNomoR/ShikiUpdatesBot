@@ -101,7 +101,7 @@ async def test_coalescing_across_page_seam_waits_for_completed_acquisition(acqui
         if row["id"] in {3, 4}:
             row["target"]["id"] = 11
             row["description"] = "Добавлено в список" if row["id"] == 3 else description
-            row["created_at"] = "2026-04-01T00:00:00.990+00:00" if row["id"] == 3 else "2026-04-01T00:00:01.010+00:00"
+            row["created_at"] = "2026-04-01T00:00:00.990+00:00" if row["id"] == 3 else "2026-04-01T00:00:02.283+00:00"
     calls = []
     unavailable = [True]
 
@@ -125,7 +125,7 @@ async def test_coalescing_across_page_seam_waits_for_completed_acquisition(acqui
     ready = storage.load_event_journal()
     assert ready["catchup"] is None and ready["processed_seq"] == 5
     plan = ready["outbox"]["plans"][0]
-    assert plan["version"] == 4
+    assert plan["version"] == 5
     assert {"events": [[2, 3], [3, 4]], "notification_seq": 3} in plan["entries"]
     assert plan["events"] == [[seq, seq + 1] for seq in range(1, 6)]
     assert calls == [1, 2, 1, 2, 1]

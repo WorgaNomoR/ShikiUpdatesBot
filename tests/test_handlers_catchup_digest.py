@@ -27,6 +27,40 @@ def _install(journal):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [2, 3])
+async def test_public_1293ms_pair_uses_second_ordinary_message(digest_env, journal_factory, monkeypatch, count):
+    from messages import normalize_history_event
+
+    journal = journal_factory(count=count)
+    for seq, (history_id, description, timestamp) in enumerate([
+        (489416037, "Добавлено в список", "2026-11-05T18:53:46.054Z"),
+        (489416042, "Смотрю", "2026-11-05T18:53:47.347Z"),
+    ], 1):
+        event = normalize_history_event({
+            "id": history_id, "description": description, "created_at": timestamp,
+            "target": {"id": 33095, "kind": "tv", "name": "Shouwa Genroku Rakugo Shinjuu: Sukeroku Futatabi-hen"},
+        }, "2026-11-06T00:00:00+00:00")
+        event["seq"] = seq
+        journal["events"][seq - 1] = event
+    _install(journal)
+    monkeypatch.setattr("messages.random.choice", lambda bank: bank[0])
+    last = journal["events"][1]
+    ordinary = handlers.build_message(handlers.history_entry_from_event(last), normalized=last)
+    await handlers._drain_history_journal(AsyncMock())
+    plan = storage.load_event_journal()["outbox"]["plans"][0]
+    assert plan["version"] == 5
+    assert plan["entries"][0] == {"events": [[1, 489416037], [2, 489416042]], "notification_seq": 2}
+    bot = AsyncMock()
+    await notification_delivery.dispatch_notifications(bot)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [unit["payload"]["text"] for unit in plan["units"]]
+    text = bot.send_message.await_args.kwargs["text"]
+    assert ordinary in text
+    if count == 2:
+        assert text == ordinary
+    assert ("Что нового у" in text) == (count == 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [2, 3])
 @pytest.mark.parametrize("status", ["watching", "completed", "dropped", "on_hold", "rewatching"])
 async def test_coalescing_counts_entries_and_keeps_independent_quarters(digest_env, coalescing_journal_factory, monkeypatch, count, status):
     journal = coalescing_journal_factory(count=count, status=status)
@@ -37,7 +71,7 @@ async def test_coalescing_counts_entries_and_keeps_independent_quarters(digest_e
     saved = storage.load_event_journal()
     assert saved["events"] == journal["events"]
     plan = saved["outbox"]["plans"][0]
-    assert plan["version"] == 4
+    assert plan["version"] == 5
     assert plan["entries"][0] == {"events": [[1, 2], [2, 3]], "notification_seq": 2}
     bot = AsyncMock()
     await notification_delivery.dispatch_notifications(bot)
@@ -75,7 +109,7 @@ async def test_coalescing_reuses_normalized_status_without_description_parsing(d
     text = plan["units"][0]["payload"]["text"]
     assert f"({suffix})" in text and "&lt;Title &amp; &quot;😀&quot;&gt;" in text
     assert f'https://shikimori.io/{media}s/11' in text
-    assert split_html(ordinary)[0] in text and plan["version"] == 4
+    assert split_html(ordinary)[0] in text and plan["version"] == 5
     assert plan["entries"][0] == {"events": [[1, 2], [2, 3]], "notification_seq": 2}
     assert ("8/10" in ordinary) == (score == 8 and status == "completed")
     assert "Полностью другое" not in text
@@ -146,7 +180,43 @@ async def test_old_frozen_plan_with_qualifying_pair_is_never_regrouped(digest_en
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [3, 4])
+async def test_legacy_entry_plan_keeps_newly_qualifying_singletons_on_cold_resume(
+    digest_env, coalescing_journal_factory, monkeypatch, version,
+):
+    from catchup_digest import render_digest
+    from notification_outbox import (
+        migrate_outbox,
+        notification_entries,
+        prepare_digest,
+    )
+
+    journal = migrate_outbox(coalescing_journal_factory(count=4, gap_us=20_000), 0)
+    first, last = journal["events"][2:]
+    first.update(event_type="planned", score=None, created_at="2026-04-01T00:00:00+00:00", event_at="2026-04-01T00:00:00+00:00")
+    last.update(event_type="watching", target_id=first["target_id"], created_at="2026-04-01T00:00:01.293000+00:00", event_at="2026-04-01T00:00:01.293000+00:00")
+    assert [len(entry) for entry in notification_entries(journal["events"])] == [2, 2]
+    entries = [journal["events"][:2], [first], [last]]
+    parts = render_digest(journal["events"], ordinary=lambda event: f"Старый статус {event['seq']}", heading="Старый заголовок", entries=entries)
+    journal = prepare_digest(journal, parts, {10: "b" * 32}, 1800000000.0, entries=entries)
+    journal["outbox"]["plans"][0]["version"] = version
+    _install(journal)
+    state = storage.load_subscriber_state(strict_subscribers=True)
+    state.notification_memberships = {10: "b" * 32}
+    storage.save_subscriber_state(state)
+    previous = deepcopy(journal["outbox"]["plans"])
+    storage._journal_history_cache = None
+    storage._journal_progress_cache = None
+    monkeypatch.setattr("notification_delivery.time.time", lambda: 1800000000.0)
+    await handlers._drain_history_journal(AsyncMock())
+    assert storage.load_event_journal()["outbox"]["plans"] == previous
+    bot = AsyncMock()
+    await notification_delivery.dispatch_notifications(bot)
+    assert [call.kwargs["text"] for call in bot.send_message.await_args_list] == [unit["payload"]["text"] for unit in previous[0]["units"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 async def test_new_status_plan_preserves_mixed_legacy_work_and_attempts(
     digest_env, legacy_digest_factory, digest_factory, coalescing_factory, coalescing_journal_factory, version,
 ):
@@ -155,7 +225,7 @@ async def test_new_status_plan_preserves_mixed_legacy_work_and_attempts(
     journal = (
         legacy_digest_factory(ready=False) if version == 1
         else digest_factory(ready=False) if version == 2
-        else coalescing_factory(ready=False, version=3)
+        else coalescing_factory(ready=False, version=version)
     )
     _install(journal)
     state = storage.load_subscriber_state(strict_subscribers=True)
@@ -180,7 +250,7 @@ async def test_new_status_plan_preserves_mixed_legacy_work_and_attempts(
     saved = storage.load_event_journal()
     assert saved["outbox"]["plans"][:-1] == previous
     new = saved["outbox"]["plans"][-1]
-    assert [plan["version"] for plan in saved["outbox"]["plans"]] == [version, 4]
+    assert [plan["version"] for plan in saved["outbox"]["plans"]] == [version, 5]
     assert new["entries"] == [{"events": [[offset + 1, offset + 2], [offset + 2, offset + 3]], "notification_seq": offset + 2}]
 
 

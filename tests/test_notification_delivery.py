@@ -1289,7 +1289,7 @@ async def test_split_coalesced_status_keeps_both_ids_owed_until_every_part_finis
 
     await _enqueue(factory, count=3 if summary else 2, digest=True)
     plan = storage.load_event_journal()["outbox"]["plans"][0]
-    assert plan["version"] == 4 and plan["presentation"] == ("digest" if summary else "ordinary")
+    assert plan["version"] == 5 and plan["presentation"] == ("digest" if summary else "ordinary")
     units = plan["units"]
     pair_parts = [unit for unit in units if 0 in unit["entries"]]
     assert len(pair_parts) > 2 and all(unit["events"][:2] == [[1, 2], [2, 3]] for unit in pair_parts)
