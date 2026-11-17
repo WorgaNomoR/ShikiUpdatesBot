@@ -109,8 +109,8 @@ def notification_event(event: dict) -> bool:
     return event["relevant"] and event["event_type"] not in {"ignored", "score_removed"}
 
 
-def coalescible_pair(first: dict, last: dict, *, plan_version: int = 4) -> bool:
-    """Соседние исходники; v3 сохраняет прежнее правило только completed."""
+def coalescible_pair(first: dict, last: dict, *, plan_version: int = 5) -> bool:
+    """V5: до двух секунд; v3/v4 сохраняют одну секунду и свои статусы."""
     statuses = {"completed"} if plan_version == 3 else {"watching", "completed", "dropped", "on_hold", "rewatching"}
     if (
         first["event_type"] != "planned" or last["event_type"] not in statuses
@@ -129,7 +129,7 @@ def coalescible_pair(first: dict, last: dict, *, plan_version: int = 4) -> bool:
             if source.utcoffset() is None or source > datetime.fromisoformat(event["observed_at"]):
                 return False
             times.append(source)
-        return timedelta(0) <= times[1] - times[0] <= timedelta(seconds=1)
+        return timedelta(0) <= times[1] - times[0] <= timedelta(seconds=2 if plan_version == 5 else 1)
     except (TypeError, ValueError, OverflowError):
         return False
 
@@ -255,7 +255,7 @@ def prepare_digest(
     box = deepcopy(journal["outbox"])
     box.update(version=4, completed_seq=completed_seq(box))
     box.setdefault("plans", []).append({
-        "version": 4 if entries is not None else 2, "plan_id": identity, "start_seq": start, "end_seq": end,
+        "version": 5 if entries is not None else 2, "plan_id": identity, "start_seq": start, "end_seq": end,
         "events": [[seq, event_at_seq(journal, seq)["history_id"]] for seq in range(start, end + 1)],
         **({"entries": [
             {"events": [[event["seq"], event["history_id"]] for event in entry], "notification_seq": entry[-1]["seq"]}
@@ -644,8 +644,8 @@ def _validate_plans(journal: dict) -> None:
         if (
             not isinstance(plan, dict)
             or set(plan) != {"version", "plan_id", "start_seq", "end_seq", "events", "units"}
-            | ({"entries", "presentation"} if plan.get("version") in (3, 4) else set())
-            or type(plan["version"]) is not int or plan["version"] not in {1, 2, 3, 4}
+            | ({"entries", "presentation"} if plan.get("version") in (3, 4, 5) else set())
+            or type(plan["version"]) is not int or plan["version"] not in {1, 2, 3, 4, 5}
             or not _identity(plan["plan_id"]) or plan["plan_id"] in identities
             or type(plan["start_seq"]) is not int or type(plan["end_seq"]) is not int
             or not max(previous_end, prefix_seq(journal)) < plan["start_seq"] <= plan["end_seq"] <= event_count(journal)
@@ -666,7 +666,7 @@ def _validate_plans(journal: dict) -> None:
             raise OutboxStateError("outbox_plan_threshold")
         expected = [[event["seq"], event["history_id"]] for event in eligible]
         by_seq = {event["seq"]: event for event in eligible}
-        if plan["version"] in {3, 4}:
+        if plan["version"] in {3, 4, 5}:
             _validate_entries(plan, by_seq, expected)
             expected = list(range(len(plan["entries"])))
         coverage = []
@@ -676,12 +676,12 @@ def _validate_plans(journal: dict) -> None:
             if (
                 not isinstance(unit, dict)
                 or set(unit) != {"unit_id", "seq", "kind", "events", "created_at", "expires_at", "payload", "recipients"}
-                | ({"entries"} if plan["version"] in {3, 4} else set())
+                | ({"entries"} if plan["version"] in {3, 4, 5} else set())
                 or unit["unit_id"] != f"{plan['plan_id']}:{index}"
                 or type(unit["seq"]) is not int
                 or unit["kind"] not in {"digest", "ordinary"}
                 or plan["version"] == 2 and unit["kind"] != "digest"
-                or plan["version"] in {3, 4} and unit["kind"] != plan["presentation"]
+                or plan["version"] in {3, 4, 5} and unit["kind"] != plan["presentation"]
                 or not isinstance(unit["events"], list) or not unit["events"]
                 or not _time(unit["created_at"]) or not _time(unit["expires_at"])
                 or unit["expires_at"] != unit["created_at"] + LIFETIME
@@ -697,10 +697,10 @@ def _validate_plans(journal: dict) -> None:
                     or plan["version"] == 1 and (by_seq[ref[0]]["event_type"] == "unknown") != (unit["kind"] == "ordinary")
                 ):
                     raise OutboxStateError("outbox_plan_coverage")
-                if plan["version"] not in {3, 4} and (not coverage or coverage[-1] != ref):
+                if plan["version"] not in {3, 4, 5} and (not coverage or coverage[-1] != ref):
                     coverage.append(ref)
                 previous_seq = ref[0]
-            if plan["version"] in {3, 4}:
+            if plan["version"] in {3, 4, 5}:
                 refs = unit["entries"]
                 if (
                     not isinstance(refs, list) or not refs
@@ -713,7 +713,7 @@ def _validate_plans(journal: dict) -> None:
                 for ref in refs:
                     if not coverage or coverage[-1] != ref:
                         coverage.append(ref)
-            if unit["seq"] != unit["events"][0][0] or plan["version"] not in {3, 4} and unit["kind"] == "ordinary" and len(unit["events"]) != 1:
+            if unit["seq"] != unit["events"][0][0] or plan["version"] not in {3, 4, 5} and unit["kind"] == "ordinary" and len(unit["events"]) != 1:
                 raise OutboxStateError("outbox_plan_order")
             payload = unit["payload"]
             if (

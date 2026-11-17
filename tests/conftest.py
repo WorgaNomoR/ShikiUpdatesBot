@@ -2,6 +2,10 @@
 # Copyright (C) 2026  WorgaNomoR
 import os
 import tempfile
+from datetime import (
+    datetime,
+    timedelta,
+)
 from functools import partial
 
 import dotenv
@@ -221,12 +225,13 @@ def achievement_state_factory(achievement_row_factory):
 
 @pytest.fixture
 def coalescing_journal_factory(journal_factory):
-    """Новая порция с соседней парой на границе секунды и квартала."""
-    def factory(count=2, *, long_title=False, status="completed"):
+    """Новая порция с соседней парой через 1,293 секунды на границе квартала."""
+    def factory(count=2, *, long_title=False, status="completed", gap_us=1_293_000):
         journal = journal_factory(count=count)
         first, last = journal["events"][:2]
         first.update(event_type="planned", score=None, created_at="2026-03-31T23:59:59.990+00:00", event_at="2026-03-31T23:59:59.990000+00:00")
-        last.update(event_type=status, target_id=first["target_id"], created_at="2026-04-01T00:00:00.010+00:00", event_at="2026-04-01T00:00:00.010000+00:00")
+        timestamp = (datetime.fromisoformat(first["event_at"]) + timedelta(microseconds=gap_us)).isoformat()
+        last.update(event_type=status, target_id=first["target_id"], created_at=timestamp, event_at=timestamp)
         if long_title:
             last["title"].update(name="😀<&>" * 2500, url="/animes/11")
         return journal
@@ -236,7 +241,7 @@ def coalescing_journal_factory(journal_factory):
 
 @pytest.fixture
 def coalescing_factory(coalescing_journal_factory):
-    """Планы v3/v4 с явно связанными источниками и продолжениями статуса."""
+    """Планы v3/v4/v5 с прежним или новым интервалом и продолжениями статуса."""
     from unittest.mock import patch
 
     from catchup_digest import (
@@ -256,8 +261,10 @@ def coalescing_factory(coalescing_journal_factory):
         validate_outbox,
     )
 
-    def factory(*, ready=True, audience=1, long_title=False, count=10, status="completed", version=4):
-        journal = migrate_outbox(coalescing_journal_factory(count=count, long_title=long_title, status=status), 0)
+    def factory(*, ready=True, audience=1, long_title=False, count=10, status="completed", version=5):
+        journal = migrate_outbox(coalescing_journal_factory(
+            count=count, long_title=long_title, status=status, gap_us=20_000 if version < 5 else 1_293_000,
+        ), 0)
         entries = notification_entries(journal["events"])
         def ordinary(event):
             return build_message(history_entry_from_event(event), normalized=event)
@@ -277,12 +284,13 @@ def coalescing_factory(coalescing_journal_factory):
     return factory
 
 
-@pytest.fixture(params=["digest", "coalesced_v3", "coalesced_v4"])
+@pytest.fixture(params=["digest", "coalesced_v3", "coalesced_v4", "coalesced_v5"])
 def frozen_history_factory(request, digest_factory, coalescing_factory):
     """Одна матрица archive/reserve contract для старого и нового frozen plan."""
     if request.param == "digest":
         return digest_factory
-    return partial(coalescing_factory, version=3) if request.param == "coalesced_v3" else partial(coalescing_factory, status="watching")
+    version = int(request.param.rsplit("v", 1)[1])
+    return partial(coalescing_factory, version=version, status="completed" if version == 3 else "watching")
 
 
 @pytest.fixture(params=["ordinary", "coalesced", "watching"])

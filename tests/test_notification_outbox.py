@@ -41,9 +41,14 @@ from notification_outbox import (
 @pytest.mark.parametrize("first,last,paired", [
     ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:00+00:00", True),
     ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:01+00:00", True),
-    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:01.000001+00:00", False),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:01.000001+00:00", True),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:01.293+00:00", True),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:02+00:00", True),
+    ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:02.000001+00:00", False),
     ("2026-04-01T00:00:00.999+00:00", "2026-04-01T00:00:01.001+00:00", True),
     ("2026-04-01T03:00:00.990+03:00", "2026-04-01T00:00:01.990+00:00", True),
+    ("2026-04-01T03:00:00.990+03:00", "2026-04-01T00:00:02.990+00:00", True),
+    ("2026-04-01T03:00:00.990+03:00", "2026-04-01T00:00:02.990001+00:00", False),
     ("2026-04-01T00:00:01.000001+00:00", "2026-04-01T00:00:01+00:00", False),
     ("2026-04-01T00:00:00+00:00", "2026-04-01T00:00:15+00:00", False),
     (None, "2026-04-01T00:00:00+00:00", False),
@@ -75,7 +80,7 @@ def test_coalescing_uses_full_trusted_source_interval(coalescing_journal_factory
     ("event_at", "2026-04-01T00:00:00+24:00"),
     ("event_at", 42),
 ])
-@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching")])
+@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching"), (5, "watching")])
 def test_coalescing_rejects_invalid_timestamps_without_mutation(coalescing_factory, index, field, value, version, status):
     journal = coalescing_factory(count=2, version=version, status=status)
     events = journal["events"]
@@ -130,7 +135,7 @@ def test_coalescing_checks_adjacency_before_filtering(coalescing_journal_factory
 
 
 @pytest.mark.parametrize("damage", ["survivor", "missing_source", "pair_order", "target", "time", "part_source", "continuation_source", "part_entry", "boolean", "presentation", "extra"])
-@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching")])
+@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching"), (5, "watching")])
 def test_coalescing_mapping_is_strict_in_runtime_and_import(coalescing_factory, damage, version, status):
     journal = coalescing_factory(count=2, long_title=True, version=version, status=status)
     plan = journal["outbox"]["plans"][0]
@@ -163,7 +168,7 @@ def test_coalescing_mapping_is_strict_in_runtime_and_import(coalescing_factory, 
         parse_event_journal(json.dumps(journal).encode())
 
 
-@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching")])
+@pytest.mark.parametrize("version,status", [(3, "completed"), (4, "watching"), (5, "watching")])
 def test_coalesced_retention_pins_both_sources_until_last_part_terminal(coalescing_factory, version, status):
     journal = coalescing_factory(count=2, long_title=True, version=version, status=status)
     units = journal["outbox"]["plans"][0]["units"]
@@ -209,15 +214,23 @@ def test_coalescing_never_recursively_collapses_longer_chains(coalescing_journal
     assert events == before
 
 
+@pytest.mark.parametrize("version", [3, 4, 5])
 @pytest.mark.parametrize("status", ["watching", "completed", "dropped", "on_hold", "rewatching"])
-def test_saved_pair_policy_is_explicitly_versioned(coalescing_factory, status):
+@pytest.mark.parametrize("gap_us", [0, 1_000_000, 1_000_001, 1_293_000, 2_000_000, 2_000_001])
+def test_saved_pair_policy_is_explicitly_versioned(coalescing_factory, version, status, gap_us):
+    from datetime import (
+        datetime,
+        timedelta,
+    )
+
     journal = coalescing_factory(count=2, status=status)
-    assert journal["outbox"]["plans"][0]["version"] == 4
-    raw = journal_json(journal).encode()
-    assert parse_event_journal(raw) == journal
-    journal["outbox"]["plans"][0]["version"] = 3
+    assert journal["outbox"]["plans"][0]["version"] == 5
+    journal["outbox"]["plans"][0]["version"] = version
+    first, last = journal["events"]
+    last["event_at"] = (datetime.fromisoformat(first["event_at"]) + timedelta(microseconds=gap_us)).isoformat()
+    last["created_at"] = last["event_at"]
     before = deepcopy(journal)
-    if status == "completed":
+    if gap_us <= (2_000_000 if version == 5 else 1_000_000) and (version != 3 or status == "completed"):
         validate_outbox(journal)
         assert parse_event_journal(journal_json(journal).encode()) == journal
     else:
@@ -228,7 +241,7 @@ def test_saved_pair_policy_is_explicitly_versioned(coalescing_factory, status):
     assert journal == before
 
 
-@pytest.mark.parametrize("version", [None, True, False, 4.0, [], {}, "4", 0, 5])
+@pytest.mark.parametrize("version", [None, True, False, 4.0, 5.0, [], {}, "4", "5", 0, 6])
 def test_saved_pair_rejects_invalid_version_without_mutation(coalescing_factory, version):
     journal = coalescing_factory(count=2)
     journal["outbox"]["plans"][0]["version"] = version

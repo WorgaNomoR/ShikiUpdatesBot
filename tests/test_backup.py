@@ -3994,33 +3994,43 @@ async def test_digest_restore_rolls_back_exact_damaged_bytes(backup_env, frozen_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("full_export", [False, True])
 @pytest.mark.parametrize("ready", [False, True])
-async def test_mixed_notification_policies_roundtrip_and_reject_v3_relabelling(
-    backup_env, coalescing_factory, coalescing_journal_factory, full_export, ready,
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4])
+async def test_mixed_notification_policies_roundtrip_and_reject_legacy_relabelling(
+    backup_env, coalescing_factory, coalescing_journal_factory, full_export, ready, old_version,
 ):
-    from catchup_digest import render_ordinary_entries
+    from catchup_digest import (
+        render_digest,
+        render_ordinary_entries,
+    )
     from event_time_stats import (
         ensure_event_time,
         project_event,
     )
-    from messages import (
-        build_message,
-        history_entry_from_event,
-    )
     from notification_outbox import (
         begin_attempt,
         enqueue,
+        migrate_outbox,
         prepare_digest,
     )
 
-    journal = coalescing_factory(count=2, version=3)
+    if old_version in {1, 2}:
+        journal = migrate_outbox(coalescing_journal_factory(count=11, status="watching"), 0)
+        parts = render_digest(journal["events"], ordinary=lambda event: f"Старое событие {event['seq']}", heading="Старый заголовок")
+        journal = prepare_digest(journal, parts, {10: "b" * 32}, 1800000000.0)
+        journal["outbox"]["plans"][0]["version"] = old_version
+        for event in journal["events"]:
+            journal = enqueue(journal, event, None, {}, 1800000000.0)
+    else:
+        journal = coalescing_factory(count=2, version=old_version)
     old = journal["outbox"]["plans"][0]["units"][0]
     begin_attempt(old["recipients"]["10"], old["created_at"])
+    offset = len(journal["events"])
     pair = coalescing_journal_factory(status="watching")["events"]
     for event in pair:
-        event["seq"] += 2
-        event["history_id"] += 2
+        event["seq"] += offset
+        event["history_id"] += offset
     journal["events"].extend(pair)
-    parts = render_ordinary_entries([pair], ordinary=lambda event: build_message(history_entry_from_event(event), normalized=event))
+    parts = render_ordinary_entries([pair], ordinary=lambda event: f"Новый статус {event['seq']}")
     journal = prepare_digest(journal, parts, {10: "b" * 32}, 1800000000.0, entries=[pair], presentation="ordinary")
     if ready:
         for event in pair:
@@ -4035,12 +4045,12 @@ async def test_mixed_notification_policies_roundtrip_and_reject_v3_relabelling(
     archive, _ = await backup._build_backup_zip(full_export=full_export)
     await backup.restore_backup_zip(archive)
     assert storage.load_event_journal() == journal
-    assert [plan["version"] for plan in journal["outbox"]["plans"]] == [3, 4]
+    assert [plan["version"] for plan in journal["outbox"]["plans"]] == [old_version, 5]
 
     with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
         members = {name: zipped.read(name) for name in zipped.namelist()}
     payload = json.loads(members["notification_progress.json"])
-    payload["outbox"]["plans"][1]["version"] = 3
+    payload["outbox"]["plans"][1]["version"] = 4
     members["notification_progress.json"] = json.dumps(payload).encode()
     files = [storage.EVENT_JOURNAL_FILE, storage.notification_progress_file(), storage.STATS_CURRENT_FILE]
     before = {path: path.read_bytes() for path in files}
