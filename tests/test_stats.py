@@ -4132,7 +4132,6 @@ async def test_sync_preserves_aliased_metadata_when_fetch_fails(monkeypatch, can
     meta = AsyncMock(side_effect=OSError("metadata unavailable"))
     monkeypatch.setattr("stats.fetch_meta_batch", meta)
     monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda _, value, **kwargs: value))
-    monkeypatch.setattr("stats.refresh_event_time_by_quarter", lambda *args: False)
     monkeypatch.setattr("stats.load_stats_current", lambda **kwargs: {})
     monkeypatch.setattr("stats.save_stats_all", lambda value: None)
     monkeypatch.setattr("stats.capture_bot_achievement_sync", AsyncMock())
