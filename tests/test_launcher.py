@@ -120,6 +120,20 @@ def test_launcher_version_does_not_load_config(monkeypatch, capsys):
     assert "v1.2.3" in capsys.readouterr().out
 
 
+def test_launcher_taste_smoke_is_offline_and_does_not_load_config(monkeypatch, tmp_path):
+    from PIL import Image
+
+    monkeypatch.setattr("launcher._load_config", lambda: pytest.fail("config read"))
+    monkeypatch.setattr("launcher.ensure_frozen_env", lambda: pytest.fail("env write"))
+    assert launcher.run(["--taste-card-smoke", str(tmp_path)]) == 0
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "taste-anime.jpg", "taste-manga.jpg", "taste-ranobe.jpg",
+    }
+    for path in tmp_path.iterdir():
+        with Image.open(path) as image:
+            assert image.format == "JPEG" and image.width == 1200
+
+
 def test_launcher_check_config_is_offline(monkeypatch, capsys, tmp_path):
     monkeypatch.setitem(sys.modules, "main", SimpleNamespace(main=lambda: None))
     monkeypatch.setattr(launcher, "ensure_frozen_env", lambda: False)

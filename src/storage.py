@@ -1488,20 +1488,8 @@ def _empty_stats_all() -> dict:
     }
 
 
-def load_stats_all_snapshot(use_cache: bool = True) -> StatsAllSnapshot:
-    """
-    Загружаем stats_all.json и сохраняем причину пустого результата.
-
-    Обычные потребители продолжают использовать load_stats_all(), а локальные
-    интерактивные сценарии могут отличить первый запуск от повреждения файла.
-    """
-    global _stats_all_cache, _stats_all_cache_state, _stats_all_cache_ts
-
-    if use_cache and _stats_all_cache is not None:
-        age = _utcnow().timestamp() - _stats_all_cache_ts
-        if age < _STATS_ALL_CACHE_TTL:
-            return StatsAllSnapshot(_stats_all_cache, _stats_all_cache_state)
-
+def read_stats_all_snapshot() -> StatsAllSnapshot:
+    """Прочитать независимый срез без доступа к общему кешу, в том числе из worker."""
     data = _empty_stats_all()
     state = STATS_ALL_MISSING
     try:
@@ -1517,10 +1505,28 @@ def load_stats_all_snapshot(use_cache: bool = True) -> StatsAllSnapshot:
         state = STATS_ALL_INVALID
         log.warning("load_stats_all: не удалось прочитать файл: %s", e)
 
-    _stats_all_cache = data
-    _stats_all_cache_state = state
-    _stats_all_cache_ts = _utcnow().timestamp()
     return StatsAllSnapshot(data, state)
+
+
+def load_stats_all_snapshot(use_cache: bool = True) -> StatsAllSnapshot:
+    """
+    Загружаем stats_all.json и сохраняем причину пустого результата.
+
+    Обычные потребители продолжают использовать load_stats_all(), а локальные
+    интерактивные сценарии могут отличить первый запуск от повреждения файла.
+    """
+    global _stats_all_cache, _stats_all_cache_state, _stats_all_cache_ts
+
+    if use_cache and _stats_all_cache is not None:
+        age = _utcnow().timestamp() - _stats_all_cache_ts
+        if age < _STATS_ALL_CACHE_TTL:
+            return StatsAllSnapshot(_stats_all_cache, _stats_all_cache_state)
+
+    snapshot = read_stats_all_snapshot()
+    _stats_all_cache = snapshot.data
+    _stats_all_cache_state = snapshot.state
+    _stats_all_cache_ts = _utcnow().timestamp()
+    return snapshot
 
 
 def load_stats_all(use_cache: bool = True) -> dict:

@@ -79,6 +79,7 @@ MAIN_MENU_ASSETS: Mapping[str, str] = MappingProxyType({
     "home": "home-v1.jpg",
     "subscription": "subscription-v1.jpg",
     "stats": "stats-v1.jpg",
+    "stats:taste": "taste-card-v1.jpg",
     "lists": "lists-v1.jpg",
     "lists:anime": "lists-anime-v1.jpg",
     "lists:manga": "lists-manga-v1.jpg",
@@ -200,12 +201,25 @@ def stats_view() -> MenuView:
     rows = (
         (MenuEntry("📆 За текущий квартал", "menu:stats:current"),),
         (MenuEntry("📚 За всё время", "menu:stats:all"),),
+        (MenuEntry("🎨 Карточка вкуса", "menu:stats:taste"),),
         (MenuEntry("⬅️ Назад", "menu:home"),),
     )
     return MenuView(
         text="📊 <b>Какую статистику показать?</b>",
         keyboard=_keyboard(rows),
         artwork="stats",
+    )
+
+
+def taste_view() -> MenuView:
+    """Выбрать отдельную категорию локального портрета профиля."""
+    rows = tuple(
+        (MenuEntry(f"{emoji} {label}", f"menu:stats:taste:{key}"),)
+        for key, (emoji, label) in LIST_MEDIA.items()
+    ) + ((MenuEntry("⬅️ Назад", "menu:stats"),),)
+    return MenuView(
+        text="🎨 <b>Карточка вкуса</b>\nВыбери категорию:", keyboard=_keyboard(rows),
+        artwork="stats:taste",
     )
 
 

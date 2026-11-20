@@ -45,7 +45,8 @@ def _texts(view):
 
 
 def test_close_is_offered_only_on_home_not_unified_submenus():
-    views = [main_menu.stats_view(), main_menu.lists_view(), main_menu.owner_view(),
+    views = [main_menu.stats_view(), main_menu.taste_view(),
+             main_menu.lists_view(), main_menu.owner_view(),
              main_menu.owner_backup_view(), main_menu.owner_broadcast_view(),
              main_menu.subscription_view(subscribed=False, target=True)]
     views.extend(main_menu.list_media_view(key) for key in main_menu.LIST_MEDIA)
@@ -189,6 +190,7 @@ def test_every_screen_uses_one_versioned_artwork_from_central_registry():
             target=True,
         ),
         "stats": main_menu.stats_view(),
+        "stats:taste": main_menu.taste_view(),
         "lists": main_menu.lists_view(),
         "lists:anime": main_menu.list_media_view("anime"),
         "lists:manga": main_menu.list_media_view("manga"),
@@ -223,6 +225,7 @@ def test_captions_keep_dynamic_or_instructional_text_only():
     assert home.caption == home.text
     assert subscription.caption == subscription.text
     assert main_menu.stats_view().caption is None
+    assert main_menu.taste_view().caption is None
     assert main_menu.list_media_view("anime").caption is None
     assert main_menu.owner_view().caption is None
     for view in (

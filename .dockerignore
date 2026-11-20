@@ -58,6 +58,9 @@ assets/*
 !assets/report-poster-placeholder-v2.jpg
 !assets/main-menu/
 !assets/main-menu/*.jpg
+!assets/taste-card/
+!assets/taste-card/*.otf
+!assets/taste-card/*.txt
 
 # Документация, не нужная во время выполнения контейнера
 README.md

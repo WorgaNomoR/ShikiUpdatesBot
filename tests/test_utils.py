@@ -23,8 +23,10 @@ from utils import (
     _safe_int,
     _subscriber_link,
     _utcnow,
+    canonical_title_id,
     current_quarter,
     h,
+    personal_score,
     previous_quarter,
     quarter_label,
     quarter_start,
@@ -32,8 +34,25 @@ from utils import (
     tracking_period_label,
 )
 
-
 # ── h: экранирование HTML ──────────────────────────────────────────
+
+def test_personal_score_requires_an_explicit_integer_in_range():
+    cases = [
+        (1, 1), (10, 10), (" 8 ", 8), ("08", 8),
+        (0, None), (11, None), (True, None), (8.0, None), (8.9, None),
+        ("8.0", None), ("+8", None), (float("inf"), None), (None, None),
+    ]
+    assert [personal_score(value) for value, _ in cases] == [expected for _, expected in cases]
+
+
+def test_canonical_title_id_does_not_invent_numeric_ids():
+    cases = [
+        (1, "1"), ("001", "1"), (" 12 ", "12"),
+        (0, None), ("0", None), (True, None), (1.0, None), ("1.0", None),
+        ("١", None), (10 ** 30, None), (None, None),
+    ]
+    assert [canonical_title_id(value) for value, _ in cases] == [expected for _, expected in cases]
+
 def test_h_escapes_special_chars():
     assert h("<b>&</b>") == "&lt;b&gt;&amp;&lt;/b&gt;"
 

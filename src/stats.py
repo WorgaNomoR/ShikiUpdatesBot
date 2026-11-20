@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import (
     datetime,
     timedelta,
+    timezone,
 )
 from urllib.parse import urlsplit
 
@@ -90,7 +91,9 @@ from utils import (
     _rel_url,
     _safe_int,
     _utcnow,
+    canonical_title_id,
     current_quarter,
+    personal_score,
     quarter_label,
     russian_count_word,
     tracking_period_label,
@@ -487,7 +490,7 @@ def _merge_title_record(
     record = {
         "title":    export_row.get("target_title_ru") or export_row.get("target_title") or "???",
         "title_en": export_row.get("target_title") or "",
-        "score":    _safe_int(export_row.get("score")),       # 0 = без оценки
+        "score":    personal_score(export_row.get("score")) or 0,
         "status":   (export_row.get("status") or "").lower(),
         "rewatches": _safe_int(export_row.get("rewatches")),
         "url":       meta.get("url") or "",
@@ -767,6 +770,35 @@ def reading_catalog_observation(export, metadata):
     return {"reader": {key: eligibility[key] for key, row in rows.items() if row["status"].lower() == "completed"}, **result}
 
 
+def _validated_list_export(export: object, media: str) -> list[dict] | None:
+    """Неполный или конфликтующий экспорт не доказывает удаление записей."""
+    if not isinstance(export, list):
+        return None
+    rows = {}
+    result = []
+    for row in export:
+        if not isinstance(row, dict):
+            return None
+        title_id = canonical_title_id(row.get("target_id"))
+        status = row.get("status")
+        target_type = row.get("target_type")
+        if (
+            title_id is None or not isinstance(status, str)
+            or status.lower() not in _STAT_STATUSES
+            or ("target_type" in row and target_type != media.capitalize())
+        ):
+            return None
+        normalized = {**row, "target_id": title_id, "status": status.lower()}
+        if title_id in rows and (
+            rows[title_id]["status"] != normalized["status"]
+            or personal_score(rows[title_id].get("score")) != personal_score(row.get("score"))
+        ):
+            return None
+        rows[title_id] = normalized
+        result.append(normalized)
+    return result
+
+
 async def sync_stats_all(
     session: "aiohttp.ClientSession | None" = None,
     fav=FAVOURITES_UNSET,
@@ -797,20 +829,16 @@ async def sync_stats_all(
     reading_generation = restorable_restore_generation()
     reading_inputs = None
 
-    exports = {
-        "anime": await fetch_list_export(session, "anime"),
-        "manga": await fetch_list_export(session, "manga"),
-    }
-    # Пропущенная строка не доказывает удаление тайтла. Неполный экспорт
-    # сохраняет весь прежний домен, как и недоступный ответ API.
-    for media, export in exports.items():
-        if export is not None and any(
-            not isinstance(row, dict) or not isinstance(row.get("status"), str)
-            or row["status"].lower() not in _STAT_STATUSES
-            for row in export
-        ):
+    exports = {}
+    export_times = {}
+    for media in ("anime", "manga"):
+        raw_export = await fetch_list_export(session, media)
+        export = _validated_list_export(raw_export, media)
+        if raw_export is not None and export is None:
             log.warning("sync_stats_all: неполный экспорт %s — пропускаем эту половину.", media)
-            exports[media] = None
+        exports[media] = export
+        if export is not None:
+            export_times[media] = _utcnow().replace(tzinfo=timezone.utc).isoformat()
 
     if all(export is None for export in exports.values()):
         log.warning("sync_stats_all: оба экспорта недоступны — пропускаем синхронизацию.")
@@ -836,6 +864,11 @@ async def sync_stats_all(
             stats[media] = {}
             changed = True
         domain = stats[media]
+        # Проверка неизменившегося списка тоже является новым наблюдением.
+        # Дата принадлежит только успешно полученной половине экспорта.
+        if domain.get("list_synced_at") != export_times[media]:
+            domain["list_synced_at"] = export_times[media]
+            changed = True
         if not isinstance(domain.get("titles"), dict):
             domain["titles"] = {}
             changed = True
@@ -843,6 +876,19 @@ async def sync_stats_all(
             domain["aggregates"] = {}
             changed = True
         titles = domain["titles"]
+        # Ключи старого кеша должны совпадать с каноническими ID экспорта.
+        # Готовая каноническая запись приоритетнее алиаса; пригодный алиас
+        # сохраняет метаданные, если каноническая запись отсутствует или повреждена.
+        for old_id in tuple(titles):
+            canonical_id = canonical_title_id(old_id)
+            if canonical_id is not None and canonical_id != old_id:
+                if canonical_id not in titles or (
+                    not isinstance(titles[canonical_id], dict)
+                    and isinstance(titles[old_id], dict)
+                ):
+                    titles[canonical_id] = titles[old_id]
+                del titles[old_id]
+                changed = True
 
         # Релевантные строки экспорта: с валидным id и известным статусом
         valid_rows: dict[str, dict] = {}
@@ -996,7 +1042,7 @@ async def sync_stats_all(
 
                 # Существующая запись — обновляем только пользовательский стейт,
                 # если она не попала в успешный maintenance-ответ.
-                new_score  = _safe_int(row.get("score"))
+                new_score  = personal_score(row.get("score")) or 0
                 new_status = (row.get("status") or "").lower()
                 new_rew    = _safe_int(row.get("rewatches"))
                 if media == "anime":
