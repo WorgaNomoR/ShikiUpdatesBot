@@ -4108,3 +4108,41 @@ async def test_failed_sync_publication_cannot_freshen_the_next_card_snapshot(tmp
     published = storage.load_stats_all_snapshot(use_cache=False)
     assert published.data["anime"]["list_synced_at"] == old
     assert path.read_bytes() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_record", ["absent", "valid", "malformed"])
+@pytest.mark.parametrize("media", ["anime", "manga"])
+async def test_sync_preserves_aliased_metadata_when_fetch_fails(monkeypatch, canonical_record, media):
+    state = storage._empty_stats_all()
+    record = _anime_rec() if media == "anime" else _manga_record("Сохранённый тайтл", "manga")
+    alias = {**record, "title": "Сохранённый тайтл", "url": "/animes/1",
+             "poster_url": "https://cdn.example/old.jpg", "meta_updated_at": "2020-01-01T00:00:00"}
+    state[media]["titles"] = {"01": alias}
+    expected = alias
+    if canonical_record == "valid":
+        expected = {**alias, "title": "Канонический тайтл"}
+        state[media]["titles"]["1"] = expected
+    elif canonical_record == "malformed":
+        state[media]["titles"]["1"] = None
+    before = copy.deepcopy(state)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    exports = {"anime": None, "manga": None, media: [_taste_export_row("01", 9)]}
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=lambda _, key: exports[key]))
+    meta = AsyncMock(side_effect=OSError("metadata unavailable"))
+    monkeypatch.setattr("stats.fetch_meta_batch", meta)
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda _, value, **kwargs: value))
+    monkeypatch.setattr("stats.refresh_event_time_by_quarter", lambda *args: False)
+    monkeypatch.setattr("stats.load_stats_current", lambda **kwargs: {})
+    monkeypatch.setattr("stats.save_stats_all", lambda value: None)
+    monkeypatch.setattr("stats.capture_bot_achievement_sync", AsyncMock())
+
+    result, ok = await smod.sync_stats_all(session=object(), fav=None)
+
+    assert ok and set(result[media]["titles"]) == {"1"}
+    record = result[media]["titles"]["1"]
+    for field in ("title", "url", "poster_url", "kind", "genres", "shiki_score", "meta_updated_at"):
+        assert record[field] == expected[field]
+    assert record["score"] == 9
+    meta.assert_awaited_once()
+    assert state == before

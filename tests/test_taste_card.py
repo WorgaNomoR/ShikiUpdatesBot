@@ -64,8 +64,9 @@ def test_preferences_are_relative_symmetric_and_do_not_force_a_side():
     assert card.preferences.higher.group.label == "Детектив"
     assert card.preferences.lower.group.label == "Романтика"
     assert card.preferences.higher.delta == 2 and card.preferences.lower.delta == -2
-    # Один набор тайтлов может иметь разные метки, но не создаёт лишних номинаций.
-    assert len(card.examples) <= 6
+    example_ids = {title.id for title in card.examples}
+    assert card.preferences.higher.example.id in example_ids
+    assert card.preferences.lower.example.id in example_ids
     only_higher = _card([replace(title, score=7) if title.score == 5 else title for title in titles])
     assert only_higher.preferences.higher is not None
     assert only_higher.preferences.lower is None
@@ -160,4 +161,6 @@ def test_sparse_tags_do_not_make_a_rare_known_genre_characteristic():
 def test_large_lists_keep_full_counts_but_bounded_examples():
     card = _card(_title(index, community=Fraction(5)) for index in range(3000))
     assert card.rated == 3000 and card.paired == 3000 and card.dropping.total == 3000
-    assert len(card.examples) <= 6
+    example_ids = [title.id for title in card.examples]
+    assert card.above.title.id in example_ids
+    assert len(example_ids) == len(set(example_ids)) <= 6

@@ -35,7 +35,7 @@ def request_env(monkeypatch):
         "manga": {"titles": {}},
     }, STATS_ALL_VALID)
     loader = MagicMock(return_value=snapshot)
-    monkeypatch.setattr("taste_card_delivery.load_stats_all_snapshot", loader)
+    monkeypatch.setattr("taste_card_delivery.read_stats_all_snapshot", loader)
     bot = MagicMock(send_photo=AsyncMock(return_value="photo"), send_message=AsyncMock())
     return bot, loader
 
@@ -59,7 +59,7 @@ async def test_one_snapshot_and_frozen_payload_with_fresh_uploads(request_env, m
     monkeypatch.setattr("taste_card_delivery.send_with_retry", send)
     result = await delivery.deliver_taste_card(bot, 42, "anime")
     assert result.state == "sent"
-    loader.assert_called_once_with(use_cache=False)
+    loader.assert_called_once_with()
     assert uploads[0] is not uploads[1] and uploads[0].data == uploads[1].data
     assert uploads[0].data.startswith(b"\xff\xd8")
     assert captions[0] == captions[1]
@@ -117,7 +117,8 @@ async def test_render_failure_is_short_safe_notice(request_env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_worker_is_drained_and_busy_requests_never_queue(request_env, monkeypatch):
+@pytest.mark.parametrize("phase", ["read", "font"])
+async def test_cancelled_worker_is_drained_and_busy_requests_never_queue(request_env, monkeypatch, phase):
     bot, loader = request_env
     original_font_reader = ImageFont.truetype
     started, release, finished = threading.Event(), threading.Event(), threading.Event()
@@ -129,7 +130,16 @@ async def test_cancelled_worker_is_drained_and_busy_requests_never_queue(request
         finished.set()
         return result
 
-    monkeypatch.setattr("PIL.ImageFont.truetype", read_font)
+    if phase == "font":
+        monkeypatch.setattr("PIL.ImageFont.truetype", read_font)
+    else:
+        def read_snapshot():
+            started.set()
+            release.wait(timeout=5)
+            finished.set()
+            return loader.return_value
+
+        loader.side_effect = read_snapshot
     first = asyncio.create_task(delivery.deliver_taste_card(bot, 42, "anime"))
     assert await asyncio.to_thread(started.wait, 3)
     try:
@@ -145,6 +155,28 @@ async def test_cancelled_worker_is_drained_and_busy_requests_never_queue(request
     assert finished.is_set()
     bot.send_photo.assert_not_awaited()
     monkeypatch.setattr("PIL.ImageFont.truetype", original_font_reader)
+    loader.side_effect = None
     resumed = await delivery.deliver_taste_card(bot, 42, "anime")
     assert resumed.state == "sent" and loader.call_count == 2
     bot.send_photo.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_read_and_conversion_run_off_the_event_loop(request_env):
+    bot, loader = request_env
+    owner_thread = threading.get_ident()
+    snapshot = loader.return_value
+
+    class WorkerData(dict):
+        def get(self, *args):
+            assert threading.get_ident() != owner_thread
+            return super().get(*args)
+
+    def read_snapshot(**kwargs):
+        assert threading.get_ident() != owner_thread
+        return StatsAllSnapshot(WorkerData(snapshot.data), snapshot.state)
+
+    loader.side_effect = read_snapshot
+    result = await delivery.deliver_taste_card(bot, 42, "anime")
+    assert result.state == "sent"
+    loader.assert_called_once()

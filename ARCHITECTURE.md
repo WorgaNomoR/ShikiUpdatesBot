@@ -319,7 +319,10 @@ unavailable as a whole: it cannot authorize title removals, partial record/aggre
 container repair or reading-achievement capture. A usable sibling export still synchronizes;
 when neither export is usable, synchronization returns the unchanged snapshot with `ok=False`.
 A valid empty export remains authoritative and removes absent titles normally.
-Canonical IDs collapse leading-zero aliases; incompatible duplicate progress marks retain
+Canonical IDs collapse leading-zero aliases. Successful list synchronization also canonicalizes
+saved title keys before metadata lookup: an existing canonical object wins over an alias; otherwise
+a usable alias preserves its metadata even when enrichment fails. This preparation touches only
+the private working copy of successfully acquired domains. Incompatible duplicate progress marks retain
 the reading calculator's per-metric uncertainty contract. Only explicit owner integers 1..10
 or their integer strings become personal scores; booleans, fractions and out-of-range values
 become unrated without changing progress helpers.
@@ -788,8 +791,11 @@ is consumed before work; noninteractive text/caption progress survives generatio
 and is cleaned best-effort. Existing initiator/chat/control/allowed-screen/access guards remain
 in force; Back returns to Statistics. Menu callbacks remain registration-neutral and read no subscriptions.
 
-`taste_card_data` reads one `load_stats_all_snapshot(use_cache=False)` and converts it synchronously
-to immutable fields before the first await. There is no fetch, sync, persistent write or
+The single bounded worker reads one `storage.read_stats_all_snapshot()` and converts it through
+`taste_card_data` to independent immutable fields before calculation/rendering. Disk access, JSON
+parsing and conversion run outside the event loop. This reader never reads or publishes the shared
+stats cache, so a slower older read cannot replace a newer cache publication. Atomic file replacement
+lets the private reader observe one complete old or new JSON file. There is no fetch, sync, persistent write or
 history/achievement/queue capture. Missing/invalid, genuinely empty, unresolved-kind and partial
 sources remain distinct. The existing manga classifier never guesses kinds from URLs/names.
 Equal canonical IDs collapse; conflicting records quarantine that ID. Ratings, finite paired
@@ -836,7 +842,11 @@ the signed badge conveys above/below-baseline direction. Numbers have reserved s
 title links remain intact. The caption contains only «Тайтлы из карточки:» and at most six
 unique linked examples within 950 visible UTF-16 units, retaining dropped statuses. Profile/category
 context stays on the image; a card without examples has an empty caption.
-The RGB image is 1200 pixels wide, at most 2400 high and 5 MiB. Pillow 13 uses one pinned static
+The RGB image is 1200 pixels wide, at most 2400 high and 5 MiB. Antialiasing preallocates a
+2400x4800 canvas on every render (about 33 MiB of RGB pixel data); Pillow storage, fonts,
+cropping/downsampling and JPEG encoding add to the process memory peak. One active generation
+bounds concurrent canvas allocation, not total memory consumption. Layout does not use a second
+measurement pass; deployments need headroom for these temporary buffers. Pillow 13 uses one pinned static
 Noto Sans CJK JP Regular through `RESOURCE_ROOT`, with no OS font, browser or media download.
 Font/OFL/origin/Pillow component notices ship in source, Docker, the one-file EXE and portable ZIP
 notices directory. Offline `--taste-card-smoke DIR` works before config/env/mutex and generates all
@@ -864,7 +874,7 @@ Evidence: [analytics](tests/test_taste_card.py), [adapter](tests/test_taste_card
 | `not_dispatched` | Preparation/guard failed before the call, or an observed first direct request failed with typed connector/connection-timeout evidence. No acknowledgement. |
 | `uncertain` | Acceptance cannot be ruled out: generic/total/read timeout, connection reset, response payload/decode failure, server failure or an unclassified dispatch exception. No acknowledgement. |
 
-Installed aiogram 3.31.0 `AiohttpSession.make_request` preserves the direct aiohttp cause when wrapping both POST and response-reading exceptions. aiohttp 3.14.1 connects before `req.send`; its automatic persistent-connection replay excludes POST. `main` supplies `TelegramDeliverySession`, retaining aiogram dispatch/response validation while adding request-start/redirect observations scoped by `ContextVar` to each attempt. A connector/connection-timeout type alone is insufficient: a redirect or multiple requests may follow an already accepted send. Missing observations, any redirect, or more than one request remain uncertain. No exception text infers dispatch stage. Local loopback tests cover this actual transport boundary without calling Telegram.
+aiogram 3.31/3.32 `AiohttpSession.make_request` preserves the direct aiohttp cause in `__cause__` when wrapping both POST and response-reading exceptions. From 3.33 it uses `original` and suppresses the traceback chain to avoid exposing Bot API URLs; classification accepts either explicit typed representation without restoring that chain or inspecting implicit exception context. aiohttp 3.14.1 connects before `req.send`; its automatic persistent-connection replay excludes POST. `main` supplies `TelegramDeliverySession`, retaining aiogram dispatch/response validation while adding request-start/redirect observations scoped by `ContextVar` to each attempt. A connector/connection-timeout type alone is insufficient: a redirect or multiple requests may follow an already accepted send. Missing observations, any redirect, or more than one request remain uncertain. No exception text infers dispatch stage. Local loopback tests cover this actual transport boundary without calling Telegram.
 
 Favourites notifications, interactive/frozen report units and archive uploads explicitly select `AT_LEAST_ONCE`: at most two retries after the first attempt for 429 or supported transient connection/network/timeout/payload/decode/server failures, with existing 0.5/1-second backoff and server RetryAfter delay. This retains #55's loss-reduction goal for non-idempotent operations while admitting bounded duplicate risk. Unknown/permanent errors stop; confirmed forbidden/blocked responses stop immediately and retain subscriber removal. Failure notices select `SAFE_ONLY`: rate limits and proven transient non-dispatch may retry, uncertainty stops. No generic policy is applied to unrelated command replies, edits, probes or updates. Cancellation propagates through preparation, send and wait; no result invents success. Fresh uploads and guards run on every attempt, outside the state lock.
 

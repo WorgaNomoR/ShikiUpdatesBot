@@ -19,9 +19,8 @@ from config import (
     SHIKI_USER,
     log,
 )
-from storage import load_stats_all_snapshot
+from storage import read_stats_all_snapshot
 from taste_card import (
-    TasteInput,
     build_taste_card,
     unavailable_text,
 )
@@ -64,15 +63,19 @@ async def _notice(bot: Bot, chat_id: int, text: str) -> None:
         log.warning("Карточка вкуса: пояснение не доставлено (%s).", type(error).__name__)
 
 
-def _prepare(source: TasteInput) -> RenderedTasteCard | str:
-    """Расчёт и Pillow выполняются вне event loop по неизменяемому срезу."""
+def _prepare(category: str) -> RenderedTasteCard | str:
+    """Чтение, независимые поля, расчёт и Pillow не блокируют event loop или общий кеш."""
+    source = build_taste_input(
+        read_stats_all_snapshot(), category, profile=SHIKI_USER, base_url=SHIKI_BASE_URL,
+        now=datetime.now(timezone.utc),
+    )
     card = build_taste_card(source)
     return render_taste_card(card) if card.available else unavailable_text(card)
 
 
-async def _generate(source: TasteInput) -> RenderedTasteCard | str:
+async def _generate(category: str) -> RenderedTasteCard | str:
     """Дождаться ограниченного worker даже при отмене, не отправляя его результат."""
-    worker = asyncio.create_task(asyncio.to_thread(_prepare, source))
+    worker = asyncio.create_task(asyncio.to_thread(_prepare, category))
     cancelled = False
     while True:
         try:
@@ -100,13 +103,7 @@ async def deliver_taste_card(bot: Bot, chat_id: int, category: str) -> TasteDeli
         return TasteDeliveryResult("busy")
     try:
         async with lock:
-            # До первого await хранилище превращается в независимые неизменяемые поля.
-            snapshot = load_stats_all_snapshot(use_cache=False)
-            source = build_taste_input(
-                snapshot, category, profile=SHIKI_USER, base_url=SHIKI_BASE_URL,
-                now=datetime.now(timezone.utc),
-            )
-            prepared = await _generate(source)
+            prepared = await _generate(category)
     except Exception as error:
         log.warning("Карточка вкуса: формирование не выполнено (%s).", type(error).__name__)
         await _notice(bot, chat_id, _RENDER_FAILURE)

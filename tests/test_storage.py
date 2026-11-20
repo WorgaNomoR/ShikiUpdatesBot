@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import threading
 from copy import deepcopy
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -3023,3 +3025,36 @@ def test_digest_source_compaction_keeps_partially_retired_terminal_plan(backup_e
     maintained = storage.compact_completed_history(partial, cur, expected_generation=storage.restorable_restore_generation(), force=True)
     assert maintained == partial
     assert storage.EVENT_JOURNAL_FILE.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_independent_stats_reader_cannot_replace_a_newer_cache_publication(monkeypatch):
+    old = _valid_stats_all()
+    fresh = {**_valid_stats_all(), "revision": "new"}
+    started, release = threading.Event(), threading.Event()
+    file = MagicMock()
+    file.exists.return_value = True
+
+    def read_text(**kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return json.dumps(old)
+
+    file.read_text.side_effect = read_text
+    monkeypatch.setattr("storage.STATS_ALL_FILE", file)
+    monkeypatch.setattr("storage._atomic_write", lambda *args: None)
+    worker = asyncio.create_task(asyncio.to_thread(storage.read_stats_all_snapshot))
+    try:
+        assert await asyncio.to_thread(started.wait, 3)
+        storage.save_stats_all(fresh)
+        cache_stamp = storage._stats_all_cache_ts
+    finally:
+        release.set()
+    snapshot = await worker
+
+    assert snapshot.state == storage.STATS_ALL_VALID and snapshot.data == old
+    assert snapshot.data is not fresh
+    assert storage._stats_all_cache is fresh
+    assert storage._stats_all_cache_state == storage.STATS_ALL_VALID
+    assert storage._stats_all_cache_ts == cache_stamp
+    file.read_text.assert_called_once_with(encoding="utf-8")

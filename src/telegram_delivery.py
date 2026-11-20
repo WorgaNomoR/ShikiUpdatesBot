@@ -147,8 +147,11 @@ class SendResult(Generic[_ResultT]):
 
 def classify_send_error(exc: Exception) -> SendOutcome:
     """Классифицировать только доступные типизированные свидетельства."""
-    # AiohttpSession сохраняет прямую причину при обёртке ClientError/timeout.
-    cause = exc.__cause__ if isinstance(exc, TelegramNetworkError) else exc
+    # aiogram >=3.33 скрывает цепочку traceback, сохраняя причину в original.
+    cause = (
+        getattr(exc, "original", None) or exc.__cause__
+        if isinstance(exc, TelegramNetworkError) else exc
+    )
     evidence = _request_evidence.get()
     if (
         isinstance(cause, _CONNECT_FAILURES)

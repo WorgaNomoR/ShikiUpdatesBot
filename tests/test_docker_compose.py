@@ -99,4 +99,8 @@ def test_docker_build_requires_runtime_assets_in_effective_context():
     assert f'wc -l)" -eq {len(expected_artwork)}' in dockerfile
     assert "RUN test -f /app/examples/facts.json" in instructions
     assert "RUN test -f /app/assets/taste-card/OFL.txt" in instructions
-    assert "render_taste_card(smoke_card(category))" in dockerfile
+    assert (
+        'RUN python -c "from taste_card_render import render_taste_card, smoke_card; '
+        "[render_taste_card(smoke_card(category)) for category in ('anime', 'manga', 'ranobe')]\""
+        in instructions
+    )

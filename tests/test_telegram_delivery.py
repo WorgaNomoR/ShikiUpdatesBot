@@ -329,3 +329,19 @@ async def test_real_aiohttp_connection_failure_after_redirect_is_not_predispatch
 ])
 def test_blocked_detection_requires_a_confirmed_api_refusal(error, blocked):
     assert is_blocked_error(error) is blocked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attribute", ["__cause__", "original"])
+@pytest.mark.parametrize("observed", [False, True])
+async def test_typed_network_cause_supports_both_aiogram_representations(attribute, observed):
+    error = TelegramNetworkError(method=_METHOD, message="connection failed")
+    setattr(error, attribute, aiohttp.ConnectionTimeoutError())
+
+    async def operation():
+        if observed:
+            await _request_started(None, None, None)
+        raise error
+
+    result = await send_with_retry(operation, policy=RetryPolicy.SAFE_ONLY, max_attempts=1)
+    assert result.outcome is (SendOutcome.NOT_DISPATCHED if observed else SendOutcome.UNCERTAIN)

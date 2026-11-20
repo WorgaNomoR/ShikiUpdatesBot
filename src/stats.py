@@ -876,6 +876,19 @@ async def sync_stats_all(
             domain["aggregates"] = {}
             changed = True
         titles = domain["titles"]
+        # Ключи старого кеша должны совпадать с каноническими ID экспорта.
+        # Готовая каноническая запись приоритетнее алиаса; пригодный алиас
+        # сохраняет метаданные, если каноническая запись отсутствует или повреждена.
+        for old_id in tuple(titles):
+            canonical_id = canonical_title_id(old_id)
+            if canonical_id is not None and canonical_id != old_id:
+                if canonical_id not in titles or (
+                    not isinstance(titles[canonical_id], dict)
+                    and isinstance(titles[old_id], dict)
+                ):
+                    titles[canonical_id] = titles[old_id]
+                del titles[old_id]
+                changed = True
 
         # Релевантные строки экспорта: с валидным id и известным статусом
         valid_rows: dict[str, dict] = {}
