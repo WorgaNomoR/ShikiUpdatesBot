@@ -64,6 +64,9 @@ def test_docker_context_keeps_required_runtime_files():
         "!assets/report-poster-placeholder-v2.jpg",
         "!assets/main-menu/",
         "!assets/main-menu/*.jpg",
+        "!assets/taste-card/",
+        "!assets/taste-card/*.otf",
+        "!assets/taste-card/*.txt",
     ]
     assert "assets/" not in patterns
     assert active_patterns[-1] == "!examples/facts.json"
@@ -95,3 +98,5 @@ def test_docker_build_requires_runtime_assets_in_effective_context():
     )
     assert f'wc -l)" -eq {len(expected_artwork)}' in dockerfile
     assert "RUN test -f /app/examples/facts.json" in instructions
+    assert "RUN test -f /app/assets/taste-card/OFL.txt" in instructions
+    assert "render_taste_card(smoke_card(category))" in dockerfile

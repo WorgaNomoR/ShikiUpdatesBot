@@ -17,6 +17,7 @@ RUN set -eu; \
         home-v1.jpg \
         subscription-v1.jpg \
         stats-v1.jpg \
+        taste-card-v1.jpg \
         achievements-v1.jpg \
         lists-v1.jpg \
         lists-anime-v1.jpg \
@@ -28,8 +29,11 @@ RUN set -eu; \
     do \
         test -f "/app/assets/main-menu/$asset"; \
     done; \
-    test "$(find /app/assets/main-menu -maxdepth 1 -type f -name '*.jpg' | wc -l)" -eq 11
+    test "$(find /app/assets/main-menu -maxdepth 1 -type f -name '*.jpg' | wc -l)" -eq 12
 RUN test -f /app/examples/facts.json
+RUN test -f /app/assets/taste-card/OFL.txt
+RUN test -f /app/assets/taste-card/Pillow-LICENSE.txt
+RUN python -c "from taste_card_render import render_taste_card, smoke_card; [render_taste_card(smoke_card(category)) for category in ('anime', 'manga', 'ranobe')]"
 
 # Порт healthcheck-сервера (healthcheck.py). Платформы, читающие Dockerfile,
 # по EXPOSE понимают, на какой порт направлять пробу /health. Если хостинг

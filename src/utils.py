@@ -271,6 +271,27 @@ def _is_partial_quarter(cur: dict) -> bool:
     return False
 
 
+def canonical_title_id(value: object) -> str | None:
+    """Положительный ID без bool, дробей и произвольного строкового приведения."""
+    if type(value) is int:
+        return str(value) if 0 < value < 10 ** 20 else None
+    if isinstance(value, str):
+        value = value.strip()
+        if 0 < len(value) <= 20 and value.isascii() and value.isdecimal():
+            return value.lstrip("0") or None
+    return None
+
+
+def personal_score(value: object) -> int | None:
+    """Явная целая личная оценка 1..10; ноль и повреждение остаются без оценки."""
+    if isinstance(value, str):
+        value = value.strip()
+        if not (0 < len(value) <= 2 and value.isascii() and value.isdecimal()):
+            return None
+        value = int(value)
+    return value if type(value) is int and 1 <= value <= 10 else None
+
+
 def _safe_int(value, default: int = 0) -> int:
     """Аккуратно приводим к int — score/episodes из экспорта бывают строками."""
     try:

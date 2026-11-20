@@ -43,6 +43,7 @@
 - Patch dependencies where callers look them up (`handlers.<name>`, `stats.<name>`, etc.); for example, `monkeypatch.setattr("handlers.fetch_favourites", …)`. String-form `monkeypatch.setattr("module.name", …)` avoids local-variable shadowing.
 - Coverage is diagnostic, not a target. Do not pin or chase a percentage; prefer focused contracts and smoke tests over exhaustive presentation snapshots.
 - Before a PR, run `pytest tests/`, `ruff check .`, and `git diff --check` when the environment provides the required tools. If verification cannot run, report that limitation explicitly.
+- When running Git-based review tools through WSL on a Windows checkout, compare the selected file set with Windows Git. If CRLF makes unchanged files look modified, set `core.autocrlf=true` only for the review process through `GIT_CONFIG_*`; preserve files and Git configuration. Explicitly include new untracked implementation files when supported. Binary resources omitted from a service's text review require direct packaging/smoke evidence.
 
 ### Live Shikimori contract verification
 

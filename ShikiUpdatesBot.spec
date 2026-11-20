@@ -101,10 +101,12 @@ datas = collect_data_files("pytrovich")
 datas += copy_metadata("aiogram")
 datas += copy_metadata("aiohttp")
 datas += copy_metadata("pytrovich")
+datas += copy_metadata("Pillow")
 datas.append((str(root / "assets" / "info-preview.png"), "assets"))
 datas.append((str(root / "assets" / "report-poster-placeholder-v1.png"), "assets"))
 datas.append((str(root / "assets" / "report-poster-placeholder-v2.jpg"), "assets"))
 datas.append((str(root / "assets" / "main-menu"), "assets/main-menu"))
+datas.append((str(root / "assets" / "taste-card"), "assets/taste-card"))
 datas.append((str(root / "examples" / "facts.json"), "examples"))
 
 a = Analysis(

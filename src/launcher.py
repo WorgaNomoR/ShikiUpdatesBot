@@ -55,8 +55,26 @@ def run(argv: Sequence[str] | None = None) -> int:
     if args == ["--version"]:
         print(f"ShikiUpdatesBot {APP_VERSION}")
         return 0
+    if len(args) == 2 and args[0] == "--taste-card-smoke":
+        # Проверка ресурсов работает до .env, mutex и запуска приложения.
+        from taste_card_render import (
+            render_taste_card,
+            smoke_card,
+        )
+
+        try:
+            destination = Path(args[1])
+            destination.mkdir(parents=True, exist_ok=True)
+            for category in ("anime", "manga", "ranobe"):
+                rendered = render_taste_card(smoke_card(category))
+                (destination / f"taste-{category}.jpg").write_bytes(rendered.image)
+                print(f"{category}: {rendered.width}x{rendered.height}, {len(rendered.image)} bytes")
+            return 0
+        except (OSError, ValueError) as error:
+            print(f"Не удалось проверить рендер карточки: {type(error).__name__}")
+            return 1
     if args and args != ["--check-config"]:
-        print("Использование: ShikiUpdatesBot.exe [--version | --check-config]")
+        print("Использование: ShikiUpdatesBot.exe [--version | --check-config | --taste-card-smoke DIR]")
         return 2
 
     try:

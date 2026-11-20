@@ -30,6 +30,7 @@ Read [AGENTS.md](AGENTS.md) for collaboration, verification, and delivery rules.
     - [Supported state formats and migration](#supported-state-formats-and-migration)
     - [Event-time quarterly projections](#event-time-quarterly-projections)
   - [Typed reports and interactive delivery](#typed-reports-and-interactive-delivery)
+    - [Taste cards](#taste-cards)
     - [Telegram send outcomes](#telegram-send-outcomes)
   - [Durable quarterly delivery](#durable-quarterly-delivery)
   - [Backup, restore and automatic scheduling](#backup-restore-and-automatic-scheduling)
@@ -79,6 +80,8 @@ Project imports form an acyclic graph. Keep orchestration above reusable domain,
 | [messages.py](src/messages.py) | Notification banks/history parsing and normalization, display-name application, and typed `/status` content/local-poster join. Uses the media and report boundaries. |
 | [stats.py](src/stats.py) | Synchronization/publication, aggregates, current events and quarter snapshots, statistics report construction, and pure picker logic; delegates favourites collection to `favourites`. |
 | [favourites.py](src/favourites.py) | Favourites collection/enrichment over the supplied statistics cache and typed report construction; uses `shiki_api` but owns no persistence, notification or delivery orchestration. |
+| [taste_card.py](src/taste_card.py), [taste_card_data.py](src/taste_card_data.py) | Immutable category inputs and pure analytical rules; local snapshot adapter with strict fields and the existing media classifier. No synchronization or persistence. |
+| [taste_card_render.py](src/taste_card_render.py), [taste_card_delivery.py](src/taste_card_delivery.py) | Bounded Pillow image/caption over packaged fonts; single-worker generation, cancellation drain and explicit Telegram outcomes. Independent of durable schemas. |
 | [report_titles.py](src/report_titles.py) | Shared typed title/link/poster construction for statistics and favourites over `config`, `utils` and `report_model`; no I/O. |
 | [lists.py](src/lists.py) | Pure declarative list grouping/ordering and typed reports; reuses the manga classifier in `stats`, with no I/O or mutation. |
 | [main_menu.py](src/main_menu.py) | Immutable menu declarations and pure text/caption/artwork/keyboard rendering; owns no FSM, authorization, storage, report building or delivery. |
@@ -263,7 +266,7 @@ Only `/start` is advertised; historical commands and inline handlers remain hidd
 
 `main.py` sets `FSMStrategy.USER_IN_CHAT`. Process-local menus bind initiator, chat and control-message ID; the main menu additionally binds current screen/origin and expected subscription target. Every transition validates those bindings and allowed screen; stale, forged, missing or `InaccessibleMessage` controls fail before progress, state change or report work. Back targets the immediate parent; root Close clears state. Restart/expiry requires a new menu. All `menu:*` callbacks are registration-neutral; each owner callback independently requires owner plus private chat, as do its rendered buttons.
 
-`main_menu.py` retains complete fallback text for every allowlisted versioned JPEG. Missing/empty artwork opens text; rejected media invalidates its process-local `file_id`. Initial rejection falls back to text; rejected photo-to-photo navigation replaces the control with text, rebinds its ID, then removes the obsolete photo. Ambiguous transport failures do not send an alternative. Text sessions stay text-only, and owner prompts edit their current caption/text rather than creating another FSM implementation.
+`main_menu.py` retains complete fallback text for every allowlisted versioned JPEG. The taste-card category picker uses its own `assets/main-menu/taste-card-v1.jpg` (RGB JPEG, 1200x800), independently of the Statistics illustration. Missing/empty artwork opens text; rejected media invalidates its process-local `file_id`. Initial rejection falls back to text; rejected photo-to-photo navigation replaces the control with text, rebinds its ID, then removes the obsolete photo. Ambiguous transport failures do not send an alternative. Text sessions stay text-only, and owner prompts edit their current caption/text rather than creating another FSM implementation.
 
 Terminal reports/documents/results clear state before best-effort removal of control and `/start` anchor, then delegate existing use-cases. Cleared state makes replay inert; cleanup failure cannot suppress the selected action. Lists retain the control for their shared progress lifecycle below. Owner tools reuse picker, broadcast, directory, fact-bank and backup flows; information-card refresh already serves the hidden `/version` operation. The hidden `/stats` command opens the same session-bound statistics screen, without reading subscriptions. The top-level achievements button and hidden `/achievs` directly deliver one combined report without an intermediate submenu. All unified submenus offer Back to the parent; only home offers Close. `/stats all` retains its direct report path; the old `stats:*` callbacks and registry remain compatible entrypoints for the former report controls.
 
@@ -310,11 +313,25 @@ Public `/status` shares successful raw anime+manga rates for a fixed 60-second m
 
 ### Synchronization, metadata and comments
 
-A media export with a non-object row, missing/non-string status or unknown status is
+A media export with a non-object row, missing/non-string or unknown status, unusable
+positive target ID, wrong explicit target type or conflicting duplicate status/owner score is
 unavailable as a whole: it cannot authorize title removals, partial record/aggregate changes,
 container repair or reading-achievement capture. A usable sibling export still synchronizes;
 when neither export is usable, synchronization returns the unchanged snapshot with `ok=False`.
 A valid empty export remains authoritative and removes absent titles normally.
+Canonical IDs collapse leading-zero aliases; incompatible duplicate progress marks retain
+the reading calculator's per-metric uncertainty contract. Only explicit owner integers 1..10
+or their integer strings become personal scores; booleans, fractions and out-of-range values
+become unrated without changing progress helpers.
+
+Each accepted API domain publishes an aware UTC `list_synced_at` captured after export receipt,
+even when content did not change. Anime and shared manga synchronize independently;
+Manga/Ranobe inherit the latter date. Failed exports retain their domain and date, and late
+privacy failure publishes no working changes. Metadata failures do not invalidate the list
+observation. An identical timestamp needs no redundant write. Top-level `stats_all.updated_at`
+remains cache-publication time: favourites, quarter-cache work and partial sync also update it.
+It is never category freshness evidence. Card reads use the published file rather than a
+working in-memory candidate, including after a failed cache publication.
 
 Each successfully applied metadata record gets `meta_updated_at`; failed/omitted/parsing records keep good metadata and timestamp for retry. Legacy, malformed and future timestamps are stale with oldest priority. Current `planned`, `watching`, `rewatching` and `on_hold` records age after seven days, `completed`/`dropped` after thirty. Each successful export half spends at most one oldest-first maintenance batch of 50 anime and one of 50 shared manga/ranobe records, with stable numeric-ID ties. New titles, missing-kind repair and malformed values still present in export use the higher-priority correctness batch outside that allowance. Failed repair leaves a canonical missing-kind record without a timestamp; export cleanup removes absent records. Refresh replaces the metadata portion, including poster/release status, while current export owns score/status/progress/rewatches. Aggregates are recomputed. Existing startup/periodic full sync is the only scheduler, and privacy prevents all working publication/cache changes.
 
@@ -763,6 +780,78 @@ Each Rich fragment freezes exactly its own complete HTML continuations and previ
 Interactive status/statistics/lists/favourites/directory flows persist no report progress and attempt one stable complete-failure, partial-delivery or uncertain-delivery notice. The uncertain notice discloses possible acceptance and duplicates instead of asserting non-delivery. Quarterly progress is durable below. Rich preview/client behaviour is a dated observation, not capability detection: Telegram supplies no client signal or Rich preview switch; ordinary fallback retains its explicit preview flag. Notifications, broadcast, inline cards and short replies keep their own delivery boundaries.
 
 Evidence: [report model tests](tests/test_report_model.py), [shared title tests](tests/test_report_titles.py), [Rich schema tests](tests/test_rich_message_schema.py), [Rich renderer tests](tests/test_rich_report.py), [asset tests](tests/test_report_assets.py), [delivery tests](tests/test_report_delivery.py).
+
+### Taste cards
+
+Statistics includes a public session-bound Anime/Manga/Ranobe picker. The terminal callback
+is consumed before work; noninteractive text/caption progress survives generation/delivery
+and is cleaned best-effort. Existing initiator/chat/control/allowed-screen/access guards remain
+in force; Back returns to Statistics. Menu callbacks remain registration-neutral and read no subscriptions.
+
+`taste_card_data` reads one `load_stats_all_snapshot(use_cache=False)` and converts it synchronously
+to immutable fields before the first await. There is no fetch, sync, persistent write or
+history/achievement/queue capture. Missing/invalid, genuinely empty, unresolved-kind and partial
+sources remain distinct. The existing manga classifier never guesses kinds from URLs/names.
+Equal canonical IDs collapse; conflicting records quarantine that ID. Ratings, finite paired
+community scores, years and labels validate independently. Naive/invalid/future/absent
+`list_synced_at` is unknown without global/file-time fallback; legacy score coercion cannot be undone.
+
+For a category E is the usable non-planned list, R its explicitly rated part, P paired R/community
+records, F current completed/dropped outcomes regardless of rating. Rated dropped titles participate
+in R; unrated dropped titles participate only in F. Rewatches do not multiply weight.
+Current rewatching/paused/ongoing records are not final outcomes. Removed titles and reconstructed
+lifetime/annual history are outside this view.
+
+| Block | Current analytical contract |
+|---|---|
+| Community differences | Owner minus paired saved community score; at most one >=+1.5 and one <=-1.5, strongest signed difference then numeric ID. One pair supports a fact, >=5 pairs a neutral summary. Coverage P/R. No popularity/objective quality inference. |
+| Preferences | R>=30, group>=8, >=10 other rated entries, usable axis labels on >=70% of R. Mean differs from R by >=0.75. Removing one best/worst group title from group and baseline must retain >=0.5 in that direction. At most one per side. Ties: effect, size, genre/theme/format, normalized label; example nearest group mean, then ID. |
+| Diversity | R only, independent known-year/format/label subsets. Release span/decades, every present eligible format separately, one frequent genre/theme. Characteristic label: R>=20, >=3 members, >=70% axis coverage, >=25% of known axis. One rare format/decade example: R>=20, >=80% coverage, <=10% share, distinct from dominant group. Ties: frequency, format before decade, key/ID. No scalar diversity score. |
+| Dropping | Dropped/F is factual from one outcome. Direction: F>=30, group>=10, >=10 other outcomes, >=3 dropped members, >=70% label coverage; group rate >=15 percentage points above baseline. One strongest result, ties by size/key; actual dropped example by ID without selecting low scores. |
+
+Calculations use exact fractions and round only presentation. Genre/theme membership may overlap;
+missing/empty legacy labels do not prove absence or usable coverage. Eligible comparisons without
+an effect are neutral; absent comparison support is insufficient. Independent facts survive
+unavailable siblings. Every rated dropped example retains its status in all blocks.
+
+The renderer owns one JPEG and its escaped caption from the same model. The warm cream/paper,
+near-black, red and muted blue palette follows the bundled icon, README and Statistics artwork.
+Higher ratings and above-usual preferences use blue; lower ratings and elevated dropping rates
+use red. Formats use the existing statistics' plural labels, four neutral blue/sand/grey tones
+and matching legend markers, without red or aggregation. Existing relevance filters limit
+Anime to Series/Movies/OVA/ONA, Manga to Manga/Manhwa/Manhua and Ranobe to Light novels/Novels.
+Every present format retains its name and share; four labels use a two-row legend.
+An overall dropping rate without a directional signal stays neutral. Signed values and
+labels convey comparison direction independently of colour. Main sections prioritize
+conclusions, comparisons and examples; the smaller footer retains distinct samples/coverage,
+rated diversity scope, exact dropping basis, list/generation dates, essential gaps, saved-metadata
+caveat and current-list limit. Full metadata coverage is implicit; only missing coverage is listed,
+separately for rated titles and completed/dropped outcomes. A complete paired selection shares
+the rated denominator instead of repeating a full fraction; partial pairs retain P/R explicitly.
+Ratings follow the final wrapped title line, with a larger gap
+between title groups. Community and preference differences share one badge style with text centred
+on its measured glyph/stroke bounds. Preferences show
+the profile baseline once, then separate neutral-coloured direction labels, group means and examples;
+the signed badge conveys above/below-baseline direction. Numbers have reserved space, long titles wrap/ellipsize and canonical
+title links remain intact. The caption contains only «Тайтлы из карточки:» and at most six
+unique linked examples within 950 visible UTF-16 units, retaining dropped statuses. Profile/category
+context stays on the image; a card without examples has an empty caption.
+The RGB image is 1200 pixels wide, at most 2400 high and 5 MiB. Pillow 13 uses one pinned static
+Noto Sans CJK JP Regular through `RESOURCE_ROOT`, with no OS font, browser or media download.
+Font/OFL/origin/Pillow component notices ship in source, Docker, the one-file EXE and portable ZIP
+notices directory. Offline `--taste-card-smoke DIR` works before config/env/mutex and generates all
+categories from explicitly fictional input.
+
+Delivery admits one generation per event loop without queuing. Cancellation drains its shielded
+bounded worker before releasing the slot and never sends the cancelled result. Captured bytes/caption
+use fresh uploads with `AT_LEAST_ONCE`; static failure notices use `SAFE_ONLY`. Aggregate uncertainty
+never authorizes another-format resend. There is no durable card queue or restart acknowledgement.
+Local visual inspection does not replace actual Telegram receipt/forwarding acceptance.
+
+Evidence: [analytics](tests/test_taste_card.py), [adapter](tests/test_taste_card_data.py),
+[render](tests/test_taste_card_render.py), [delivery](tests/test_taste_card_delivery.py),
+[navigation](tests/test_handlers_taste_card.py), [sync](tests/test_stats.py),
+[Windows](tests/test_windows_workflow.py), [Docker](tests/test_docker_compose.py).
 
 ### Telegram send outcomes
 

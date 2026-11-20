@@ -304,6 +304,7 @@ from storage import (
     validate_pending_quarter_delivery,
     validate_telegram_user_id,
 )
+from taste_card_delivery import deliver_taste_card
 from telegram_delivery import (
     RetryPolicy,
     send_with_retry,
@@ -1299,13 +1300,15 @@ def _lists_snapshot_report(media_key: str, view_key: str) -> Report:
     )
 
 
-async def _lists_show_progress(message: Message) -> Message | None:
+async def _lists_show_progress(
+    message: Message, *, text: str = _LISTS_PROGRESS_TEXT,
+) -> Message | None:
     """Показать неинтерактивный прогресс, предпочитая прежний control message."""
     try:
         if _main_menu_message_has_photo(message):
-            await message.edit_caption(caption=_LISTS_PROGRESS_TEXT, reply_markup=None)
+            await message.edit_caption(caption=text, reply_markup=None)
         else:
-            await message.edit_text(_LISTS_PROGRESS_TEXT, reply_markup=None)
+            await message.edit_text(text, reply_markup=None)
         return message
     except Exception as e:
         log.debug("lists: не удалось переиспользовать меню для прогресса: %s", e)
@@ -1314,7 +1317,7 @@ async def _lists_show_progress(message: Message) -> Message | None:
     except Exception as e:
         log.debug("lists: не удалось убрать кнопки перед прогрессом: %s", e)
     try:
-        return await message.answer(_LISTS_PROGRESS_TEXT)
+        return await message.answer(text)
     except Exception as e:
         log.debug("lists: не удалось отправить отдельный прогресс: %s", e)
         return None
@@ -1323,6 +1326,8 @@ async def _lists_show_progress(message: Message) -> Message | None:
 async def _lists_cleanup_progress(
     control_message: Message,
     progress_message: Message | None,
+    *,
+    finished_text: str = _LISTS_PROGRESS_FINISHED_TEXT,
 ) -> None:
     """Удалить прогресс или нейтрализовать старое переиспользованное меню."""
     if progress_message is control_message:
@@ -1333,12 +1338,12 @@ async def _lists_cleanup_progress(
             try:
                 if _main_menu_message_has_photo(control_message):
                     await control_message.edit_caption(
-                        caption=_LISTS_PROGRESS_FINISHED_TEXT,
+                        caption=finished_text,
                         reply_markup=None,
                     )
                 else:
                     await control_message.edit_text(
-                        _LISTS_PROGRESS_FINISHED_TEXT,
+                        finished_text,
                         reply_markup=None,
                     )
             except Exception as e:
@@ -1396,6 +1401,27 @@ async def _lists_deliver(
             )
     finally:
         await _lists_cleanup_progress(callback.message, progress_message)
+
+
+async def _taste_deliver(
+    callback: CallbackQuery, state: FSMContext, category: str,
+) -> None:
+    """Завершить выбор до чтения списка и удерживать прогресс до отправки."""
+    await state.clear()
+    try:
+        await callback.answer()
+    except Exception as error:
+        log.debug("Карточка вкуса: подтверждение кнопки недоступно (%s).", type(error).__name__)
+    await _cleanup_inline_command(callback.message)
+    progress = await _lists_show_progress(
+        callback.message, text="⏳ Формирую и отправляю карточку вкуса…",
+    )
+    try:
+        await deliver_taste_card(callback.message.bot, callback.message.chat.id, category)
+    finally:
+        await _lists_cleanup_progress(
+            callback.message, progress, finished_text="Обработка запроса завершена.",
+        )
 
 
 async def lists_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
@@ -5015,6 +5041,22 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
                 _stats_report_all,
                 label="stats-all",
             )
+            return
+        if action == "menu:stats:taste":
+            await _edit_main_menu(
+                callback, state, main_menu.taste_view(), screen="stats:taste",
+            )
+            return
+
+    if screen == "stats:taste":
+        if action == "menu:stats":
+            await _edit_main_menu(
+                callback, state, main_menu.stats_view(), screen="stats",
+            )
+            return
+        choices = {f"menu:stats:taste:{key}": key for key in main_menu.LIST_MEDIA}
+        if action in choices:
+            await _taste_deliver(callback, state, choices[action])
             return
 
     if screen == "lists":

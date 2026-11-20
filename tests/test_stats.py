@@ -19,6 +19,7 @@ import re
 from datetime import (
     datetime,
     timedelta,
+    timezone,
 )
 from html.parser import HTMLParser
 from unittest.mock import (
@@ -877,7 +878,7 @@ async def test_sync_forwards_favourites_input_and_session(monkeypatch, own_sessi
     monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
     monkeypatch.setattr("stats.fetch_list_export", AsyncMock(return_value=[]))
     monkeypatch.setattr("stats._collect_favourites", collect)
-    save = AsyncMock()
+    save = MagicMock()
     monkeypatch.setattr("stats.save_stats_all", save)
     kwargs = {} if own_session else {"session": session}
     if input_kind != "omitted":
@@ -891,7 +892,8 @@ async def test_sync_forwards_favourites_input_and_session(monkeypatch, own_sessi
     assert calls[0][1] is result and result is not state
     expected = smod.FAVOURITES_UNSET if input_kind == "omitted" else kwargs["fav"]
     assert calls[0][2] is expected
-    save.assert_not_called()
+    save.assert_called_once_with(result)
+    assert result["anime"]["list_synced_at"] and result["manga"]["list_synced_at"]
 
 
 @pytest.mark.asyncio
@@ -925,7 +927,7 @@ async def test_sync_retains_collection_publication_and_failure_policy(monkeypatc
     else:
         result, ok = await smod.sync_stats_all(session=object(), fav=None)
         assert ok is True
-        assert saved == ([result] if outcome in {"changed", "error"} else [])
+        assert saved == [result]
         if outcome == "changed":
             assert result["favourites"]["anime"][0]["id"] == "new"
         else:
@@ -4017,3 +4019,92 @@ async def test_catalog_marks_use_export_while_report_aggregates_stay_completed_o
     saved = storage.load_bot_achievement_state()
     assert saved["families"]["chapters"]["current_value"] == 60
     assert saved["families"]["long_works"]["current_value"] == 1
+
+
+def _taste_export_row(title_id=1, score=8):
+    return {"target_id": title_id, "status": "completed", "score": score}
+
+
+@pytest.mark.asyncio
+async def test_partial_unchanged_sync_publishes_only_successful_domain_time(monkeypatch):
+    state = storage._empty_stats_all()
+    old = "2026-01-01T00:00:00+00:00"
+    for media in ("anime", "manga"):
+        state[media]["list_synced_at"] = old
+    before = copy.deepcopy(state)
+    now = datetime(2026, 11, 18, 12)
+    monkeypatch.setattr("stats._utcnow", lambda: now)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=[[], None]))
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda _, value, **kwargs: value))
+    monkeypatch.setattr("stats.refresh_event_time_by_quarter", lambda *args: False)
+    monkeypatch.setattr("stats.load_stats_current", lambda **kwargs: {})
+    saved = []
+    monkeypatch.setattr("stats.save_stats_all", lambda value: saved.append(copy.deepcopy(value)))
+    result, ok = await smod.sync_stats_all(session=object(), fav=None)
+    assert ok and saved == [result]
+    assert result["anime"]["list_synced_at"] == now.replace(tzinfo=timezone.utc).isoformat()
+    assert result["manga"] == before["manga"]
+    assert state == before
+
+
+@pytest.mark.parametrize("raw", [True, float("inf")])
+def test_sync_does_not_coerce_invalid_owner_rating_into_a_rating(raw):
+    assert smod._merge_title_record("anime", _taste_export_row(score=raw), {"kind": "tv"})["score"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_rows", [[_taste_export_row(True)], [_taste_export_row("bad")], [_taste_export_row(), _taste_export_row(score=9)]])
+async def test_unusable_export_cannot_refresh_or_remove_domain(monkeypatch, bad_rows):
+    state = storage._empty_stats_all()
+    state["anime"]["titles"]["42"] = {
+        "title": "Сохранённый тайтл", "kind": "tv", "status": "completed", "score": 8,
+    }
+    state["anime"]["list_synced_at"] = "2026-01-01T00:00:00+00:00"
+    before = copy.deepcopy(state)
+    monkeypatch.setattr("stats.load_stats_all", lambda **kwargs: state)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=[bad_rows, None]))
+    monkeypatch.setattr("stats.save_stats_all", lambda value: pytest.fail("unusable export saved"))
+    result, ok = await smod.sync_stats_all(session=object(), fav=None)
+    assert not ok and result == before
+    assert state == before
+
+
+def test_validated_export_preserves_per_metric_duplicate_progress_uncertainty():
+    rows = [
+        {**_taste_export_row(1), "chapters": 10, "volumes": 2},
+        {**_taste_export_row("01", "8"), "chapters": 20, "volumes": 2},
+    ]
+    before = copy.deepcopy(rows)
+    validated = smod._validated_list_export(rows, "manga")
+    assert [row["target_id"] for row in validated] == ["1", "1"]
+    reading_rows = smod._reading_rows(validated)
+    assert reading_rows["1"]["chapters"] is None
+    assert reading_rows["1"]["volumes"] == 2
+    assert rows == before
+
+
+@pytest.mark.asyncio
+async def test_failed_sync_publication_cannot_freshen_the_next_card_snapshot(tmp_path, monkeypatch):
+    state = storage._empty_stats_all()
+    old = "2020-01-01T00:00:00+00:00"
+    state["anime"]["list_synced_at"] = old
+    path = tmp_path / "stats_all.json"
+    original = json.dumps(state).encode("utf-8")
+    path.write_bytes(original)
+    monkeypatch.setattr("storage.STATS_ALL_FILE", path)
+    monkeypatch.setattr("storage._stats_all_cache", None)
+    monkeypatch.setattr("stats.fetch_list_export", AsyncMock(side_effect=[[], None]))
+    monkeypatch.setattr("stats._collect_favourites", AsyncMock(side_effect=lambda _, value, **kwargs: value))
+    monkeypatch.setattr("stats.refresh_event_time_by_quarter", lambda *args: False)
+    monkeypatch.setattr("stats.load_stats_current", lambda **kwargs: {})
+
+    def fail_write(*args):
+        raise OSError("write failed")
+
+    monkeypatch.setattr("storage._atomic_write", fail_write)
+    candidate, _ = await smod.sync_stats_all(session=object(), fav=None)
+    assert candidate["anime"]["list_synced_at"] != old
+    published = storage.load_stats_all_snapshot(use_cache=False)
+    assert published.data["anime"]["list_synced_at"] == old
+    assert path.read_bytes() == original
