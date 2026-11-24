@@ -155,6 +155,11 @@ async def deliver_taste_card(bot: Bot, chat_id: int, category: str) -> TasteDeli
     if isinstance(prepared, str):
         await _notice(bot, chat_id, prepared)
         return TasteDeliveryResult("unavailable")
+
+    async def check_avatar_identity() -> None:
+        if avatar.image and avatar.user_id != current_profile_avatar().user_id:
+            raise RuntimeError("taste_card_avatar_identity_changed")
+
     result = await send_with_retry(
         lambda: bot.send_photo(
             chat_id=chat_id,
@@ -163,6 +168,7 @@ async def deliver_taste_card(bot: Bot, chat_id: int, category: str) -> TasteDeli
             parse_mode=ParseMode.HTML,
         ),
         policy=RetryPolicy.AT_LEAST_ONCE,
+        before_attempt=check_avatar_identity,
     )
     if result.delivered:
         return TasteDeliveryResult("sent", result)

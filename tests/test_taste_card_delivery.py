@@ -14,7 +14,10 @@ from unittest.mock import (
 )
 
 import pytest
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramRetryAfter,
+)
 from aiogram.methods import SendPhoto
 from PIL import (
     Image,
@@ -52,26 +55,22 @@ def request_env(monkeypatch):
 @pytest.mark.asyncio
 async def test_one_snapshot_and_frozen_payload_with_fresh_uploads(request_env, monkeypatch):
     bot, loader = request_env
-    uploads = []
-    captions = []
+    avatar = _avatar((32, 96, 160))
+    monkeypatch.setattr("taste_card_delivery.current_profile_avatar", lambda: avatar)
+    bot.send_photo.side_effect = [TimeoutError(), "photo"]
 
-    async def send(factory, *, policy):
-        assert policy is RetryPolicy.AT_LEAST_ONCE
-        await factory()
-        uploads.append(bot.send_photo.await_args.kwargs["photo"])
-        captions.append(bot.send_photo.await_args.kwargs["caption"])
-        await factory()
-        uploads.append(bot.send_photo.await_args.kwargs["photo"])
-        captions.append(bot.send_photo.await_args.kwargs["caption"])
-        return SendResult((SendAttempt(SendOutcome.CONFIRMED_SUCCESS),), value="photo")
+    async def refresh_avatar(_delay):
+        nonlocal avatar
+        avatar = _avatar((160, 96, 32))
 
-    monkeypatch.setattr("taste_card_delivery.send_with_retry", send)
+    monkeypatch.setattr("telegram_delivery._sleep", refresh_avatar)
     result = await delivery.deliver_taste_card(bot, 42, "anime")
     assert result.state == "sent"
     loader.assert_called_once_with()
-    assert uploads[0] is not uploads[1] and uploads[0].data == uploads[1].data
-    assert uploads[0].data.startswith(b"\xff\xd8")
-    assert captions[0] == captions[1]
+    first, retry = (call.kwargs for call in bot.send_photo.await_args_list)
+    assert first["photo"] is not retry["photo"] and first["photo"].data == retry["photo"].data
+    assert first["photo"].data.startswith(b"\xff\xd8")
+    assert first["caption"] == retry["caption"]
     bot.send_message.assert_not_awaited()
 
 
@@ -85,9 +84,10 @@ async def test_uncertainty_then_rejection_cannot_trigger_alternative_format(requ
         SendAttempt(SendOutcome.CONFIRMED_REJECTION, rejection),
     ))
 
-    async def send(factory, *, policy):
+    async def send(factory, *, policy, before_attempt=None):
         calls.append(policy)
         if policy is RetryPolicy.AT_LEAST_ONCE:
+            await before_attempt()
             await factory()
             return uncertain
         await factory()
@@ -237,6 +237,38 @@ def _avatar(color):
 def _avatar_pixel(photo):
     with Image.open(BytesIO(photo)) as image:
         return image.getpixel((1063, 120))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("first_outcome", "state", "notice_text"), [
+    (SendOutcome.CONFIRMED_REJECTION, "failed", "Не удалось отправить"),
+    (SendOutcome.UNCERTAIN, "uncertain", "могла прийти"),
+], ids=["rate_limited", "timeout"])
+async def test_avatar_identity_change_in_retry_wait_prevents_another_photo(
+    request_env, monkeypatch, first_outcome, state, notice_text,
+):
+    bot, _ = request_env
+    avatar = _avatar((32, 96, 160))
+    monkeypatch.setattr("taste_card_delivery.current_profile_avatar", lambda: avatar)
+    error = TimeoutError() if first_outcome is SendOutcome.UNCERTAIN else TelegramRetryAfter(
+        SendPhoto(chat_id=42, photo="x"), "retry later", retry_after=1,
+    )
+    bot.send_photo.side_effect = [error, "photo"]
+
+    async def change_identity(_delay):
+        nonlocal avatar
+        avatar = ProfileAvatar(2)
+
+    monkeypatch.setattr("telegram_delivery._sleep", change_identity)
+    result = await delivery.deliver_taste_card(bot, 42, "anime")
+
+    bot.send_photo.assert_awaited_once()
+    assert result.state == state
+    assert [attempt.outcome for attempt in result.send_result.attempts] == [
+        first_outcome, SendOutcome.NOT_DISPATCHED,
+    ]
+    assert notice_text in bot.send_message.await_args.kwargs["text"]
+    bot.send_document.assert_not_called()
 
 
 @pytest.mark.asyncio
