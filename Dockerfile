@@ -17,7 +17,6 @@ RUN set -eu; \
         home-v1.jpg \
         subscription-v1.jpg \
         stats-v1.jpg \
-        taste-card-v1.jpg \
         achievements-v1.jpg \
         lists-v1.jpg \
         lists-anime-v1.jpg \
@@ -29,7 +28,7 @@ RUN set -eu; \
     do \
         test -f "/app/assets/main-menu/$asset"; \
     done; \
-    test "$(find /app/assets/main-menu -maxdepth 1 -type f -name '*.jpg' | wc -l)" -eq 12
+    test "$(find /app/assets/main-menu -maxdepth 1 -type f -name '*.jpg' | wc -l)" -eq 11
 RUN test -f /app/examples/facts.json
 RUN test -f /app/assets/taste-card/OFL.txt
 RUN test -f /app/assets/taste-card/Pillow-LICENSE.txt

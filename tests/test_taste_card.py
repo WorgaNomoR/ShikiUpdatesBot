@@ -32,6 +32,32 @@ def _card(titles):
     return build_taste_card(TasteInput("DEMO", "anime", NOW, None, tuple(titles)))
 
 
+def test_overview_genres_histogram_and_outcomes_use_independent_selections():
+    card = _card([
+        replace(_title(1, 10, status="planned", kind="ova", community=Fraction(2)),
+                genres=("Драма", "драма", "Приключения")),
+        _title(2, 1, "Приключения", status="watching", community=Fraction(10)),
+        _title(3, 10, "Драма", status="dropped"),
+        _title(4, None, "", status="dropped"),
+        _title(5, 6, "", kind="movie"),
+    ])
+    assert card.available and card.overview.statuses == (1, 1, 0, 1, 0, 2)
+    assert card.overview.formats == (("Сериалы", 3), ("OVA", 1), ("Фильмы", 1))
+    assert card.overview.known_genres == 3
+    assert card.overview.genres == (("Драма", 2), ("Приключения", 2))
+    assert card.histogram == (1, 0, 0, 0, 0, 1, 0, 0, 0, 1)
+    assert card.rated == 3 and card.preferences.baseline == Fraction(17, 3)
+    assert card.paired == 1 and card.below.title.id == 2 and card.above is None
+    assert card.dropping.rate == Fraction(2, 3)
+
+
+def test_overview_genre_rows_stop_at_five_without_changing_denominator():
+    card = _card(_title(index, genre=f"Жанр {index}", status="planned") for index in range(1, 8))
+    assert card.available and card.rated == 0 and card.dropping.rate is None
+    assert card.overview.known_genres == 7
+    assert card.overview.genres == tuple((f"Жанр {index}", 1) for index in range(1, 6))
+
+
 def test_paired_comparisons_include_rated_dropped_and_have_stable_ties():
     titles = [
         _title(2, 9, community=Fraction("6.8"), status="dropped"),

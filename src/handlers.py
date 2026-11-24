@@ -1411,10 +1411,10 @@ async def _taste_deliver(
     try:
         await callback.answer()
     except Exception as error:
-        log.debug("Карточка вкуса: подтверждение кнопки недоступно (%s).", type(error).__name__)
+        log.debug("Карточка статистики: подтверждение кнопки недоступно (%s).", type(error).__name__)
     await _cleanup_inline_command(callback.message)
     progress = await _lists_show_progress(
-        callback.message, text="⏳ Формирую и отправляю карточку вкуса…",
+        callback.message, text="⏳ Формирую и отправляю карточку статистики…",
     )
     try:
         await deliver_taste_card(callback.message.bot, callback.message.chat.id, category)
@@ -5035,6 +5035,16 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
             )
             return
         if action == "menu:stats:all":
+            await _edit_main_menu(
+                callback, state, main_menu.stats_all_view(), screen="stats:all",
+            )
+            return
+
+    if screen == "stats:all":
+        if action == "menu:stats":
+            await _edit_main_menu(callback, state, main_menu.stats_view(), screen="stats")
+            return
+        if action == "menu:stats:detail":
             await _deliver_main_report(
                 callback,
                 state,
@@ -5042,19 +5052,19 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext) -> None:
                 label="stats-all",
             )
             return
-        if action == "menu:stats:taste":
+        if action == "menu:stats:short":
             await _edit_main_menu(
-                callback, state, main_menu.taste_view(), screen="stats:taste",
+                callback, state, main_menu.taste_view(), screen="stats:short",
             )
             return
 
-    if screen == "stats:taste":
-        if action == "menu:stats":
+    if screen == "stats:short":
+        if action == "menu:stats:all":
             await _edit_main_menu(
-                callback, state, main_menu.stats_view(), screen="stats",
+                callback, state, main_menu.stats_all_view(), screen="stats:all",
             )
             return
-        choices = {f"menu:stats:taste:{key}": key for key in main_menu.LIST_MEDIA}
+        choices = {f"menu:stats:short:{key}": key for key in main_menu.LIST_MEDIA}
         if action in choices:
             await _taste_deliver(callback, state, choices[action])
             return

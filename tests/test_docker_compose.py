@@ -66,6 +66,7 @@ def test_docker_context_keeps_required_runtime_files():
         "!assets/main-menu/*.jpg",
         "!assets/taste-card/",
         "!assets/taste-card/*.otf",
+        "!assets/taste-card/*.png",
         "!assets/taste-card/*.txt",
     ]
     assert "assets/" not in patterns

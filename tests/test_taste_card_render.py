@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Реальный локальный рендер, ограничения картинки и безопасные ссылки."""
+"""Реальный рендер, измеренные границы текста и атрибуция карточки."""
 
 from dataclasses import replace
 from fractions import Fraction
+from hashlib import sha256
 from html.parser import HTMLParser
 from io import BytesIO
+from shutil import copyfile
 
 import pytest
 from PIL import (
@@ -13,249 +15,256 @@ from PIL import (
     ImageDraw,
 )
 
+from runtime import RESOURCE_ROOT
 from taste_card import build_taste_card
 from taste_card_render import (
     CAPTION_LIMIT,
     MAX_BYTES,
     MAX_HEIGHT,
+    PROJECT_URL,
     TasteRenderError,
+    _Canvas,
     _footer_notes,
-    caption_for,
     render_taste_card,
     smoke_card,
 )
 
 
 class _Caption(HTMLParser):
-    def __init__(self):
+    def __init__(self, markup):
         super().__init__(convert_charrefs=True)
         self.text = ""
         self.links = []
+        self.feed(markup)
 
     def handle_data(self, data):
         self.text += data
 
     def handle_starttag(self, tag, attrs):
-        assert tag in {"b", "a"}
-        if tag == "a":
-            self.links.append(dict(attrs)["href"])
+        assert tag == "a"
+        self.links.append(dict(attrs)["href"])
 
 
-def test_caption_is_only_title_links_without_repeating_image_heading_or_profile():
-    card = smoke_card()
-    caption = _Caption()
-    caption.feed(caption_for(card))
-    assert caption.text.startswith("Тайтлы из карточки:\n1. ")
-    assert "Карточка вкуса" not in caption.text and card.source.profile not in caption.text
-    assert "Небо и море / 空と海 · брошено" in caption.text
+@pytest.fixture
+def drawing(monkeypatch):
+    captured = {}
+    original_text = ImageDraw.ImageDraw.text
+    original_panel = _Canvas.panel
 
+    def record_text(draw, xy, text, *args, **kwargs):
+        if draw._image.width > 1:
+            captured.setdefault("text", []).append((text, draw.textbbox(
+                xy, text, font=kwargs["font"], anchor=kwargs["anchor"], stroke_width=kwargs["stroke_width"],
+            )))
+        return original_text(draw, xy, text, *args, **kwargs)
 
-def test_caption_is_empty_when_card_has_no_examples():
-    source = smoke_card().source
-    source = replace(source, titles=(replace(
-        source.titles[0], status="completed", score=7, community=Fraction(7),
-    ),))
-    assert caption_for(build_taste_card(source)) == ""
+    def record_panel(canvas, y, end, *args, **kwargs):
+        if canvas.image.width > 1:
+            captured.setdefault("panels", []).append((2 * y, 2 * end))
+        return original_panel(canvas, y, end, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", record_text)
+    monkeypatch.setattr(_Canvas, "panel", record_panel)
+    return captured
 
 
 @pytest.mark.parametrize("category", ["anime", "manga", "ranobe"])
-def test_real_jpeg_fonts_cyrillic_cjk_and_category_smoke(category):
+def test_real_jpeg_fonts_caption_and_dense_category_smoke(category):
     card = smoke_card(category)
     rendered = render_taste_card(card)
     with Image.open(BytesIO(rendered.image)) as image:
         image.load()
         assert image.format == "JPEG" and image.mode == "RGB"
         assert image.size == (1200, rendered.height)
-    assert rendered.height <= MAX_HEIGHT
-    assert len(rendered.image) <= MAX_BYTES
+    assert rendered.height <= MAX_HEIGHT and len(rendered.image) <= MAX_BYTES
     assert rendered.width + rendered.height <= 10000
-    assert rendered.caption == caption_for(card)
-    caption = _Caption()
-    caption.feed(rendered.caption)
+    caption = _Caption(rendered.caption)
     assert len(caption.text.encode("utf-16-le")) // 2 <= CAPTION_LIMIT
-    assert caption.links == [title.url for title in card.examples]
+    assert caption.text.startswith("Тайтлы из карточки:\n1. ")
+    assert card.source.profile not in caption.text
+    assert caption.links == [card.above.title.url, card.below.title.url, card.dropping.pattern.example.url, PROJECT_URL]
+    assert "眠らない街" in caption.text and "· брошено" in caption.text
 
 
-def test_long_hostile_names_fit_bounded_image_and_caption_without_losing_links(monkeypatch):
+def test_planned_only_card_keeps_overview_and_project_link(drawing):
     source = smoke_card().source
-    titles = []
-    for title in source.titles:
-        changes = {}
-        if title.id == 2:
-            changes.update(score=10, community=Fraction(1))
-        if title.id == 12:
-            changes.update(score=1, community=Fraction(10))
-        if 21 <= title.id <= 30:
-            changes.update(themes=("Ужасы",), status="dropped" if title.id <= 25 else "completed")
-        titles.append(replace(
-            title, **changes,
-            title="<b>НЕ РАЗМЕТКА</b> & 😀 日本語 " + "Оченьдлинноеназвание" * 120,
-        ))
-    source = replace(source, profile="<Профиль> & " + "Я" * 110, titles=tuple(titles))
-    card = build_taste_card(source)
-    assert len(card.examples) == 6
-    drawn = []
-    original = ImageDraw.ImageDraw.text
+    source = replace(source, titles=(replace(
+        source.titles[0], status="planned", score=10, kind="tv", community=None,
+    ),))
+    rendered = render_taste_card(build_taste_card(source))
+    assert rendered.height < 1300
+    caption = _Caption(rendered.caption)
+    assert caption.links == [PROJECT_URL]
+    words = {text for text, _ in drawing["text"]}
+    assert {"Все тайтлы · сериалы", "В планах 1", "Пока нет личных оценок", "—"} <= words
+    assert "Доля брошенных" not in words
 
-    def record(drawing, xy, value, *args, **kwargs):
-        drawn.append((value, drawing.textbbox(
-            xy, value, font=kwargs["font"], anchor=kwargs.get("anchor"),
-            stroke_width=kwargs.get("stroke_width", 0),
-        )))
-        return original(drawing, xy, value, *args, **kwargs)
 
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", record)
-    rendered = render_taste_card(card)
-    caption = _Caption()
-    caption.feed(rendered.caption)
+def test_extreme_titles_and_labels_fit_measured_bounds_and_safe_caption(drawing):
+    source = smoke_card().source
+    long_title = "<b>НЕ РАЗМЕТКА</b> &lt; 😀 日本語 " + "Оченьдлинноеназвание" * 120
+    long_genre = "Триллер" + "曲" * 120
+    source = replace(source, profile="<Профиль> & " + "Я" * 110, titles=tuple(replace(
+        item, title=long_title,
+        genres=tuple(long_genre if tag == "Триллер" else tag for tag in item.genres),
+    ) for item in source.titles))
+    rendered = render_taste_card(build_taste_card(source))
+    caption = _Caption(rendered.caption)
     assert rendered.height <= MAX_HEIGHT
     assert len(caption.text.encode("utf-16-le")) // 2 <= CAPTION_LIMIT
-    assert "<b>НЕ РАЗМЕТКА</b>" in caption.text
-    assert caption.links == [title.url for title in card.examples]
-    assert len(caption.links) <= 6
-    assert sum("брошено" in value.lower() for value, _ in drawn) >= 3
+    assert "<b>НЕ РАЗМЕТКА</b> &lt;" in caption.text
     assert all(
         left >= 0 and top >= 0 and right <= rendered.width * 2 and bottom <= rendered.height * 2
-        for _, (left, top, right, bottom) in drawn
+        for _, (left, top, right, bottom) in drawing["text"]
     )
+    assert any(text.endswith("…") for text, _ in drawing["text"])
 
 
-@pytest.mark.parametrize("long_title", [False, True])
-def test_comparison_ratings_are_closer_to_own_title_than_next_title(monkeypatch, long_title):
-    source = smoke_card().source
-    suffix = " и путешествие через далёкие города" * 6 if long_title else ""
-    source = replace(source, titles=tuple(
-        replace(title, title=title.title + suffix) if title.id in {1, 11} else title
-        for title in source.titles
-    ))
-    drawn = []
-    original = ImageDraw.ImageDraw.text
-
-    def record(drawing, xy, value, *args, **kwargs):
-        drawn.append((value, drawing.textbbox(
-            xy, value, font=kwargs["font"], anchor=kwargs.get("anchor"),
-            stroke_width=kwargs.get("stroke_width", 0),
-        )))
-        return original(drawing, xy, value, *args, **kwargs)
-
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", record)
-    render_taste_card(build_taste_card(source))
-    rating_index = next(index for index, (value, _) in enumerate(drawn) if value.startswith("Профиль "))
-    title_bottom = drawn[rating_index - 1][1][3]
-    rating_top, rating_bottom = drawn[rating_index][1][1::2]
-    next_title_top = next(box[1] for value, box in drawn if value.startswith("Стеклянный город"))
-    own_gap = rating_top - title_bottom
-    between_groups = next_title_top - rating_bottom
-    assert 0 <= own_gap < between_groups
-    assert between_groups >= 24 * 2
+def test_comparison_legend_centres_head_clearance_and_long_title_padding(drawing):
+    render_taste_card(smoke_card())
+    entries = drawing["text"]
+    heading = next(box for text, box in entries if text == "Расхождения оценок по тайтлам")
+    profile = next(box for text, box in entries if text == "Профиль")
+    shikimori = next(box for text, box in entries if text == "Shikimori")
+    assert abs(sum(profile[1::2]) - sum(shikimori[1::2])) <= 2
+    assert heading[2] < profile[0] and profile[2] < shikimori[0]
+    row = next(box for text, box in entries if "Небо над городом" in text)
+    assert row[1] - max(heading[3], profile[3], shikimori[3]) >= 26 * 2
+    continuation = next(box for text, box in entries if "街の空" in text)
+    next_title = next(box for text, box in entries if "Тетрадь странствий" in text)
+    assert continuation[1] > row[3]
+    assert next_title[1] - continuation[3] >= 10 * 2
 
 
-def test_missing_packaged_font_is_a_typed_local_error(tmp_path):
+def test_dropping_explanation_and_example_have_real_padding(drawing):
+    render_taste_card(smoke_card())
+    entries = drawing["text"]
+    heading = next(box for text, box in entries if text == "Что доводилось бросать чаще")
+    panel_end = next(end for start, end in drawing["panels"] if start <= heading[1] < end)
+    explanation = next(box for text, box in entries if text == "Среди завершённых и брошенных тайтлов")
+    first = next(box for text, box in entries if text == "10 из 20")
+    example = next(box for text, box in entries if text.startswith("Пример · Хроники"))
+    assert first[1] >= explanation[3] + 32 * 2
+    assert panel_end - example[3] >= 19 * 2
+
+
+def test_degradation_keeps_both_comparisons_and_links_only_shown_examples(drawing, monkeypatch):
+    card = smoke_card()
+    monkeypatch.setattr("taste_card_render.MAX_HEIGHT", 2330)
+    rendered = render_taste_card(card)
+    links = _Caption(rendered.caption).links
+    assert rendered.height <= 2330
+    assert links[:2] == [card.above.title.url, card.below.title.url]
+    assert (card.dropping.pattern.example.url in links) == any(
+        text.startswith("Пример ·") for text, _ in drawing["text"]
+    )
+    assert links[-1] == PROJECT_URL
+
+
+def test_unreadable_font_is_a_typed_local_error(monkeypatch):
+    def unreadable_font(*args, **kwargs):
+        raise OSError("font")
+
+    monkeypatch.setattr("PIL.ImageFont.truetype", unreadable_font)
+    with pytest.raises(TasteRenderError, match="local_render"):
+        render_taste_card(smoke_card())
+
+
+def test_missing_packaged_font_in_requested_resource_root_is_a_typed_local_error(tmp_path):
+    assets = tmp_path / "assets" / "taste-card"
+    assets.mkdir(parents=True)
+    for name in ("repository-qr.png", "logo.png"):
+        copyfile(RESOURCE_ROOT / "assets" / "taste-card" / name, assets / name)
     with pytest.raises(TasteRenderError, match="local_render"):
         render_taste_card(smoke_card(), resource_root=tmp_path)
 
 
-def test_partial_unrated_list_retains_actual_drop_fact(monkeypatch):
+def test_transparent_or_invalid_avatar_uses_logo_and_partial_alpha_is_composited():
+    card = smoke_card()
+
+    def png(color):
+        output = BytesIO()
+        Image.new("RGBA", (160, 160), color).save(output, format="PNG")
+        return output.getvalue()
+
+    baseline = render_taste_card(card).image
+    assert render_taste_card(card, avatar=png((0, 0, 0, 0))).image == baseline
+    assert render_taste_card(card, avatar=b"bad image").image == baseline
+    translucent = render_taste_card(card, avatar=png((100, 20, 40, 128))).image
+    with Image.open(BytesIO(translucent)) as image:
+        rgb = image.getpixel((1063, 120))
+    assert all(abs(channel - expected) < 5 for channel, expected in zip(rgb, (177, 137, 147)))
+
+
+def test_qr_keeps_verified_matrix_and_clear_cream_quiet_zone(drawing):
+    path = RESOURCE_ROOT / "assets" / "taste-card" / "repository-qr.png"
+    with Image.open(path) as image:
+        alpha = image.convert("RGBA").getchannel("A")
+    # Матрица QR, декодированная в PROJECT_URL при проверке оригинала и JPEG.
+    assert sha256(alpha.tobytes()).hexdigest() == "985ecdf1331defa2313e5efd75519d5e327f0f42f0b537ca2c7034be77024db6"
+    rendered = render_taste_card(smoke_card())
+    with Image.open(BytesIO(rendered.image)) as image:
+        x, y = 1148 - 222, rendered.height - 16 - 246
+        crop = image.crop((x, y, x + 246, y + 246)).convert("L")
+        dark = crop.point(lambda n: 255 if n < 100 else 0)
+        assert dark.getbbox() == alpha.getbbox() == (24, 24, 222, 222)
+        # Ближайший пиксель при уменьшении в 6 раз проверяет центр каждого модуля.
+        modules = (41, 41)
+        assert dark.resize(modules, Image.Resampling.NEAREST).tobytes() == (
+            alpha.resize(modules, Image.Resampling.NEAREST).tobytes()
+        )
+        assert image.getpixel((x + 10, y + 40)) == image.getpixel((x - 10, y + 40))
+    assert {"Made by ShikiUpdatesBot", PROJECT_URL.removeprefix("https://")} <= {text for text, _ in drawing["text"]}
+
+
+def test_unrated_outcomes_keep_actual_drop_pattern(drawing):
     source = smoke_card().source
     source = replace(source, titles=tuple(replace(title, score=None, community=None) for title in source.titles))
-    card = build_taste_card(source)
-    assert card.available and card.rated == 0 and card.dropping.total == 60
-    drawn = []
-    original = ImageDraw.ImageDraw.text
-
-    def record(drawing, xy, value, *args, **kwargs):
-        drawn.append(value)
-        return original(drawing, xy, value, *args, **kwargs)
-
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", record)
-    rendered = render_taste_card(card)
-    assert rendered.height < MAX_HEIGHT and "<a " in rendered.caption
-    assert "10%" in drawn
-    assert any("6/60" in value for value in drawn)
+    rendered = render_taste_card(build_taste_card(source))
+    assert rendered.height < MAX_HEIGHT
+    words = {text for text, _ in drawing["text"]}
+    assert {"Пока нет личных оценок", "10 из 20", "20 из 120", "50%"} <= words
 
 
-def test_footer_full_coverage_shares_selection_without_repeated_complete_fractions():
-    notes = "\n".join(_footer_notes(smoke_card()))
-    assert "60 тайтлов без запланированного — все оценены" in notes
-    assert "Сравнение и разнообразие — по оценённым" in notes
-    assert "Группы оценок: Детектив — 10; Романтика — 10" in notes
-    assert "среди завершённых и брошенных: 6/60; Детектив: 4/10" in notes
-    assert "60/60" not in notes and "Неполные метаданные" not in notes
-    assert notes.count("UTC") == 1
-    assert "Рейтинги Shikimori могут быть старше списка" in notes
-    assert "удалённые тайтлы не учтены" in notes
-
-
-@pytest.mark.parametrize("format_count, expected", [
-    (2, {"Сериалы", "Фильмы"}),
-    (3, {"Сериалы", "Фильмы", "OVA"}),
-    (4, {"Сериалы", "Фильмы", "OVA", "ONA"}),
-])
-def test_format_legend_names_every_present_format(
-    monkeypatch, format_count, expected,
-):
+def test_four_format_legend_names_and_shares_stay_inside_panel(drawing):
     source = smoke_card().source
-    kinds = ("tv",) * 30 + ("movie",) * 15 + ("ova",) * 10 + ("ona",) * 5
-    allowed = {"tv", "movie", "ova", "ona"} if format_count == 4 else (
-        {"tv", "movie", "ova"} if format_count == 3 else {"tv", "movie"}
-    )
-    source = replace(source, titles=tuple(replace(
-        title, kind=kinds[index] if kinds[index] in allowed else "tv",
-    ) for index, title in enumerate(source.titles)))
-    drawn = []
-    measured = []
-    original = ImageDraw.ImageDraw.text
-
-    def record(drawing, xy, value, *args, **kwargs):
-        drawn.append(value)
-        measured.append((value, drawing.textbbox(
-            xy, value, font=kwargs["font"], anchor=kwargs.get("anchor"),
-            stroke_width=kwargs.get("stroke_width", 0),
-        )))
-        return original(drawing, xy, value, *args, **kwargs)
-
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", record)
-    render_taste_card(build_taste_card(source))
-    names = {"Сериалы", "Фильмы", "OVA", "ONA", "Другое", "TV"}
-    legend = {value.split()[0] for value in drawn if "%" in value and value.split()[0] in names}
-    assert legend == expected
-    if format_count == 4:
-        assert "OVA 17%" in drawn and "ONA 8%" in drawn
-        boxes = {value.split()[0]: box for value, box in measured if "%" in value and value.split()[0] in names}
-        assert boxes["Сериалы"][1] == boxes["Фильмы"][1]
-        assert boxes["OVA"][1] == boxes["ONA"][1]
-        assert boxes["OVA"][1] > max(boxes[name][3] for name in ("Сериалы", "Фильмы"))
-        facts_top = min(box[1] for value, box in measured if value.startswith("Часто встречается:"))
-        assert max(box[3] for box in boxes.values()) < facts_top
+    kinds = ("tv",) * 104 + ("movie",) * 32 + ("ova",) * 16 + ("ona",) * 8
+    titles = tuple(replace(title, kind=kind) for title, kind in zip(source.titles, kinds, strict=True))
+    render_taste_card(build_taste_card(replace(source, titles=titles)))
+    expected = {"Сериалы": "65%", "Фильмы": "20%", "OVA": "10%", "ONA": "5%"}
+    rows = {text: box for text, box in drawing["text"] if text in expected}
+    assert rows.keys() == expected.keys()
+    for name, label_box in rows.items():
+        [(share, share_box)] = [
+            (text, box) for text, box in drawing["text"]
+            if text.endswith("%") and box[1] == label_box[1] and label_box[2] < box[0] < 580 * 2
+        ]
+        assert share == expected[name]
+        assert share_box[2] < 580 * 2 and share_box[3] < (386 + 276) * 2
 
 
-def test_footer_partial_coverage_keeps_rated_and_outcome_denominators_separate():
+def test_neutral_ratings_and_outcomes_fit_compact_sections(drawing):
     source = smoke_card().source
-    source = replace(source, titles=tuple(replace(
-        title,
-        score=None if title.id <= 10 else title.score,
-        community=None if 11 <= title.id <= 15 else title.community,
-        genres=() if 11 <= title.id <= 20 else title.genres,
+    source = replace(source, titles=tuple(replace(title, score=7, status="completed", community=Fraction(7))
+                                         for title in source.titles))
+    rendered = render_taste_card(build_taste_card(source))
+    assert rendered.height < 2080
+    words = " ".join(text for text, _ in drawing["text"])
+    assert "Заметных расхождений нет" in words
+    assert "Заметной разницы между группами нет" in words
+    assert "Направление не выделяется" in words
+
+
+def test_footer_reports_partial_coverage_without_using_the_global_cache_date():
+    source = smoke_card().source
+    source = replace(source, synced_at=None, excluded=1, titles=tuple(replace(
+        title, genres=() if 11 <= title.id <= 20 else title.genres,
         themes=() if title.id <= 15 else title.themes,
         year=None if 11 <= title.id <= 16 else title.year,
     ) for title in source.titles))
     notes = "\n".join(_footer_notes(build_taste_card(source)))
-    assert "оценено 50" in notes and "Сравнение с Shikimori: 45/50" in notes
-    assert "Неполные метаданные оценённых: жанры 40/50; темы 45/50; годы 44/50" in notes
-    assert "Неполные метаданные завершённых и брошенных: жанры 50/60; темы 45/60" in notes
-    assert "форматы" not in notes and "тип не определён у 0" not in notes
-
-
-@pytest.mark.parametrize("unrated", [False, True])
-def test_footer_empty_selection_has_no_zero_denominator_or_false_coverage(unrated):
-    source = smoke_card().source
-    source = replace(source, synced_at=None, titles=tuple(replace(
-        title, score=None if unrated else title.score,
-        status="completed" if unrated else "watching", genres=(), themes=(), year=None,
-    ) for title in source.titles))
-    notes = "\n".join(_footer_notes(build_taste_card(source)))
-    assert "0/0" not in notes and "дата неизвестна" in notes
-    assert ("Неполные метаданные оценённых:" in notes) is not unrated
-    assert ("Неполные метаданные завершённых и брошенных:" in notes) is unrated
-    if not unrated:
-        assert "пока нет конечных исходов" in notes
+    assert "Оценено 112. Рейтинг Shikimori — у 94 из них." in notes
+    assert "жанры 102/112 · темы 97/112 · годы 106/112" in notes
+    assert "жанры 110/120 · темы 105/120" in notes
+    assert "непригодных записей 1" in notes and "Дата списка неизвестна" in notes
+    assert "тип не определён у 0" not in notes and "UTC" in notes

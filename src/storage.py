@@ -1475,6 +1475,21 @@ class StatsAllSnapshot:
 
     data: dict
     state: str
+    revision: tuple | None = None
+
+
+def _stats_all_revision(stat: os.stat_result) -> tuple:
+    # На Windows st_ctime_ns у Path.stat и fstat может означать разное.
+    created_or_changed = getattr(stat, "st_birthtime_ns", stat.st_ctime_ns)
+    return (STATS_ALL_FILE, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, created_or_changed)
+
+
+def published_stats_all_revision() -> tuple | None:
+    """Проверить опубликованный файл без чтения JSON или доверия рабочему кешу."""
+    try:
+        return _stats_all_revision(STATS_ALL_FILE.stat())
+    except OSError:
+        return None
 
 
 def _empty_stats_all() -> dict:
@@ -1492,20 +1507,26 @@ def read_stats_all_snapshot() -> StatsAllSnapshot:
     """Прочитать независимый срез без доступа к общему кешу, в том числе из worker."""
     data = _empty_stats_all()
     state = STATS_ALL_MISSING
+    revision = None
     try:
-        if STATS_ALL_FILE.exists():
-            raw = json.loads(STATS_ALL_FILE.read_text(encoding="utf-8"))
+        with STATS_ALL_FILE.open(encoding="utf-8") as handle:
+            before = _stats_all_revision(os.fstat(handle.fileno()))
+            raw = json.load(handle)
             if isinstance(raw, dict) and "anime" in raw and "manga" in raw:
                 data = raw
                 state = STATS_ALL_VALID
+                if before == _stats_all_revision(os.fstat(handle.fileno())):
+                    revision = before
             else:
                 state = STATS_ALL_INVALID
                 log.warning("load_stats_all: неожиданная структура, сбрасываем.")
-    except (json.JSONDecodeError, OSError, ValueError) as e:
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RecursionError) as e:
         state = STATS_ALL_INVALID
         log.warning("load_stats_all: не удалось прочитать файл: %s", e)
 
-    return StatsAllSnapshot(data, state)
+    return StatsAllSnapshot(data, state, revision)
 
 
 def load_stats_all_snapshot(use_cache: bool = True) -> StatsAllSnapshot:

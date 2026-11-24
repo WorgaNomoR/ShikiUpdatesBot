@@ -39,6 +39,7 @@ from notification_outbox import (
     finish,
     possible_delivery,
 )
+from profile_avatar import observe_profile_avatar
 from shiki_api import (
     fetch_achievement_labels,
     fetch_achievements,
@@ -114,6 +115,7 @@ async def synchronize_achievements(*, session=None) -> bool:
         expected = load_achievement_state()
     if expected is not None and source["user_id"] != expected["user_id"]:
         _profile_conflicts[asyncio.get_running_loop()] = expected["state_id"]
+        observe_profile_avatar(source["user_id"], None, matches=False)
         raise AchievementStateError("achievement_profile")
     labels = {}
     if expected is not None and any(
@@ -135,6 +137,7 @@ async def synchronize_achievements(*, session=None) -> bool:
             return False
         save_achievement_state(candidate)
         _profile_conflicts.pop(asyncio.get_running_loop(), None)
+    observe_profile_avatar(source["user_id"], source.get("avatar_url"))
     return True
 
 

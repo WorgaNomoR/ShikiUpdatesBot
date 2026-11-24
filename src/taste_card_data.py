@@ -20,6 +20,7 @@ from storage import (
 )
 from taste_card import (
     CATEGORY_LABELS,
+    STATUSES,
     TasteInput,
     TasteTitle,
 )
@@ -27,8 +28,6 @@ from utils import (
     canonical_title_id,
     personal_score,
 )
-
-_STATUSES = {"planned", "watching", "rewatching", "completed", "on_hold", "dropped"}
 
 
 def _text(value: object, limit: int = 2048) -> str:
@@ -109,7 +108,7 @@ def build_taste_input(
     base_url = f"{base.scheme}://{base.netloc}"
     raw_titles = {}
     conflicts = set()
-    excluded = unresolved = planned = 0
+    excluded = unresolved = 0
     for raw_id, record in domain["titles"].items():
         title_id = canonical_title_id(raw_id)
         if title_id is None or not isinstance(record, dict):
@@ -141,11 +140,8 @@ def build_taste_input(
                 continue
         status = record.get("status")
         status = status.strip().lower() if isinstance(status, str) else ""
-        if status not in _STATUSES:
+        if status not in STATUSES:
             excluded += 1
-            continue
-        if status == "planned":
-            planned += 1
             continue
         year = record.get("year")
         year = year if type(year) is int and 1 <= year <= now.year else None
@@ -164,5 +160,5 @@ def build_taste_input(
         )
     return TasteInput(
         **initial, titles=tuple(titles), state=state,
-        unresolved=unresolved, excluded=excluded, planned=planned,
+        unresolved=unresolved, excluded=excluded,
     )

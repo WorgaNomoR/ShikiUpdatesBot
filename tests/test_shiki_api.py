@@ -139,12 +139,15 @@ async def test_achievement_api_resolves_user_and_retries_through_central_client(
     sleeps = AsyncMock()
     monkeypatch.setattr("shiki_api.asyncio.sleep", sleeps)
     session = _AchievementSession([
-        _FakeResponse(200, json_value={"id": 42, "nickname": "WNR"}),
+        _FakeResponse(200, json_value={
+            "id": 42, "nickname": "WNR", "image": {"x160": "/system/users/x160/42.png"},
+        }),
         _FakeResponse(429),
         _FakeResponse(200, json_value=[achievement_row_factory()]),
     ])
     result = await shiki_api.fetch_achievements(session)
     assert result["user_id"] == 42
+    assert result["avatar_url"] == "/system/users/x160/42.png"
     assert result["rows"][0]["level"] == 1
     assert session.requests[0][0][0].endswith("/api/users/WNR/info")
     assert all(request[0][0].endswith("/api/achievements?user_id=42") for request in session.requests[1:])
@@ -169,7 +172,7 @@ async def test_achievement_api_empty_success_and_failures(status, payload):
         _FakeResponse(status, json_value=payload),
     ])
     result = await shiki_api.fetch_achievements(session)
-    assert result == ({"user_id": 42, "rows": []} if status == 200 and payload == [] else None)
+    assert result == ({"user_id": 42, "rows": [], "avatar_url": None} if status == 200 and payload == [] else None)
 
 
 class _AchievementPageContent:
@@ -182,6 +185,26 @@ class _AchievementPageContent:
         for chunk in self.chunks:
             self.read_count += 1
             yield chunk
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("length", "chunks", "expected", "consumed"), [
+    (None, [b"abc", b"def"], b"abcdef", 2),
+    (256 * 1024 + 1, [b"unread"], None, 0),
+    (None, [b"x" * (256 * 1024), b"y", b"unread"], None, 2),
+])
+async def test_avatar_uses_central_client_without_redirects_and_bounds_bytes(length, chunks, expected, consumed):
+    response = _FakeResponse(200)
+    response.content_length = length
+    response.content = _AchievementPageContent(chunks)
+    session = _AchievementSession([response])
+    url = "https://shikimori.io/system/users/x160/42.png"
+    assert await shiki_api.fetch_profile_avatar(session, url) == expected
+    assert response.content.read_count == consumed
+    [(args, kwargs)] = session.requests
+    assert args == (url,) and kwargs["allow_redirects"] is False
+    assert kwargs["headers"]["User-Agent"] == shiki_api.HEADERS["User-Agent"]
+    assert shiki_api._request_attempt_budget.snapshot().used == 1
 
 
 @pytest.mark.asyncio

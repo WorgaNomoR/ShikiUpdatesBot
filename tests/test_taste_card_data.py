@@ -60,12 +60,13 @@ def test_statuses_and_independent_bad_metadata_remain_unavailable():
                      year=2027, url="javascript:bad"),
     })
     result = _build(snapshot)
-    assert result.planned == 1 and result.excluded == 1
+    assert result.excluded == 1
     assert result.titles[0].score is None and result.titles[0].community is None
     assert result.titles[0].year is None
-    assert result.titles[1].genres == ("Драма",) and result.titles[1].themes == ()
-    assert result.titles[1].year is None
-    assert result.titles[1].url == "https://shikimori.io/mangas/4"
+    assert result.titles[1].status == "planned"
+    assert result.titles[2].genres == ("Драма",) and result.titles[2].themes == ()
+    assert result.titles[2].year is None
+    assert result.titles[2].url == "https://shikimori.io/mangas/4"
 
 
 def test_duplicate_ids_collapse_but_conflict_quarantines_complete_id():
@@ -97,7 +98,7 @@ def test_confirmed_empty_legacy_empty_unknown_and_corrupt_categories_are_distinc
     assert _build(_snapshot({}, timestamp=NOW.isoformat())).state == "empty"
     assert _build(_snapshot({"1": _record("future")})).state == "unresolved"
     assert _build(_snapshot({"1": None})).state == "invalid"
-    assert _build(_snapshot({"1": _record(status="planned")})).state == "empty"
+    assert _build(_snapshot({"1": _record(status="planned")})).state == "ready"
 
 
 def test_valid_sibling_survives_damaged_domain():

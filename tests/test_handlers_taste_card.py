@@ -10,10 +10,7 @@ from unittest.mock import (
 import pytest
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import (
-    BufferedInputFile,
-    Chat,
-)
+from aiogram.types import Chat
 
 import handlers
 from taste_card_delivery import TasteDeliveryResult
@@ -65,14 +62,23 @@ def _callback(action):
 @pytest.mark.asyncio
 async def test_category_menu_and_back_are_public_and_do_not_read_subscriptions(monkeypatch):
     state = _State()
-    callback = _callback("menu:stats:taste")
+    callback = _callback("menu:stats:all")
     monkeypatch.setattr("handlers.load_subscribers", lambda: pytest.fail("subscription read"))
     await handlers.main_menu_cb(callback, state)
-    assert state.data["main_menu_screen"] == "stats:taste"
+    assert state.data["main_menu_screen"] == "stats:all"
     keyboard = callback.message.edit_text.await_args.kwargs["reply_markup"]
     buttons = {button.callback_data for row in keyboard.inline_keyboard for button in row}
-    assert buttons == {"menu:stats:taste:anime", "menu:stats:taste:manga",
-                       "menu:stats:taste:ranobe", "menu:stats"}
+    assert buttons == {"menu:stats:short", "menu:stats:detail", "menu:stats"}
+    callback.data = "menu:stats:short"
+    await handlers.main_menu_cb(callback, state)
+    assert state.data["main_menu_screen"] == "stats:short"
+    keyboard = callback.message.edit_text.await_args.kwargs["reply_markup"]
+    buttons = {button.callback_data for row in keyboard.inline_keyboard for button in row}
+    assert buttons == {"menu:stats:short:anime", "menu:stats:short:manga",
+                       "menu:stats:short:ranobe", "menu:stats:all"}
+    callback.data = "menu:stats:all"
+    await handlers.main_menu_cb(callback, state)
+    assert state.data["main_menu_screen"] == "stats:all"
     callback.data = "menu:stats"
     await handlers.main_menu_cb(callback, state)
     assert state.data["main_menu_screen"] == "stats"
@@ -81,14 +87,14 @@ async def test_category_menu_and_back_are_public_and_do_not_read_subscriptions(m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("category", ["anime", "manga", "ranobe"])
 async def test_selection_is_consumed_before_work_and_replay_is_inert(monkeypatch, category):
-    state = _State("stats:taste")
-    callback = _callback(f"menu:stats:taste:{category}")
+    state = _State("stats:short")
+    callback = _callback(f"menu:stats:short:{category}")
     monkeypatch.setattr("handlers._cleanup_inline_command", AsyncMock())
     monkeypatch.setattr("handlers.load_subscribers", lambda: pytest.fail("subscription read"))
 
     async def deliver(*args):
         assert state.state is None
-        assert "карточку вкуса" in callback.message.edit_text.await_args.args[0]
+        assert "карточку статистики" in callback.message.edit_text.await_args.args[0]
         callback.message.delete.assert_not_awaited()
         return TasteDeliveryResult("sent")
 
@@ -105,8 +111,8 @@ async def test_selection_is_consumed_before_work_and_replay_is_inert(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["sender", "chat", "control", "expired", "screen", "category"])
 async def test_invalid_controls_cannot_read_data_or_change_session(monkeypatch, invalid):
-    state = _State("stats:taste")
-    callback = _callback("menu:stats:taste:anime")
+    state = _State("stats:short")
+    callback = _callback("menu:stats:short:anime")
     if invalid == "sender":
         callback.from_user.id = 778
     elif invalid == "chat":
@@ -118,7 +124,7 @@ async def test_invalid_controls_cannot_read_data_or_change_session(monkeypatch, 
     elif invalid == "screen":
         state.data["main_menu_screen"] = "stats"
     else:
-        callback.data = "menu:stats:taste:unknown"
+        callback.data = "menu:stats:short:unknown"
     before_state = state.state
     before_data = state.data.copy()
     delivery = AsyncMock()
@@ -133,25 +139,25 @@ async def test_invalid_controls_cannot_read_data_or_change_session(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_progress_failure_does_not_suppress_delivery(monkeypatch):
-    callback = _callback("menu:stats:taste:anime")
+    callback = _callback("menu:stats:short:anime")
     callback.message.edit_text.side_effect = RuntimeError("edit failed")
     callback.message.answer.side_effect = RuntimeError("progress failed")
     monkeypatch.setattr("handlers._cleanup_inline_command", AsyncMock())
     delivery = AsyncMock(return_value=TasteDeliveryResult("sent"))
     monkeypatch.setattr("handlers.deliver_taste_card", delivery)
-    await handlers.main_menu_cb(callback, _State("stats:taste"))
+    await handlers.main_menu_cb(callback, _State("stats:short"))
     delivery.assert_awaited_once()
     callback.message.edit_reply_markup.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_callback_acknowledgement_failure_does_not_suppress_selected_card(monkeypatch):
-    callback = _callback("menu:stats:taste:anime")
+    callback = _callback("menu:stats:short:anime")
     callback.answer.side_effect = RuntimeError("expired callback")
     monkeypatch.setattr("handlers._cleanup_inline_command", AsyncMock())
     delivery = AsyncMock(return_value=TasteDeliveryResult("sent"))
     monkeypatch.setattr("handlers.deliver_taste_card", delivery)
-    state = _State("stats:taste")
+    state = _State("stats:short")
     await handlers.main_menu_cb(callback, state)
     delivery.assert_awaited_once()
     assert state.state is None
@@ -159,59 +165,53 @@ async def test_callback_acknowledgement_failure_does_not_suppress_selected_card(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["photo", "missing", "rejected"])
-async def test_category_picker_uses_own_artwork_and_retains_text_fallback(monkeypatch, outcome):
-    state = _State()
-    callback = _callback("menu:stats:taste")
-    callback.message.photo = [MagicMock(file_id="telegram-taste-v1")]
+@pytest.mark.parametrize("reject", [False, True])
+async def test_category_picker_reuses_statistics_artwork_and_has_text_fallback(monkeypatch, reject):
+    state = _State("stats:all")
+    callback = _callback("menu:stats:short")
+    callback.message.photo = [MagicMock(file_id="cached-stats")]
     callback.message.edit_media = AsyncMock(return_value=callback.message)
     callback.message.bot = AsyncMock()
     callback.message.bot.send_message.return_value = MagicMock(message_id=201)
-    monkeypatch.setattr("handlers._main_menu_artwork_bytes", {})
     monkeypatch.setattr("handlers._main_menu_file_ids", {"stats": "cached-stats"})
-    asset_path = MagicMock()
-    asset_path.read_bytes.return_value = b"taste-artwork"
     asset_dir = MagicMock()
-    asset_dir.__truediv__.return_value = asset_path
     monkeypatch.setattr("handlers.MAIN_MENU_ASSET_DIR", asset_dir)
-    if outcome == "missing":
-        asset_path.read_bytes.side_effect = OSError("missing asset")
-    elif outcome == "rejected":
+    if reject:
         callback.message.edit_media.side_effect = TelegramBadRequest(
             method=MagicMock(), message="wrong file identifier",
         )
 
     await handlers.main_menu_cb(callback, state)
-
-    asset_dir.__truediv__.assert_called_once_with("taste-card-v1.jpg")
-    assert state.data["main_menu_screen"] == "stats:taste"
-    assert handlers._main_menu_file_ids["stats"] == "cached-stats"
-    if outcome == "photo":
-        callback.message.edit_media.assert_awaited_once()
-        media = callback.message.edit_media.await_args.kwargs["media"]
-        assert isinstance(media.media, BufferedInputFile)
-        assert media.media.filename == "taste-card-v1.jpg"
-        assert media.media.data == b"taste-artwork"
-        assert media.caption is None
-        assert handlers._main_menu_file_ids["stats:taste"] == "telegram-taste-v1"
-        callback.message.bot.send_message.assert_not_awaited()
-        control = callback.message.edit_media.await_args
-    else:
-        callback.message.bot.send_message.assert_awaited_once()
+    asset_dir.__truediv__.assert_not_called()
+    assert state.data["main_menu_screen"] == "stats:short"
+    assert callback.message.edit_media.await_args.kwargs["media"].media == "cached-stats"
+    if reject:
         control = callback.message.bot.send_message.await_args
-        assert "Карточка вкуса" in control.args[1]
+        assert "Краткая карточка" in control.args[1]
         assert "Выбери категорию" in control.args[1]
         assert state.data["main_menu_message_id"] == 201
-        assert "stats:taste" not in handlers._main_menu_file_ids
+        assert "stats" not in handlers._main_menu_file_ids
         callback.message.bot.delete_message.assert_awaited_once_with(55, 200)
-        if outcome == "missing":
-            callback.message.edit_media.assert_not_awaited()
-        else:
-            callback.message.edit_media.assert_awaited_once()
+    else:
+        callback.message.bot.send_message.assert_not_awaited()
+        assert handlers._main_menu_file_ids["stats"] == "cached-stats"
+        control = callback.message.edit_media.await_args
     buttons = {
         button.callback_data
         for row in control.kwargs["reply_markup"].inline_keyboard
         for button in row
     }
-    assert buttons == {"menu:stats:taste:anime", "menu:stats:taste:manga",
-                       "menu:stats:taste:ranobe", "menu:stats"}
+    assert buttons == {"menu:stats:short:anime", "menu:stats:short:manga",
+                       "menu:stats:short:ranobe", "menu:stats:all"}
+
+
+@pytest.mark.asyncio
+async def test_detailed_report_retains_existing_builder_and_validates_screen(monkeypatch):
+    callback = _callback("menu:stats:detail")
+    delivery = AsyncMock()
+    monkeypatch.setattr("handlers._deliver_main_report", delivery)
+    await handlers.main_menu_cb(callback, _State("stats"))
+    delivery.assert_not_awaited()
+    state = _State("stats:all")
+    await handlers.main_menu_cb(callback, state)
+    delivery.assert_awaited_once_with(callback, state, handlers._stats_report_all, label="stats-all")

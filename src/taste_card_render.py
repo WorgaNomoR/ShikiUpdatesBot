@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026  WorgaNomoR
-"""Локальное изображение и подпись из одного неизменяемого портрета."""
+"""Локальная карточка статистики и её подпись."""
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import (
+    dataclass,
+    replace,
+)
 from datetime import (
     datetime,
     timezone,
@@ -16,6 +20,7 @@ from PIL import (
     Image,
     ImageDraw,
     ImageFont,
+    ImageOps,
 )
 
 from runtime import RESOURCE_ROOT
@@ -33,39 +38,56 @@ MAX_HEIGHT = 2400
 MAX_BYTES = 5 * 1024 * 1024
 CAPTION_LIMIT = 950
 FONT_NAME = "NotoSansCJKjp-Regular.otf"
-# Кремовый, красный и тёмные тона повторяют логотип, README и иллюстрацию статистики.
-_BG, _INK, _MUTED = "#FBF0E0", "#101817", "#6A5C50"
-_RED, _BLUE, _LINE = "#B72518", "#354D60", "#D8C8B4"
-_PAPER, _SHADOW, _SAND = "#FFF9EF", "#E8DCC9", "#B39B7C"
-_SLATE = "#849B9F"
-_RED_TINT, _BLUE_TINT = "#F7E3D8", "#E8EBEA"
+PROJECT_ADDRESS = "github.com/WorgaNomoR/ShikiUpdatesBot"
+PROJECT_URL = "https://" + PROJECT_ADDRESS
+
+_BG, _PAPER, _INK, _MUTED = "#FBF0E0", "#FFFFFF", "#101817", "#6A5C50"
+_LINE, _TRACK = "#E1D5C6", "#ECE8E2"
+_BLUE, _DARK_BLUE, _RED = "#41647B", "#234659", "#A3382C"
+_SAND, _SLATE = "#AA8D67", "#779197"
+_FORMAT_COLORS = (_BLUE, _SAND, _SLATE, "#565968")
+_STATUS_COLORS = (_BLUE, _SLATE, "#57576F", "#C6AA83", "#736762", "#AD493D")
+_LEFT, _RIGHT, _TEXT_LEFT, _TEXT_RIGHT = 52, 1148, 78, 1122
+_AXIS_LABELS = {"genre": "Жанр", "theme": "Тема", "format": "Формат"}
+_AXIS_HEADINGS = {
+    "genre": "Средние оценки по жанрам",
+    "theme": "Средние оценки по темам",
+    "format": "Средние оценки по форматам",
+}
 
 
 class TasteRenderError(ValueError):
-    """Локальный макет или ресурсы не позволяют безопасно сформировать фото."""
+    """Локальный макет или ресурсы не позволяют сформировать фото."""
 
 
 @dataclass(frozen=True)
 class RenderedTasteCard:
-    """Замороженная пара фото/подпись до первой попытки Telegram."""
+    """Замороженная пара фото и подписи до первой попытки Telegram."""
 
     image: bytes
     caption: str
     width: int
     height: int
-    filename: str = "taste-card.jpg"
+    filename: str = "profile-statistics.jpg"
 
 
-def _number(value: Fraction | int, *, signed: bool = False) -> str:
-    """Округлить только отображение, сохранив простые русские числа."""
-    return format(float(value), "+.1f" if signed else ".1f").replace(".", ",").replace("-", "−")
+@dataclass(frozen=True)
+class _Layout:
+    rare: bool = True
+    two_line_titles: bool = True
+    drop_example: bool = True
+    years: bool = True
+
+
+def _number(value: Fraction | int, *, signed: bool = False, compact: bool = False) -> str:
+    label = format(float(value), "+.1f" if signed else ".1f").replace(".", ",").replace("-", "−")
+    return label.removesuffix(",0") if compact else label
 
 
 def _percent(value: Fraction) -> str:
-    """Процент показывается рядом с собственной раскрытой внизу выборкой."""
-    if 0 < value < Fraction(1, 100):
-        return "менее 1%"
-    return f"{float(value) * 100:.0f}%"
+    if 0 < value < Fraction(1, 1000):
+        return "<0,1%"
+    return _number(value * 100, compact=True) + "%"
 
 
 def _utf16(value: str) -> int:
@@ -87,93 +109,88 @@ def _short(value: str, budget: int) -> str:
     return "".join(result).rstrip() + "…"
 
 
-def caption_for(card: TasteCard) -> str:
-    """HTML собирается только из собственных тегов и экранированных полей."""
-    examples = card.examples
-    if not examples:
-        return ""
-    result = "Тайтлы из карточки:"
-    used = _utf16(result)
-    for index, title in enumerate(examples, 1):
+def caption_for(examples: Iterable[TasteTitle]) -> str:
+    """Включить проект и только действительно показанные примеры."""
+    unique = {}
+    for title in examples:
+        unique.setdefault(title.id, title)
+    link = f'<a href="{PROJECT_URL}">ShikiUpdatesBot на GitHub</a>'
+    if not unique:
+        return link
+    lines = ["Тайтлы из карточки:"]
+    visible = [*lines, "", "ShikiUpdatesBot на GitHub"]
+    for index, title in enumerate(tuple(unique.values())[:6], 1):
         suffix = " · брошено" if title.status == "dropped" else ""
-        remaining = len(examples) - index + 1
-        budget = min(90, (CAPTION_LIMIT - used) // remaining - _utf16(f"\n{index}. {suffix}"))
-        label = _short(title.title, max(8, budget))
-        line = f"\n{index}. {label}{suffix}"
-        result += f'\n{index}. <a href="{escape(title.url, quote=True)}">{escape(label)}</a>{suffix}'
-        used += _utf16(line)
-    if used > CAPTION_LIMIT:
+        label = _short(title.title, 90)
+        lines.append(f'{index}. <a href="{escape(title.url, quote=True)}">{escape(label)}</a>{suffix}')
+        visible.append(f"{index}. {label}{suffix}")
+    if _utf16("\n".join(visible)) > CAPTION_LIMIT:
         raise TasteRenderError("caption_limit")
-    return result
+    return "\n".join((*lines, "", link))
 
 
 def _footer_notes(card: TasteCard) -> tuple[str, ...]:
-    """Сохранить базы блоков, раскрывая только действительно неполные метаданные."""
-    prefs, drop, source = card.preferences, card.dropping, card.source
-    total = len(source.titles)
-    selection = f"Выборка: {total} тайтлов без запланированного"
-    selection += " — все оценены." if card.rated == total else f"; оценено {card.rated}."
-    notes = [selection]
+    source = card.source
+    notes = []
     if card.rated:
-        scope = (
-            "Сравнение и разнообразие — по оценённым."
-            if card.paired == card.rated else
-            f"Разнообразие — по оценённым. Сравнение с Shikimori: {card.paired}/{card.rated}."
-        )
-        groups = [
-            f"{item.group.label} — {len(item.group.titles)}"
-            for item in (prefs.higher, prefs.lower) if item
-        ]
-        if groups:
-            scope += " Группы оценок: " + "; ".join(groups) + "."
-        notes.append(scope)
-    labels = ("жанры", "темы", "форматы")
-    if card.rated:
-        gaps = [
+        sample = f"Оценено {card.rated}."
+        if card.paired < card.rated:
+            sample += f" Рейтинг Shikimori — у {card.paired} из них."
+        notes.append(sample)
+        if card.paired:
+            notes.append("Рейтинги Shikimori могут быть старше списка.")
+        missing = [
             f"{label} {count}/{card.rated}"
-            for label, count in (*zip(labels, prefs.coverage), ("годы", len(card.diversity.years)))
+            for label, count in zip(
+                ("жанры", "темы", "годы"), (*card.preferences.coverage[:2], len(card.diversity.years)),
+            )
             if count < card.rated
         ]
-        if gaps:
-            notes.append("Неполные метаданные оценённых: " + "; ".join(gaps) + ".")
-    if drop.total:
-        outcomes = f"Доля отказов среди завершённых и брошенных: {drop.dropped}/{drop.total}"
-        if drop.pattern:
-            pattern = drop.pattern
-            outcomes += f"; {pattern.group.label}: {pattern.dropped}/{len(pattern.group.titles)}"
-        notes.append(outcomes + ".")
-        gaps = [
+        if missing:
+            notes.append("Данные об оценённых: " + " · ".join(missing) + ".")
+    drop = card.dropping
+    if drop.pattern:
+        missing = [
             f"{label} {count}/{drop.total}"
-            for label, count in zip(labels, drop.coverage) if count < drop.total
+            for label, count in zip(("жанры", "темы"), drop.coverage)
+            if count < drop.total
         ]
-        if gaps:
-            notes.append("Неполные метаданные завершённых и брошенных: " + "; ".join(gaps) + ".")
-    else:
-        notes.append("Для доли отказов пока нет конечных исходов.")
-    issues = []
+        if missing:
+            notes.append("Данные о завершённых и брошенных: " + " · ".join(missing) + ".")
+    gaps = []
     if source.unresolved:
-        issues.append(f"тип не определён у {source.unresolved}")
+        gaps.append(f"тип не определён у {source.unresolved}")
     if source.excluded:
-        issues.append(f"непригодных записей {source.excluded}")
-    if issues:
-        notes.append("В исходном списке: " + "; ".join(issues) + ".")
-    synced = source.synced_at.strftime("%d.%m.%Y %H:%M") if source.synced_at else "дата неизвестна"
-    notes.extend((
-        f"Список проверен: {synced}. Создано: {source.generated_at:%d.%m.%Y %H:%M} (UTC).",
-        "Рейтинги Shikimori могут быть старше списка; удалённые тайтлы не учтены.",
-    ))
+        gaps.append(f"непригодных записей {source.excluded}")
+    if gaps:
+        notes.append("В исходном списке: " + " · ".join(gaps) + ".")
+    notes.append("Только тайтлы из текущего списка.")
+    generated = source.generated_at
+    synced = source.synced_at
+    if synced is None:
+        notes.append(f"Дата списка неизвестна · создано {generated:%d.%m.%Y %H:%M} UTC.")
+    elif synced.date() == generated.date():
+        notes.append(f"{generated:%d.%m.%Y} UTC · список проверен в {synced:%H:%M}, создано в {generated:%H:%M}.")
+    else:
+        notes.append(f"Список проверен {synced:%d.%m.%Y %H:%M} · создано {generated:%d.%m.%Y %H:%M} UTC.")
     return tuple(notes)
 
 
 class _Canvas:
-    """Ограниченный холст; подписи измеряются тем же шрифтом, которым рисуются."""
+    """Рисование в масштабе 2× с одинаковым измерением и выводом глифов."""
 
-    def __init__(self, resource_root: Path):
-        self.scale = 2
-        self.image = Image.new("RGB", (WIDTH * 2, MAX_HEIGHT * 2), _BG)
+    def __init__(self, font_path: Path):
+        self.image = Image.new("RGB", (1, 1))
         self.draw = ImageDraw.Draw(self.image)
-        self.font_path = resource_root / "assets" / "taste-card" / FONT_NAME
+        self.font_path = font_path
         self.fonts = {}
+        self.examples = []
+
+    def allocate(self, height: int) -> None:
+        """Выделить только холст уже измеренной высоты."""
+        self.image = Image.new("RGB", (WIDTH * 2, height * 2), _BG)
+        self.draw = ImageDraw.Draw(self.image)
+        self.examples.clear()
 
     def font(self, size):
         if size not in self.fonts:
@@ -182,261 +199,426 @@ class _Canvas:
             )
         return self.fonts[size]
 
-    def measure(self, text, size):
-        return self.draw.textlength(text, font=self.font(size)) / 2
+    def bounds(self, text, size, bold=False):
+        return self.draw.textbbox((0, 0), text, font=self.font(size), anchor="lt", stroke_width=int(bold))
 
-    def fit(self, text, size, width):
-        if self.measure(text, size) <= width:
-            return text
+    def width(self, text, size, bold=False):
+        left, _, right, _ = self.bounds(text, size, bold)
+        return (right - left) / 2
+
+    def height(self, text, size, bold=False):
+        _, top, _, bottom = self.bounds(text, size, bold)
+        return (bottom - top) / 2
+
+    def _prefix(self, text, size, width, *, bold=False, suffix=""):
         low, high = 0, len(text)
         while low < high:
             middle = (low + high + 1) // 2
-            if self.measure(text[:middle].rstrip() + "…", size) <= width:
+            if self.width(text[:middle].rstrip() + suffix, size, bold) <= width:
                 low = middle
             else:
                 high = middle - 1
-        return text[:low].rstrip() + "…"
+        return low
 
-    def wrap(self, text, size, width, lines=2):
-        rest = " ".join(text.split())
+    def wrap(self, text, size, width, lines, *, bold=False):
         result = []
-        while rest and len(result) < lines:
-            if self.measure(rest, size) <= width:
-                result.append(rest)
-                rest = ""
+        for index in range(lines):
+            if self.width(text, size, bold) <= width:
+                result.append(text)
                 break
-            if len(result) == lines - 1:
-                result.append(self.fit(rest, size, width))
-                rest = ""
-                break
-            low, high = 1, len(rest)
-            while low < high:
-                middle = (low + high + 1) // 2
-                if self.measure(rest[:middle], size) <= width:
-                    low = middle
-                else:
-                    high = middle - 1
-            cut = rest.rfind(" ", 0, low + 1)
-            cut = cut if cut > 0 else low
-            result.append(rest[:cut].rstrip())
-            rest = rest[cut:].lstrip()
-        return result or [""]
+            last = index == lines - 1
+            suffix = "…" if last else ""
+            cut = self._prefix(text, size, width, bold=bold, suffix=suffix)
+            if not last:
+                space = text.rfind(" ", 0, cut + 1)
+                if space > cut * 0.65:
+                    cut = space
+            result.append(text[:cut].rstrip() + suffix)
+            text = text[cut:].lstrip()
+        return result
 
-    def text(self, x, y, text, size=30, color=_INK, *, bold=False, width=None):
-        if width is not None:
-            text = self.fit(text, size, width)
+    def text(self, x, y, text, size=34, color=_INK, *, align="left", bold=False, width=None, middle=False):
+        if width is not None and self.width(text, size, bold) > width:
+            text = self.wrap(text, size, width, 1, bold=bold)[0]
+        left, top, right, bottom = self.bounds(text, size, bold)
+        height = (bottom - top) / 2
+        x_offset = left if align == "left" else right if align == "right" else (left + right) / 2
+        if middle:
+            y -= height / 2
         self.draw.text(
-            (x * 2, y * 2), text, font=self.font(size), fill=color, anchor="lt",
-            stroke_width=1 if bold else 0, stroke_fill=color,
+            (round(x * 2 - x_offset), round(y * 2 - top)), text, font=self.font(size), fill=color,
+            anchor="lt", stroke_width=int(bold), stroke_fill=color,
         )
+        return y + height
 
-    def multiline(self, x, y, text, size=30, color=_INK, *, width=1024, lines=2, bold=False):
-        for line in self.wrap(text, size, width, lines):
-            self.text(x, y, line, size, color, bold=bold)
-            y += size + 9
-        return y
-
-    def box(self, x, y, width, height, color, radius=18, outline=None):
+    def box(self, left, top, right, bottom, color, radius=0, outline=None):
+        if right <= left or bottom <= top:
+            return
         self.draw.rounded_rectangle(
-            (x * 2, y * 2, (x + width) * 2, (y + height) * 2),
+            (left * 2, top * 2, right * 2 - 1, bottom * 2 - 1),
             radius=radius * 2, fill=color, outline=outline, width=2,
         )
 
-    def section(self, y, height, heading):
-        self.box(56, y + 3, 1088, height, _SHADOW, 24)
-        self.box(56, y, 1088, height, _PAPER, 24, _LINE)
-        self.text(88, y + 27, heading, 37, bold=True)
-
-    def example(self, y, title, *, prefix="Например: "):
-        # Существенный статус ставится до сокращаемого названия.
-        label = ("брошено · " if title.status == "dropped" else "") + title.title
-        self.text(91, y, prefix + label, 27, _MUTED, width=1018)
-
-    def delta(self, y, value):
-        """Одна плашка разницы для личных сравнений и предпочтений."""
-        color, background = (_BLUE, _BLUE_TINT) if value > 0 else (_RED, _RED_TINT)
-        x, top, width, height = 944, y + 6, 164, 76
-        self.box(x, top, width, height, background)
-        label, font = _number(value, signed=True), self.font(39)
-        left, upper, right, lower = self.draw.textbbox(
-            (0, 0), label, font=font, anchor="lt", stroke_width=1,
-        )
-        # Учитываем реальные границы знака, цифр и обводки в масштабе холста.
-        self.draw.text(
-            ((x + width / 2) * 2 - (left + right) / 2,
-             (top + height / 2) * 2 - (upper + lower) / 2),
-            label, font=font, fill=color, anchor="lt", stroke_width=1, stroke_fill=color,
+    def dot(self, x, y, radius, fill, outline=None):
+        self.draw.ellipse(
+            ((x - radius) * 2, (y - radius) * 2, (x + radius) * 2, (y + radius) * 2),
+            fill=fill, outline=outline, width=4,
         )
 
-    def comparison(self, y, card):
-        rows = []
-        for item in (card.above, card.below):
-            if item:
-                label = ("Брошено · " if item.title.status == "dropped" else "") + item.title.title
-                row_height = len(self.wrap(label, 32, 805, lines=2)) * 41 + 55
-                rows.append((item, label, row_height))
-        height = 87 + sum(row_height for _, _, row_height in rows) if rows else 210
-        self.section(y, height, "Где оценки расходятся")
-        if not rows:
-            message = (
-                "Заметных расхождений не видно" if card.comparison_state == "neutral"
-                else "Нет сохранённых пар оценок" if card.comparison_state == "unavailable"
-                else "Для сравнения пока мало данных"
-            )
-            self.text(91, y + 99, message, 31, _MUTED)
-        top = y + 87
-        for item, label, row_height in rows:
-            title_end = self.multiline(91, top, label, 32, width=805, lines=2, bold=True)
-            # Собственные оценки ближе к названию, чем к следующему тайтлу.
-            self.text(
-                92, title_end + 1,
-                f"Профиль {item.title.score}  /  Shikimori {_number(item.title.community)}",
-                27, _MUTED,
-            )
-            self.delta(top, item.delta)
-            top += row_height
-        return y + height + 24
+    def panel(self, y, end, left=_LEFT, right=_RIGHT):
+        self.box(left, y, right, end, _PAPER, 22, _LINE)
+
+    def bar(self, left, right, y, ratio, color, height=14):
+        self.box(left, y, right, y + height, _TRACK, height // 2)
+        fill = round((right - left) * ratio)
+        if ratio:
+            fill = max(1, fill)
+            self.box(left, y, left + fill, y + height, color, min(height // 2, fill // 2))
+
+    def header(self, card, statuses):
+        source = card.source
+        self.text(52, 31, f"{CATEGORY_LABELS[source.category]} · За всё время", 37, _DARK_BLUE, bold=True)
+        self.text(52, 88, "Статистика профиля", 76, bold=True, width=889)
+        self.text(52, 184, f"{source.profile} в Shikimori", 35, _MUTED, width=889)
+        self.panel(240, 368)
+        baseline = card.preferences.baseline
+        for i, (label, value) in enumerate((
+            ("В списке", len(source.titles)), (statuses[0], card.overview.statuses[0]),
+            ("Брошено", card.dropping.dropped), ("Средний балл", _number(baseline) if baseline else "—"),
+        )):
+            left = _TEXT_LEFT + i * 270
+            if i:
+                self.box(left - 17, 262, left - 16, 345, _LINE)
+            self.text(left, 255, str(value), 57, _RED if i == 2 and value else _DARK_BLUE, bold=True, width=248)
+            self.text(left, 319, label, 32, width=250)
+        return 386
+
+    def charts(self, y, card):
+        formats = card.overview.formats
+        end = y + (150 if len(formats) == 1 and not card.rated else 276)
+        self.panel(y, end, _LEFT, 580)
+        self.panel(y, end, 602, _RIGHT)
+        self.text(78, y + 22, "Форматы", 42, bold=True)
+        self.text(628, y + 22, "Личные оценки", 42, bold=True)
+        total = len(card.source.titles)
+        if len(formats) == 1:
+            self.text(78, y + 92, "Все тайтлы · " + formats[0][0].lower(), 35, _MUTED, width=477)
+        else:
+            start = 0
+            for index, ((label, count), color) in enumerate(zip(formats, _FORMAT_COLORS)):
+                finish = start + count
+                self.draw.pieslice(
+                    (156, (y + 87) * 2, 516, (y + 267) * 2),
+                    start=360 * start / total - 90, end=360 * finish / total - 90, fill=color,
+                )
+                start = finish
+                top = y + 91 + index * 44
+                self.box(279, top + 6, 299, top + 25, color, 4)
+                self.text(310, top, label, 33, width=148)
+                self.text(552, top, _percent(Fraction(count, total)), 31, _DARK_BLUE, align="right", width=94)
+            self.dot(168, y + 177, 57, _PAPER)
+        if not card.rated:
+            self.text(628, y + 92, "Пока нет личных оценок", 35, _MUTED, width=494)
+            return end + 18
+
+        top, bottom, left, step = y + 102, y + 219, 694, 42
+        maximum = max(card.histogram)
+        ceiling = (maximum + 4) // 5 * 5
+        for count in (0, ceiling // 2, ceiling):
+            level = bottom - round((bottom - top) * count / ceiling)
+            self.box(left, level, left + step * 10, level + 1, _LINE)
+            if count:
+                self.text(left - 5, level, str(count), 21, _MUTED, align="right", middle=True, width=64)
+        for index, count in enumerate(card.histogram):
+            x = left + step * index
+            if count:
+                height = max(1, round((bottom - top) * count / ceiling))
+                self.box(x + 6, bottom - height, x + 36, bottom, _RED if index < 4 else _BLUE, 3)
+            self.text(x + step / 2, y + 238, str(index + 1), 29, _MUTED, align="center")
+        return end + 18
+
+    def statuses(self, y, card, labels):
+        rows = [(count, label, color) for count, label, color in zip(
+            card.overview.statuses, labels, _STATUS_COLORS,
+        ) if count]
+        end = y + 110 + 48 * ((len(rows) + 2) // 3)
+        self.panel(y, end)
+        self.text(_TEXT_LEFT, y + 21, "Что в списке", 42, bold=True)
+        seen = 0
+        for i, (count, label, color) in enumerate(rows):
+            left = _TEXT_LEFT + round(1044 * seen / len(card.source.titles))
+            seen += count
+            right = _TEXT_LEFT + round(1044 * seen / len(card.source.titles))
+            self.box(left, y + 77, right, y + 94, color)
+            x, top = _TEXT_LEFT + 351 * (i % 3), y + 112 + 48 * (i // 3)
+            self.box(x, top + 6, x + 17, top + 23, color, 3)
+            self.text(x + 27, top, f"{label} {count}", 32, width=314)
+        return end + 18
+
+    def _single(self, y, title, detail):
+        heading_size = 39
+        detail_width = 625
+        heading_width = _TEXT_RIGHT - _TEXT_LEFT - detail_width - 18
+        title = self.wrap(title, heading_size, heading_width, 2, bold=True)
+        detail = self.wrap(detail, 32, detail_width, 2)
+        end = y + max(len(title) * 44, len(detail) * 38) + 46
+        self.panel(y, end)
+        for index, line in enumerate(title):
+            self.text(_TEXT_LEFT, y + 22 + 44 * index, line, heading_size, bold=True)
+        for index, line in enumerate(detail):
+            self.text(_TEXT_RIGHT, y + 27 + 38 * index, line, 32, _MUTED, align="right")
+        return end + 18
+
+    def genres(self, y, card):
+        data = card.overview
+        if not data.genres:
+            return self._single(y, "Жанры", "Пока нет данных о жанрах")
+        end = y + 88 + 41 * len(data.genres)
+        self.panel(y, end)
+        self.text(_TEXT_LEFT, y + 19, "Частые жанры", 42, bold=True)
+        total = len(card.source.titles)
+        overlap = "У тайтла может быть несколько жанров"
+        if data.known_genres < total:
+            self.text(_TEXT_RIGHT, y + 16, f"Жанры известны у {data.known_genres} из {total} тайтлов",
+                      23, _MUTED, align="right", width=601)
+            self.text(_TEXT_RIGHT, y + 44, overlap, 23, _MUTED, align="right", width=601)
+        else:
+            self.text(_TEXT_RIGHT, y + 27, overlap, 29, _MUTED, align="right", width=601)
+        for index, (label, count) in enumerate(data.genres):
+            top = y + 74 + index * 41
+            ratio = Fraction(count, data.known_genres)
+            self.text(_TEXT_LEFT, top, label, 34, bold=True, width=296)
+            self.bar(397, 804, top + 12, ratio, _BLUE)
+            unit = russian_count_word(count, "тайтл", "тайтла", "тайтлов")
+            self.text(997, top + 3, f"{count} {unit}", 28, _MUTED, align="right", width=183)
+            self.text(_TEXT_RIGHT, top, _percent(ratio), 33, _DARK_BLUE, bold=True, align="right", width=119)
+        return end + 18
 
     def preferences(self, y, card):
-        preferences = card.preferences
-        rows = [item for item in (preferences.higher, preferences.lower) if item]
-        height = 124 + len(rows) * 148 if rows else 235
-        self.section(y, height, "Предпочтения")
+        data = card.preferences
+        rows = tuple(row for row in (data.higher, data.lower) if row is not None)
         if not rows:
-            message = (
-                "Выраженного предпочтения не видно" if preferences.state == "neutral"
-                else "Пока нет личных оценок" if preferences.state == "unavailable"
-                else "Для вывода о предпочтениях пока мало данных"
-            )
-            self.multiline(91, y + 102, message, 31, _MUTED, lines=2)
-        if rows:
-            self.text(91, y + 78, f"Обычная оценка профиля — {_number(preferences.baseline)}", 26, _MUTED)
+            message = ("Заметной разницы между группами нет" if data.state == "neutral"
+                       else "Пока мало оценок для сравнения")
+            return self._single(y, "Предпочтения", message) if card.rated else y
+        axes = {row.group.axis for row in rows}
+        heading = _AXIS_HEADINGS[next(iter(axes))] if len(axes) == 1 else "Предпочтения профиля"
+        end = y + 91 + 70 * len(rows)
+        self.panel(y, end)
+        self.text(_TEXT_LEFT, y + 21, heading, 40, bold=True, width=638)
+        self.text(_TEXT_RIGHT, y + 28, "Средний балл профиля " + _number(data.baseline),
+                  28, _MUTED, align="right", width=404)
+        left, right = 398, 789
+        reference = left + round((right - left) * (data.baseline - 1) / 9)
         for index, item in enumerate(rows):
-            top = y + 124 + index * 148
-            if index:
-                self.draw.line((91 * 2, (top - 17) * 2, 1108 * 2, (top - 17) * 2), fill=_LINE, width=2)
-            self.text(91, top, item.group.label, 32, bold=True, width=805)
-            self.text(92, top + 41, f"Средняя оценка — {_number(item.mean)}", 27, _MUTED)
-            self.delta(top, item.delta)
-            self.example(top + 85, item.example)
-        return y + height + 24
+            top = y + 80 + index * 70
+            color = _DARK_BLUE if item.delta > 0 else _RED
+            self.text(_TEXT_LEFT, top, item.group.label, 39, bold=True, width=296)
+            count = len(item.group.titles)
+            label = f"{count} {russian_count_word(count, 'оценка', 'оценки', 'оценок')}"
+            if len(axes) > 1:
+                label = f"{_AXIS_LABELS[item.group.axis]} · {label}"
+            self.text(_TEXT_LEFT, top + 44, label, 24, _MUTED, width=296)
+            mark = left + round((right - left) * (item.mean - 1) / 9)
+            self.box(left, top + 21, right, top + 28, _TRACK, 4)
+            self.box(min(mark, reference), top + 20, max(mark, reference), top + 29, color, 4)
+            self.box(reference, top + 9, reference + 1, top + 41, _MUTED)
+            self.dot(mark, top + 25, 7, color)
+            self.text(868, top + 2, _number(item.mean), 48, color, bold=True, align="center", width=126)
+            direction = "выше" if item.delta > 0 else "ниже"
+            self.text(_TEXT_RIGHT, top + 11, f"на {_number(abs(item.delta))} {direction}",
+                      31, color, align="right", width=190)
+        return end + 18
 
-    def diversity(self, y, card):
-        data = card.diversity
-        extra = sum(bool(value) for value in (data.genre, data.theme, data.rare))
-        columns = 2 if len(data.formats) > 3 else 3
-        legend_extra = 40 if len(data.formats) > 3 else 0
-        height = 260 + extra * 40 + legend_extra if card.rated else 180
-        self.section(y, height, "Разнообразие")
-        top = y + 88
-        if not card.rated:
-            self.text(91, top + 15, "Пока нет оценённых тайтлов", 31, _MUTED)
-            return y + height + 24
-        if data.years:
-            span = str(data.years[0]) if data.years[0] == data.years[-1] else f"{data.years[0]}–{data.years[-1]}"
-            self.text(91, top, span, 40, bold=True)
-            count = len(data.decades)
-            word = russian_count_word(count, "десятилетие", "десятилетия", "десятилетий")
-            label = f"годы выпуска · {count} {word}"
-            self.text(91 + self.measure(span, 40) + 26, top + 12, label, 24, _MUTED)
-        else:
-            self.text(91, top + 8, "Годы выпуска неизвестны", 31, _MUTED)
-        formats = list(data.formats)
-        x, colors = 91, (_BLUE, _SAND, _MUTED, _SLATE)
-        for index, (_, count) in enumerate(formats):
-            segment = round(1018 * count / card.rated)
-            self.box(x, top + 72, segment, 25, colors[index], radius=3)
-            x += segment
-        for index, (label, count) in enumerate(formats):
-            x = 91 + index % columns * (546 if columns == 2 else 345)
-            legend_y = top + 110 + index // columns * 40
-            self.box(x, legend_y + 6, 14, 14, colors[index], radius=3)
-            self.text(
-                x + 24, legend_y,
-                f"{label} {_percent(Fraction(count, card.rated))}", 25,
-                width=446 if columns == 2 else 300,
-            )
-        cursor = top + 154 + legend_extra
-        for value in (data.genre, data.theme):
-            if value:
-                self.text(91, cursor, "Часто встречается: " + value[0], 27, width=1018)
-                cursor += 40
-        if data.rare:
-            self.example(cursor, data.rare, prefix=f"Редкость ({data.rare_label}): ")
-        return y + height + 24
+    def comparison(self, y, card, lines):
+        rows = tuple(row for row in (card.above, card.below) if row is not None)
+        if not rows:
+            messages = {
+                "neutral": "Заметных расхождений нет",
+                "unavailable": "Пока нет пар оценок",
+                "insufficient": "Пока мало пар оценок",
+            }
+            return self._single(y, "Расхождения оценок", messages[card.comparison_state]) if card.rated else y
 
-    def dropping(self, y, card):
+        heading = "Расхождения оценок по тайтлам"
+        legend_half_height = max(9, *(self.height(label, 25) / 2 for label in ("Профиль", "Shikimori")))
+        head_bottom = max(y + 21 + self.height(heading, 40, True), y + 43 + legend_half_height)
+        title_rows = []
+        for row in rows:
+            label = ("Брошено · " if row.title.status == "dropped" else "") + row.title.title
+            wrapped = self.wrap(label, 29, 470, lines)
+            height = sum(self.height(line, 29) + 4 for line in wrapped)
+            title_rows.append((row, wrapped, max(53, height)))
+        top = round(head_bottom + 28)
+        end = top + round(sum(height + 16 for _, _, height in title_rows))
+        self.panel(y, end)
+        self.text(_TEXT_LEFT, y + 21, heading, 40, bold=True, width=707)
+        marker = "#4D5053"
+        center = y + 43
+        for x, label, fill, outline in (
+            (812, "Профиль", marker, None), (967, "Shikimori", _PAPER, marker),
+        ):
+            self.dot(x, center, 9, fill, outline)
+            self.text(x + 17, center, label, 25, _MUTED, middle=True)
+        for index, (row, wrapped, height) in enumerate(title_rows):
+            cursor = top
+            for line in wrapped:
+                cursor = self.text(_TEXT_LEFT, cursor, line, 29) + 4
+            center = top + 25
+            color = _DARK_BLUE if row.delta > 0 else _RED
+            left, right = 591, 1006
+            profile = left + round((right - left) * row.title.score / 10)
+            shiki = left + round((right - left) * row.title.community / 10)
+            self.box(left, center - 3, right, center + 3, _TRACK, 3)
+            self.box(min(profile, shiki), center - 4, max(profile, shiki), center + 4, color, 4)
+            self.dot(profile, center, 24, color)
+            self.dot(shiki, center, 24, _PAPER, _MUTED)
+            self.text(profile, center, str(row.title.score), 27, _PAPER, align="center", middle=True, bold=True)
+            self.text(shiki, center, _number(row.title.community, compact=True), 25, _INK,
+                      align="center", middle=True, bold=True)
+            self.text(_TEXT_RIGHT, center, _number(row.delta, signed=True, compact=True), 35, color,
+                      align="right", middle=True, bold=True, width=83)
+            if index + 1 < len(title_rows):
+                self.box(_TEXT_LEFT, top + height + 5, _TEXT_RIGHT, top + height + 6, _TRACK)
+            top += height + 16
+            self.examples.append(row.title)
+        return end + 18
+
+    def dropping(self, y, card, example):
         data = card.dropping
-        height = 295 if data.pattern else 250
-        self.section(y, height, "Что чаще бросается")
-        top = y + 86
         if not data.total:
-            self.multiline(91, top + 14, "Пока нет завершённых и брошенных тайтлов", 31, _MUTED)
-        else:
-            pattern = data.pattern
-            for x, label, rate, color in (
-                (91, pattern.group.label if pattern else "В целом",
-                 Fraction(pattern.dropped, len(pattern.group.titles)) if pattern else data.rate,
-                 _RED if pattern else _MUTED),
-                (637, "В целом", data.rate, _MUTED),
-            )[:2 if pattern else 1]:
-                self.text(x, top, label, 27, color, bold=True, width=470)
-                self.text(x, top + 40, _percent(rate), 52, color, bold=True)
-                self.box(x, top + 111, 470, 12, _SHADOW, radius=6)
-                if rate:
-                    self.box(x, top + 111, max(1, round(470 * rate)), 12, color, radius=6)
-            if pattern:
-                self.example(top + 150, pattern.example)
-            else:
-                message = (
-                    "Повышенная доля по направлениям не выделяется" if data.state == "neutral"
-                    else "Для вывода по направлениям пока мало данных"
-                )
-                self.text(91, top + 139, message, 27, _MUTED, width=1018)
-        return y + height + 24
+            return y
+        if data.pattern is None:
+            state = "Направление не выделяется" if data.state == "neutral" else "Для сравнения групп мало данных"
+            return self._single(
+                y, "Доля брошенных",
+                f"{data.dropped} из {data.total} завершённых и брошенных · {_percent(data.rate)}. {state}.",
+            )
+
+        subtitle = "Среди завершённых и брошенных тайтлов"
+        data_y = y + 68 + self.height(subtitle, 28) + 33
+        label = "Пример · " + data.pattern.example.title
+        shortened = self.wrap(label, 29, 1044, 1)[0]
+        example_y = data_y + 111
+        end = round(example_y + (self.height(shortened, 29) if example else 0) + 21)
+        self.panel(y, end)
+        self.text(_TEXT_LEFT, y + 21, "Что доводилось бросать чаще", 40, bold=True)
+        self.text(_TEXT_LEFT, y + 68, subtitle, 28, _MUTED)
+        for index, (group, dropped, total, color) in enumerate((
+            (data.pattern.group.label, data.pattern.dropped, len(data.pattern.group.titles), _RED),
+            ("В целом", data.dropped, data.total, _BLUE),
+        )):
+            top = data_y + index * 53
+            ratio = Fraction(dropped, total)
+            self.text(_TEXT_LEFT, top + 2, group, 38, bold=index == 0, width=283)
+            self.bar(379, 795, top + 13, ratio, color, 18)
+            self.text(969, top + 4, f"{dropped} из {total}", 31, _MUTED, align="right", width=161)
+            self.text(_TEXT_RIGHT, top, _percent(ratio), 41, color, bold=True, align="right", width=143)
+        if example:
+            self.text(_TEXT_LEFT, example_y, shortened, 29, _MUTED)
+            self.examples.append(data.pattern.example)
+        return end + 18
+
+    def diversity(self, y, card, options):
+        data = card.diversity
+        if options.years and data.years:
+            first, last = data.years[0], data.years[-1]
+            self.panel(y, y + 66)
+            self.text(_TEXT_LEFT, y + 20, "Годы выпуска оценённых тайтлов", 35, bold=True, width=730)
+            self.text(_TEXT_RIGHT, y + 16, str(first) if first == last else f"{first}–{last}",
+                      41, _DARK_BLUE, align="right", width=283)
+            y += 84
+        if options.rare and data.rare and all(title.id != data.rare.id for title in self.examples):
+            label = ("брошено · " if data.rare.status == "dropped" else "") + data.rare.title
+            y = self._single(y, f"Редкость · {data.rare_label}", label)
+            self.examples.append(data.rare)
+        return y
 
     def footer(self, y, card):
-        self.draw.line((66 * 2, y * 2, 1134 * 2, y * 2), fill=_LINE, width=2)
-        cursor = y + 18
-        for sample in _footer_notes(card):
-            # Числа и существенный контекст не обрезаются; слишком большой макет отклоняется.
-            lines = self.wrap(sample, 21, 1068, lines=8)
-            if any(line.endswith("…") for line in lines):
-                raise TasteRenderError("footer_overflow")
-            for line in lines:
-                self.text(67, cursor, line, 21, _MUTED)
-                cursor += 28
-        return cursor + 25
+        self.box(_LEFT, y, 893, y + 1, _LINE)
+        cursor = y + 13
+        for note in _footer_notes(card):
+            for line in self.wrap(note, 21, 841, 2):
+                cursor = self.text(_LEFT, cursor, line, 21, _MUTED) + 5
+        cursor = self.text(_LEFT, cursor + 3, "Made by ShikiUpdatesBot", 27, _DARK_BLUE, bold=True) + 10
+        return self.text(_LEFT, cursor, PROJECT_ADDRESS, 29)
+
+    def layout(self, card, options, qr_height):
+        self.examples.clear()
+        labels = (("Просмотрено", "Смотрю", "Пересматриваю") if card.source.category == "anime"
+                  else ("Прочитано", "Читаю", "Перечитываю"))
+        labels += ("В планах", "Отложено", "Брошено")
+        y = self.header(card, labels)
+        y = self.charts(y, card)
+        y = self.statuses(y, card, labels)
+        y = self.genres(y, card)
+        y = self.preferences(y, card)
+        y = self.comparison(y, card, 2 if options.two_line_titles else 1)
+        y = self.dropping(y, card, options.drop_example)
+        y = self.diversity(y, card, options)
+        bottom = self.footer(y, card)
+        return round(max(y + qr_height + 8, bottom) + 16), y + 8
+
+    def avatar(self, avatar, logo_path):
+        size, x, y = 170, 978, 35
+        self.box(x - 3, y - 3, x + size + 3, y + size + 3, _PAPER, 22, _LINE)
+        art = None
+        if avatar:
+            try:
+                with Image.open(BytesIO(avatar), formats=("PNG",)) as source:
+                    if source.size == (160, 160):
+                        art = source.convert("RGBA")
+            except (OSError, ValueError):
+                pass
+        tile = Image.new("RGB", (size * 2, size * 2), _PAPER)
+        if art is not None and art.getchannel("A").getbbox():
+            art = ImageOps.fit(art, tile.size, Image.Resampling.BICUBIC)
+        else:
+            with Image.open(logo_path) as source:
+                art = ImageOps.contain(source.convert("RGBA"), (size * 2 - 46, size * 2 - 46))
+        tile.paste(art, ((tile.width - art.width) // 2, (tile.height - art.height) // 2), art.getchannel("A"))
+        mask = Image.new("L", tile.size)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, tile.width - 1, tile.height - 1), radius=40, fill=255)
+        self.image.paste(tile, (x * 2, y * 2), mask)
 
 
-def render_taste_card(card: TasteCard, *, resource_root: Path = RESOURCE_ROOT) -> RenderedTasteCard:
-    """Сформировать ограниченный JPEG и подпись без сети и записи состояния."""
+def render_taste_card(
+    card: TasteCard, *, avatar: bytes | None = None, resource_root: Path = RESOURCE_ROOT,
+) -> RenderedTasteCard:
+    """Измерить макет, уместить его в лимит и собрать одну пару JPEG и HTML."""
     if not card.available:
         raise TasteRenderError("unavailable_card")
+    assets = resource_root / "assets" / "taste-card"
     try:
-        canvas = _Canvas(resource_root)
-        canvas.text(64, 45, "Карточка вкуса", 70, bold=True)
-        profile = f"{card.source.profile} / {CATEGORY_LABELS[card.source.category]}"
-        end = canvas.multiline(68, 142, profile, 32, _BLUE, width=1060, lines=2, bold=True)
-        y = end + 34
-        for block in (canvas.comparison, canvas.preferences, canvas.diversity, canvas.dropping):
-            y = block(y, card)
-        height = canvas.footer(y + 8, card)
+        with Image.open(assets / "repository-qr.png") as asset:
+            qr = asset.convert("RGBA")
+        ink = qr.getchannel("A").getbbox()
+        if qr.size != (246, 246) or ink != (24, 24, 222, 222):
+            raise TasteRenderError("qr_geometry")
+        canvas = _Canvas(assets / FONT_NAME)
+        options = _Layout()
+        height, qr_y = canvas.layout(card, options, qr.height)
+        # Второстепенные примеры, переносы и диапазон лет уступают место основным числам.
+        for field in ("rare", "two_line_titles", "drop_example", "years"):
+            if height <= MAX_HEIGHT:
+                break
+            options = replace(options, **{field: False})
+            height, qr_y = canvas.layout(card, options, qr.height)
         if height > MAX_HEIGHT:
             raise TasteRenderError("image_height")
-        image = canvas.image.crop((0, 0, WIDTH * 2, height * 2)).resize(
-            (WIDTH, height), Image.Resampling.LANCZOS,
-        )
-        content = b""
+        canvas.allocate(height)
+        canvas.layout(card, options, qr.height)
+        canvas.avatar(avatar, assets / "logo.png")
+        image = canvas.image.resize((WIDTH, height), Image.Resampling.LANCZOS)
+        image.paste(qr, (_RIGHT - ink[2], qr_y), qr)
+
         for quality in (92, 85, 78):
             output = BytesIO()
             image.save(output, format="JPEG", quality=quality, subsampling=0)
             content = output.getvalue()
             if len(content) <= MAX_BYTES:
-                break
-        if len(content) > MAX_BYTES:
-            raise TasteRenderError("image_size")
-        return RenderedTasteCard(content, caption_for(card), WIDTH, height)
+                return RenderedTasteCard(content, caption_for(canvas.examples), WIDTH, height)
+        raise TasteRenderError("image_size")
     except (OSError, ValueError, OverflowError) as error:
         if isinstance(error, TasteRenderError):
             raise
@@ -444,23 +626,48 @@ def render_taste_card(card: TasteCard, *, resource_root: Path = RESOURCE_ROOT) -
 
 
 def smoke_card(category: str = "anime") -> TasteCard:
-    """Условный срез для офлайн-проверки реальных ресурсов и frozen-рендера."""
+    """Условный плотный срез для проверки реальных ресурсов и frozen-рендера."""
     if category not in CATEGORY_LABELS:
         raise ValueError("taste_category")
     titles = []
     media = "animes" if category == "anime" else "mangas"
-    for index in range(1, 61):
-        genre = "Детектив" if index <= 10 else "Романтика" if index <= 20 else "Фэнтези"
-        score = 9 if index <= 10 else 5 if index <= 20 else 7
-        kind = ("movie" if index <= 10 else "ova" if index > 58 else "tv") if category == "anime" else (
-            "manga" if category == "manga" else "light_novel"
-        )
-        name = {1: "Небо и море / 空と海", 11: "Стеклянный город", 59: "Письма на север"}.get(index, f"История {index}")
+    formats = {
+        "anime": ("tv", "movie", "ova", "ona"),
+        "manga": ("manga", "manhwa", "manhua"),
+        "ranobe": ("light_novel", "novel"),
+    }[category]
+    for index in range(1, 161):
+        tags = ["Приключения"]
+        if index <= 24:
+            tags.append("Детектив")
+        if 25 <= index <= 40:
+            tags.append("Комедия")
+        if 41 <= index <= 60:
+            tags.append("Триллер")
+        if 61 <= index <= 72:
+            tags.append("Фэнтези")
+        if index <= 100:
+            status = "dropped" if index in {1, 25, *range(41, 51)} else "completed"
+        elif index <= 120:
+            status = "dropped" if index <= 108 else "completed"
+        else:
+            status = ("watching", "rewatching", "planned", "on_hold")[index % 4]
+        score = 9 if index <= 24 else 5 if index <= 40 else 8
+        if index <= 2:
+            score = 10
+        elif index == 25:
+            score = 4
+        name = {
+            1: "Небо над городом / 眠らない街の空と海の物語、最初から最後まで",
+            25: "Тетрадь странствий по тихим улицам несуществующего города",
+            41: "Хроники города, который разучился спать и давно потерял своё название",
+        }.get(index, f"История {index}")
+        kind = formats[(index - 1) % len(formats)] if index <= 60 else formats[0]
+        community = Fraction(5) if index == 1 else Fraction(8) if index == 25 else Fraction(score)
         titles.append(TasteTitle(
-            index, name, f"https://shikimori.io/{media}/{index}",
-            "dropped" if index <= 4 or index in {21, 22} else "completed",
-            kind, score, Fraction("6.6") if index <= 10 else Fraction("8.4"),
-            1980 + index % 46, (genre,), ("Путешествие",),
+            index, name, f"https://shikimori.io/{media}/{index}", status, kind,
+            score if index <= 112 else None, community if index <= 94 else None,
+            1986 + index % 40, tuple(tags) if index <= 140 else (), ("Путешествие",),
         ))
-    now = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
-    return build_taste_card(TasteInput("DEMO · условные данные", category, now, now, tuple(titles)))
+    now = datetime(2026, 11, 23, 9, 30, tzinfo=timezone.utc)
+    return build_taste_card(TasteInput("DEMO (условные данные)", category, now, now.replace(hour=8), tuple(titles)))

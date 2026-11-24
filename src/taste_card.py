@@ -2,6 +2,7 @@
 # Copyright (C) 2026  WorgaNomoR
 """Неизменяемый портрет сохранённого списка и объяснимые расчёты без I/O."""
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
@@ -13,6 +14,7 @@ FORMAT_LABELS = {
     "light_novel": "Ранобэ", "novel": "Новеллы",
 }
 AXES = ("genre", "theme", "format")
+STATUSES = ("completed", "watching", "rewatching", "planned", "on_hold", "dropped")
 
 
 @dataclass(frozen=True)
@@ -43,7 +45,16 @@ class TasteInput:
     state: str = "ready"
     unresolved: int = 0
     excluded: int = 0
-    planned: int = 0
+
+
+@dataclass(frozen=True)
+class Overview:
+    """Состав всех пригодных записей и частые жанры среди известных."""
+
+    statuses: tuple[int, ...]
+    formats: tuple[tuple[str, int], ...]
+    genres: tuple[tuple[str, int], ...]
+    known_genres: int
 
 
 @dataclass(frozen=True)
@@ -130,9 +141,11 @@ class Dropping:
 
 @dataclass(frozen=True)
 class TasteCard:
-    """Результат четырёх независимых блоков и их собственные выборки."""
+    """Сводка и аналитические блоки со своими выборками."""
 
     source: TasteInput
+    overview: Overview
+    histogram: tuple[int, ...]
     rated: int
     paired: int
     comparison_state: str
@@ -161,8 +174,8 @@ class TasteCard:
 
     @property
     def available(self) -> bool:
-        """Карточка требует хотя бы оценку или пригодный конечный исход."""
-        return self.source.state == "ready" and bool(self.rated or self.dropping.total)
+        """Для обзора достаточно одной пригодной записи любого статуса."""
+        return self.source.state == "ready" and bool(self.source.titles)
 
 
 def _mean(titles: tuple[TasteTitle, ...]) -> Fraction:
@@ -178,8 +191,12 @@ def _groups(titles: tuple[TasteTitle, ...]) -> tuple[tuple[Group, ...], tuple[in
         for index, values in enumerate((title.genres, title.themes, (title.kind,))):
             if values:
                 coverage[index] += 1
+            seen = set()
             for label in values:
                 key = (AXES[index], label.casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
                 display = FORMAT_LABELS.get(label, label) if index == 2 else label
                 if key not in rows:
                     rows[key] = (display, [])
@@ -311,9 +328,20 @@ def _dropping(titles: tuple[TasteTitle, ...]) -> Dropping:
 
 def build_taste_card(source: TasteInput) -> TasteCard:
     """Рассчитать независимые блоки по одному неизменяемому срезу."""
+    statuses = Counter(title.status for title in source.titles)
+    groups, coverage = _groups(source.titles)
+    by_frequency = sorted(groups, key=lambda group: (-len(group.titles), group.key))
+    overview = Overview(
+        tuple(statuses[status] for status in STATUSES),
+        tuple((group.label, len(group.titles)) for group in by_frequency if group.axis == "format"),
+        tuple((group.label, len(group.titles)) for group in by_frequency if group.axis == "genre")[:5],
+        coverage[0],
+    )
     rated = tuple(sorted(
-        (title for title in source.titles if title.score is not None), key=lambda title: title.id,
+        (title for title in source.titles if title.status != "planned" and title.score is not None),
+        key=lambda title: title.id,
     ))
+    counts = Counter(title.score for title in rated)
     paired = tuple(title for title in rated if title.community is not None)
     differences = tuple(Difference(title, title.score - title.community) for title in paired)
     above = min(
@@ -333,7 +361,8 @@ def build_taste_card(source: TasteInput) -> TasteCard:
         key=lambda title: title.id,
     ))
     return TasteCard(
-        source, len(rated), len(paired), comparison_state, above, below,
+        source, overview, tuple(counts[score] for score in range(1, 11)),
+        len(rated), len(paired), comparison_state, above, below,
         _preferences(rated), _diversity(rated), _dropping(finals),
     )
 
@@ -348,5 +377,5 @@ def unavailable_text(card: TasteCard) -> str:
     if state == "unresolved":
         return "В сохранённом списке есть записи, тип которых пока не определён. Карточка этой категории пока недоступна."
     if state == "empty":
-        return "В этой категории пока нет тайтлов для карточки. Запланированное не учитывается."
-    return "Для карточки пока нет оценок или завершённых и брошенных тайтлов."
+        return "В этой категории пока нет тайтлов."
+    return "Для карточки пока нет пригодных записей."
