@@ -445,6 +445,8 @@ async def _fetch(
     json_body: dict | None = None,
     traffic_class: str = "general",
     actor_user_id: int | None = None,
+    allow_redirects: bool = True,
+    check_privacy: bool = True,
 ):
     """
     Единый выстрел HTTP через центральный троттл + ретрай на 429.
@@ -486,6 +488,7 @@ async def _fetch(
                 cm = session.get(
                     url, headers=headers,
                     timeout=aiohttp.ClientTimeout(total=timeout),
+                    **({} if allow_redirects else {"allow_redirects": False}),
                 )
             async with cm as resp:
                 if resp.status == 429:
@@ -500,7 +503,7 @@ async def _fetch(
                         continue
                     log.warning("%s: HTTP 429; повторы исчерпаны", label)
                     return None
-                if resp.status == 403 and await _is_private_profile_response(resp):
+                if resp.status == 403 and check_privacy and await _is_private_profile_response(resp):
                     log.warning("%s: профиль Shikimori закрыт", label)
                     raise ProfilePrivacyError(label)
                 if resp.status != 200:
@@ -839,7 +842,33 @@ async def fetch_achievements(session: aiohttp.ClientSession) -> dict | None:
     except AchievementSourceError:
         log.warning("Достижения: некорректный ответ; snapshot сохранён.")
         return None
-    return {"user_id": user_id, "rows": rows}
+    image = info.get("image")
+    avatar = image.get("x160") if isinstance(image, dict) else None
+    return {"user_id": user_id, "rows": rows, "avatar_url": avatar}
+
+
+async def fetch_profile_avatar(session: aiohttp.ClientSession, url: str) -> bytes | None:
+    """Получить проверенный вызывающим URL без переходов и не более 256 КиБ."""
+    limit = 256 * 1024
+
+    async def parse(response):
+        if response.content_length is not None and response.content_length > limit:
+            return None
+        content = bytearray()
+        async for part in response.content.iter_chunked(16 * 1024):
+            if len(content) + len(part) > limit:
+                return None
+            content.extend(part)
+        return bytes(content) if content else None
+
+    try:
+        async with asyncio.timeout(8):
+            return await _fetch(
+                session, "GET", url, parse=parse, label="fetch_profile_avatar", timeout=8,
+                allow_redirects=False, check_privacy=False,
+            )
+    except TimeoutError:
+        return None
 
 
 async def fetch_current_rates(media: str, statuses: list[str]) -> list[dict] | None:

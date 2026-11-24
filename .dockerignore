@@ -60,6 +60,7 @@ assets/*
 !assets/main-menu/*.jpg
 !assets/taste-card/
 !assets/taste-card/*.otf
+!assets/taste-card/*.png
 !assets/taste-card/*.txt
 
 # Документация, не нужная во время выполнения контейнера

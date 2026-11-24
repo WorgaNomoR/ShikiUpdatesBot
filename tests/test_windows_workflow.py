@@ -74,7 +74,8 @@ def test_pyinstaller_bundles_fact_bank_example():
 def test_taste_resources_notices_and_real_frozen_smoke_are_packaged():
     assert 'datas.append((str(root / "assets" / "taste-card"), "assets/taste-card"))' in PYINSTALLER_SPEC
     assert 'copy_metadata("Pillow")' in PYINSTALLER_SPEC
-    for filename in ("NotoSansCJKjp-Regular.otf", "OFL.txt", "NOTICE.txt", "Pillow-LICENSE.txt"):
+    for filename in ("NotoSansCJKjp-Regular.otf", "OFL.txt", "NOTICE.txt", "Pillow-LICENSE.txt", "logo.png",
+                     "repository-qr.png"):
         assert (ROOT / "assets" / "taste-card" / filename).is_file()
     step = _step(SPEC["jobs"]["build"], "Smoke taste card generation")
     assert '$smokeExecutable = (Resolve-Path .\\dist\\ShikiUpdatesBot.exe).Path' in step["run"]

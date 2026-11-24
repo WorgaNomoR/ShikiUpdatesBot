@@ -190,7 +190,6 @@ def test_every_screen_uses_one_versioned_artwork_from_central_registry():
             target=True,
         ),
         "stats": main_menu.stats_view(),
-        "stats:taste": main_menu.taste_view(),
         "lists": main_menu.lists_view(),
         "lists:anime": main_menu.list_media_view("anime"),
         "lists:manga": main_menu.list_media_view("manga"),
@@ -204,6 +203,7 @@ def test_every_screen_uses_one_versioned_artwork_from_central_registry():
     for key, view in views.items():
         assert view.artwork == key
         assert main_menu.MAIN_MENU_ASSETS[key].endswith("-v1.jpg")
+    assert main_menu.stats_all_view().artwork == main_menu.taste_view().artwork == views["stats"].artwork
 
 
 @pytest.mark.parametrize("registry", [
@@ -225,6 +225,7 @@ def test_captions_keep_dynamic_or_instructional_text_only():
     assert home.caption == home.text
     assert subscription.caption == subscription.text
     assert main_menu.stats_view().caption is None
+    assert main_menu.stats_all_view().caption is None
     assert main_menu.taste_view().caption is None
     assert main_menu.list_media_view("anime").caption is None
     assert main_menu.owner_view().caption is None

@@ -91,6 +91,7 @@ from handlers import (
     version_refresh_cb,
 )
 from healthcheck import start_health_server
+from profile_avatar import stop_profile_avatar
 from runtime import (
     IS_FROZEN,
     WindowsConsoleCloseGuard,
@@ -266,9 +267,12 @@ async def main() -> None:
             allowed_updates=["message", "callback_query", "inline_query"],
         )
     finally:
-        if close_guard is not None:
-            close_guard.complete()
-            close_guard.uninstall()
+        try:
+            await stop_profile_avatar()
+        finally:
+            if close_guard is not None:
+                close_guard.complete()
+                close_guard.uninstall()
 
 
 if __name__ == "__main__":
